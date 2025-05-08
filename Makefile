@@ -1,4 +1,4 @@
-.PHONY: build agent-up debugfs-volume generate-config generate-bpf test-controller clean-compose clean
+.PHONY: build agent-up debugfs-volume generate-config generate-bpf test-controller test-agent test clean-compose clean
 
 # Default configuration
 IMAGE_NAME := rpingmesh-agent
@@ -65,7 +65,17 @@ generate-bpf:
 # Test controller
 test-controller:
 	@echo "Running controller tests with Docker..."
-	@docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
+	@docker compose -f docker-compose.test.yml up --build controller_test --abort-on-container-exit
+
+# Test agent
+test-agent:
+	@echo "Running agent tests with Docker..."
+	@KERNEL_VERSION=$(KERNEL_VERSION) docker compose -f docker-compose.test.yml up --build agent_test --abort-on-container-exit
+
+# Run all tests
+test:
+	@echo "Running all tests with Docker..."
+	@KERNEL_VERSION=$(KERNEL_VERSION) docker compose -f docker-compose.test.yml up --build controller_test agent_test --abort-on-container-exit
 
 # Help target
 help:
@@ -76,6 +86,8 @@ help:
 	@echo "  generate-config  - Generate default configuration file with Docker Compose"
 	@echo "  generate-bpf     - Generate eBPF Go bindings locally"
 	@echo "  test-controller  - Run controller tests with Docker Compose"
+	@echo "  test-agent       - Run agent tests with Docker Compose"
+	@echo "  test             - Run all tests with Docker Compose"
 	@echo "  clean            - Remove the Docker image"
 	@echo "  clean-compose    - Clean up Docker Compose resources"
 	@echo "  help             - Show this help message"

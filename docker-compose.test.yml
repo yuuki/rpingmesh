@@ -38,6 +38,30 @@ services:
     # Ensure container exits when tests complete
     restart: "no"
 
+  # Agent test execution container
+  agent_test:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      target: builder
+      args:
+        - KERNEL_VERSION=${KERNEL_VERSION:-5.15.0-generic}
+    volumes:
+      - go_mod_cache:/go/pkg/mod
+      - go_build_cache:/root/.cache/go-build
+      - .:/app
+    working_dir: /app
+    environment:
+      - CGO_ENABLED=1
+    entrypoint: []
+    command: >
+      sh -c "
+        echo 'Running agent tests...' &&
+        go test -v ./internal/agent/... -count=1
+      "
+    # Ensure container exits when tests complete
+    restart: "no"
+
 volumes:
   go_mod_cache:
   go_build_cache:

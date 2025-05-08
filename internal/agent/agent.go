@@ -37,13 +37,7 @@ type Agent struct {
 }
 
 // New creates a new agent instance
-func New(configPath string) (*Agent, error) {
-	// Load configuration
-	cfg, err := config.LoadAgentConfig(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load config: %w", err)
-	}
-
+func New(cfg *config.AgentConfig) (*Agent, error) {
 	// Initialize logging
 	initLogging(cfg.LogLevel)
 

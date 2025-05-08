@@ -11,29 +11,16 @@ import (
 
 // TestNew tests the New function
 func TestNew(t *testing.T) {
-	// Create a temporary config file
-	tmpFile, err := os.CreateTemp("", "rpingmesh-agent-test-*.yaml")
-	if err != nil {
-		t.Fatalf("Failed to create temp file: %v", err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	// Write minimal config
-	configContent := `
-agent_id: "test-agent"
-controller_addr: "localhost:50051"
-analyzer_addr: "localhost:50052"
-log_level: "info"
-`
-	if _, err := tmpFile.Write([]byte(configContent)); err != nil {
-		t.Fatalf("Failed to write to temp file: %v", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		t.Fatalf("Failed to close temp file: %v", err)
+	// Create a test configuration
+	cfg := &config.AgentConfig{
+		AgentID:        "test-agent",
+		ControllerAddr: "localhost:50051",
+		AnalyzerAddr:   "localhost:50052",
+		LogLevel:       "info",
 	}
 
 	// Try to create a new agent
-	a, err := New(tmpFile.Name())
+	a, err := New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create new agent: %v", err)
 	}
@@ -69,32 +56,19 @@ func TestAgentBasicOperation(t *testing.T) {
 		t.Skip("Skipping integration tests when not in CI environment")
 	}
 
-	// Create a temporary config file
-	tmpFile, err := os.CreateTemp("", "rpingmesh-agent-test-*.yaml")
-	if err != nil {
-		t.Fatalf("Failed to create temp file: %v", err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	// Write minimal config
-	configContent := `
-agent_id: "test-agent"
-controller_addr: "localhost:50051"
-analyzer_addr: "localhost:50052"
-log_level: "info"
-probe_interval_ms: 1000
-timeout_ms: 500
-data_upload_interval_ms: 10000
-`
-	if _, err := tmpFile.Write([]byte(configContent)); err != nil {
-		t.Fatalf("Failed to write to temp file: %v", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		t.Fatalf("Failed to close temp file: %v", err)
+	// Create a test configuration
+	cfg := &config.AgentConfig{
+		AgentID:              "test-agent",
+		ControllerAddr:       "localhost:50051",
+		AnalyzerAddr:         "localhost:50052",
+		LogLevel:             "info",
+		ProbeIntervalMS:      1000,
+		TimeoutMS:            500,
+		DataUploadIntervalMS: 10000,
 	}
 
 	// Create an agent
-	a, err := New(tmpFile.Name())
+	a, err := New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create agent: %v", err)
 	}
@@ -125,9 +99,7 @@ data_upload_interval_ms: 10000
 
 // TestAgentConfiguration tests configuration loading and validation
 func TestAgentConfiguration(t *testing.T) {
-	// Test that the agent correctly handles configuration
-
-	// Create a temporary config file
+	// Create a temporary config file to test LoadAgentConfig
 	tmpFile, err := os.CreateTemp("", "rpingmesh-agent-test-*.yaml")
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
@@ -182,7 +154,7 @@ ebpf_enabled: false
 	}
 
 	// Create agent with this config and verify it loads correctly
-	a, err := New(tmpFile.Name())
+	a, err := New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create agent with config: %v", err)
 	}

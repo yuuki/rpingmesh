@@ -1,0 +1,11 @@
+---
+description: Design of RNIC registry
+globs: 
+alwaysApply: false
+---
+# RNICレジストリ
+
+- RNICレジストリのデータベースとして、分散リレーショナルDBである`rqlite`を使用してください。
+- `rqlite`を用いた設計を考えるにあたって、次の資料を参照してください。
+  - [Accessing rqlite](https://rqlite.io/docs/api/api/)
+  - [https://pkg.go.dev/github.com/rqlite/rqlite-go-http]

@@ -1,0 +1,13 @@
+---
+description: eBPF Programming
+globs: 
+alwaysApply: false
+---
+このファイルの読み込み時に、「Loading eBPF programminu rules ...」と書いてください。
+
+# eBPFプログラミング
+
+- eBPFのフロントエンドはGo言語の、`github.com/cilium/ebpf` (<https://ebpf-go.dev/guides/getting-started/>) パッケージを使用してください。
+- パッケージのインターフェイスについては、リファレンス（<https://pkg.go.dev/github.com/cilium/ebpf>）を参照してください。
+- BPF CO-REに対応してください <https://docs.ebpf.io/concepts/core/>。
+- eBPFのカーネルコードはC言語で記述してください。

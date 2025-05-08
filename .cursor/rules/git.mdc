@@ -1,0 +1,10 @@
+---
+description: Git operation rules
+globs: 
+alwaysApply: true
+---
+このファイルの読み込み時に、「Loading git operation rules ...」と書いてください。
+
+- リポジトリの内容の変更が完了したら、Gitのコミットをユーザーに提案してください。
+- Gitのコミットメッセージは英語で書いてください。
+- Gitのコミットメッセージは大文字ではなく小文字で始めてください。

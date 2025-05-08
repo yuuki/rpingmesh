@@ -1,0 +1,230 @@
+---
+description: Design document
+globs: 
+alwaysApply: true
+---
+このファイルの読み込み時に、「Loading design document ...」と書いてください。
+
+# 設計書
+
+## 設計目標
+
+設計目標は、コモディティRNIC（RDMA NIC）を用いたエンドツーエンドのアクティブプロービング、ネットワークRTT（Round Trip Time）とエンドホスト処理遅延の正確な測定、RNIC起因とネットワーク内部起因の問題の区別、サービスアウェアな監視と影響評価といったコア機能を実装することである。
+
+## アーキテクチャ概要
+
+システムは、3つの主要コンポーネントで構成される。すべてのコンポーネントはLinux上で動作する。
+
+1.  **Controller:** RNIC情報を管理し、Agent全体にわたるプロービングタスクを調整する中央サービス。
+2.  **Agent:** 各RoCE対応ホスト上で動作するデーモン。プロービングタスクの実行、プローブへの応答、ローカルサービスフローの監視、パスのトレース、結果の報告を担当。
+3.  **Analyzer:** Agentからデータを受信し、異常検出、問題特定、SLA追跡、サービス影響評価のための分析を実行する中央サービス。（詳細な実装はController/Agent間のインタラクションの範囲外だが、Agentとのインタフェースは考慮される）。
+
+**通信フロー:**
+
+*   **Agent <-> Controller (gRPC):**
+    *   Agentは起動時に自身のRNICをControllerに登録する。
+    *   AgentはCluster MonitoringのためにControllerにPinglist（ToR-mesh, Inter-ToR）を要求する。
+    *   AgentはService TracingプローブのためにControllerにターゲットRNICの通信情報（GID, QPN）を要求する。
+*   **Agent -> Analyzer (例: gRPC):**
+    *   Agentはプローブ結果（RTT、遅延、タイムアウト）、パストレース、集約されたローカル統計情報などをアップロードします。
+*   **Controller -> Agent (gRPC応答経由):**
+    *   ControllerはAgentのリクエストに応じてPinglistとRNIC情報を送信する。
+
+**3. コンポーネント詳細**
+
+**3.1. Controller**
+
+*   **責務:**
+    *   アクティブなAgentとその関連RNIC（IP, GID, QPN, ホスト情報）のレジストリを維持する。
+    *   Cluster MonitoringのためのToR-meshおよびInter-ToR Pinglistを生成・配布する。
+    *   Service TracingのためのAgentリクエストに応じて、ターゲットRNICの通信詳細（GID, QPN）を提供する。
+    *   カバレッジ向上と5タプル固有の問題検出のために、Pinglistの5タプルを定期的に更新する。
+    *   基本的な設定配布（例：デフォルトのプローブ間隔、タイムアウト）を管理する（Agentがローカルで上書きすることも可能）。
+*   **技術要素:**
+    *   Go プログラミング言語 [golang.mdc](mdc:.cursor/rules/golang.mdc)
+    *   Agent通信用のgRPCサーバー (`google.golang.org/grpc`)
+    *   RNICレジストリを格納するデータベース（）。`RnicStore`インターフェースでストレージバックエンドを抽象化する。 [rnic_registry.mdc](mdc:.cursor/rules/rnic_registry.mdc)
+    *   トポロジ情報、プロービングポリシーのための設定管理（例：ViperライブラリとYAML/TOMLファイル）。
+*   **主要モジュール/パッケージ:**
+    *   `rpc`: gRPCサービス、リクエスト/レスポンスのproto定義、サーバー実装。
+    *   `registry`: RNIC情報の管理（CRUD操作、クエリ）。
+    *   `pinglist`: レジストリデータとトポロジ設定に基づき、ToR-meshおよびInter-ToR Pinglistを生成するロジック（kタプル選択のための式(1)のロジックを実装）。
+    *   `store`: RNICデータストアのインターフェースと実装。
+    *   `config`: Controller設定の読み込みと管理。
+
+**3.2. Agent**
+
+*   **責務:**
+    *   ローカルRNICを検出します。
+    *   ローカルRNICをgRPC経由でControllerに登録します。
+    *   ControllerからPinglistを取得・管理します。
+    *   RoCE UD QP（Unreliable Datagram Queue Pair）パケットを使用してプロービングタスク（Cluster Monitoring & Service Tracing）を実行します。
+        *   RoCEプローブパケットを構築します。
+        *   Pinglistに基づいてターゲットRNICにプローブを送信します。
+        *   CQE（Completion Queue Event）完了イベントを使用してタイムスタンプ（T2, T5）を測定します。
+    *   レスポンダーとして機能します。
+        *   UD QPでプローブを受信します。
+        *   タイムスタンプ（T3, T4）を測定します。
+        *   レスポンダー処理遅延（T4-T3）を計算します。
+        *   ACKパケットを送信します（論文に従い、即時ACKと遅延情報付きACKの2つのACKの可能性があります）。
+    *   ネットワークRTT（(T5-T2) - (T4-T3)）とプローバー遅延（(T6-T1) - (T5-T2)）を計算します。（T1/T6はアプリケーションレベルのpost/poll時間）。
+    *   eBPFを使用してローカルサービスのRDMA接続を監視し（`modify_qp`, `destroy_qp`をフック）、5タプル（送信元/宛先GID、送信元/宛先QPN）を抽出します。
+    *   発見されたサービス5タプルを使用してService Tracingプローブを開始します（ControllerからターゲットRNIC情報を取得する必要があります）。
+    *   定期的または問題検出時に、プローブのパストレース（例：Tracerouteを使用）を実行します。
+    *   プローブ結果（RTT、遅延、タイムアウト、パス情報）をバッチ処理し、Analyzerにアップロードします。
+*   **技術要素:**
+    *   Go プログラミング言語 [golang.mdc](mdc:.cursor/rules/golang.mdc)
+    *   Controller通信用のgRPCクライアント (`google.golang.org/grpc`)
+    *   **RDMA Verbs:** `libibverbs`（または同等の低レベルRDMAライブラリ）のCgoラッパー。これは非常に重要であり、最も複雑な依存関係となる可能性があります。以下のためのCバインディングが必要です。
+        *   デバイス検出 (`ibv_get_device_list`)
+        *   デバイスオープン (`ibv_open_device`)
+        *   デバイス/ポート属性クエリ (`ibv_query_device`, `ibv_query_port`)
+        *   保護ドメイン割り当て (`ibv_alloc_pd`)
+        *   完了キュー作成 (`ibv_create_cq`)
+        *   非信頼性データグラム（UD）キューペア作成 (`ibv_create_qp`)
+        *   QP状態変更 (`ibv_modify_qp`)
+        *   メモリ領域登録 (`ibv_reg_mr`)
+        *   送受信リクエスト投入 (`ibv_post_send`, `ibv_post_recv`)
+        *   完了キューポーリング (`ibv_poll_cq`)
+        *   UD用アドレスハンドル作成 (`ibv_create_ah`)
+    *   **eBPF:** eBPFプログラムをロードし、対話するためのGo eBPFライブラリ（例：`cilium/ebpf`）。 [ebpf.mdc](mdc:.cursor/rules/ebpf.mdc)
+        *   `modify_qp`/`destroy_qp`カーネル関数にアタッチするeBPFプログラム（C言語で記述、kprobes/fentry経由が有力）。
+        *   perf/ringバッファを使用して、カーネルからGoユーザー空間アプリケーションに接続5タプルデータを送信します。
+    *   **パストレーシング:** 標準Goネットワーキング (`net`) および、場合によってはrawソケット (`golang.org/x/net/ipv4`, `ipv6`) または既存のGo tracerouteライブラリ。適切なケーパビリティ/権限が必要です。
+    *   並行処理: 各RNICの管理、個別のプロービングタスク（ToR, Inter-ToR, Service）、応答、eBPF監視、データアップロードのためのGoroutine。調整のためのチャネルと`sync`プリミティブ。
+    *   ローカル設定（Controllerアドレス、Analyzerアドレス）のための設定管理（例：Viper）。
+    *   ロギングライブラリ。
+*   **主要モジュール/パッケージ:**
+    *   `rdma`: `libibverbs`機能のためのCgoラッパーとGoインターフェース。
+    *   `ebpf`: eBPFプログラムのロードと管理、カーネルバッファからのデータ読み取り。
+    *   `probe`: プローブ送信、ACK処理、RTT/遅延計算のコアロジック。`prober`と`responder`のロジックを含む。
+    *   `monitor`: 異なる監視タスク（Cluster, Service）を処理。Pinglistを管理し、プローブをスケジュール。
+    *   `tracer`: パストレーシング実装。
+    *   `upload`: Analyzerへのデータのバッチ処理と送信。
+    *   `controller_client`: Controllerと対話するためのgRPCクライアントロジック。
+    *   `config`: Agent設定の読み込み。
+    *   `state`: ローカルエージェントの状態（RNIC、アクティブフローなど）の管理。
+
+**3.3. Analyzer**
+
+*   **責務:**
+    *   Agentからのプローブデータを受信・格納する。
+    *   非ネットワーク関連のタイムアウト（ホストダウン、QPNリセット）を除外する。
+    *   ToR-meshプローブ結果に基づいて異常なRNICを検出する（特定のRNICとの間で高いタイムアウト率）。
+    *   プローブのタイムアウト/高RTTとパス情報を関連付けて、スイッチ/リンクの問題箇所を特定する（投票メカニズム - アルゴリズム1）。
+    *   ClusterおよびServiceネットワークのネットワークSLA（RTT分布、ドロップ率）を追跡する。
+    *   検出された問題のサービスへの影響を評価します（P0, P1, P2分類）。ネットワークの問題をサービスネットワークパスや外部のサービスパフォーマンスメトリクスと関連付ける。
+    *   オペレータがネットワーク状態や特定された問題を表示するためのAPIまたはダッシュボードを提供する。
+*   **技術要素:**
+    *   Go プログラミング言語 [golang.mdc](mdc:.cursor/rules/golang.mdc)
+    *   Agentからデータを受信するためのAPIサーバー（gRPC）。
+    *   RTT、遅延、ドロップ率などのメトリクスを格納する時系列データベース（TSDB）（例：VictoriaMetrics, Prometheus）。
+    *   インシデント/イベントデータとパス情報を格納する可能性のある別のデータベース（SQLまたはNoSQL）。
+    *   検出および特定アルゴリズムを実装する分析エンジン（Goコード）。
+    *   アラート連携（例：Alertmanager）。
+    *   ロギングライブラリ。
+*   **主要モジュール/パッケージ:**
+    *   `api`: Agentデータ受信用サーバー実装。
+    *   `storage`: TSDBや他のデータベースと対話するためのインターフェースと実装。
+    *   `analysis`: 異常検出、特定、影響評価のためのコアアルゴリズム。
+    *   `sla`: SLA追跡ロジック。
+    *   `alerting`: アラート送信インターフェース。
+    *   `config`: Analyzer設定の読み込み。
+
+**4. プロトコルとデータ構造**
+
+**4.1. gRPC (Controller <-> Agent)**
+
+*   メッセージとサービスのための `.proto` ファイルを定義する。
+*   **メッセージ:**
+    *   `RnicInfo`: GID, QPN, IPアドレス, ホスト名など。
+    *   `AgentRegistrationRequest`: エージェントの`RnicInfo`リスト。
+    *   `AgentRegistrationResponse`: ステータス。
+    *   `PinglistRequest`: 要求元Agent/RNIC情報、Pinglistの種類（ToR, InterToR）。
+    *   `PingTarget`: ターゲットRNIC情報（GID, QPN, IP）、5タプルの詳細（例：使用する送信元ポート/フローラベル）。
+    *   `PinglistResponse`: `PingTarget`リスト、プローブ間隔、タイムアウト期間。
+    *   `TargetRnicInfoRequest`: Service Tracing用のターゲットIPまたはGID。
+    *   `TargetRnicInfoResponse`: ターゲットの`RnicInfo`。
+*   **サービス:** `ControllerService`
+    *   `rpc RegisterAgent(AgentRegistrationRequest) returns (AgentRegistrationResponse)`
+    *   `rpc GetPinglist(PinglistRequest) returns (PinglistResponse)`
+    *   `rpc GetTargetRnicInfo(TargetRnicInfoRequest) returns (TargetRnicInfoResponse)`
+
+**4.2. Agent -> Analyzer 通信 (例: gRPC)**
+
+*   `.proto` ファイルを定義します。
+*   **メッセージ:**
+    *   `ProbeResult`: 送信元/宛先RNIC情報、タイムスタンプ（利用可能な場合はT1-T6）、計算されたRTT、プローバー遅延、レスポンダー遅延、ステータス（OK, Timeout）、プローブ5タプル。
+    *   `PathInfo`: プローブ5タプル、ホップリスト（IP, RTT）。
+    *   `UploadDataRequest`: `ProbeResult`リスト、`PathInfo`リスト。
+    *   `UploadDataResponse`: ステータス。
+*   **サービス:** `AnalyzerService`
+    *   `rpc UploadData(UploadDataRequest) returns (UploadDataResponse)`
+
+**4.3. 内部Go構造体**
+
+各コンポーネント内で、設定、状態、処理中のデータを表現するためのGo `struct`を定義します。多くの場合、proto定義を反映したものになる。
+
+**4.4. Controllerのレジストリのデータ構造とアクセスパターン
+
+Controllerがデータベース（RNICレジストリ）に求めるデータ構造は、RNICのコア情報を効率的に格納し、かつ主要なアクセスパターン（特にToR IDやIP/GIDでの検索）を高速化するためのインデックスや補助的なデータ構造を組み合わせたものとなる。**RNIC GIDを主キーとし、ToR IDやRNIC IPアドレスでの高速な検索を可能にする設計**が重要である。
+
+***格納すべきコア情報（RNIC単位）***
+
+各RNICエントリに対して、最低限以下の情報が必要となる。
+
+1.  **RNIC GID (Global Identifier):** RNICを一意に識別するキー。 (例: `fe80:0000:0000:0000:0002:c903:0033:1234`) - **プライマリキー候補**
+2.  **RNIC QPN (Queue Pair Number):** Agentがプローブ応答用に割り当てたQP番号。Agent再起動時に変更される可能性がある。 (例: `1025`) - **頻繁に更新される値**
+3.  **Agent ID/Name:** このRNICを管理するAgentの一意な識別子。 (例: `agent-hostname-abc`)
+4.  **Agent IP Address:** Agentが動作しているホストの管理用IPアドレス。 (例: `192.168.1.100`)
+5.  **RNIC IP Address (オプション):** RoCE通信に使用されるRNICのIPアドレス（GIDから導出可能だが、利便性のために持つことも）。 (例: `10.1.1.10`)
+6.  **ToR ID/Name (トポロジ情報):** このRNICが接続されているToRスイッチの識別子。Pinglist生成（特にToR-mesh）に必要。 (例: `tor-switch-A1`) - **検索キー候補**
+7.  **Last Updated Timestamp:** このエントリが最後に更新された時刻。タイムアウト処理（古いエントリの削除）に使用。 (例: `2023-10-27T10:00:00Z`)
+
+***効率的なアクセスパターンとそれに適したデータ構造/インデックス***
+
+1.  **Agent登録/更新/削除 (Write Heavy):**
+    *   **アクセスキー:** Agent ID + RNIC GID (またはRNIC GIDのみ)
+    *   **要求:** 高速な書き込み/更新/削除。
+    *   **データ構造/インデックス:**
+        *   RNIC GIDをプライマリキーとするKVSが基本。
+        *   Agentが複数のRNICを持つ場合、Agent ID単位で情報をまとめて更新/削除できると効率的かもしれない（例: Agent IDをキーとし、値にRNIC情報のリスト/マップを持つ）。
+
+2.  **Pinglist生成 (ToR-mesh) (Read Heavy):**
+    *   **アクセスキー:** ToR ID
+    *   **要求:** 特定のToR IDに属する全てのRNICエントリ（特にGID, QPN, IP）を高速にリストアップ。
+    *   **データ構造/インデックス:**
+        *   **KVS (Redisなど):** RedisのSetデータ構造を利用。「`tor:{ToR_ID}`」のようなキーで、そのToRに属するRNIC GIDのリストを保持する。別途、RNIC GIDをキーとするHashで詳細情報を格納。
+        *   **RDBMS:** `tor_id` カラムにインデックスを作成。`SELECT rnic_gid, qpn, rnic_ip FROM rnics WHERE tor_id = 'tor-switch-A1';` のようなクエリを高速化。
+        *   **NoSQL (Document DBなど):** `tor_id` フィールドにインデックスを作成。
+
+3.  **Pinglist生成 (Inter-ToR) (Read Heavy):**
+    *   **アクセスキー:** (特定のキーなし、全エントリ走査に近い)
+    *   **要求:** アクティブな全RNICのリスト（GID, QPN, IP, ToR ID）を効率的に取得し、Controllerロジックで選択する。
+    *   **データ構造/インデックス:** 全件スキャンが効率的に行えるか、あるいは特定の属性（例: アクティブフラグ）でフィルタリングできるインデックス。
+
+4.  **Service Tracing ターゲット検索 (Read Heavy):**
+    *   **アクセスキー:** ターゲットのIPアドレスまたはGID
+    *   **要求:** 特定のIPアドレスまたはGIDを持つRNICのQPNを高速に検索。
+    *   **データ構造/インデックス:**
+        *   **KVS (Redisなど):** RNIC GIDをキーとするHashで情報を格納。IPアドレスでの検索が必要な場合は、別途「`ip:{IP_Address}`」をキーとし、値にRNIC GIDを持つマッピングを追加するか、全件検索（データ量が少なければ許容範囲）。
+        *   **RDBMS:** `rnic_gid` (Primary Key) と `rnic_ip` (Secondary Index) にインデックスを作成。
+        *   **NoSQL (Document DBなど):** `rnic_gid` と `rnic_ip` フィールドにインデックスを作成。
+
+***データ構造の選択肢（具体例）***
+
+*   **RDBMSを使用する場合:**
+    *   `rnics` テーブルを作成。
+    *   **カラム:** `rnic_gid` (TEXT/VARCHAR, PRIMARY KEY), `qpn` (INTEGER), `agent_id` (TEXT/VARCHAR, INDEX), `agent_ip` (INET/VARCHAR), `rnic_ip` (INET/VARCHAR, INDEX), `tor_id` (TEXT/VARCHAR, INDEX), `last_updated` (TIMESTAMP WITH TIME ZONE)。
+    *   適切なカラムにインデックス（特に `rnic_gid`, `tor_id`, `rnic_ip`, `agent_id`）を作成する。
+
+
+**5. 主要な技術的課題と考慮事項**
+
+*   **RDMA Verbs 統合:** `libibverbs`のための堅牢でパフォーマンスの高いCgoラッパーを作成することは非常に重要であり、慎重なメモリ管理とRDMAコンセプトの理解が必要となる。
+*   **eBPF 信頼性:** eBPFプログラムが正しくロードされ、カーネルバージョンの違いを適切に処理し、ユーザー空間に効率的にデータを渡すことを保証する。適切な権限が必要となる。
+*   **パフォーマンスオーバーヘッド:** Agentは最小限のCPUとメモリフットプリントである必要があります。効率的なCgo呼び出し、慎重なgoroutine管理、最適化されたeBPFインタラクションが必要です。プロービング頻度は慎重な調整が必要となる。
+*   **タイムスタンプ精度:** CQEタイムスタンプへの依存は基本となる。ハードウェア/ドライバの潜在的な不正確さや制限を理解することが重要となる。
+*   **スケーラビリティ:** ControllerとAnalyzerは、数万のAgentを処理できる必要がある。効率的なデータ構造、データベースの選択、および場合によってはシャーディング/レプリケーションが必要である。
+*   **パストレーシングの制限:** Tracerouteは遅く、ネットワークデバイスによってレート制限される可能性があり、UDP/ICMPとRoCEパケットでルーティング/ECMPが異なる場合、常に正確なパスを反映するとは限らない。
+*   **デプロイメント:** パッケージング（コンテナ）、設定管理、通信の保護（gRPC用TLS）は重要な運用側面である。

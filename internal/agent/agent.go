@@ -41,6 +41,8 @@ func New(cfg *config.AgentConfig) (*Agent, error) {
 	// Initialize logging
 	initLogging(cfg.LogLevel)
 
+	log.Debug().Msg("Creating new agent instance")
+
 	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -59,20 +61,25 @@ func New(cfg *config.AgentConfig) (*Agent, error) {
 		controllerClient: controllerClient,
 	}
 
+	log.Debug().Str("agent_id", cfg.AgentID).Str("controller_addr", cfg.ControllerAddr).Msg("Agent instance created")
 	return agent, nil
 }
 
 // Start starts the agent
 func (a *Agent) Start() error {
+	log.Debug().Msg("Starting agent")
+
 	// Initialize agent state
 	if err := a.agentState.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize agent state: %w", err)
 	}
+	log.Debug().Msg("Agent state initialized")
 
 	// Connect to controller
 	if err := a.controllerClient.Connect(); err != nil {
 		return fmt.Errorf("failed to connect to controller: %w", err)
 	}
+	log.Debug().Msg("Connected to controller")
 
 	// Register with controller
 	primaryRnic := a.agentState.GetPrimaryRNIC()
@@ -84,12 +91,14 @@ func (a *Agent) Start() error {
 	if udQueue == nil {
 		return fmt.Errorf("no UD queue available for RNIC %s", primaryRnic.GID)
 	}
+	log.Debug().Str("primary_rnic_gid", primaryRnic.GID).Msg("Got primary RNIC and UD queue")
 
 	// Create prober
 	a.prober = probe.NewProber(a.agentState.GetRDMAManager(), udQueue, a.config.TimeoutMS)
 	if err := a.prober.Start(); err != nil {
 		return fmt.Errorf("failed to start prober: %w", err)
 	}
+	log.Debug().Msg("Prober started")
 
 	// Create cluster monitor
 	a.clusterMonitor = monitor.NewClusterMonitor(
@@ -100,9 +109,11 @@ func (a *Agent) Start() error {
 	if err := a.clusterMonitor.Start(); err != nil {
 		return fmt.Errorf("failed to start cluster monitor: %w", err)
 	}
+	log.Debug().Uint32("probe_interval_ms", a.config.ProbeIntervalMS).Msg("Cluster monitor started")
 
 	// Create tracer
 	a.tracer = tracer.NewTracer()
+	log.Debug().Msg("Tracer created")
 
 	// Create uploader
 	a.uploader = upload.NewUploader(
@@ -115,11 +126,13 @@ func (a *Agent) Start() error {
 	if err := a.uploader.Start(); err != nil {
 		return fmt.Errorf("failed to start uploader: %w", err)
 	}
+	log.Debug().Str("analyzer_addr", a.config.AnalyzerAddr).Uint32("upload_interval_ms", a.config.DataUploadIntervalMS).Msg("Uploader started")
 
 	// Start background goroutines
 	a.wg.Add(2)
 	go a.resultHandler()
 	go a.pinglistUpdater()
+	log.Debug().Msg("Background goroutines started")
 
 	log.Info().Msg("Agent started successfully")
 	return nil
@@ -128,6 +141,7 @@ func (a *Agent) Start() error {
 // resultHandler collects and forwards results from components
 func (a *Agent) resultHandler() {
 	defer a.wg.Done()
+	log.Debug().Msg("Result handler started")
 
 	// Handle probe results
 	probeResults := a.prober.GetProbeResults()
@@ -137,16 +151,29 @@ func (a *Agent) resultHandler() {
 	for {
 		select {
 		case <-a.ctx.Done():
+			log.Debug().Msg("Result handler stopping due to context cancellation")
 			return
 		case result, ok := <-probeResults:
 			if !ok {
+				log.Debug().Msg("Probe results channel closed")
 				return
 			}
+			log.Debug().
+				Str("src_gid", result.FiveTuple.SrcGid).
+				Str("dst_gid", result.FiveTuple.DstGid).
+				Int32("status", int32(result.Status)).
+				Float64("rtt_ms", float64(result.NetworkRtt)/1000000.0).
+				Msg("Received probe result")
+
 			// Forward to uploader
 			a.uploader.AddProbeResult(result)
 
 			// If it's a timeout, maybe run a traceroute
 			if result.Status == 1 && a.config.TracerouteOnTimeout {
+				log.Debug().
+					Str("dst_gid", result.FiveTuple.DstGid).
+					Msg("Timeout detected, initiating traceroute")
+
 				go func(fiveTuple *agent_analyzer.ProbeFiveTuple) {
 					if err := a.tracer.Trace(a.ctx, fiveTuple); err != nil {
 						log.Error().Err(err).Msg("Failed to run traceroute")
@@ -155,8 +182,15 @@ func (a *Agent) resultHandler() {
 			}
 		case traceInfo, ok := <-traceResults:
 			if !ok {
+				log.Debug().Msg("Trace results channel closed")
 				return
 			}
+			log.Debug().
+				Str("src_gid", traceInfo.FiveTuple.SrcGid).
+				Str("dst_gid", traceInfo.FiveTuple.DstGid).
+				Int("hop_count", len(traceInfo.Hops)).
+				Msg("Received trace result")
+
 			// Forward to uploader
 			a.uploader.AddPathInfo(traceInfo)
 		}
@@ -166,6 +200,7 @@ func (a *Agent) resultHandler() {
 // pinglistUpdater periodically updates the pinglist from the controller
 func (a *Agent) pinglistUpdater() {
 	defer a.wg.Done()
+	log.Debug().Msg("Pinglist updater started")
 
 	// Initial update
 	a.updatePinglist()
@@ -177,8 +212,10 @@ func (a *Agent) pinglistUpdater() {
 	for {
 		select {
 		case <-a.ctx.Done():
+			log.Debug().Msg("Pinglist updater stopping due to context cancellation")
 			return
 		case <-ticker.C:
+			log.Debug().Msg("Periodic pinglist update triggered")
 			a.updatePinglist()
 		}
 	}
@@ -186,11 +223,14 @@ func (a *Agent) pinglistUpdater() {
 
 // updatePinglist gets a fresh pinglist from the controller
 func (a *Agent) updatePinglist() {
+	log.Debug().Msg("Updating pinglist from controller")
+
 	primaryRnic := a.agentState.GetPrimaryRNIC()
 	if primaryRnic == nil {
 		log.Error().Msg("No primary RNIC available")
 		return
 	}
+	log.Debug().Str("primary_rnic_gid", primaryRnic.GID).Msg("Retrieved primary RNIC for pinglist request")
 
 	// Get ToR-mesh pinglist
 	torTargets, intervalMs, timeoutMs, err := a.controllerClient.GetPinglist(
@@ -201,21 +241,25 @@ func (a *Agent) updatePinglist() {
 		log.Error().Err(err).Msg("Failed to get ToR-mesh pinglist")
 		return
 	}
+	log.Debug().Int("target_count", len(torTargets)).Msg("Received ToR-mesh pinglist")
 
 	// Update probe timeout if controller specified it
 	if timeoutMs > 0 && timeoutMs != a.config.TimeoutMS {
+		log.Debug().Uint32("old_timeout_ms", a.config.TimeoutMS).Uint32("new_timeout_ms", timeoutMs).Msg("Updating probe timeout")
 		a.config.TimeoutMS = timeoutMs
 		log.Info().Uint32("timeout_ms", timeoutMs).Msg("Updated probe timeout from controller")
 	}
 
 	// Update probe interval if controller specified it
 	if intervalMs > 0 && intervalMs != a.config.ProbeIntervalMS {
+		log.Debug().Uint32("old_interval_ms", a.config.ProbeIntervalMS).Uint32("new_interval_ms", intervalMs).Msg("Updating probe interval")
 		a.config.ProbeIntervalMS = intervalMs
 		log.Info().Uint32("interval_ms", intervalMs).Msg("Updated probe interval from controller")
 	}
 
 	// Update cluster monitor's pinglist
 	a.clusterMonitor.UpdatePinglist(torTargets)
+	log.Debug().Msg("Updated cluster monitor pinglist")
 
 	// Also get Inter-ToR pinglist
 	interTorTargets, _, _, err := a.controllerClient.GetPinglist(
@@ -226,6 +270,7 @@ func (a *Agent) updatePinglist() {
 		log.Error().Err(err).Msg("Failed to get Inter-ToR pinglist")
 		return
 	}
+	log.Debug().Int("target_count", len(interTorTargets)).Msg("Received Inter-ToR pinglist")
 
 	// Combine the pinglists (in a real implementation, you might want to keep them separate)
 	log.Info().Int("torTargets", len(torTargets)).Int("interTorTargets", len(interTorTargets)).Msg("Updated pinglists")
@@ -233,40 +278,50 @@ func (a *Agent) updatePinglist() {
 
 // Stop stops the agent
 func (a *Agent) Stop() {
+	log.Debug().Msg("Stopping agent")
 	a.cancel()
 
 	// Stop components in reverse order
 	if a.uploader != nil {
+		log.Debug().Msg("Closing uploader")
 		_ = a.uploader.Close()
 	}
 
 	if a.tracer != nil {
+		log.Debug().Msg("Closing tracer")
 		_ = a.tracer.Close()
 	}
 
 	if a.clusterMonitor != nil {
+		log.Debug().Msg("Stopping cluster monitor")
 		a.clusterMonitor.Stop()
 	}
 
 	if a.prober != nil {
+		log.Debug().Msg("Closing prober")
 		a.prober.Close()
 	}
 
 	if a.controllerClient != nil {
+		log.Debug().Msg("Closing controller client")
 		_ = a.controllerClient.Close()
 	}
 
 	if a.agentState != nil {
+		log.Debug().Msg("Closing agent state")
 		a.agentState.Close()
 	}
 
 	// Wait for goroutines to complete
+	log.Debug().Msg("Waiting for background goroutines to complete")
 	a.wg.Wait()
 	log.Info().Msg("Agent stopped")
 }
 
 // Run runs the agent with signal handling for graceful shutdown
 func (a *Agent) Run() error {
+	log.Debug().Msg("Running agent")
+
 	// Start the agent
 	if err := a.Start(); err != nil {
 		return err
@@ -275,10 +330,11 @@ func (a *Agent) Run() error {
 	// Set up signal handling for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	log.Debug().Msg("Signal handlers set up")
 
 	// Wait for a signal
-	<-sigCh
-	log.Info().Msg("Received signal, shutting down...")
+	sig := <-sigCh
+	log.Info().Str("signal", sig.String()).Msg("Received signal, shutting down...")
 
 	// Stop the agent
 	a.Stop()

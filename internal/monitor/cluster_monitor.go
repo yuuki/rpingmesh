@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"github.com/yuuki/rpingmesh/pkg/probe"
-	"github.com/yuuki/rpingmesh/pkg/state"
+	"github.com/yuuki/rpingmesh/internal/probe"
+	"github.com/yuuki/rpingmesh/internal/state"
 	"github.com/yuuki/rpingmesh/proto/agent_analyzer"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )

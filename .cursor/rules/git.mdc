@@ -1,10 +1,25 @@
 ---
 description: Git operation rules
-globs: 
+globs:
 alwaysApply: true
 ---
 このファイルの読み込み時に、「Loading git operation rules ...」と書いてください。
 
+# Git
+
+## Commit guidelines
+
+- 1コミット＝1論理的単位
 - リポジトリの内容の変更が完了したら、Gitのコミットをユーザーに提案してください。
 - Gitのコミットメッセージは英語で書いてください。
-- Gitのコミットメッセージは大文字ではなく小文字で始めてください。
+- 自動コミットは行わず、必ず指示者確認後に実行してください。
+
+## Commit message prefixes
+
+- `feat:` 新機能追加
+- `fix:` バグ修正
+- `docs:` ドキュメント
+- `style:` スタイル調整
+- `refactor:` リファクタリング
+- `test:` テスト関連
+- `chore:` 雑務的変更

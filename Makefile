@@ -8,7 +8,7 @@ KERNEL_VERSION := 5.10.0-34
 
 build:
 	@echo "Building Docker image with Docker Compose: $(TAG)"
-	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose build agent
+	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --remove-orphans
 
 # Run with Docker Compose
 agent-up:

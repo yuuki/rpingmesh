@@ -1,29 +1,31 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
 
 	"github.com/rs/zerolog/log"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 	"github.com/yuuki/rpingmesh/internal/agent"
 	"github.com/yuuki/rpingmesh/internal/config"
 )
 
 func main() {
-	// Parse command line flags
-	var (
-		configPath   string
-		createConfig bool
-		configOutput string
-		showVersion  bool
-	)
+	// Setup command line flags
+	config.SetupAgentFlags(pflag.CommandLine)
 
-	flag.StringVar(&configPath, "config", "", "Path to configuration file")
-	flag.BoolVar(&createConfig, "create-config", false, "Create a default configuration file")
-	flag.StringVar(&configOutput, "config-output", "agent.yaml", "Path where to write the default configuration")
-	flag.BoolVar(&showVersion, "version", false, "Show version information")
-	flag.Parse()
+	// Parse flags
+	pflag.Parse()
+
+	// Setup viper for the main application flags (create-config, version, etc.)
+	v := viper.New()
+	v.BindPFlags(pflag.CommandLine)
+
+	// Get flag values
+	createConfig := v.GetBool("create-config")
+	configOutput := v.GetString("config-output")
+	showVersion := v.GetBool("version")
 
 	// Show version information
 	if showVersion {
@@ -41,8 +43,14 @@ func main() {
 		return
 	}
 
-	// Create and run agent
-	agent, err := agent.New(configPath)
+	// Load configuration from viper (flags, env vars, and config file)
+	cfg, err := config.LoadAgentConfigWithFlags()
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to load configuration")
+	}
+
+	// Create and run agent with the loaded config
+	agent, err := agent.New(cfg)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to create agent")
 	}

@@ -30,13 +30,7 @@ type Controller struct {
 }
 
 // New creates a new controller instance
-func New(configPath string) (*Controller, error) {
-	// Load configuration
-	cfg, err := config.LoadControllerConfig(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load config: %w", err)
-	}
-
+func New(cfg *config.ControllerConfig) (*Controller, error) {
 	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 

@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/yuuki/rpingmesh/internal/config"
 )
 
 func TestMain(m *testing.M) {
@@ -20,8 +21,15 @@ func TestMain(m *testing.M) {
 }
 
 func TestControllerBasic(t *testing.T) {
-	// Create controller with empty config path (will use environment variables)
-	controller, err := New("")
+	// Create a config for testing
+	cfg := &config.ControllerConfig{
+		ListenAddr:  "127.0.0.1:0", // Use port 0 to let the OS choose an available port
+		DatabaseURI: "http://rqlite:4001",
+		LogLevel:    "info",
+	}
+
+	// Create controller with the config
+	controller, err := New(cfg)
 	require.NoError(t, err, "Should create controller without error")
 
 	// Make sure controller is properly initialized

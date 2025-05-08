@@ -8,7 +8,7 @@ KERNEL_VERSION := 5.10.0-34
 
 build:
 	@echo "Building Docker image with Docker Compose: $(TAG)"
-	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --remove-orphans
+	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --abort-on-container-exit --remove-orphans
 
 # Run with Docker Compose
 agent-up:
@@ -65,12 +65,12 @@ generate-bpf:
 # Test controller
 test-controller:
 	@echo "Running controller tests with Docker..."
-	@docker compose -f docker-compose.test.yml up --build controller_test --abort-on-container-exit
+	@docker compose -f docker-compose.test.yml up --build controller_test --abort-on-container-exit --remove-orphans
 
 # Test agent
 test-agent:
 	@echo "Running agent tests with Docker..."
-	@KERNEL_VERSION=$(KERNEL_VERSION) docker compose -f docker-compose.test.yml up --build agent_test --abort-on-container-exit
+	@KERNEL_VERSION=$(KERNEL_VERSION) docker compose -f docker-compose.test.yml up --build agent_test --abort-on-container-exit --remove-orphans
 
 # Run all tests
 test:

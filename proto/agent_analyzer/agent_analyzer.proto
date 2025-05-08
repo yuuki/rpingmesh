@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package agent_analyzer;
+
+option go_package = "github.com/yuuki/rpingmesh/proto/agent_analyzer";
+
+import "google/protobuf/timestamp.proto";
+
+// Basic RNIC information
+message RnicIdentifier {
+  string gid = 1;
+  uint32 qpn = 2;
+  string ip_address = 3;
+  string host_name = 4;
+  string tor_id = 5;
+}
+
+// Probe 5-tuple details
+message ProbeFiveTuple {
+  string src_gid = 1;
+  uint32 src_qpn = 2;
+  string dst_gid = 3;
+  uint32 dst_qpn = 4;
+  uint32 flow_label = 5;
+}
+
+// Probe result data
+message ProbeResult {
+  RnicIdentifier source_rnic = 1;
+  RnicIdentifier destination_rnic = 2;
+
+  // Timestamps (nanoseconds since Unix epoch)
+  google.protobuf.Timestamp t1 = 3; // Probe post time
+  google.protobuf.Timestamp t2 = 4; // Prober CQE time
+  google.protobuf.Timestamp t3 = 5; // Responder receive time
+  google.protobuf.Timestamp t4 = 6; // Responder ACK post time
+  google.protobuf.Timestamp t5 = 7; // Prober ACK receive time
+  google.protobuf.Timestamp t6 = 8; // Prober poll complete time
+
+  // Calculated metrics (nanoseconds)
+  int64 network_rtt = 9;     // (T5-T2)-(T4-T3)
+  int64 prober_delay = 10;   // (T6-T1)-(T5-T2)
+  int64 responder_delay = 11; // (T4-T3)
+
+  enum ProbeStatus {
+    OK = 0;
+    TIMEOUT = 1;
+    ERROR = 2;
+  }
+  ProbeStatus status = 12;
+
+  ProbeFiveTuple five_tuple = 13;
+  string probe_type = 14; // "TOR_MESH", "INTER_TOR", "SERVICE"
+}
+
+// Path information
+message PathInfo {
+  ProbeFiveTuple five_tuple = 1;
+
+  message Hop {
+    string ip_address = 1;
+    int64 rtt_ns = 2;  // RTT in nanoseconds
+  }
+  repeated Hop hops = 2;
+
+  google.protobuf.Timestamp timestamp = 3;
+}
+
+// Data upload request
+message UploadDataRequest {
+  string agent_id = 1;
+  repeated ProbeResult probe_results = 2;
+  repeated PathInfo path_infos = 3;
+}
+
+// Data upload response
+message UploadDataResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Analyzer service definition
+service AnalyzerService {
+  // Upload probe data to analyzer
+  rpc UploadData(UploadDataRequest) returns (UploadDataResponse);
+}

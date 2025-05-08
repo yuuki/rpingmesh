@@ -70,7 +70,6 @@ func (u *Uploader) Connect() error {
 	if err != nil {
 		return fmt.Errorf("failed to connect to analyzer at %s: %w", u.addr, err)
 	}
-	defer conn.Close()
 
 	conn.Connect()
 
@@ -84,6 +83,7 @@ func (u *Uploader) Connect() error {
 			break
 		}
 		if !conn.WaitForStateChange(ctx, state) {
+			conn.Close() // Close the connection if we can't reach READY state
 			return fmt.Errorf("connection to analyzer at %s failed to become READY within timeout", u.addr)
 		}
 	}
@@ -102,8 +102,10 @@ func (u *Uploader) Start() error {
 	}
 
 	if u.client == nil {
+		// Try to connect, but continue even if it fails
 		if err := u.Connect(); err != nil {
-			return err
+			log.Warn().Err(err).Str("addr", u.addr).Msg("Failed to connect to analyzer, will retry later")
+			// We continue without a connection - the uploader will try to reconnect later
 		}
 	}
 
@@ -218,23 +220,12 @@ func (u *Uploader) uploadLoop() {
 
 // uploadData uploads the pending data to the analyzer
 func (u *Uploader) uploadData() error {
+	u.mutex.Lock()
 	// Check if there's anything to upload
 	if len(u.probeResults) == 0 && len(u.pathInfos) == 0 {
+		u.mutex.Unlock()
 		log.Debug().Msg("No data to upload")
 		return nil
-	}
-
-	log.Debug().
-		Int("pendingProbeResults", len(u.probeResults)).
-		Int("pendingPathInfos", len(u.pathInfos)).
-		Msg("Starting data upload")
-
-	// Check connection
-	if u.client == nil {
-		log.Debug().Msg("Client is nil, attempting to reconnect")
-		if err := u.Connect(); err != nil {
-			return err
-		}
 	}
 
 	// Prepare batch
@@ -263,6 +254,48 @@ func (u *Uploader) uploadData() error {
 	log.Debug().
 		Int("pathInfoCount", len(pathInfos)).
 		Msg("Prepared path infos for upload")
+	u.mutex.Unlock()
+
+	log.Debug().
+		Int("pendingProbeResults", len(results)).
+		Int("pendingPathInfos", len(pathInfos)).
+		Msg("Starting data upload")
+
+	// Check connection
+	if u.client == nil {
+		log.Debug().Msg("Client is nil, attempting to reconnect")
+		if err := u.Connect(); err != nil {
+			// Return the data to the queue
+			u.mutex.Lock()
+			// Add data back to queue, but respect the maximum queue size
+			// For probe results, if adding back would exceed the max, drop older entries
+			if len(results)+len(u.probeResults) > u.maxQueueSize {
+				// Calculate how many items to keep to stay within maxQueueSize
+				toKeep := u.maxQueueSize - len(results)
+				if toKeep > 0 {
+					// Keep the newest items (assuming they're at the end of the slice)
+					u.probeResults = u.probeResults[len(u.probeResults)-toKeep:]
+				} else {
+					// If we can't keep any existing items, clear the queue
+					u.probeResults = make([]*agent_analyzer.ProbeResult, 0, u.maxQueueSize)
+				}
+				log.Warn().
+					Int("dropped", len(u.probeResults)-toKeep).
+					Msg("Dropping older probe results from queue due to size limit")
+			}
+			u.probeResults = append(results, u.probeResults...)
+
+			// For path infos, simply add back and potentially trim if needed
+			u.pathInfos = append(pathInfos, u.pathInfos...)
+			if len(u.pathInfos) > 100 { // Assuming 100 is the max capacity for path infos
+				u.pathInfos = u.pathInfos[:100]
+				log.Warn().Msg("Trimming path info queue to stay within limit")
+			}
+			u.mutex.Unlock()
+
+			return fmt.Errorf("failed to connect to analyzer: %w", err)
+		}
+	}
 
 	// Create request
 	req := &agent_analyzer.UploadDataRequest{
@@ -279,25 +312,66 @@ func (u *Uploader) uploadData() error {
 	if err != nil {
 		// In case of failure, put the data back in the queue
 		u.mutex.Lock()
+		// Same queue management logic as above
+		if len(results)+len(u.probeResults) > u.maxQueueSize {
+			toKeep := u.maxQueueSize - len(results)
+			if toKeep > 0 {
+				u.probeResults = u.probeResults[len(u.probeResults)-toKeep:]
+			} else {
+				u.probeResults = make([]*agent_analyzer.ProbeResult, 0, u.maxQueueSize)
+			}
+			log.Warn().
+				Int("dropped", len(u.probeResults)-toKeep).
+				Msg("Dropping older probe results from queue due to size limit")
+		}
 		u.probeResults = append(results, u.probeResults...)
+
 		u.pathInfos = append(pathInfos, u.pathInfos...)
+		if len(u.pathInfos) > 100 {
+			u.pathInfos = u.pathInfos[:100]
+			log.Warn().Msg("Trimming path info queue to stay within limit")
+		}
 		u.mutex.Unlock()
+
+		// Reset connection for next attempt
+		u.mutex.Lock()
+		u.conn = nil
+		u.client = nil
+		u.mutex.Unlock()
+
 		return fmt.Errorf("failed to upload data: %w", err)
 	}
 
 	if !resp.Success {
 		// Similarly, in case of failure, put the data back in the queue
 		u.mutex.Lock()
+		// Same queue management logic as above
+		if len(results)+len(u.probeResults) > u.maxQueueSize {
+			toKeep := u.maxQueueSize - len(results)
+			if toKeep > 0 {
+				u.probeResults = u.probeResults[len(u.probeResults)-toKeep:]
+			} else {
+				u.probeResults = make([]*agent_analyzer.ProbeResult, 0, u.maxQueueSize)
+			}
+			log.Warn().
+				Int("dropped", len(u.probeResults)-toKeep).
+				Msg("Dropping older probe results from queue due to size limit")
+		}
 		u.probeResults = append(results, u.probeResults...)
+
 		u.pathInfos = append(pathInfos, u.pathInfos...)
+		if len(u.pathInfos) > 100 {
+			u.pathInfos = u.pathInfos[:100]
+			log.Warn().Msg("Trimming path info queue to stay within limit")
+		}
 		u.mutex.Unlock()
+
 		return fmt.Errorf("upload failed: %s", resp.Message)
 	}
 
 	log.Debug().
 		Int("probeResults", len(results)).
 		Int("pathInfos", len(pathInfos)).
-		Msg("Successfully uploaded data to analyzer")
-
+		Msg("Data uploaded successfully")
 	return nil
 }

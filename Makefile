@@ -1,4 +1,4 @@
-.PHONY: build run clean generate debugfs-volume run-desktop
+.PHONY: build run clean generate debugfs-volume run-desktop test-registry
 
 # Default configuration
 IMAGE_NAME := rpingmesh-agent
@@ -95,6 +95,11 @@ generate-bpf:
 		-go-package github.com/yuuki/rpingmesh/pkg/ebpf \
 		rdmaTracing ../ebpf/bpf/rdma_tracing.c -- $(INCLUDE_PATHS)
 
+# Test controller
+test-controller:
+	@echo "Running controller tests with Docker..."
+	@scripts/test-controller.sh
+
 # Help target
 help:
 	@echo "Available targets:"
@@ -107,4 +112,5 @@ help:
 	@echo "  generate-config  - Generate a default configuration file"
 	@echo "  clean            - Remove the Docker image"
 	@echo "  generate-bpf     - Generate eBPF Go bindings locally"
+	@echo "  test-registry    - Run registry tests with Docker"
 	@echo "  help             - Show this help message"

@@ -1,0 +1,43 @@
+services:
+  # rqlite database - data store that registry.go depends on
+  rqlite:
+    image: rqlite/rqlite:8.37.0
+    command: -http-addr "0.0.0.0:4001"
+    ports:
+      - "4001:4001"
+    environment:
+      - RQLITE_CLUSTER_ADDR=rqlite:4002
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:4001/status"]
+      interval: 3s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # Test execution container
+  controller_test:
+    image: golang:1.24-bullseye
+    volumes:
+      - go_mod_cache:/go/pkg/mod
+      - go_build_cache:/root/.cache/go-build
+      - .:/app
+    working_dir: /app
+    environment:
+      - RQLITE_DB_URI=http://rqlite:4001
+      - RPINGMESH_CONTROLLER_DATABASE_URI=http://rqlite:4001
+      - CGO_ENABLED=0
+    depends_on:
+      rqlite:
+        condition: service_healthy
+    entrypoint: []
+    command: >
+      sh -c "
+        echo 'Running registry tests...' &&
+        go test -v ./internal/controller/... -count=1
+      "
+    # Ensure container exits when tests complete
+    restart: "no"
+
+volumes:
+  go_mod_cache:
+  go_build_cache:

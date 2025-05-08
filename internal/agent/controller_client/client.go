@@ -10,6 +10,7 @@ import (
 	"github.com/yuuki/rpingmesh/internal/rdma"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -38,21 +39,32 @@ func (c *ControllerClient) Connect() error {
 		return nil
 	}
 
-	// Connect with timeout
+	// Establish connection without TLS for now
+	// In production, should use TLS credentials
+	conn, err := grpc.NewClient(
+		"dns:///"+c.addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create client for controller at %s: %w", c.addr, err)
+	}
+
+	// Initiate connection with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Create connection options
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-	}
+	// Start connection process
+	conn.Connect()
 
-	// Establish connection without TLS for now
-	// In production, should use TLS credentials
-	conn, err := grpc.DialContext(ctx, c.addr, opts...)
-	if err != nil {
-		return fmt.Errorf("failed to connect to controller at %s: %w", c.addr, err)
+	// Wait for connection to be ready
+	for {
+		state := conn.GetState()
+		if state == connectivity.Ready {
+			break
+		}
+		if !conn.WaitForStateChange(ctx, state) {
+			return fmt.Errorf("connection to controller at %s failed to become ready within timeout", c.addr)
+		}
 	}
 
 	c.conn = conn

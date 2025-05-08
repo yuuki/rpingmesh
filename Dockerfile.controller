@@ -1,0 +1,28 @@
+FROM golang:1.24-bullseye AS builder
+
+WORKDIR /app
+
+# Copy go.mod and go.sum first to leverage Docker cache
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the source code
+COPY . .
+
+# Build the Go application
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /app/bin/controller cmd/controller/main.go
+
+# Create default configuration
+RUN mkdir -p /app && \
+    /app/bin/controller --create-config --config-output /app/controller.yaml || true
+
+# Runtime image
+FROM debian:bullseye-slim
+
+WORKDIR /app
+
+# Copy binary and config
+COPY --from=builder /app/bin/controller ./controller
+COPY --from=builder /app/controller.yaml ./controller.yaml
+
+ENTRYPOINT ["./controller"]

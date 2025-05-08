@@ -1,0 +1,20 @@
+services:
+  agent-builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        - KERNEL_VERSION=${KERNEL_VERSION:-5.15.0-generic}
+    entrypoint: []
+    volumes:
+      - ./bin:/output
+    command: sh -c "cp /app/agent /output/ && cp /app/agent.yaml /output/"
+
+  controller-builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    entrypoint: []
+    volumes:
+      - ./bin:/output
+    command: sh -c "cp /app/controller /output/ && cp /app/controller.yaml /output/"

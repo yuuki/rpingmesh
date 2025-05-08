@@ -123,6 +123,7 @@ func (a *Agent) Start() error {
 		1000,  // Batch size
 		10000, // Max queue size
 	)
+	log.Debug().Msg("Uploader created")
 	if err := a.uploader.Start(); err != nil {
 		return fmt.Errorf("failed to start uploader: %w", err)
 	}
@@ -322,15 +323,17 @@ func (a *Agent) Stop() {
 func (a *Agent) Run() error {
 	log.Debug().Msg("Running agent")
 
-	// Start the agent
-	if err := a.Start(); err != nil {
-		return err
-	}
-
 	// Set up signal handling for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	log.Debug().Msg("Signal handlers set up")
+
+	// Start the agent
+	go func() {
+		if err := a.Start(); err != nil {
+			log.Error().Err(err).Msg("Failed to start agent")
+		}
+	}()
 
 	// Wait for a signal
 	sig := <-sigCh

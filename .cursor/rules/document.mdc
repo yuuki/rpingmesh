@@ -1,0 +1,13 @@
+---
+description: Project document requirements
+globs: *.md
+alwaysApply: false
+---
+このファイルの読み込み時に、「Loaded project documentation requirements!」と書いてください。
+
+# ドキュメント要件
+
+- ドキュメントは英語で書く
+- 機能の修正時には、/docs 内の関連ドキュメントを更新する
+- README.md を新しい機能と同期させる
+- CHANGELOG.md の変更履歴エントリを維持する

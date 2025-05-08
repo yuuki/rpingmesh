@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"github.com/yuuki/rpingmesh/pkg/rdma"
+	"github.com/yuuki/rpingmesh/internal/rdma"
 	"github.com/yuuki/rpingmesh/proto/agent_analyzer"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )

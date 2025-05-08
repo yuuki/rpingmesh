@@ -6,8 +6,8 @@ import (
 	"os"
 
 	"github.com/rs/zerolog/log"
-	"github.com/yuuki/rpingmesh/internal/agent"
 	"github.com/yuuki/rpingmesh/internal/config"
+	"github.com/yuuki/rpingmesh/internal/controller"
 )
 
 func main() {
@@ -21,13 +21,13 @@ func main() {
 
 	flag.StringVar(&configPath, "config", "", "Path to configuration file")
 	flag.BoolVar(&createConfig, "create-config", false, "Create a default configuration file")
-	flag.StringVar(&configOutput, "config-output", "agent.yaml", "Path where to write the default configuration")
+	flag.StringVar(&configOutput, "config-output", "controller.yaml", "Path where to write the default configuration")
 	flag.BoolVar(&showVersion, "version", false, "Show version information")
 	flag.Parse()
 
 	// Show version information
 	if showVersion {
-		fmt.Println("RPingMesh Agent")
+		fmt.Println("RPingMesh Controller")
 		fmt.Println("Version: 0.1.0")
 		return
 	}
@@ -41,15 +41,15 @@ func main() {
 		return
 	}
 
-	// Create and run agent
-	agent, err := agent.New(configPath)
+	// Create and run controller
+	controller, err := controller.New(configPath)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to create agent")
+		log.Fatal().Err(err).Msg("Failed to create controller")
 	}
 
-	// Run the agent with signal handling
-	if err := agent.Run(); err != nil {
-		log.Fatal().Err(err).Msg("Agent failed")
+	// Run the controller with signal handling
+	if err := controller.Run(); err != nil {
+		log.Fatal().Err(err).Msg("Controller failed")
 	}
 
 	// Exit normally

@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"github.com/yuuki/rpingmesh/pkg/rdma"
+	"github.com/yuuki/rpingmesh/internal/rdma"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

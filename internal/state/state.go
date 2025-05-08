@@ -5,7 +5,7 @@ import (
 	"sync"
 
 	"github.com/rs/zerolog/log"
-	"github.com/yuuki/rpingmesh/pkg/rdma"
+	"github.com/yuuki/rpingmesh/internal/rdma"
 )
 
 // AgentState holds the current state of the agent

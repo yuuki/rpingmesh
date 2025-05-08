@@ -35,16 +35,8 @@ RUN go mod download
 # Copy the source code
 COPY . .
 
-# Compile eBPF C code using standard include paths
-RUN clang -g -O2 -Wall -target bpf \
-      -I pkg/ebpf/bpf/include \
-      -I /usr/src/linux-headers-${KERNEL_VERSION}/include \
-      -I /usr/include \
-      -c pkg/ebpf/bpf/rdma_tracing.c -o /tmp/rdma_tracing.o || touch /tmp/rdma_tracing.o
-
 # Install bpf2go and run go generate to create eBPF bindings
-RUN go install github.com/cilium/ebpf/cmd/bpf2go@latest
-RUN cd pkg/ebpf && KERNEL_VERSION=${KERNEL_VERSION} go generate ./... || echo "Warning: Failed to generate eBPF bindings"
+RUN cd internal/ebpf && KERNEL_VERSION=${KERNEL_VERSION} go generate ./... || echo "Warning: Failed to generate eBPF bindings"
 
 # Build the Go application
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o /app/bin/agent cmd/agent/main.go

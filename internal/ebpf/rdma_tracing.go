@@ -1,7 +1,7 @@
 // Package ebpf provides eBPF functionality for monitoring RDMA connections.
 package ebpf
 
-//go:generate bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" -target amd64 rdmaTracing bpf/rdma_tracing.c -- -I./bpf/include -I/usr/include -I/usr/include/linux/bpf -I/usr/include/x86_64-linux-gnu
+//go:generate go tool bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" -target amd64 rdmaTracing bpf/rdma_tracing.c -- -I./bpf/include -I/usr/include -I/usr/include/linux/bpf -I/usr/include/x86_64-linux-gnu
 
 import (
 	"bytes"

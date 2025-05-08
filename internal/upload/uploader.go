@@ -83,7 +83,6 @@ func (u *Uploader) Connect() error {
 			return fmt.Errorf("timeout connecting to analyzer at %s", u.addr)
 		default:
 			state := conn.GetState()
-			log.Debug().Str("state", state.String()).Msg("Connection state")
 			if state == connectivity.Ready {
 				u.conn = conn
 				u.client = agent_analyzer.NewAnalyzerServiceClient(conn)

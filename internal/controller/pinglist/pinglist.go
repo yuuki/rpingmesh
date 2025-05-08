@@ -2,6 +2,8 @@ package pinglist
 
 import (
 	"context"
+	"math/rand"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/controller/registry"
@@ -11,12 +13,18 @@ import (
 // PingLister generates pinglists for agents
 type PingLister struct {
 	registry *registry.RnicRegistry
+	rand     *rand.Rand
 }
 
 // NewPingLister creates a new ping lister
 func NewPingLister(registry *registry.RnicRegistry) *PingLister {
+	// Initialize random number generator with a seed
+	source := rand.NewSource(time.Now().UnixNano())
+	rng := rand.New(source)
+
 	return &PingLister{
 		registry: registry,
+		rand:     rng,
 	}
 }
 
@@ -59,13 +67,20 @@ func (p *PingLister) generateTorMeshPinglist(
 			continue
 		}
 
+		// Create target with randomized 5-tuple details
 		targets = append(targets, &controller_agent.PingTarget{
-			Gid:       rnic.Gid,
-			Qpn:       rnic.Qpn,
-			IpAddress: rnic.IpAddress,
-			// Add 5-tuple details later
+			TargetRnic: rnic,
+			SourcePort: p.generateRandomPort(),
+			FlowLabel:  p.generateRandomFlowLabel(),
+			Priority:   p.generateRandomPriority(),
 		})
 	}
+
+	log.Info().
+		Str("requesterGID", requesterRnic.Gid).
+		Str("torID", requesterRnic.TorId).
+		Int("targetCount", len(targets)).
+		Msg("Generated ToR-mesh pinglist")
 
 	return targets, nil
 }
@@ -84,13 +99,38 @@ func (p *PingLister) generateInterTorPinglist(
 	// Convert to ping targets
 	targets := make([]*controller_agent.PingTarget, 0, len(rnics))
 	for _, rnic := range rnics {
+		// Create target with randomized 5-tuple details
 		targets = append(targets, &controller_agent.PingTarget{
-			Gid:       rnic.Gid,
-			Qpn:       rnic.Qpn,
-			IpAddress: rnic.IpAddress,
-			// Add 5-tuple details later
+			TargetRnic: rnic,
+			SourcePort: p.generateRandomPort(),
+			FlowLabel:  p.generateRandomFlowLabel(),
+			Priority:   p.generateRandomPriority(),
 		})
 	}
 
+	log.Info().
+		Str("requesterGID", requesterRnic.Gid).
+		Str("excludeTorID", requesterRnic.TorId).
+		Int("targetCount", len(targets)).
+		Msg("Generated Inter-ToR pinglist")
+
 	return targets, nil
+}
+
+// generateRandomPort generates a random port number in the ephemeral range
+func (p *PingLister) generateRandomPort() uint32 {
+	// Use ephemeral port range (49152-65535)
+	return uint32(p.rand.Intn(16384) + 49152)
+}
+
+// generateRandomFlowLabel generates a random IPv6 flow label
+func (p *PingLister) generateRandomFlowLabel() uint32 {
+	// Flow label is 20 bits (0-1048575)
+	return uint32(p.rand.Intn(1048576))
+}
+
+// generateRandomPriority generates a random priority value
+func (p *PingLister) generateRandomPriority() uint32 {
+	// Priority is typically 0-7 for IPv6 traffic class
+	return uint32(p.rand.Intn(8))
 }

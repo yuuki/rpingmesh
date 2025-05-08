@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package controller_agent;
+
+option go_package = "github.com/yuuki/rpingmesh/proto/controller_agent";
+
+// RNIC information structure
+message RnicInfo {
+  string gid = 1;
+  uint32 qpn = 2;
+  string ip_address = 3;
+  string host_name = 4;
+  string tor_id = 5;
+}
+
+// Agent registration request
+message AgentRegistrationRequest {
+  string agent_id = 1;
+  string agent_ip = 2;
+  repeated RnicInfo rnics = 3;
+}
+
+// Agent registration response
+message AgentRegistrationResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Pinglist request
+message PinglistRequest {
+  RnicInfo requester_rnic = 1;
+  enum PinglistType {
+    TOR_MESH = 0;
+    INTER_TOR = 1;
+  }
+  PinglistType type = 2;
+}
+
+// Target for ping operations
+message PingTarget {
+  RnicInfo target_rnic = 1;
+  // 5-tuple details
+  uint32 source_port = 2;
+  uint32 flow_label = 3;
+  uint32 priority = 4;
+}
+
+// Pinglist response
+message PinglistResponse {
+  repeated PingTarget targets = 1;
+  uint32 probe_interval_ms = 2;
+  uint32 timeout_ms = 3;
+}
+
+// Target RNIC info request for Service Tracing
+message TargetRnicInfoRequest {
+  string target_ip = 1;
+  string target_gid = 2; // Optional, can be used instead of IP
+}
+
+// Target RNIC info response
+message TargetRnicInfoResponse {
+  bool success = 1;
+  string message = 2;
+  RnicInfo target_rnic = 3;
+}
+
+// Controller service definition
+service ControllerService {
+  // Register an agent and its RNICs
+  rpc RegisterAgent(AgentRegistrationRequest) returns (AgentRegistrationResponse);
+
+  // Get pinglist for an agent
+  rpc GetPinglist(PinglistRequest) returns (PinglistResponse);
+
+  // Get target RNIC info for service tracing
+  rpc GetTargetRnicInfo(TargetRnicInfoRequest) returns (TargetRnicInfoResponse);
+}

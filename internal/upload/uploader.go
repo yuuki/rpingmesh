@@ -61,37 +61,38 @@ func (u *Uploader) Connect() error {
 
 	log.Debug().Str("addr", u.addr).Msg("Connecting to analyzer...")
 
-	// Connect with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
 	// Establish connection without TLS for now
 	// In production, should use TLS credentials
-	conn, err := grpc.NewClient(u.addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(
+		"dns:///"+u.addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
 	if err != nil {
 		return fmt.Errorf("failed to connect to analyzer at %s: %w", u.addr, err)
 	}
+	defer conn.Close()
+
+	conn.Connect()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
 	// Wait for connection to be READY state with timeout
 	for {
-		select {
-		case <-ctx.Done():
-			if conn != nil {
-				conn.Close()
-			}
-			return fmt.Errorf("timeout connecting to analyzer at %s", u.addr)
-		default:
-			state := conn.GetState()
-			if state == connectivity.Ready {
-				u.conn = conn
-				u.client = agent_analyzer.NewAnalyzerServiceClient(conn)
-				log.Info().Str("addr", u.addr).Msg("Connected to analyzer")
-				return nil
-			}
-			time.Sleep(100 * time.Millisecond)
+		state := conn.GetState()
+		if state == connectivity.Ready {
+			break
+		}
+		if !conn.WaitForStateChange(ctx, state) {
+			return fmt.Errorf("connection to analyzer at %s failed to become READY within timeout", u.addr)
 		}
 	}
+
+	u.conn = conn
+	u.client = agent_analyzer.NewAnalyzerServiceClient(conn)
+	log.Info().Str("addr", u.addr).Msg("Connected to analyzer")
+
+	return nil
 }
 
 // Start starts the uploader

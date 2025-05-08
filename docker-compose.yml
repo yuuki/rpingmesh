@@ -1,0 +1,38 @@
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        KERNEL_VERSION: ${KERNEL_VERSION:-5.10.0-34}
+    image: rpingmesh-agent:${VERSION:-0.1.0}
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - IPC_LOCK
+      - CAP_BPF
+    network_mode: host
+    volumes:
+      - ./agent.yaml:/app/config.yaml
+      - debugfs:/sys/kernel/debug
+    command: --config /app/config.yaml
+
+  generate-config:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        KERNEL_VERSION: ${KERNEL_VERSION:-5.10.0-34}
+    image: rpingmesh-agent:${VERSION:-0.1.0}
+    entrypoint: []
+    command: sh -c "/app/agent --create-config --config-output /tmp/agent.yaml"
+    volumes:
+      - ./agent.yaml:/tmp/agent.yaml
+
+volumes:
+  debugfs:
+    driver: local
+    driver_opts:
+      type: debugfs
+      device: debugfs

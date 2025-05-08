@@ -1,4 +1,4 @@
-.PHONY: build run clean generate debugfs-volume run-desktop test-registry
+.PHONY: build agent-up debugfs-volume generate-config generate-bpf test-controller clean-compose clean
 
 # Default configuration
 IMAGE_NAME := rpingmesh-agent
@@ -6,38 +6,14 @@ VERSION := 0.1.0
 TAG := $(IMAGE_NAME):$(VERSION)
 KERNEL_VERSION := 5.10.0-34
 
-# Build the Docker image
 build:
-	@echo "Building Docker image: $(TAG)"
-	@docker build --build-arg KERNEL_VERSION=$(KERNEL_VERSION) -t $(TAG) .
+	@echo "Building Docker image with Docker Compose: $(TAG)"
+	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose build agent
 
-# Build the Docker image with debug output
-build-debug:
-	@echo "Building Docker image with debug output: $(TAG)"
-	@docker build --build-arg KERNEL_VERSION=$(KERNEL_VERSION) --progress=plain -t $(TAG) .
-
-# Run the Docker container with privileged mode
-run: build
-	@echo "Running Docker container: $(TAG)"
-	@docker run -it --rm \
-		--privileged \
-		--cap-add SYS_ADMIN \
-		--cap-add NET_ADMIN \
-		--cap-add IPC_LOCK \
-		--network host \
-		$(TAG)
-
-# Run the Docker container with a specific config file
-run-with-config: build
-	@echo "Running Docker container with config: $(TAG)"
-	@docker run -it --rm \
-		--privileged \
-		--cap-add SYS_ADMIN \
-		--cap-add NET_ADMIN \
-		--cap-add IPC_LOCK \
-		--network host \
-		-v $(PWD)/agent.yaml:/app/config.yaml \
-		$(TAG) --config /app/config.yaml
+# Run with Docker Compose
+agent-up:
+	@echo "Starting service with Docker Compose"
+	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose up agent
 
 # Create a debugfs volume for Docker Desktop
 debugfs-volume:
@@ -45,25 +21,16 @@ debugfs-volume:
 	@docker volume create --driver local --opt type=debugfs --opt device=debugfs debugfs || echo "Volume may already exist"
 	@echo "debugfs volume created."
 
-# Run with Docker Desktop support
-run-desktop: build debugfs-volume
-	@echo "Running Docker container with Docker Desktop support: $(TAG)"
-	@docker run -it --rm \
-		--privileged \
-		--cap-add SYS_ADMIN \
-		--cap-add NET_ADMIN \
-		--cap-add IPC_LOCK \
-		--network host \
-		-v debugfs:/sys/kernel/debug \
-		$(TAG)
-
-# Generate a default configuration file
 generate-config:
-	@echo "Generating default configuration file"
-	@docker run --rm \
-		$(TAG) --create-config --config-output /app/agent.yaml
-	@docker cp $$(docker ps -lq):/app/agent.yaml ./agent.yaml
+	@echo "Generating default configuration file with Docker Compose"
+	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose run --rm generate-config > agent.yaml
 	@echo "Configuration file generated: ./agent.yaml"
+
+# Clean up Docker Compose resources
+clean-compose:
+	@echo "Cleaning up Docker Compose resources"
+	@docker compose down -v
+	@docker compose rm -f
 
 # Clean up Docker images
 clean:
@@ -98,19 +65,17 @@ generate-bpf:
 # Test controller
 test-controller:
 	@echo "Running controller tests with Docker..."
-	@scripts/test-controller.sh
+	@docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 
 # Help target
 help:
 	@echo "Available targets:"
-	@echo "  build            - Build the Docker image"
-	@echo "  build-debug      - Build with debug output"
-	@echo "  run              - Run the Docker container with privileged mode"
-	@echo "  run-with-config  - Run with a specific config file"
-	@echo "  run-desktop      - Run with Docker Desktop support (with debugfs)"
+	@echo "  build            - Build the Docker image with Docker Compose"
+	@echo "  agent-up         - Run the agent container with Docker Compose"
 	@echo "  debugfs-volume   - Create debugfs volume for Docker Desktop"
-	@echo "  generate-config  - Generate a default configuration file"
-	@echo "  clean            - Remove the Docker image"
+	@echo "  generate-config  - Generate default configuration file with Docker Compose"
 	@echo "  generate-bpf     - Generate eBPF Go bindings locally"
-	@echo "  test-registry    - Run registry tests with Docker"
+	@echo "  test-controller  - Run controller tests with Docker Compose"
+	@echo "  clean            - Remove the Docker image"
+	@echo "  clean-compose    - Clean up Docker Compose resources"
 	@echo "  help             - Show this help message"

@@ -53,6 +53,7 @@ func (r *RnicRegistry) initializeSchema() error {
 		rnic_ip TEXT NOT NULL,
 		tor_id TEXT NOT NULL,
 		hostname TEXT NOT NULL,
+		device_name TEXT NOT NULL,
 		last_updated TEXT NOT NULL
 	);
 	`
@@ -102,8 +103,8 @@ func (r *RnicRegistry) RegisterRNIC(
 	// Upsert RNIC in database
 	upsertSQL := `
 	INSERT OR REPLACE INTO rnics
-	(rnic_gid, qpn, agent_id, agent_ip, rnic_ip, tor_id, hostname, last_updated)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+	(rnic_gid, qpn, agent_id, agent_ip, rnic_ip, tor_id, hostname, device_name, last_updated)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
 
 	// Current time in RFC3339 format
@@ -120,6 +121,7 @@ func (r *RnicRegistry) RegisterRNIC(
 			rnic.IpAddress,
 			rnic.TorId,
 			rnic.HostName,
+			rnic.DeviceName,
 			now,
 		},
 	}
@@ -142,7 +144,7 @@ func (r *RnicRegistry) GetRNICsByToR(
 
 	// Query for all RNICs in the specified ToR
 	querySQL := `
-	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id
+	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 	FROM rnics
 	WHERE tor_id = ?
 	AND last_updated > datetime('now', '-5 minutes');
@@ -164,21 +166,22 @@ func (r *RnicRegistry) GetRNICsByToR(
 
 	// Iterate through result rows
 	for result.Next() {
-		var gid, ip, hostname, torID string
+		var gid, ip, hostname, torID, deviceName string
 		var qpn int64
 
 		// Scan row values
-		if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID); err != nil {
+		if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID, &deviceName); err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
 		// Add to result list
 		rnics = append(rnics, &controller_agent.RnicInfo{
-			Gid:       gid,
-			Qpn:       uint32(qpn),
-			IpAddress: ip,
-			HostName:  hostname,
-			TorId:     torID,
+			Gid:        gid,
+			Qpn:        uint32(qpn),
+			IpAddress:  ip,
+			HostName:   hostname,
+			TorId:      torID,
+			DeviceName: deviceName,
 		})
 	}
 
@@ -261,7 +264,7 @@ func (r *RnicRegistry) GetRNICInfo(
 	if targetGID != "" {
 		// Query by GID (primary key)
 		querySQL := `
-		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id
+		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 		FROM rnics
 		WHERE rnic_gid = ?
 		AND last_updated > datetime('now', '-5 minutes')
@@ -274,7 +277,7 @@ func (r *RnicRegistry) GetRNICInfo(
 	} else {
 		// Query by IP address
 		querySQL := `
-		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id
+		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 		FROM rnics
 		WHERE rnic_ip = ?
 		AND last_updated > datetime('now', '-5 minutes')
@@ -298,19 +301,20 @@ func (r *RnicRegistry) GetRNICInfo(
 	}
 
 	// Scan values
-	var gid, ip, hostname, torID string
+	var gid, ip, hostname, torID, deviceName string
 	var qpn int64
-	if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID); err != nil {
+	if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID, &deviceName); err != nil {
 		return nil, fmt.Errorf("failed to scan row: %w", err)
 	}
 
 	// Return the RNIC info
 	return &controller_agent.RnicInfo{
-		Gid:       gid,
-		Qpn:       uint32(qpn),
-		IpAddress: ip,
-		HostName:  hostname,
-		TorId:     torID,
+		Gid:        gid,
+		Qpn:        uint32(qpn),
+		IpAddress:  ip,
+		HostName:   hostname,
+		TorId:      torID,
+		DeviceName: deviceName,
 	}, nil
 }
 
@@ -341,7 +345,7 @@ func (r *RnicRegistry) ListAllRNICs(ctx context.Context) ([]*controller_agent.Rn
 
 	// Query for all active RNICs
 	querySQL := `
-	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id
+	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 	FROM rnics
 	WHERE last_updated > datetime('now', '-15 minutes')
 	ORDER BY tor_id, hostname;
@@ -357,21 +361,22 @@ func (r *RnicRegistry) ListAllRNICs(ctx context.Context) ([]*controller_agent.Rn
 
 	// Iterate through result rows
 	for result.Next() {
-		var gid, ip, hostname, torID string
+		var gid, ip, hostname, torID, deviceName string
 		var qpn int64
 
 		// Scan row values
-		if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID); err != nil {
+		if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID, &deviceName); err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
 		// Add to result list
 		rnics = append(rnics, &controller_agent.RnicInfo{
-			Gid:       gid,
-			Qpn:       uint32(qpn),
-			IpAddress: ip,
-			HostName:  hostname,
-			TorId:     torID,
+			Gid:        gid,
+			Qpn:        uint32(qpn),
+			IpAddress:  ip,
+			HostName:   hostname,
+			TorId:      torID,
+			DeviceName: deviceName,
 		})
 	}
 

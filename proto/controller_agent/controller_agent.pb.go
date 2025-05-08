@@ -75,6 +75,7 @@ type RnicInfo struct {
 	IpAddress     string                 `protobuf:"bytes,3,opt,name=ip_address,json=ipAddress,proto3" json:"ip_address,omitempty"`
 	HostName      string                 `protobuf:"bytes,4,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
 	TorId         string                 `protobuf:"bytes,5,opt,name=tor_id,json=torId,proto3" json:"tor_id,omitempty"`
+	DeviceName    string                 `protobuf:"bytes,6,opt,name=device_name,json=deviceName,proto3" json:"device_name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -140,6 +141,13 @@ func (x *RnicInfo) GetHostName() string {
 func (x *RnicInfo) GetTorId() string {
 	if x != nil {
 		return x.TorId
+	}
+	return ""
+}
+
+func (x *RnicInfo) GetDeviceName() string {
+	if x != nil {
+		return x.DeviceName
 	}
 	return ""
 }
@@ -560,14 +568,16 @@ var File_proto_controller_agent_controller_agent_proto protoreflect.FileDescript
 
 const file_proto_controller_agent_controller_agent_proto_rawDesc = "" +
 	"\n" +
-	"-proto/controller_agent/controller_agent.proto\x12\x10controller_agent\"\x81\x01\n" +
+	"-proto/controller_agent/controller_agent.proto\x12\x10controller_agent\"\xa2\x01\n" +
 	"\bRnicInfo\x12\x10\n" +
 	"\x03gid\x18\x01 \x01(\tR\x03gid\x12\x10\n" +
 	"\x03qpn\x18\x02 \x01(\rR\x03qpn\x12\x1d\n" +
 	"\n" +
 	"ip_address\x18\x03 \x01(\tR\tipAddress\x12\x1b\n" +
 	"\thost_name\x18\x04 \x01(\tR\bhostName\x12\x15\n" +
-	"\x06tor_id\x18\x05 \x01(\tR\x05torId\"\x82\x01\n" +
+	"\x06tor_id\x18\x05 \x01(\tR\x05torId\x12\x1f\n" +
+	"\vdevice_name\x18\x06 \x01(\tR\n" +
+	"deviceName\"\x82\x01\n" +
 	"\x18AgentRegistrationRequest\x12\x19\n" +
 	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12\x19\n" +
 	"\bagent_ip\x18\x02 \x01(\tR\aagentIp\x120\n" +

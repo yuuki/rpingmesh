@@ -107,11 +107,12 @@ func (c *ControllerClient) RegisterAgent(
 	rnicInfos := make([]*controller_agent.RnicInfo, 0, len(rnics))
 	for _, rnic := range rnics {
 		rnicInfos = append(rnicInfos, &controller_agent.RnicInfo{
-			Gid:       rnic.GID,
-			Qpn:       rnic.UDQueues[rnic.GID].QPN,
-			IpAddress: rnic.IPAddr,
-			HostName:  rnic.DeviceName,
-			TorId:     "", // This would need to be set from config
+			Gid:        rnic.GID,
+			Qpn:        rnic.UDQueues[rnic.GID].QPN,
+			IpAddress:  rnic.IPAddr,
+			HostName:   agentID,
+			DeviceName: rnic.DeviceName,
+			TorId:      "", // This would need to be set from config
 		})
 	}
 

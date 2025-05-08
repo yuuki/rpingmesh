@@ -165,7 +165,7 @@ func (r *RnicRegistry) GetRNICsByToR(
 	// Iterate through result rows
 	for result.Next() {
 		var gid, ip, hostname, torID string
-		var qpn uint32
+		var qpn int64
 
 		// Scan row values
 		if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID); err != nil {
@@ -175,7 +175,7 @@ func (r *RnicRegistry) GetRNICsByToR(
 		// Add to result list
 		rnics = append(rnics, &controller_agent.RnicInfo{
 			Gid:       gid,
-			Qpn:       qpn,
+			Qpn:       uint32(qpn),
 			IpAddress: ip,
 			HostName:  hostname,
 			TorId:     torID,
@@ -221,7 +221,7 @@ func (r *RnicRegistry) GetSampleRNICsFromOtherToRs(
 	// Iterate through result rows
 	for result.Next() {
 		var gid, ip, hostname, torID string
-		var qpn uint32
+		var qpn int64
 
 		// Scan row values
 		if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID); err != nil {
@@ -231,7 +231,7 @@ func (r *RnicRegistry) GetSampleRNICsFromOtherToRs(
 		// Add to result list
 		rnics = append(rnics, &controller_agent.RnicInfo{
 			Gid:       gid,
-			Qpn:       qpn,
+			Qpn:       uint32(qpn),
 			IpAddress: ip,
 			HostName:  hostname,
 			TorId:     torID,
@@ -299,7 +299,7 @@ func (r *RnicRegistry) GetRNICInfo(
 
 	// Scan values
 	var gid, ip, hostname, torID string
-	var qpn uint32
+	var qpn int64
 	if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID); err != nil {
 		return nil, fmt.Errorf("failed to scan row: %w", err)
 	}
@@ -307,7 +307,7 @@ func (r *RnicRegistry) GetRNICInfo(
 	// Return the RNIC info
 	return &controller_agent.RnicInfo{
 		Gid:       gid,
-		Qpn:       qpn,
+		Qpn:       uint32(qpn),
 		IpAddress: ip,
 		HostName:  hostname,
 		TorId:     torID,
@@ -358,7 +358,7 @@ func (r *RnicRegistry) ListAllRNICs(ctx context.Context) ([]*controller_agent.Rn
 	// Iterate through result rows
 	for result.Next() {
 		var gid, ip, hostname, torID string
-		var qpn uint32
+		var qpn int64
 
 		// Scan row values
 		if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID); err != nil {
@@ -368,7 +368,7 @@ func (r *RnicRegistry) ListAllRNICs(ctx context.Context) ([]*controller_agent.Rn
 		// Add to result list
 		rnics = append(rnics, &controller_agent.RnicInfo{
 			Gid:       gid,
-			Qpn:       qpn,
+			Qpn:       uint32(qpn),
 			IpAddress: ip,
 			HostName:  hostname,
 			TorId:     torID,

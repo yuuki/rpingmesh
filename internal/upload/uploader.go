@@ -97,9 +97,6 @@ func (u *Uploader) Connect() error {
 
 // Start starts the uploader
 func (u *Uploader) Start() error {
-	u.mutex.Lock()
-	defer u.mutex.Unlock()
-
 	if u.running {
 		return nil
 	}
@@ -221,11 +218,8 @@ func (u *Uploader) uploadLoop() {
 
 // uploadData uploads the pending data to the analyzer
 func (u *Uploader) uploadData() error {
-	u.mutex.Lock()
-
 	// Check if there's anything to upload
 	if len(u.probeResults) == 0 && len(u.pathInfos) == 0 {
-		u.mutex.Unlock()
 		log.Debug().Msg("No data to upload")
 		return nil
 	}
@@ -237,12 +231,10 @@ func (u *Uploader) uploadData() error {
 
 	// Check connection
 	if u.client == nil {
-		u.mutex.Unlock()
 		log.Debug().Msg("Client is nil, attempting to reconnect")
 		if err := u.Connect(); err != nil {
 			return err
 		}
-		u.mutex.Lock()
 	}
 
 	// Prepare batch
@@ -271,8 +263,6 @@ func (u *Uploader) uploadData() error {
 	log.Debug().
 		Int("pathInfoCount", len(pathInfos)).
 		Msg("Prepared path infos for upload")
-
-	u.mutex.Unlock()
 
 	// Create request
 	req := &agent_analyzer.UploadDataRequest{

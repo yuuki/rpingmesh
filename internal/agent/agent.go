@@ -82,6 +82,15 @@ func (a *Agent) Start() error {
 	log.Debug().Msg("Connected to controller")
 
 	// Register with controller
+	if err := a.controllerClient.RegisterAgent(
+		a.agentState.GetAgentID(),
+		a.agentState.GetAgentIP(),
+		a.agentState.GetDetectedRNICs(),
+	); err != nil {
+		return fmt.Errorf("failed to register agent with controller: %w", err)
+	}
+	log.Info().Msg("Registered agent with controller")
+
 	primaryRnic := a.agentState.GetPrimaryRNIC()
 	if primaryRnic == nil {
 		return fmt.Errorf("no RDMA devices available")

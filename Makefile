@@ -12,11 +12,11 @@ build:
 
 build-controller:
 	@echo "Building controller with Docker Compose"
-	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --abort-on-container-exit --remove-orphans controller
+	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --abort-on-container-exit --remove-orphans controller-builder
 
 build-agent:
 	@echo "Building agent with Docker Compose"
-	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --abort-on-container-exit --remove-orphans agent
+	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --abort-on-container-exit --remove-orphans agent-builder
 
 # Run with Docker Compose
 agent-up:

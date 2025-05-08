@@ -55,8 +55,11 @@ func (u *Uploader) Connect() error {
 
 	// If already connected, return
 	if u.conn != nil {
+		log.Debug().Msg("Already connected to analyzer")
 		return nil
 	}
+
+	log.Debug().Str("addr", u.addr).Msg("Connecting to analyzer...")
 
 	// Connect with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -80,6 +83,7 @@ func (u *Uploader) Connect() error {
 			return fmt.Errorf("timeout connecting to analyzer at %s", u.addr)
 		default:
 			state := conn.GetState()
+			log.Debug().Str("state", state.String()).Msg("Connection state")
 			if state == connectivity.Ready {
 				u.conn = conn
 				u.client = agent_analyzer.NewAnalyzerServiceClient(conn)
@@ -159,9 +163,16 @@ func (u *Uploader) AddProbeResult(result *agent_analyzer.ProbeResult) {
 
 	// Add to queue
 	u.probeResults = append(u.probeResults, result)
+	log.Debug().
+		Int("queueSize", len(u.probeResults)).
+		Int("maxQueueSize", u.maxQueueSize).
+		Msg("Added probe result to queue")
 
 	// If queue is full, trigger upload
 	if len(u.probeResults) >= u.maxQueueSize {
+		log.Debug().
+			Int("queueSize", len(u.probeResults)).
+			Msg("Queue is full, triggering immediate upload")
 		// Trigger immediate upload in a goroutine to avoid blocking
 		go func() {
 			if err := u.uploadData(); err != nil {
@@ -177,6 +188,9 @@ func (u *Uploader) AddPathInfo(pathInfo *agent_analyzer.PathInfo) {
 	defer u.mutex.Unlock()
 
 	u.pathInfos = append(u.pathInfos, pathInfo)
+	log.Debug().
+		Int("pathInfoCount", len(u.pathInfos)).
+		Msg("Added path info to queue")
 }
 
 // uploadLoop periodically uploads data to the analyzer
@@ -212,12 +226,19 @@ func (u *Uploader) uploadData() error {
 	// Check if there's anything to upload
 	if len(u.probeResults) == 0 && len(u.pathInfos) == 0 {
 		u.mutex.Unlock()
+		log.Debug().Msg("No data to upload")
 		return nil
 	}
+
+	log.Debug().
+		Int("pendingProbeResults", len(u.probeResults)).
+		Int("pendingPathInfos", len(u.pathInfos)).
+		Msg("Starting data upload")
 
 	// Check connection
 	if u.client == nil {
 		u.mutex.Unlock()
+		log.Debug().Msg("Client is nil, attempting to reconnect")
 		if err := u.Connect(); err != nil {
 			return err
 		}
@@ -232,14 +253,24 @@ func (u *Uploader) uploadData() error {
 	if len(u.probeResults) > u.batchSize {
 		results = u.probeResults[:u.batchSize]
 		u.probeResults = u.probeResults[u.batchSize:]
+		log.Debug().
+			Int("batchSize", len(results)).
+			Int("remainingResults", len(u.probeResults)).
+			Msg("Split probe results into batch")
 	} else {
 		results = u.probeResults
 		u.probeResults = make([]*agent_analyzer.ProbeResult, 0, u.maxQueueSize)
+		log.Debug().
+			Int("batchSize", len(results)).
+			Msg("Using all probe results as batch")
 	}
 
 	// Take all path infos
 	pathInfos = u.pathInfos
 	u.pathInfos = make([]*agent_analyzer.PathInfo, 0, 100)
+	log.Debug().
+		Int("pathInfoCount", len(pathInfos)).
+		Msg("Prepared path infos for upload")
 
 	u.mutex.Unlock()
 

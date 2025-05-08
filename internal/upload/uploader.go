@@ -9,6 +9,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/proto/agent_analyzer"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -63,18 +64,31 @@ func (u *Uploader) Connect() error {
 
 	// Establish connection without TLS for now
 	// In production, should use TLS credentials
-	conn, err := grpc.DialContext(ctx, u.addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock())
+	conn, err := grpc.NewClient(u.addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to connect to analyzer at %s: %w", u.addr, err)
 	}
 
-	u.conn = conn
-	u.client = agent_analyzer.NewAnalyzerServiceClient(conn)
-	log.Info().Str("addr", u.addr).Msg("Connected to analyzer")
-
-	return nil
+	// Wait for connection to be READY state with timeout
+	for {
+		select {
+		case <-ctx.Done():
+			if conn != nil {
+				conn.Close()
+			}
+			return fmt.Errorf("timeout connecting to analyzer at %s", u.addr)
+		default:
+			state := conn.GetState()
+			if state == connectivity.Ready {
+				u.conn = conn
+				u.client = agent_analyzer.NewAnalyzerServiceClient(conn)
+				log.Info().Str("addr", u.addr).Msg("Connected to analyzer")
+				return nil
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 }
 
 // Start starts the uploader

@@ -134,9 +134,10 @@ func (a *Agent) Start() error {
 	)
 	log.Debug().Msg("Uploader created")
 	if err := a.uploader.Start(); err != nil {
-		return fmt.Errorf("failed to start uploader: %w", err)
+		log.Warn().Err(err).Str("analyzer_addr", a.config.AnalyzerAddr).Msg("Failed to start uploader, will retry later. Agent will continue without analyzer connection")
+	} else {
+		log.Debug().Str("analyzer_addr", a.config.AnalyzerAddr).Uint32("upload_interval_ms", a.config.DataUploadIntervalMS).Msg("Uploader started")
 	}
-	log.Debug().Str("analyzer_addr", a.config.AnalyzerAddr).Uint32("upload_interval_ms", a.config.DataUploadIntervalMS).Msg("Uploader started")
 
 	// Start background goroutines
 	a.wg.Add(2)
@@ -176,7 +177,11 @@ func (a *Agent) resultHandler() {
 				Msg("Received probe result")
 
 			// Forward to uploader
-			a.uploader.AddProbeResult(result)
+			if a.uploader != nil {
+				a.uploader.AddProbeResult(result)
+			} else {
+				log.Debug().Msg("Uploader not available, probe result discarded")
+			}
 
 			// If it's a timeout, maybe run a traceroute
 			if result.Status == 1 && a.config.TracerouteOnTimeout {
@@ -202,7 +207,11 @@ func (a *Agent) resultHandler() {
 				Msg("Received trace result")
 
 			// Forward to uploader
-			a.uploader.AddPathInfo(traceInfo)
+			if a.uploader != nil {
+				a.uploader.AddPathInfo(traceInfo)
+			} else {
+				log.Debug().Msg("Uploader not available, path info discarded")
+			}
 		}
 	}
 }

@@ -26,7 +26,7 @@ import (
 type Agent struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
-	config           *config.Config
+	config           *config.AgentConfig
 	agentState       *state.AgentState
 	controllerClient *controller_client.ControllerClient
 	prober           *probe.Prober
@@ -39,7 +39,7 @@ type Agent struct {
 // New creates a new agent instance
 func New(configPath string) (*Agent, error) {
 	// Load configuration
-	cfg, err := config.LoadConfig(configPath)
+	cfg, err := config.LoadAgentConfig(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}

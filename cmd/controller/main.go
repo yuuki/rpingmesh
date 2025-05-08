@@ -34,7 +34,7 @@ func main() {
 
 	// Create default configuration file if requested
 	if createConfig {
-		if err := config.CreateDefaultConfig(configOutput); err != nil {
+		if err := config.CreateDefaultControllerConfig(configOutput); err != nil {
 			log.Fatal().Err(err).Str("path", configOutput).Msg("Failed to create default configuration")
 		}
 		fmt.Printf("Default configuration written to %s\n", configOutput)

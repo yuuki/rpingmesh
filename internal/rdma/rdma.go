@@ -17,6 +17,53 @@ package rdma
 //     wr->wr.ud.remote_qpn = remote_qpn;
 //     wr->wr.ud.remote_qkey = remote_qkey;
 // }
+//
+// // Helper function to post receive WR without Go pointers
+// int post_recv(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey) {
+//     struct ibv_sge sge;
+//     struct ibv_recv_wr wr;
+//     struct ibv_recv_wr *bad_wr = NULL;
+//
+//     memset(&sge, 0, sizeof(sge));
+//     sge.addr = addr;
+//     sge.length = length;
+//     sge.lkey = lkey;
+//
+//     memset(&wr, 0, sizeof(wr));
+//     wr.sg_list = &sge;
+//     wr.num_sge = 1;
+//
+//     return ibv_post_recv(qp, &wr, &bad_wr);
+// }
+//
+// // Helper function to post send WR without Go pointers
+// int post_send(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey,
+//              struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey) {
+//     struct ibv_sge sge;
+//     struct ibv_send_wr wr;
+//     struct ibv_send_wr *bad_wr = NULL;
+//
+//     memset(&sge, 0, sizeof(sge));
+//     sge.addr = addr;
+//     sge.length = length;
+//     sge.lkey = lkey;
+//
+//     memset(&wr, 0, sizeof(wr));
+//     wr.sg_list = &sge;
+//     wr.num_sge = 1;
+//     wr.opcode = IBV_WR_SEND;
+//     wr.send_flags = IBV_SEND_SIGNALED;
+//     wr.wr.ud.ah = ah;
+//     wr.wr.ud.remote_qpn = remote_qpn;
+//     wr.wr.ud.remote_qkey = remote_qkey;
+//
+//     return ibv_post_send(qp, &wr, &bad_wr);
+// }
+//
+// // Helper function to poll completion queue
+// int poll_cq_once(struct ibv_cq *cq, struct ibv_wc *wc) {
+//     return ibv_poll_cq(cq, 1, wc);
+// }
 import "C"
 
 import (
@@ -323,17 +370,16 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC) (*UDQueue, error) {
 
 // PostRecv posts a receive work request
 func (u *UDQueue) PostRecv() error {
-	var sge C.struct_ibv_sge
-	sge.addr = C.uint64_t(uintptr(u.RecvBuf))
-	sge.length = C.uint32_t(MRSize)
-	sge.lkey = u.RecvMR.lkey
+	// Use the C helper function that manages work request memory on C side
+	// This avoids the "cgo argument has Go pointers to unpinned Go pointers" error
+	ret := C.post_recv(
+		u.QP,
+		C.uint64_t(uintptr(u.RecvBuf)),
+		C.uint32_t(MRSize),
+		u.RecvMR.lkey,
+	)
 
-	var wr C.struct_ibv_recv_wr
-	wr.sg_list = &sge
-	wr.num_sge = 1
-
-	var badWr *C.struct_ibv_recv_wr
-	if ret := C.ibv_post_recv(u.QP, &wr, &badWr); ret != 0 {
+	if ret != 0 {
 		return fmt.Errorf("ibv_post_recv failed: %d", ret)
 	}
 
@@ -399,30 +445,23 @@ func (u *UDQueue) SendProbePacket(
 	packet.IsAck = 0
 	packet.Flags = 0
 
-	var sge C.struct_ibv_sge
-	sge.addr = C.uint64_t(uintptr(u.SendBuf))
-	sge.length = C.uint32_t(unsafe.Sizeof(ProbePacket{}))
-	sge.lkey = u.SendMR.lkey
-
-	var wr C.struct_ibv_send_wr
-	wr.sg_list = &sge
-	wr.num_sge = 1
-	wr.opcode = C.IBV_WR_SEND
-	wr.send_flags = C.IBV_SEND_SIGNALED
-	wr.wr_id = 0
-
-	// Use the helper function to set UD specific fields
-	C.set_ud_send_params(&wr, ah, C.uint32_t(targetQPN), 0x11111111)
-
-	var badWr *C.struct_ibv_send_wr
-	if ret := C.ibv_post_send(u.QP, &wr, &badWr); ret != 0 {
+	// Use the C helper function to post a send WR from C-allocated memory
+	if ret := C.post_send(
+		u.QP,
+		C.uint64_t(uintptr(u.SendBuf)),
+		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
+		u.SendMR.lkey,
+		ah,
+		C.uint32_t(targetQPN),
+		0x11111111,
+	); ret != 0 {
 		return time.Time{}, fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
 
 	// Get send completion
 	var wc C.struct_ibv_wc
 	for {
-		ne := C.ibv_poll_cq(u.CQ, 1, &wc)
+		ne := C.poll_cq_once(u.CQ, &wc)
 		if ne < 0 {
 			return time.Time{}, fmt.Errorf("ibv_poll_cq failed")
 		}
@@ -450,7 +489,7 @@ func (u *UDQueue) ReceivePacket(timeout time.Duration) (*ProbePacket, time.Time,
 	var wc C.struct_ibv_wc
 	start := time.Now()
 	for {
-		ne := C.ibv_poll_cq(u.CQ, 1, &wc)
+		ne := C.poll_cq_once(u.CQ, &wc)
 		if ne < 0 {
 			return nil, time.Time{}, fmt.Errorf("ibv_poll_cq failed")
 		}
@@ -512,30 +551,23 @@ func (u *UDQueue) SendAckPacket(
 	packet.IsAck = 1
 	packet.Flags = 0
 
-	var sge C.struct_ibv_sge
-	sge.addr = C.uint64_t(uintptr(u.SendBuf))
-	sge.length = C.uint32_t(unsafe.Sizeof(ProbePacket{}))
-	sge.lkey = u.SendMR.lkey
-
-	var wr C.struct_ibv_send_wr
-	wr.sg_list = &sge
-	wr.num_sge = 1
-	wr.opcode = C.IBV_WR_SEND
-	wr.send_flags = C.IBV_SEND_SIGNALED
-	wr.wr_id = 0
-
-	// Use the helper function to set UD specific fields
-	C.set_ud_send_params(&wr, ah, C.uint32_t(targetQPN), 0x11111111)
-
-	var badWr *C.struct_ibv_send_wr
-	if ret := C.ibv_post_send(u.QP, &wr, &badWr); ret != 0 {
+	// Use the C helper function to post a send WR from C-allocated memory
+	if ret := C.post_send(
+		u.QP,
+		C.uint64_t(uintptr(u.SendBuf)),
+		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
+		u.SendMR.lkey,
+		ah,
+		C.uint32_t(targetQPN),
+		0x11111111,
+	); ret != 0 {
 		return fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
 
 	// Get send completion (can be asynchronous in real implementation)
 	var wc C.struct_ibv_wc
 	for {
-		ne := C.ibv_poll_cq(u.CQ, 1, &wc)
+		ne := C.poll_cq_once(u.CQ, &wc)
 		if ne < 0 {
 			return fmt.Errorf("ibv_poll_cq failed")
 		}

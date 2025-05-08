@@ -7,8 +7,16 @@ TAG := $(IMAGE_NAME):$(VERSION)
 KERNEL_VERSION := 5.10.0-34
 
 build:
-	@echo "Building Docker image with Docker Compose: $(TAG)"
+	@echo "Building all components with Docker Compose"
 	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --abort-on-container-exit --remove-orphans
+
+build-controller:
+	@echo "Building controller with Docker Compose"
+	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --abort-on-container-exit --remove-orphans controller
+
+build-agent:
+	@echo "Building agent with Docker Compose"
+	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --abort-on-container-exit --remove-orphans agent
 
 # Run with Docker Compose
 agent-up:

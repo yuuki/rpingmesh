@@ -69,6 +69,7 @@ import "C"
 import (
 	"fmt"
 	"net"
+	"os"
 	"time"
 	"unsafe"
 
@@ -209,16 +210,82 @@ func (r *RNIC) OpenDevice() error {
 	ipv6 := net.IP(gidBytes)
 	r.GID = ipv6.String()
 
-	// Extract IPv4 from IPv6 if it's an IPv4-mapped IPv6 address
-	if ipv4 := ipv6.To4(); ipv4 != nil {
-		r.IPAddr = ipv4.String()
-	} else {
-		r.IPAddr = ipv6.String()
-	}
+	// Get IP address from network interface or fall back to GID
+	r.IPAddr = r.getIPAddress(ipv6)
 
 	r.IsOpen = true
 	log.Info().Str("device", r.DeviceName).Str("gid", r.GID).Str("ip", r.IPAddr).Msg("Opened RDMA device")
 	return nil
+}
+
+// getIPAddress tries to get the IP address from the network interface
+// and falls back to GID-based extraction if that fails
+func (r *RNIC) getIPAddress(ipv6 net.IP) string {
+	// Try to get IP address from the network interface
+	if ipAddr := r.getIPAddressFromInterface(); ipAddr != "" {
+		return ipAddr
+	}
+
+	// Fall back to GID-based extraction
+	return r.getIPAddressFromGID(ipv6)
+}
+
+// getIPAddressFromInterface gets the IPv4 address from the network interface
+// associated with the RNIC, returns empty string if not found
+func (r *RNIC) getIPAddressFromInterface() string {
+	// Get network interface name from /sys/class/infiniband/<device>/device/net
+	netDir := fmt.Sprintf("/sys/class/infiniband/%s/device/net", r.DeviceName)
+	netDirEntries, err := os.ReadDir(netDir)
+	if err != nil {
+		log.Warn().Str("device", r.DeviceName).Err(err).Msg("Failed to read network interfaces directory")
+		return ""
+	}
+
+	// Check if there are any interfaces
+	if len(netDirEntries) == 0 {
+		log.Warn().Str("device", r.DeviceName).Msg("No network interfaces found")
+		return ""
+	}
+
+	// Get the first interface (there should typically be only one)
+	ifName := netDirEntries[0].Name()
+	log.Debug().Str("device", r.DeviceName).Str("interface", ifName).Msg("Found network interface for RDMA device")
+
+	// Get the IPv4 address for this interface
+	iface, err := net.InterfaceByName(ifName)
+	if err != nil {
+		log.Warn().Str("device", r.DeviceName).Str("interface", ifName).Err(err).Msg("Failed to get interface")
+		return ""
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil || len(addrs) == 0 {
+		log.Warn().Str("device", r.DeviceName).Str("interface", ifName).Err(err).Msg("Failed to get interface addresses")
+		return ""
+	}
+
+	// Find the first IPv4 address
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ipv4 := ipNet.IP.To4(); ipv4 != nil {
+			log.Debug().Str("device", r.DeviceName).Str("interface", ifName).Str("ipv4", ipv4.String()).Msg("Found IPv4 address for interface")
+			return ipv4.String()
+		}
+	}
+
+	log.Warn().Str("device", r.DeviceName).Str("interface", ifName).Msg("No IPv4 address found for interface")
+	return ""
+}
+
+// getIPAddressFromGID extracts IPv4 from IPv6 GID if it's an IPv4-mapped IPv6 address
+func (r *RNIC) getIPAddressFromGID(ipv6 net.IP) string {
+	if ipv4 := ipv6.To4(); ipv4 != nil {
+		return ipv4.String()
+	}
+	return ipv6.String()
 }
 
 // CloseDevice closes the RDMA device and frees its resources

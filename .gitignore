@@ -10,12 +10,6 @@ pkg/ebpf/rdmaTracing.o
 *.elf
 *.so
 
-# Configuration files (optional)
-agent.yaml
-
-# Docker related
-.dockerignore
-
 # Go build and test artifacts
 *.test
 /vendor/

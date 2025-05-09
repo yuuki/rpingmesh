@@ -32,11 +32,12 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy the source code
-COPY . .
-
+COPY internal/ebpf internal/ebpf
 # Install bpf2go and run go generate to create eBPF bindings
 RUN cd internal/ebpf && KERNEL_VERSION=${KERNEL_VERSION} go generate ./... || echo "Warning: Failed to generate eBPF bindings"
+
+# Copy the all remaining source code
+COPY . .
 
 # Build the Go application
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o /app/bin/agent cmd/agent/main.go

@@ -21,8 +21,10 @@ FROM debian:bullseye-slim
 
 WORKDIR /app
 
-# Copy binary and config
-COPY --from=builder /app/bin/controller ./controller
-COPY --from=builder /app/controller.yaml ./controller.yaml
+RUN mkdir -p /output
 
-ENTRYPOINT ["./controller"]
+# Copy binary and config
+COPY --from=builder /app/bin/controller /output/controller
+COPY --from=builder /app/controller.yaml /output/controller.yaml
+
+ENTRYPOINT ["/output/controller"]

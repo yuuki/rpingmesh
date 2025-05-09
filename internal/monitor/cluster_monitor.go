@@ -79,9 +79,6 @@ func (c *ClusterMonitor) Start() error {
 
 // Stop stops the cluster monitor
 func (c *ClusterMonitor) Stop() {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
 	if !c.running {
 		return
 	}

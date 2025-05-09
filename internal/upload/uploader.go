@@ -141,9 +141,6 @@ func (u *Uploader) Stop() {
 func (u *Uploader) Close() error {
 	u.Stop()
 
-	u.mutex.Lock()
-	defer u.mutex.Unlock()
-
 	if u.conn != nil {
 		if err := u.conn.Close(); err != nil {
 			return err

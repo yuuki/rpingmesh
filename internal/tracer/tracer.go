@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"os/exec"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/proto/agent_analyzer"
+	"github.com/yuuki/rpingmesh/proto/controller_agent"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -20,6 +22,8 @@ import (
 type Tracer struct {
 	traceResults chan *agent_analyzer.PathInfo
 	mutex        sync.Mutex
+	ctx          context.Context
+	periodicWg   sync.WaitGroup
 }
 
 // NewTracer creates a new tracer
@@ -32,6 +36,11 @@ func NewTracer() *Tracer {
 // GetTraceResults returns the channel where trace results are published
 func (t *Tracer) GetTraceResults() <-chan *agent_analyzer.PathInfo {
 	return t.traceResults
+}
+
+// SetContext sets the context for the tracer
+func (t *Tracer) SetContext(ctx context.Context) {
+	t.ctx = ctx
 }
 
 // Trace performs a traceroute to the target IP
@@ -229,10 +238,88 @@ func (t *Tracer) TracePeriodically(ctx context.Context, fiveTuple *agent_analyze
 	}
 }
 
+// StartPeriodicTracing starts periodic traceroute to targets from the pinglist
+// Returns the number of targets being traced
+func (t *Tracer) StartPeriodicTracing(
+	ctx context.Context,
+	sourceGID string,
+	targets []*controller_agent.PingTarget,
+	intervalMS uint32,
+	maxTargets int,
+) int {
+	if len(targets) == 0 {
+		log.Warn().Msg("No pinglist targets available for traceroute")
+		return 0
+	}
+
+	// Use up to maxTargets from the pinglist
+	targetCount := min(maxTargets, len(targets))
+
+	// Start traceroute for each target
+	for i := 0; i < targetCount; i++ {
+		target := targets[i]
+		fiveTuple := &agent_analyzer.ProbeFiveTuple{
+			SrcGid: sourceGID,
+			DstGid: target.TargetRnic.Gid,
+		}
+
+		// Add a slight delay between starting each traceroute to avoid overloading
+		tracerouteInterval := time.Duration(intervalMS) * time.Millisecond
+
+		// Start traceroute goroutine
+		t.periodicWg.Add(1)
+		go func(ft *agent_analyzer.ProbeFiveTuple, interval time.Duration) {
+			defer t.periodicWg.Done()
+			// Add small delay to offset the traceroutes
+			time.Sleep(time.Duration(rand.Intn(5000)) * time.Millisecond)
+			t.TracePeriodically(ctx, ft, interval)
+		}(fiveTuple, tracerouteInterval)
+
+		log.Info().
+			Uint32("interval_ms", intervalMS).
+			Str("target", fiveTuple.DstGid).
+			Msg("Started periodic traceroute")
+	}
+
+	log.Info().
+		Int("target_count", targetCount).
+		Uint32("interval_ms", intervalMS).
+		Msg("Started periodic traceroute to multiple targets")
+
+	return targetCount
+}
+
+// StartPeriodicTracingToLocalhost starts periodic traceroute to localhost as a fallback
+func (t *Tracer) StartPeriodicTracingToLocalhost(
+	ctx context.Context,
+	sourceGID string,
+	intervalMS uint32,
+) {
+	fiveTuple := &agent_analyzer.ProbeFiveTuple{
+		SrcGid: sourceGID,
+		DstGid: "127.0.0.1",
+	}
+
+	tracerouteInterval := time.Duration(intervalMS) * time.Millisecond
+	t.periodicWg.Add(1)
+	go func() {
+		defer t.periodicWg.Done()
+		t.TracePeriodically(ctx, fiveTuple, tracerouteInterval)
+	}()
+
+	log.Info().
+		Uint32("interval_ms", intervalMS).
+		Str("target", fiveTuple.DstGid).
+		Msg("Started periodic traceroute to localhost (fallback)")
+}
+
 // Close cleans up resources
 func (t *Tracer) Close() error {
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
+
+	// Wait for all periodic traceroute goroutines to complete
+	t.periodicWg.Wait()
 
 	close(t.traceResults)
 	return nil
@@ -322,4 +409,12 @@ func (t *Tracer) parseTracepathLine(line string) (*agent_analyzer.PathInfo_Hop, 
 		IpAddress: ip.String(),
 		RttNs:     rttNs,
 	}, nil
+}
+
+// Helper function to find minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

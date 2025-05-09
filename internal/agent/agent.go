@@ -139,6 +139,31 @@ func (a *Agent) Start() error {
 	a.tracer = tracer.NewTracer()
 	log.Debug().Msg("Tracer created")
 
+	// Set context for tracer
+	a.tracer.SetContext(a.ctx)
+
+	// Start periodic traceroute if interval is set
+	if a.config.TracerouteIntervalMS > 0 {
+		// Get primary RNIC for periodic traceroute
+		primaryRnic := a.agentState.GetPrimaryRNIC()
+		if primaryRnic != nil {
+			// Get a pinglist from the controller to use as traceroute targets
+			targets, _, _, err := a.controllerClient.GetPinglist(
+				primaryRnic,
+				controller_agent.PinglistRequest_TOR_MESH,
+			)
+
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to get pinglist for traceroute targets, will use localhost")
+				// Fallback to localhost if we can't get targets
+				a.tracer.StartPeriodicTracingToLocalhost(a.ctx, primaryRnic.GID, a.config.TracerouteIntervalMS)
+			} else {
+				// Start periodic tracing to targets
+				a.tracer.StartPeriodicTracing(a.ctx, primaryRnic.GID, targets, a.config.TracerouteIntervalMS, 3)
+			}
+		}
+	}
+
 	// Create uploader
 	a.uploader = upload.NewUploader(
 		a.config.AnalyzerAddr,
@@ -407,12 +432,26 @@ func (a *Agent) Run() error {
 		}
 	}()
 
-	// Wait for a signal
+	// Wait for the first signal
 	sig := <-sigCh
-	log.Info().Str("signal", sig.String()).Msg("Received signal, shutting down...")
+	log.Info().Str("signal", sig.String()).Msg("Received signal, shutting down gracefully...")
 
-	// Stop the agent
+	// Normal shutdown process
 	a.Stop()
+
+	// Create a new channel for the second signal
+	forceQuitCh := make(chan os.Signal, 1)
+	signal.Notify(forceQuitCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// Wait for the second signal in a separate goroutine
+	go func() {
+		<-forceQuitCh
+		log.Warn().Msg("Received second signal, forcing immediate exit...")
+		os.Exit(1)
+	}()
+
+	// This won't be reached if forceQuit is called
+	log.Info().Msg("Agent shut down gracefully")
 	return nil
 }
 

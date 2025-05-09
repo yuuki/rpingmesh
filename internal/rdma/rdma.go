@@ -125,6 +125,27 @@ type ProbePacket struct {
 	Padding     [2]byte
 }
 
+// WorkCompletion contains extracted work completion info
+type WorkCompletion struct {
+	Status    uint32
+	SrcQP     uint32
+	SGID      string
+	DGID      string
+	IMM       uint32
+	VendorErr uint32
+}
+
+// Placeholder structure for go build to succeed even if we don't have the actual header
+type ibv_wc struct {
+	status     uint32
+	vendor_err uint32
+	byte_len   uint32
+	imm_data   uint32
+	qp_num     uint32
+	src_qp     uint32
+	wc_flags   uint32
+}
+
 // NewRDMAManager creates a new RDMA manager
 func NewRDMAManager() (*RDMAManager, error) {
 	manager := &RDMAManager{
@@ -551,20 +572,20 @@ func (u *UDQueue) SendProbePacket(
 }
 
 // ReceivePacket waits for and processes a received packet
-func (u *UDQueue) ReceivePacket(timeout time.Duration) (*ProbePacket, time.Time, error) {
+func (u *UDQueue) ReceivePacket(timeout time.Duration) (*ProbePacket, time.Time, *WorkCompletion, error) {
 	// Poll for completion
 	var wc C.struct_ibv_wc
 	start := time.Now()
 	for {
 		ne := C.poll_cq_once(u.CQ, &wc)
 		if ne < 0 {
-			return nil, time.Time{}, fmt.Errorf("ibv_poll_cq failed")
+			return nil, time.Time{}, nil, fmt.Errorf("ibv_poll_cq failed")
 		}
 
 		if ne == 0 {
 			// No completion yet, check timeout
 			if time.Since(start) > timeout {
-				return nil, time.Time{}, fmt.Errorf("receive timeout")
+				return nil, time.Time{}, nil, fmt.Errorf("receive timeout")
 			}
 			// Sleep a bit to avoid busy-waiting
 			time.Sleep(10 * time.Microsecond)
@@ -575,11 +596,33 @@ func (u *UDQueue) ReceivePacket(timeout time.Duration) (*ProbePacket, time.Time,
 		if wc.status != C.IBV_WC_SUCCESS {
 			// Post another receive buffer to replace the failed one
 			u.PostRecv()
-			return nil, time.Time{}, fmt.Errorf("receive completion failed: %d", wc.status)
+			return nil, time.Time{}, nil, fmt.Errorf("receive completion failed: %d", wc.status)
 		}
 
 		// Receive completed successfully
 		receiveTime := time.Now()
+
+		// Extract work completion information
+		workComp := &WorkCompletion{
+			Status:    uint32(wc.status),
+			SrcQP:     uint32(wc.src_qp), // Source QP number from WC
+			VendorErr: uint32(wc.vendor_err),
+		}
+
+		// Extract GRH header information (for UD transport)
+		// GRH header is at the beginning of the receive buffer for UD transport
+		if u.GRHSize > 0 {
+			// Source GID is at offset 8 (SGID field) in the GRH header
+			sgidOffset := 8
+			sgidSize := 16 // IPv6 size in bytes
+			sgidBytes := C.GoBytes(unsafe.Pointer(uintptr(u.RecvBuf)+uintptr(sgidOffset)), C.int(sgidSize))
+			workComp.SGID = net.IP(sgidBytes).String()
+
+			// Destination GID is also in the GRH header
+			dgidOffset := 24
+			dgidBytes := C.GoBytes(unsafe.Pointer(uintptr(u.RecvBuf)+uintptr(dgidOffset)), C.int(sgidSize))
+			workComp.DGID = net.IP(dgidBytes).String()
+		}
 
 		// The UD transport adds a GRH header to the packet
 		// Skip over it to get to our data
@@ -592,7 +635,7 @@ func (u *UDQueue) ReceivePacket(timeout time.Duration) (*ProbePacket, time.Time,
 		// Post another receive buffer to replace the one we just consumed
 		u.PostRecv()
 
-		return &packetCopy, receiveTime, nil
+		return &packetCopy, receiveTime, workComp, nil
 	}
 }
 

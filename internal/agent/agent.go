@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/agent/controller_client"
+	"github.com/yuuki/rpingmesh/internal/agent/metrics"
 	"github.com/yuuki/rpingmesh/internal/config"
 	"github.com/yuuki/rpingmesh/internal/monitor"
 	"github.com/yuuki/rpingmesh/internal/probe"
@@ -20,6 +21,8 @@ import (
 	"github.com/yuuki/rpingmesh/internal/upload"
 	"github.com/yuuki/rpingmesh/proto/agent_analyzer"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Agent represents the RPingMesh agent
@@ -33,6 +36,7 @@ type Agent struct {
 	clusterMonitor   *monitor.ClusterMonitor
 	tracer           *tracer.Tracer
 	uploader         *upload.Uploader
+	metrics          *metrics.Metrics
 	wg               sync.WaitGroup
 }
 
@@ -101,6 +105,17 @@ func (a *Agent) Start() error {
 		return fmt.Errorf("no UD queue available for RNIC %s", primaryRnic.GID)
 	}
 	log.Debug().Str("primary_rnic_gid", primaryRnic.GID).Msg("Got primary RNIC and UD queue")
+
+	// Initialize metrics if enabled
+	if a.config.MetricsEnabled {
+		metricsInstance, err := metrics.NewMetrics(a.ctx, a.agentState.GetAgentID(), a.config.OtelCollectorAddr)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to initialize metrics, continuing without metrics")
+		} else {
+			a.metrics = metricsInstance
+			log.Info().Msg("Metrics initialized")
+		}
+	}
 
 	// Create prober
 	a.prober = probe.NewProber(a.agentState.GetRDMAManager(), udQueue, a.config.TimeoutMS)
@@ -175,6 +190,29 @@ func (a *Agent) resultHandler() {
 				Int32("status", int32(result.Status)).
 				Float64("rtt_ms", float64(result.NetworkRtt)/1000000.0).
 				Msg("Received probe result")
+
+			// Record metrics if enabled
+			if a.metrics != nil {
+				// Create common attributes
+				commonAttrs := attribute.NewSet(
+					attribute.String("src_gid", result.FiveTuple.SrcGid),
+					attribute.String("dst_gid", result.FiveTuple.DstGid),
+					attribute.String("probe_type", result.ProbeType),
+				)
+
+				// Record metrics based on probe status
+				if result.Status == agent_analyzer.ProbeResult_OK {
+					// Record RTT with RecordOption
+					a.metrics.RecordRTT(a.ctx, result.NetworkRtt, metric.WithAttributeSet(commonAttrs))
+
+					// Record processing delays with RecordOption
+					a.metrics.RecordProberDelay(a.ctx, result.ProberDelay, metric.WithAttributeSet(commonAttrs))
+					a.metrics.RecordResponderDelay(a.ctx, result.ResponderDelay, metric.WithAttributeSet(commonAttrs))
+				} else if result.Status == agent_analyzer.ProbeResult_TIMEOUT {
+					// Record timeout with AddOption
+					a.metrics.RecordTimeout(a.ctx, metric.WithAttributeSet(commonAttrs))
+				}
+			}
 
 			// Forward to uploader
 			if a.uploader != nil {
@@ -324,6 +362,16 @@ func (a *Agent) Stop() {
 	if a.controllerClient != nil {
 		log.Debug().Msg("Closing controller client")
 		_ = a.controllerClient.Close()
+	}
+
+	// Shutdown metrics if enabled
+	if a.metrics != nil {
+		log.Debug().Msg("Shutting down metrics")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := a.metrics.Shutdown(shutdownCtx); err != nil {
+			log.Error().Err(err).Msg("Failed to shutdown metrics properly")
+		}
 	}
 
 	if a.agentState != nil {

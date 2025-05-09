@@ -126,7 +126,7 @@ func (p *Prober) ProbeTarget(
 	result.T2 = timestamppb.New(t2Time)
 
 	// Wait for ACK with timeout
-	ackPacket, t5Time, err := p.udQueue.ReceivePacket(p.timeout)
+	ackPacket, t5Time, _, err := p.udQueue.ReceivePacket(p.timeout)
 	if err != nil {
 		log.Debug().Err(err).
 			Str("targetGID", targetGID).
@@ -205,7 +205,7 @@ func (p *Prober) responderLoop() {
 			return
 		default:
 			// Poll for incoming packets with a short timeout
-			packet, receiveTime, err := p.udQueue.ReceivePacket(10 * time.Millisecond)
+			packet, receiveTime, workComp, err := p.udQueue.ReceivePacket(10 * time.Millisecond)
 			if err != nil {
 				// This is expected on timeout, so don't log unless it's a real error
 				if err.Error() != "receive timeout" {
@@ -217,10 +217,9 @@ func (p *Prober) responderLoop() {
 			// Check if this is a probe packet (not an ACK)
 			if packet.IsAck == 0 {
 				// Get source GID and QPN from work completion
-				// In a real implementation, you would extract these from the packet's GRH header
-				// For now, we'll use a fixed value for demo purposes
-				sourceGID := "fe80::1"
-				sourceQPN := uint32(1000)
+				// Now we get this information directly from the WorkCompletion
+				sourceGID := workComp.SGID
+				sourceQPN := workComp.SrcQP
 
 				log.Debug().
 					Str("sourceGID", sourceGID).

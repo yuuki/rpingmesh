@@ -6,17 +6,23 @@ VERSION := 0.1.0
 TAG := $(IMAGE_NAME):$(VERSION)
 KERNEL_VERSION := 5.10.0-34
 
-build:
-	@echo "Building all components with Docker Compose"
-	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --abort-on-container-exit --remove-orphans
+build: build-controller build-agent
 
 build-controller:
 	@echo "Building controller with Docker Compose"
-	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --abort-on-container-exit --remove-orphans controller-builder
+	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml build controller-builder
+	@echo "Copying controller binary from container..."
+	@chmod +x scripts/copy-from-image.sh
+	@./scripts/copy-from-image.sh rpingmesh-cursor-controller-builder controller-temp /app/controller ./bin/controller
+	@./scripts/copy-from-image.sh rpingmesh-cursor-controller-builder controller-temp /app/controller.yaml ./bin/controller.yaml
 
 build-agent:
 	@echo "Building agent with Docker Compose"
-	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml up --build --abort-on-container-exit --remove-orphans agent-builder
+	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml build agent-builder
+	@echo "Copying agent binary from container..."
+	@chmod +x scripts/copy-from-image.sh
+	@./scripts/copy-from-image.sh rpingmesh-cursor-agent-builder agent-temp /app/agent ./bin/agent
+	@./scripts/copy-from-image.sh rpingmesh-cursor-agent-builder agent-temp /app/agent.yaml ./bin/agent.yaml
 
 # Run with Docker Compose
 agent-up:

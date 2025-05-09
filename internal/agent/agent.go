@@ -148,10 +148,16 @@ func (a *Agent) Start() error {
 		10000, // Max queue size
 	)
 	log.Debug().Msg("Uploader created")
-	if err := a.uploader.Start(); err != nil {
-		log.Warn().Err(err).Str("analyzer_addr", a.config.AnalyzerAddr).Msg("Failed to start uploader, will retry later. Agent will continue without analyzer connection")
+
+	// Start uploader only if enabled
+	if a.config.AnalyzerEnabled {
+		if err := a.uploader.Start(); err != nil {
+			log.Warn().Err(err).Str("analyzer_addr", a.config.AnalyzerAddr).Msg("Failed to start uploader, will retry later. Agent will continue without analyzer connection")
+		} else {
+			log.Info().Str("analyzer_addr", a.config.AnalyzerAddr).Uint32("upload_interval_ms", a.config.DataUploadIntervalMS).Msg("Uploader started")
+		}
 	} else {
-		log.Debug().Str("analyzer_addr", a.config.AnalyzerAddr).Uint32("upload_interval_ms", a.config.DataUploadIntervalMS).Msg("Uploader started")
+		log.Info().Msg("Analyzer data upload is disabled")
 	}
 
 	// Start background goroutines
@@ -215,10 +221,10 @@ func (a *Agent) resultHandler() {
 			}
 
 			// Forward to uploader
-			if a.uploader != nil {
+			if a.uploader != nil && a.config.AnalyzerEnabled {
 				a.uploader.AddProbeResult(result)
 			} else {
-				log.Debug().Msg("Uploader not available, probe result discarded")
+				log.Debug().Msg("Uploader not available or disabled, probe result discarded")
 			}
 
 			// If it's a timeout, maybe run a traceroute
@@ -245,10 +251,10 @@ func (a *Agent) resultHandler() {
 				Msg("Received trace result")
 
 			// Forward to uploader
-			if a.uploader != nil {
+			if a.uploader != nil && a.config.AnalyzerEnabled {
 				a.uploader.AddPathInfo(traceInfo)
 			} else {
-				log.Debug().Msg("Uploader not available, path info discarded")
+				log.Debug().Msg("Uploader not available or disabled, path info discarded")
 			}
 		}
 	}
@@ -339,7 +345,7 @@ func (a *Agent) Stop() {
 	a.cancel()
 
 	// Stop components in reverse order
-	if a.uploader != nil {
+	if a.uploader != nil && a.config.AnalyzerEnabled {
 		log.Debug().Msg("Closing uploader")
 		_ = a.uploader.Close()
 	}

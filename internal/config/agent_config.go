@@ -20,6 +20,9 @@ type AgentConfig struct {
 	TracerouteIntervalMS uint32
 	TracerouteOnTimeout  bool
 	EBPFEnabled          bool
+	OtelCollectorAddr    string
+	MetricsEnabled       bool
+	AnalyzerEnabled      bool
 }
 
 // SetupAgentFlags sets up the command line flags for the agent
@@ -38,112 +41,35 @@ func SetupAgentFlags(flagSet *pflag.FlagSet) {
 	flagSet.Uint32("traceroute-interval-ms", 300000, "Traceroute interval in milliseconds")
 	flagSet.Bool("traceroute-on-timeout", true, "Run traceroute on probe timeout")
 	flagSet.Bool("ebpf-enabled", true, "Enable eBPF monitoring")
+	flagSet.String("otel-collector-addr", "localhost:4317", "OpenTelemetry collector address")
+	flagSet.Bool("metrics-enabled", true, "Enable OpenTelemetry metrics")
+	flagSet.Bool("analyzer-enabled", false, "Enable data upload to Analyzer")
 }
 
 // LoadAgentConfig loads the configuration for an agent from a file or environment variables
-func LoadAgentConfig(configPath string) (*AgentConfig, error) {
+func LoadAgentConfig(flagSet *pflag.FlagSet) (*AgentConfig, error) {
+	// Create a new viper instance
 	v := viper.New()
 
-	// Set defaults
-	v.SetDefault("agent_id", getSystemHostname())
-	v.SetDefault("controller_addr", "localhost:50051")
-	v.SetDefault("analyzer_addr", "localhost:50052")
-	v.SetDefault("log_level", "info")
-	v.SetDefault("probe_interval_ms", 1000)        // 1 second default
-	v.SetDefault("timeout_ms", 500)                // 500 ms default
-	v.SetDefault("data_upload_interval_ms", 10000) // 10 seconds
-	v.SetDefault("traceroute_interval_ms", 300000) // 5 minutes
-	v.SetDefault("traceroute_on_timeout", true)
-	v.SetDefault("ebpf_enabled", true)
-
-	// Environment variables
-	v.SetEnvPrefix("RPINGMESH_AGENT")
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	// Set environment variable prefix
+	v.SetEnvPrefix("RPINGMESH")
+	v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 	v.AutomaticEnv()
 
-	// Config file
-	if configPath != "" {
-		v.SetConfigFile(configPath)
-	} else {
-		// Look for config in default locations
-		v.SetConfigName("agent")
-		v.SetConfigType("yaml")
-		v.AddConfigPath(".")
-		v.AddConfigPath("$HOME/.rpingmesh")
-		v.AddConfigPath("/etc/rpingmesh")
+	// Bind flags to viper
+	if err := v.BindPFlags(flagSet); err != nil {
+		return nil, fmt.Errorf("failed to bind flags: %w", err)
 	}
 
-	if err := v.ReadInConfig(); err != nil {
-		// It's okay if config file is not found, but other errors should be handled
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			return nil, fmt.Errorf("error reading config file: %w", err)
-		}
-	}
-
-	var config AgentConfig
-	config.AgentID = v.GetString("agent_id")
-	config.ControllerAddr = v.GetString("controller_addr")
-	config.AnalyzerAddr = v.GetString("analyzer_addr")
-	config.LogLevel = v.GetString("log_level")
-	config.ProbeIntervalMS = v.GetUint32("probe_interval_ms")
-	config.TimeoutMS = v.GetUint32("timeout_ms")
-	config.DataUploadIntervalMS = v.GetUint32("data_upload_interval_ms")
-	config.TracerouteIntervalMS = v.GetUint32("traceroute_interval_ms")
-	config.TracerouteOnTimeout = v.GetBool("traceroute_on_timeout")
-	config.EBPFEnabled = v.GetBool("ebpf_enabled")
-
-	return &config, nil
-}
-
-// LoadAgentConfigWithFlags loads the configuration for an agent using viper and flags
-func LoadAgentConfigWithFlags() (*AgentConfig, error) {
-	v := viper.New()
-
-	// Set defaults
-	v.SetDefault("agent-id", getSystemHostname())
-	v.SetDefault("controller-addr", "localhost:50051")
-	v.SetDefault("analyzer-addr", "localhost:50052")
-	v.SetDefault("log-level", "info")
-	v.SetDefault("probe-interval-ms", 1000)        // 1 second default
-	v.SetDefault("timeout-ms", 500)                // 500 ms default
-	v.SetDefault("data-upload-interval-ms", 10000) // 10 seconds
-	v.SetDefault("traceroute-interval-ms", 300000) // 5 minutes
-	v.SetDefault("traceroute-on-timeout", true)
-	v.SetDefault("ebpf-enabled", true)
-
-	// Setup for environment variables
-	v.SetEnvPrefix("RPINGMESH_AGENT")
-	v.SetEnvKeyReplacer(strings.NewReplacer("-", "_", ".", "_"))
-	v.AutomaticEnv()
-
-	// Bind command line flags
-	v.BindPFlags(pflag.CommandLine)
-
-	// Try to load config file if provided
-	configPath := v.GetString("config")
-	if configPath != "" {
-		v.SetConfigFile(configPath)
+	// Check if a config file was specified
+	if configFile := v.GetString("config"); configFile != "" {
+		v.SetConfigFile(configFile)
 		if err := v.ReadInConfig(); err != nil {
-			return nil, fmt.Errorf("error reading config file: %w", err)
-		}
-	} else {
-		// Look for config in default locations if no explicit path provided
-		v.SetConfigName("agent")
-		v.SetConfigType("yaml")
-		v.AddConfigPath(".")
-		v.AddConfigPath("$HOME/.rpingmesh")
-		v.AddConfigPath("/etc/rpingmesh")
-
-		// Try to read config, but don't error if not found
-		if err := v.ReadInConfig(); err != nil {
-			// It's okay if config file is not found, but other errors should be handled
-			if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-				return nil, fmt.Errorf("error reading config file: %w", err)
-			}
+			return nil, fmt.Errorf("failed to read config file: %w", err)
 		}
 	}
 
-	// Create config from viper values
+	// Create config
 	config := &AgentConfig{
 		AgentID:              v.GetString("agent-id"),
 		ControllerAddr:       v.GetString("controller-addr"),
@@ -155,26 +81,38 @@ func LoadAgentConfigWithFlags() (*AgentConfig, error) {
 		TracerouteIntervalMS: v.GetUint32("traceroute-interval-ms"),
 		TracerouteOnTimeout:  v.GetBool("traceroute-on-timeout"),
 		EBPFEnabled:          v.GetBool("ebpf-enabled"),
+		OtelCollectorAddr:    v.GetString("otel-collector-addr"),
+		MetricsEnabled:       v.GetBool("metrics-enabled"),
+		AnalyzerEnabled:      v.GetBool("analyzer-enabled"),
 	}
 
 	return config, nil
 }
 
-// CreateDefaultAgentConfig creates a default configuration file for an agent
-func CreateDefaultAgentConfig(path string) error {
-	// Default config content
-	configContent := `# RPingMesh Agent Configuration
-agent_id: "" # Leave empty to use hostname
-controller_addr: "localhost:50051"
-analyzer_addr: "localhost:50052"
-log_level: "info" # debug, info, warn, error
-probe_interval_ms: 1000 # 1 second
-timeout_ms: 500 # 500 milliseconds
-data_upload_interval_ms: 10000 # 10 seconds
-traceroute_interval_ms: 300000 # 5 minutes
-traceroute_on_timeout: true
-ebpf_enabled: true
-`
+// WriteDefaultConfig writes a default configuration file
+func WriteDefaultConfig(path string) error {
+	v := viper.New()
+	v.SetConfigFile(path)
 
-	return writeConfigFile(path, configContent)
+	// Set default values
+	v.Set("agent-id", "")
+	v.Set("controller-addr", "localhost:50051")
+	v.Set("analyzer-addr", "localhost:50052")
+	v.Set("log-level", "info")
+	v.Set("probe-interval-ms", 1000)
+	v.Set("timeout-ms", 500)
+	v.Set("data-upload-interval-ms", 10000)
+	v.Set("traceroute-interval-ms", 300000)
+	v.Set("traceroute-on-timeout", true)
+	v.Set("ebpf-enabled", true)
+	v.Set("otel-collector-addr", "localhost:4317")
+	v.Set("metrics-enabled", true)
+	v.Set("analyzer-enabled", false)
+
+	// Write the config file
+	if err := v.WriteConfig(); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
 }

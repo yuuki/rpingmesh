@@ -7,7 +7,7 @@ alwaysApply: false
 
 # RDMA
 
-- RDMAプログラミングにあたっては @https://valinux.hatenablog.com/entry/20200806 を参考にしてください。
-- 特にRDMAのpingについては、@https://github.com/linux-rdma/rdma-core/blob/master/librdmacm/examples/rping.c を参照してください。
-- ROCEv2にのみ対応したコードを書いてください。
-- ROCEv2パケット送受信に関する最小限のコードをC言語で記述し、cgoでラップしてください。
+- RoCE v2を前提にしてください。
+- UD (Unreliable Datagram) を使用してください。
+- RDMAパケット送受信に関する最小限のコードをC言語で記述し、cgoでラップしてください。
+- RDMAのping/pongのGo言語のコード例については、@https://github.com/yuuki/go-rocev2-ud-pingpong/blob/main/main.go と @https://github.com/yuuki/go-rocev2-ud-pingpong/blob/main/rdma.go を参照してください。

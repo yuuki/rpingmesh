@@ -1,4 +1,4 @@
-.PHONY: build agent-up debugfs-volume generate-config generate-bpf test-controller test-agent test clean-compose clean
+.PHONY: build agent-up debugfs-volume generate-config generate-bpf test-controller test-agent test clean-compose clean build-local
 
 # Default configuration
 IMAGE_NAME := rpingmesh-agent
@@ -51,6 +51,11 @@ clean:
 	@echo "Removing Docker image: $(TAG)"
 	@docker rmi $(TAG) || true
 
+build-local:
+	@echo "Building controller and agent locally"
+	@go build -o ./bin/controller ./cmd/controller
+	@go build -o ./bin/agent ./cmd/agent
+
 # Generate bpf2go code locally (requires local dependencies)
 ARCH_SUFFIX := $(shell if [ -d /usr/include/$$(uname -m)-linux-gnu ]; then echo "$$(uname -m)-linux-gnu"; fi)
 INCLUDE_PATHS := -Ipkg/ebpf/bpf/include -I/usr/include
@@ -91,10 +96,15 @@ test:
 	@echo "Running all tests with Docker..."
 	@KERNEL_VERSION=$(KERNEL_VERSION) docker compose -f docker-compose.test.yml up --build controller_test agent_test --abort-on-container-exit
 
+test-local:
+	@echo "Running all Go tests locally"
+	@go test ./...
+
 # Help target
 help:
 	@echo "Available targets:"
 	@echo "  build            - Build the Docker image with Docker Compose"
+	@echo "  build-local      - Build the controller and agent binaries locally"
 	@echo "  agent-up         - Run the agent container with Docker Compose"
 	@echo "  debugfs-volume   - Create debugfs volume for Docker Desktop"
 	@echo "  generate-config  - Generate default configuration file with Docker Compose"
@@ -102,6 +112,7 @@ help:
 	@echo "  test-controller  - Run controller tests with Docker Compose"
 	@echo "  test-agent       - Run agent tests with Docker Compose"
 	@echo "  test             - Run all tests with Docker Compose"
+	@echo "  test-local       - Run all Go tests locally"
 	@echo "  clean            - Remove the Docker image"
 	@echo "  clean-compose    - Clean up Docker Compose resources"
 	@echo "  help             - Show this help message"

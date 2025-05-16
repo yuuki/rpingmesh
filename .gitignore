@@ -13,3 +13,5 @@ pkg/ebpf/rdmaTracing.o
 # Go build and test artifacts
 *.test
 /vendor/
+# SpecStory explanation file
+.specstory

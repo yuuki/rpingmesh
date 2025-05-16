@@ -53,8 +53,8 @@ clean:
 
 build-local:
 	@echo "Building controller and agent locally"
-	@go build -o ./bin/controller ./cmd/controller
-	@go build -o ./bin/agent ./cmd/agent
+	@go build -buildvcs=false -o ./bin/controller ./cmd/controller
+	@go build -buildvcs=false -o ./bin/agent ./cmd/agent
 
 # Generate bpf2go code locally (requires local dependencies)
 ARCH_SUFFIX := $(shell if [ -d /usr/include/$$(uname -m)-linux-gnu ]; then echo "$$(uname -m)-linux-gnu"; fi)

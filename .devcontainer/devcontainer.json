@@ -1,0 +1,44 @@
+{
+  "name": "R-pingmesh Development Environment",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "KERNEL_VERSION": "${localEnv:KERNEL_VERSION}"
+    }
+  },
+  "runArgs": [
+    "--cap-add=SYS_PTRACE",
+    "--cap-add=NET_ADMIN",
+    "--cap-add=SYS_ADMIN",
+    "--cap-add=IPC_LOCK",
+    "--security-opt", "seccomp=unconfined"
+  ],
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go",
+        "ms-vscode.cpptools",
+        "eamodio.gitlens",
+        "rangav.vscode-thunder-client",
+        "editorconfig.editorconfig",
+        "gruntfuggly.todo-tree"
+      ],
+      "settings": {
+        "go.toolsManagement.checkForUpdates": "local",
+        "go.useLanguageServer": true,
+        "go.gopath": "/go",
+        "go.lintFlags": [
+          "--enable-all"
+        ],
+        "files.eol": "\n"
+      }
+    }
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "mounts": [
+    "type=volume,source=rpingmesh-go-cache,target=/go/pkg"
+  ],
+  "remoteUser": "root"
+}

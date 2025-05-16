@@ -43,3 +43,5 @@ docker-compose*
 *.log
 *.tmp
 *.temp
+
+.specstory

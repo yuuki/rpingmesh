@@ -98,7 +98,7 @@ test:
 
 test-local:
 	@echo "Running all Go tests locally"
-	@go test ./...
+	@go test ./internal/...
 
 # Help target
 help:

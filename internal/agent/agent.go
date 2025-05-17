@@ -436,9 +436,6 @@ func (a *Agent) Run() error {
 	sig := <-sigCh
 	log.Info().Str("signal", sig.String()).Msg("Received signal, shutting down gracefully...")
 
-	// Normal shutdown process
-	a.Stop()
-
 	// Create a new channel for the second signal
 	forceQuitCh := make(chan os.Signal, 1)
 	signal.Notify(forceQuitCh, syscall.SIGINT, syscall.SIGTERM)
@@ -449,6 +446,9 @@ func (a *Agent) Run() error {
 		log.Warn().Msg("Received second signal, forcing immediate exit...")
 		os.Exit(1)
 	}()
+
+	// Normal shutdown process
+	a.Stop()
 
 	// This won't be reached if forceQuit is called
 	log.Info().Msg("Agent shut down gracefully")

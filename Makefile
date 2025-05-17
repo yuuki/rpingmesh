@@ -98,7 +98,8 @@ test:
 
 test-local:
 	@echo "Running all Go tests locally"
-	@go test ./internal/...
+	@export RQLITE_LOCAL_TEST_URI="http://localhost:4001"
+	@go test ./...
 
 # Help target
 help:

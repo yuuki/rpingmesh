@@ -65,6 +65,14 @@ func New(cfg *config.AgentConfig) (*Agent, error) {
 		controllerClient: controllerClient,
 	}
 
+	// Initialize tracer if enabled
+	if cfg.TracerEnabled {
+		agent.tracer = tracer.NewTracer()
+		log.Debug().Msg("Tracer created and enabled")
+	} else {
+		log.Info().Msg("Tracer is disabled via configuration")
+	}
+
 	log.Debug().Str("agent_id", cfg.AgentID).Str("controller_addr", cfg.ControllerAddr).Msg("Agent instance created")
 	return agent, nil
 }
@@ -135,12 +143,10 @@ func (a *Agent) Start() error {
 	}
 	log.Debug().Uint32("probe_interval_ms", a.config.ProbeIntervalMS).Msg("Cluster monitor started")
 
-	// Create tracer
-	a.tracer = tracer.NewTracer()
-	log.Debug().Msg("Tracer created")
-
 	// Set context for tracer
+	if a.tracer != nil {
 	a.tracer.SetContext(a.ctx)
+	}
 
 	// Start periodic traceroute if interval is set
 	if a.config.TracerouteIntervalMS > 0 {
@@ -156,10 +162,14 @@ func (a *Agent) Start() error {
 			if err != nil {
 				log.Warn().Err(err).Msg("Failed to get pinglist for traceroute targets, will use localhost")
 				// Fallback to localhost if we can't get targets
+				if a.tracer != nil {
 				a.tracer.StartPeriodicTracingToLocalhost(a.ctx, primaryRnic.GID, a.config.TracerouteIntervalMS)
+				}
 			} else {
 				// Start periodic tracing to targets
+				if a.tracer != nil {
 				a.tracer.StartPeriodicTracing(a.ctx, primaryRnic.GID, targets, a.config.TracerouteIntervalMS, 3)
+				}
 			}
 		}
 	}
@@ -202,8 +212,14 @@ func (a *Agent) resultHandler() {
 
 	// Handle probe results
 	probeResults := a.prober.GetProbeResults()
-	// Handle trace results
-	traceResults := a.tracer.GetTraceResults()
+
+	// Handle trace results only if tracer is enabled
+	var traceResults <-chan *agent_analyzer.PathInfo
+	if a.tracer != nil {
+		traceResults = a.tracer.GetTraceResults()
+	} else {
+		log.Debug().Msg("Tracer is disabled, trace results will not be processed.")
+	}
 
 	for {
 		select {
@@ -213,6 +229,9 @@ func (a *Agent) resultHandler() {
 		case result, ok := <-probeResults:
 			if !ok {
 				log.Debug().Msg("Probe results channel closed")
+				// If probe results channel is closed, we might want to stop the handler.
+				// However, if traceResults is still open (and tracer enabled), we might want to continue.
+				// For now, let's assume closing probeResults means we should stop.
 				return
 			}
 			log.Debug().
@@ -254,6 +273,7 @@ func (a *Agent) resultHandler() {
 
 			// If it's a timeout, maybe run a traceroute
 			if result.Status == 1 && a.config.TracerouteOnTimeout {
+				if a.tracer != nil {
 				log.Debug().
 					Str("dst_gid", result.FiveTuple.DstGid).
 					Msg("Timeout detected, initiating traceroute")
@@ -263,11 +283,35 @@ func (a *Agent) resultHandler() {
 						log.Error().Err(err).Msg("Failed to run traceroute")
 					}
 				}(result.FiveTuple)
+				} else {
+					log.Debug().Msg("Traceroute on timeout is configured, but tracer is disabled. Skipping traceroute.")
+				}
 			}
 		case traceInfo, ok := <-traceResults:
 			if !ok {
 				log.Debug().Msg("Trace results channel closed")
-				return
+				// If tracer was enabled, this means its channel closed, so we might want to stop or handle.
+				// If tracer was disabled, traceResults is nil, so this case should not be hit often,
+				// but if it is (e.g., if a nil channel somehow becomes readable as closed),
+				// we simply continue the loop or return if probeResults is also closed.
+				// For safety, if traceResults is nil and this case is hit, we log and continue.
+				if a.tracer == nil {
+					log.Warn().Msg("Trace results channel (which should be nil as tracer is disabled) reported as closed. Continuing.")
+					// Make sure we don't get stuck in a loop if a nil channel somehow repeatedly signals closed.
+					// Setting it to a new nil should prevent this, though select on nil chan should block.
+					traceResults = nil
+					continue
+				}
+				// If tracer was active and channel is now closed, we might stop this handler
+				// if probe channel is also expected to close or already closed.
+				// For now, just log and treat as if this source is done.
+				// If probeResults is still active, the loop will continue for that.
+				// If we want to exit when EITHER is done, more complex logic is needed or
+				// we rely on context cancellation.
+				log.Debug().Msg("Trace results channel from active tracer closed. Will no longer process trace results.")
+				// To prevent this case from being selected again after closure:
+				traceResults = nil // Set to nil so select doesn't pick it.
+				continue
 			}
 			log.Debug().
 				Str("src_gid", traceInfo.FiveTuple.SrcGid).

@@ -23,6 +23,7 @@ type AgentConfig struct {
 	OtelCollectorAddr    string
 	MetricsEnabled       bool
 	AnalyzerEnabled      bool
+	TracerEnabled        bool
 }
 
 // SetupAgentFlags sets up the command line flags for the agent
@@ -44,6 +45,7 @@ func SetupAgentFlags(flagSet *pflag.FlagSet) {
 	flagSet.String("otel-collector-addr", "localhost:4317", "OpenTelemetry collector address")
 	flagSet.Bool("metrics-enabled", true, "Enable OpenTelemetry metrics")
 	flagSet.Bool("analyzer-enabled", false, "Enable data upload to Analyzer")
+	flagSet.Bool("tracer-enabled", false, "Enable traceroute functionality")
 }
 
 // LoadAgentConfig loads the configuration for an agent from a file or environment variables
@@ -84,6 +86,7 @@ func LoadAgentConfig(flagSet *pflag.FlagSet) (*AgentConfig, error) {
 		OtelCollectorAddr:    v.GetString("otel-collector-addr"),
 		MetricsEnabled:       v.GetBool("metrics-enabled"),
 		AnalyzerEnabled:      v.GetBool("analyzer-enabled"),
+		TracerEnabled:        v.GetBool("tracer-enabled"),
 	}
 
 	return config, nil
@@ -108,6 +111,7 @@ func WriteDefaultConfig(path string) error {
 	v.Set("otel-collector-addr", "localhost:4317")
 	v.Set("metrics-enabled", true)
 	v.Set("analyzer-enabled", false)
+	v.Set("tracer-enabled", false)
 
 	// Write the config file
 	if err := v.WriteConfig(); err != nil {

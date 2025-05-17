@@ -12,25 +12,25 @@ import (
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
-// RnicRegistryInterface はテスト用のインターフェースです
+// RnicRegistryInterface is an interface for testing
 type RnicRegistryInterface interface {
 	GetRNICsByToR(ctx context.Context, torID string) ([]*controller_agent.RnicInfo, error)
 	GetSampleRNICsFromOtherToRs(ctx context.Context, excludeTorID string) ([]*controller_agent.RnicInfo, error)
 }
 
-// PingLister のモック用バージョン - 本物のPingListerと同じフィールド構造だが、registryが異なる型
+// Mock version of PingLister - has the same field structure as the real PingLister but with a different registry type
 type mockPingLister struct {
 	registry RnicRegistryInterface
 	rand     *rand.Rand
 }
 
-// モック用にGeneratePinglist実装
+// Implement GeneratePinglist for mock
 func (p *mockPingLister) GeneratePinglist(
 	ctx context.Context,
 	requesterRnic *controller_agent.RnicInfo,
 	pinglistType controller_agent.PinglistRequest_PinglistType,
 ) ([]*controller_agent.PingTarget, error) {
-	// 実際の実装と同じロジック
+	// Same logic as the actual implementation
 	switch pinglistType {
 	case controller_agent.PinglistRequest_TOR_MESH:
 		return p.generateTorMeshPinglist(ctx, requesterRnic)
@@ -41,7 +41,7 @@ func (p *mockPingLister) GeneratePinglist(
 	}
 }
 
-// モック用にgenerateTorMeshPinglist実装
+// Implement generateTorMeshPinglist for mock
 func (p *mockPingLister) generateTorMeshPinglist(
 	ctx context.Context,
 	requesterRnic *controller_agent.RnicInfo,
@@ -68,7 +68,7 @@ func (p *mockPingLister) generateTorMeshPinglist(
 	return targets, nil
 }
 
-// モック用にgenerateInterTorPinglist実装
+// Implement generateInterTorPinglist for mock
 func (p *mockPingLister) generateInterTorPinglist(
 	ctx context.Context,
 	requesterRnic *controller_agent.RnicInfo,
@@ -91,7 +91,7 @@ func (p *mockPingLister) generateInterTorPinglist(
 	return targets, nil
 }
 
-// ランダム関数の実装 - 本物と同じロジック
+// Implement random function - same logic as the real one
 func (p *mockPingLister) generateRandomPort() uint32 {
 	return uint32(p.rand.Intn(16384) + 49152)
 }
@@ -104,7 +104,7 @@ func (p *mockPingLister) generateRandomPriority() uint32 {
 	return uint32(p.rand.Intn(8))
 }
 
-// newMockPingLister は、テスト用のモックPingListerを作成します
+// newMockPingLister creates a mock PingLister for testing
 func newMockPingLister(reg RnicRegistryInterface) *mockPingLister {
 	source := rand.NewSource(time.Now().UnixNano())
 	rng := rand.New(source)
@@ -115,28 +115,28 @@ func newMockPingLister(reg RnicRegistryInterface) *mockPingLister {
 	}
 }
 
-// MockRegistry は RnicRegistry のモックです
+// MockRegistry is a mock of RnicRegistry
 type MockRegistry struct {
 	mock.Mock
 }
 
-// GetRNICsByToR は RnicRegistry.GetRNICsByToR のモックメソッドです
+// GetRNICsByToR is a mock method of RnicRegistry.GetRNICsByToR
 func (m *MockRegistry) GetRNICsByToR(ctx context.Context, torID string) ([]*controller_agent.RnicInfo, error) {
 	args := m.Called(ctx, torID)
 	return args.Get(0).([]*controller_agent.RnicInfo), args.Error(1)
 }
 
-// GetSampleRNICsFromOtherToRs は RnicRegistry.GetSampleRNICsFromOtherToRs のモックメソッドです
+// GetSampleRNICsFromOtherToRs is a mock method of RnicRegistry.GetSampleRNICsFromOtherToRs
 func (m *MockRegistry) GetSampleRNICsFromOtherToRs(ctx context.Context, excludeTorID string) ([]*controller_agent.RnicInfo, error) {
 	args := m.Called(ctx, excludeTorID)
 	return args.Get(0).([]*controller_agent.RnicInfo), args.Error(1)
 }
 
 func TestGenerateTorMeshPinglist(t *testing.T) {
-	// モックレジストリの作成
+	// Create mock registry
 	mockReg := &MockRegistry{}
 
-	// テスト用の RNIC データを作成
+	// Create RNIC data for testing
 	requesterRnic := &controller_agent.RnicInfo{
 		Gid:       "fe80:0000:0000:0000:0002:c903:0033:1001",
 		Qpn:       1001,
@@ -146,7 +146,7 @@ func TestGenerateTorMeshPinglist(t *testing.T) {
 	}
 
 	sameToRRnics := []*controller_agent.RnicInfo{
-		requesterRnic, // 同じ ToR 内の自分自身（スキップされるはず）
+		requesterRnic, // Self within the same ToR (should be skipped)
 		{
 			Gid:       "fe80:0000:0000:0000:0002:c903:0033:1002",
 			Qpn:       1002,
@@ -163,29 +163,29 @@ func TestGenerateTorMeshPinglist(t *testing.T) {
 		},
 	}
 
-	// モックの設定：requesterRnic と同じ ToR に属する RNIC のリストを返す
+	// Mock setup: return list of RNICs belonging to the same ToR as requesterRnic
 	mockReg.On("GetRNICsByToR", mock.Anything, "tor-A").Return(sameToRRnics, nil)
 
-	// モック版PingLister の作成
+	// Create mock version of PingLister
 	pingLister := newMockPingLister(mockReg)
 
-	// テスト実行
+	// Run test
 	ctx := context.Background()
 	targets, err := pingLister.GeneratePinglist(ctx, requesterRnic, controller_agent.PinglistRequest_TOR_MESH)
 
-	// 検証
+	// Verify
 	require.NoError(t, err)
 	require.Len(t, targets, 2, "Should return 2 targets (excluding requester)")
 
-	// ターゲットの検証
+	// Verify targets
 	for _, target := range targets {
-		// 自分自身は含まれていないことを確認
+		// Verify that self is not included
 		assert.NotEqual(t, requesterRnic.Gid, target.TargetRnic.Gid, "Requester should not be in targets")
 
-		// 同じ ToR 内の RNIC であることを確認
+		// Verify that it's an RNIC within the same ToR
 		assert.Equal(t, "tor-A", target.TargetRnic.TorId, "Target should be in the same ToR")
 
-		// ランダム値の確認
+		// Verify random values
 		assert.GreaterOrEqual(t, target.SourcePort, uint32(49152), "Source port should be in ephemeral range")
 		assert.LessOrEqual(t, target.SourcePort, uint32(65535), "Source port should be in ephemeral range")
 
@@ -196,15 +196,15 @@ func TestGenerateTorMeshPinglist(t *testing.T) {
 		assert.LessOrEqual(t, target.Priority, uint32(7), "Priority should be at most 7")
 	}
 
-	// モックが期待通り呼び出されたことを確認
+	// Verify that mock was called as expected
 	mockReg.AssertExpectations(t)
 }
 
 func TestGenerateInterTorPinglist(t *testing.T) {
-	// モックレジストリの作成
+	// Create mock registry
 	mockReg := &MockRegistry{}
 
-	// テスト用の RNIC データを作成
+	// Create RNIC data for testing
 	requesterRnic := &controller_agent.RnicInfo{
 		Gid:       "fe80:0000:0000:0000:0002:c903:0033:1001",
 		Qpn:       1001,
@@ -230,26 +230,26 @@ func TestGenerateInterTorPinglist(t *testing.T) {
 		},
 	}
 
-	// モックの設定：requesterRnic とは異なる ToR に属する RNIC のリストを返す
+	// Mock setup: return list of RNICs belonging to a different ToR than requesterRnic
 	mockReg.On("GetSampleRNICsFromOtherToRs", mock.Anything, "tor-A").Return(otherToRRnics, nil)
 
-	// モック版PingLister の作成
+	// Create mock version of PingLister
 	pingLister := newMockPingLister(mockReg)
 
-	// テスト実行
+	// Run test
 	ctx := context.Background()
 	targets, err := pingLister.GeneratePinglist(ctx, requesterRnic, controller_agent.PinglistRequest_INTER_TOR)
 
-	// 検証
+	// Verify
 	require.NoError(t, err)
 	require.Len(t, targets, 2, "Should return 2 targets from other ToRs")
 
-	// ターゲットの検証
+	// Verify targets
 	for _, target := range targets {
-		// 異なる ToR 内の RNIC であることを確認
+		// Verify that it's an RNIC in a different ToR
 		assert.NotEqual(t, "tor-A", target.TargetRnic.TorId, "Target should be in a different ToR")
 
-		// ランダム値の確認
+		// Verify random values
 		assert.GreaterOrEqual(t, target.SourcePort, uint32(49152), "Source port should be in ephemeral range")
 		assert.LessOrEqual(t, target.SourcePort, uint32(65535), "Source port should be in ephemeral range")
 
@@ -260,21 +260,21 @@ func TestGenerateInterTorPinglist(t *testing.T) {
 		assert.LessOrEqual(t, target.Priority, uint32(7), "Priority should be at most 7")
 	}
 
-	// モックが期待通り呼び出されたことを確認
+	// Verify that mock was called as expected
 	mockReg.AssertExpectations(t)
 }
 
 func TestRandomFunctions(t *testing.T) {
-	// 独自のランダム生成器を作成して再現性を確保（シード固定）
-	source := rand.NewSource(12345) // 固定シード値
+	// Create our own random generator to ensure reproducibility (fixed seed)
+	source := rand.NewSource(12345) // Fixed seed value
 	rng := rand.New(source)
 
 	pingLister := &mockPingLister{
-		registry: nil, // ランダムテストではレジストリ不要
+		registry: nil, // No registry needed for random test
 		rand:     rng,
 	}
 
-	// ランダムポートのテスト
+	// Test random ports
 	counts := make(map[uint32]int)
 	for i := 0; i < 1000; i++ {
 		port := pingLister.generateRandomPort()
@@ -283,10 +283,10 @@ func TestRandomFunctions(t *testing.T) {
 		assert.LessOrEqual(t, port, uint32(65535), "Source port should be in ephemeral range")
 	}
 
-	// ある程度分散していることを確認（厳密なテストは難しいですが、重複の数を確認）
+	// Verify some distribution (exact test is difficult, but check number of duplicates)
 	assert.Greater(t, len(counts), 100, "Random ports should have good distribution")
 
-	// ランダムフローラベルのテスト
+	// Test random flow labels
 	flowCounts := make(map[uint32]int)
 	for i := 0; i < 1000; i++ {
 		flow := pingLister.generateRandomFlowLabel()
@@ -295,10 +295,10 @@ func TestRandomFunctions(t *testing.T) {
 		assert.LessOrEqual(t, flow, uint32(1048575), "Flow label should be at most 20 bits")
 	}
 
-	// ある程度分散していることを確認
+	// Verify some distribution
 	assert.Greater(t, len(flowCounts), 100, "Random flow labels should have good distribution")
 
-	// ランダム優先度のテスト
+	// Test random priorities
 	priorityCounts := make(map[uint32]int)
 	for i := 0; i < 1000; i++ {
 		priority := pingLister.generateRandomPriority()
@@ -307,7 +307,7 @@ func TestRandomFunctions(t *testing.T) {
 		assert.LessOrEqual(t, priority, uint32(7), "Priority should be at most 7")
 	}
 
-	// 0-7のすべての値が生成されることを確認
+	// Verify that all values from 0-7 are generated
 	for i := uint32(0); i <= 7; i++ {
 		_, exists := priorityCounts[i]
 		assert.True(t, exists, "Priority value %d should be generated", i)
@@ -315,10 +315,10 @@ func TestRandomFunctions(t *testing.T) {
 }
 
 func TestUnknownPinglistType(t *testing.T) {
-	// モックレジストリの作成
+	// Create mock registry
 	mockReg := &MockRegistry{}
 
-	// テスト用の RNIC データを作成
+	// Create RNIC data for testing
 	requesterRnic := &controller_agent.RnicInfo{
 		Gid:       "fe80:0000:0000:0000:0002:c903:0033:1001",
 		Qpn:       1001,
@@ -338,20 +338,20 @@ func TestUnknownPinglistType(t *testing.T) {
 		},
 	}
 
-	// モックの設定
+	// Mock setup
 	mockReg.On("GetRNICsByToR", mock.Anything, "tor-A").Return(sameToRRnics, nil)
 
-	// モック版PingLister の作成
+	// Create mock version of PingLister
 	pingLister := newMockPingLister(mockReg)
 
-	// 不明なpinglistタイプでテスト実行（デフォルトでTOR_MESHが使用されるはず）
+	// Run test with unknown pinglist type (should use TOR_MESH by default)
 	ctx := context.Background()
-	targets, err := pingLister.GeneratePinglist(ctx, requesterRnic, 999) // 無効な値
+	targets, err := pingLister.GeneratePinglist(ctx, requesterRnic, 999) // Invalid value
 
-	// 検証
+	// Verify
 	require.NoError(t, err)
 	require.Len(t, targets, 1, "Should default to TOR_MESH and return 1 target")
 
-	// モックが期待通り呼び出されたことを確認
+	// Verify that mock was called as expected
 	mockReg.AssertExpectations(t)
 }

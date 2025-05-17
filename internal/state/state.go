@@ -143,6 +143,31 @@ func (a *AgentState) GetRDMAManager() *rdma.RDMAManager {
 	return a.rdmaManager
 }
 
+// FindRNICByIP searches for an RNIC with the given IP address.
+// It returns the RNIC if found, otherwise nil.
+func (a *AgentState) FindRNICByIP(ipAddress string) *rdma.RNIC {
+	a.mutex.RLock()
+	defer a.mutex.RUnlock()
+
+	for _, rnic := range a.detectedRNICs {
+		if rnic.IPAddr == ipAddress {
+			return rnic
+		}
+		// Also check if the GID, when interpreted as an IP, matches.
+		// This is less likely to be the primary match key but can be a fallback.
+		parsedGIDIP := net.ParseIP(rnic.GID)
+		if parsedGIDIP != nil {
+			if parsedGIDIP.String() == ipAddress {
+				return rnic
+			}
+			if ipv4 := parsedGIDIP.To4(); ipv4 != nil && ipv4.String() == ipAddress {
+				return rnic
+			}
+		}
+	}
+	return nil
+}
+
 // Close releases all resources
 func (a *AgentState) Close() {
 	a.mutex.Lock()

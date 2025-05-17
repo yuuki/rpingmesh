@@ -118,7 +118,7 @@ func (a *Agent) Start() error {
 	}
 
 	// Create prober
-	a.prober = probe.NewProber(a.agentState.GetRDMAManager(), udQueue, a.config.TimeoutMS)
+	a.prober = probe.NewProber(a.agentState.GetRDMAManager(), a.agentState, a.config.TimeoutMS)
 	if err := a.prober.Start(); err != nil {
 		return fmt.Errorf("failed to start prober: %w", err)
 	}

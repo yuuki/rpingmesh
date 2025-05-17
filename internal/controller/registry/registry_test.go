@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -13,11 +14,20 @@ import (
 )
 
 func getDBURI() string {
+	// If a specific environment variable is set, use it
 	dbURI := os.Getenv("RQLITE_DB_URI")
-	if dbURI == "" {
-		dbURI = "http://localhost:4001" // Default value for Docker container environment
+	if dbURI != "" {
+		return dbURI
 	}
-	return dbURI
+
+	// Check for local test environment variable
+	localTestURI := os.Getenv("RQLITE_LOCAL_TEST_URI")
+	if localTestURI != "" {
+		return localTestURI
+	}
+
+	// Use localhost for make test-local execution
+	return "http://localhost:4001"
 }
 
 // clearRnicsTable cleans up the rnics table before each test
@@ -27,7 +37,23 @@ func clearRnicsTable(t *testing.T, registry *RnicRegistry) {
 	require.NoError(t, err, "Failed to clear rnics table")
 }
 
+// TestMain sets up the local test environment before running tests
+func TestMain(m *testing.M) {
+	// If not in CI, set local test URI
+	if os.Getenv("CI") != "true" {
+		os.Setenv("RQLITE_LOCAL_TEST_URI", "http://localhost:4001")
+	}
+
+	code := m.Run()
+	os.Exit(code)
+}
+
 func TestRnicRegistryBasic(t *testing.T) {
+	// Skip test if rqlite is not running
+	if !isRqliteRunning() {
+		t.Skip("Skipping test: rqlite is not running at " + getDBURI())
+	}
+
 	dbURI := getDBURI()
 
 	// Create registry
@@ -76,6 +102,11 @@ func TestRnicRegistryBasic(t *testing.T) {
 }
 
 func TestMultipleRNICs(t *testing.T) {
+	// Skip test if rqlite is not running
+	if !isRqliteRunning() {
+		t.Skip("Skipping test: rqlite is not running at " + getDBURI())
+	}
+
 	dbURI := getDBURI()
 
 	// Create registry
@@ -156,6 +187,11 @@ func TestMultipleRNICs(t *testing.T) {
 }
 
 func TestRnicRegistryStaleEntries(t *testing.T) {
+	// Skip test if rqlite is not running
+	if !isRqliteRunning() {
+		t.Skip("Skipping test: rqlite is not running at " + getDBURI())
+	}
+
 	dbURI := getDBURI()
 
 	// Create registry
@@ -214,4 +250,15 @@ func TestRnicRegistryStaleEntries(t *testing.T) {
 	for _, r := range rnics {
 		assert.NotEqual(t, testRNIC.Gid, r.Gid, "Found stale RNIC after cleanup")
 	}
+}
+
+// isRqliteRunning checks if rqlite is running and accessible
+func isRqliteRunning() bool {
+	uri := getDBURI()
+	resp, err := http.Get(uri + "/status")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }

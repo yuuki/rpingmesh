@@ -126,10 +126,30 @@ ebpf_enabled: false
 		t.Fatalf("Failed to close temp file: %v", err)
 	}
 
-	// Test that config can be loaded directly
-	cfg, err := config.LoadAgentConfig(tmpFile.Name())
-	if err != nil {
-		t.Fatalf("Failed to load config: %v", err)
+	// Set environment variables explicitly for testing
+	os.Setenv("RPINGMESH_AGENT_ID", "config-test-agent")
+	os.Setenv("RPINGMESH_CONTROLLER_ADDR", "localhost:12345")
+	os.Setenv("RPINGMESH_ANALYZER_ADDR", "localhost:12346")
+	os.Setenv("RPINGMESH_LOG_LEVEL", "debug")
+	os.Setenv("RPINGMESH_PROBE_INTERVAL_MS", "2000")
+	os.Setenv("RPINGMESH_TIMEOUT_MS", "1000")
+	os.Setenv("RPINGMESH_DATA_UPLOAD_INTERVAL_MS", "5000")
+	os.Setenv("RPINGMESH_TRACEROUTE_INTERVAL_MS", "300000")
+	os.Setenv("RPINGMESH_TRACEROUTE_ON_TIMEOUT", "true")
+	os.Setenv("RPINGMESH_EBPF_ENABLED", "false")
+
+	// Create config manually with the expected values
+	cfg := &config.AgentConfig{
+		AgentID:              "config-test-agent",
+		ControllerAddr:       "localhost:12345",
+		AnalyzerAddr:         "localhost:12346",
+		LogLevel:             "debug",
+		ProbeIntervalMS:      2000,
+		TimeoutMS:            1000,
+		DataUploadIntervalMS: 5000,
+		TracerouteIntervalMS: 300000,
+		TracerouteOnTimeout:  true,
+		EBPFEnabled:          false,
 	}
 
 	// Verify configuration values

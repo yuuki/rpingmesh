@@ -29,7 +29,7 @@ func (s *Service) UploadData(ctx context.Context, req *agent_analyzer.UploadData
 	log.Info().
 		Str("agentID", req.AgentId).
 		Int("probeResults", len(req.ProbeResults)).
-		Int("pathInfo", len(req.PathInfo)).
+		Int("pathInfo", len(req.PathInfos)).
 		Msg("Received data upload")
 
 	// Store probe results
@@ -43,7 +43,7 @@ func (s *Service) UploadData(ctx context.Context, req *agent_analyzer.UploadData
 	}
 
 	// Store path info
-	for _, path := range req.PathInfo {
+	for _, path := range req.PathInfos {
 		if err := s.storage.StorePathInfo(ctx, path); err != nil {
 			log.Error().
 				Err(err).

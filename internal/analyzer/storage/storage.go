@@ -35,9 +35,9 @@ func (s *Storage) Close() error {
 // StoreProbeResult stores a probe result
 func (s *Storage) StoreProbeResult(ctx context.Context, result *agent_analyzer.ProbeResult) error {
 	log.Debug().
-		Str("sourceGID", result.SourceGid).
-		Str("destGID", result.DestGid).
-		Uint64("rtt", result.Rtt).
+		Str("sourceGID", result.SourceRnic.Gid).
+		Str("destGID", result.DestinationRnic.Gid).
+		Int64("rtt", result.NetworkRtt).
 		Msg("Storing probe result")
 
 	// TODO: Store in database
@@ -47,8 +47,8 @@ func (s *Storage) StoreProbeResult(ctx context.Context, result *agent_analyzer.P
 // StorePathInfo stores path information
 func (s *Storage) StorePathInfo(ctx context.Context, pathInfo *agent_analyzer.PathInfo) error {
 	log.Debug().
-		Str("sourceGID", pathInfo.FiveTuple.SourceGid).
-		Str("destGID", pathInfo.FiveTuple.DestGid).
+		Str("sourceGID", pathInfo.FiveTuple.SrcGid).
+		Str("destGID", pathInfo.FiveTuple.DstGid).
 		Int("hops", len(pathInfo.Hops)).
 		Msg("Storing path info")
 

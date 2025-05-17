@@ -12,7 +12,6 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/analyzer/analysis"
 	"github.com/yuuki/rpingmesh/internal/analyzer/storage"
-	"github.com/yuuki/rpingmesh/internal/config"
 	"github.com/yuuki/rpingmesh/proto/agent_analyzer"
 	"google.golang.org/grpc"
 )
@@ -21,21 +20,22 @@ import (
 type Analyzer struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
-	config   *config.Config
+	config   *AnalyzerConfig
 	server   *grpc.Server
 	storage  *storage.Storage
 	analysis *analysis.Engine
 	wg       sync.WaitGroup
 }
 
-// New creates a new analyzer instance
-func New(configPath string) (*Analyzer, error) {
-	// Load configuration
-	cfg, err := config.LoadConfig(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load config: %w", err)
-	}
+// AnalyzerConfig holds configuration for the analyzer
+type AnalyzerConfig struct {
+	ListenAddr  string
+	DatabaseURI string
+	LogLevel    string
+}
 
+// New creates a new analyzer instance
+func New(cfg *AnalyzerConfig) (*Analyzer, error) {
 	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 

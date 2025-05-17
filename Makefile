@@ -13,16 +13,16 @@ build-controller:
 	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml build controller-builder
 	@echo "Copying controller binary from container..."
 	@chmod +x scripts/copy-from-image.sh
-	@./scripts/copy-from-image.sh rpingmesh-cursor-controller-builder controller-temp /app/controller ./bin/controller
-	@./scripts/copy-from-image.sh rpingmesh-cursor-controller-builder controller-temp /app/controller.yaml ./bin/controller.yaml
+	@./scripts/copy-from-image.sh rpingmesh-controller-builder controller-temp /app/controller ./bin/controller
+	@./scripts/copy-from-image.sh rpingmesh-controller-builder controller-temp /app/controller.yaml ./bin/controller.yaml
 
 build-agent:
 	@echo "Building agent with Docker Compose"
 	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml build agent-builder
 	@echo "Copying agent binary from container..."
 	@chmod +x scripts/copy-from-image.sh
-	@./scripts/copy-from-image.sh rpingmesh-cursor-agent-builder agent-temp /app/agent ./bin/agent
-	@./scripts/copy-from-image.sh rpingmesh-cursor-agent-builder agent-temp /app/agent.yaml ./bin/agent.yaml
+	@./scripts/copy-from-image.sh rpingmesh-agent-builder agent-temp /app/agent ./bin/agent
+	@./scripts/copy-from-image.sh rpingmesh-agent-builder agent-temp /app/agent.yaml ./bin/agent.yaml
 
 # Run with Docker Compose
 agent-up:

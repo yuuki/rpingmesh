@@ -35,7 +35,7 @@ enum ib_qp_attr_mask {
     IB_QP_RATE_LIMIT = (1 << 25),
 };
 
-// 新しいカーネルではRDMA AHフラグが変更されている可能性があります
+// RDMA AH flags may have changed in newer kernels
 #define RDMA_AH_ATTR_GRH 1
 
 // Structure definition for RDMA 5-tuple information
@@ -89,12 +89,12 @@ int BPF_KPROBE(trace_modify_qp, struct ib_qp *qp, struct ib_qp_attr *attr,
 
     // Read destination information based on attr_mask
     if (attr_mask & IB_QP_AV) {
-        // カーネル構造体の変更に対応
+        // Handle kernel structure changes
         struct rdma_ah_attr *ah_attr = &attr->ah_attr;
 
-        // GRHフィールドがある場合のみDGIDにアクセス
+        // Access DGID only if GRH field exists
         if (BPF_CORE_READ(ah_attr, grh.sgid_attr)) {
-            // GRHからDGIDを読み取り
+            // Read DGID from GRH
             const void *dgid_ptr = BPF_CORE_READ(ah_attr, grh.dgid.raw);
             if (dgid_ptr) {
                 bpf_probe_read_kernel(event->dst_gid, sizeof(event->dst_gid),

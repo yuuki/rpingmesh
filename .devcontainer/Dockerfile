@@ -33,17 +33,15 @@ RUN if [ -n "${KERNEL_VERSION}" ]; then \
     echo "Warning: Failed to install linux-headers-${KERNEL_VERSION}. eBPF features may not work correctly."; \
     fi
 
-# Install Go tools
-RUN go install golang.org/x/tools/gopls@latest \
-    && go install github.com/go-delve/delve/cmd/dlv@latest \
-    && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest \
-    && go install google.golang.org/protobuf/cmd/protoc-gen-go@latest \
-    && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest \
-    && go install github.com/cilium/ebpf/cmd/bpf2go@latest
-
 # Install protoc
 RUN apt-get update && apt-get install -y protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
+
+# Install rqlite
+RUN curl -L https://github.com/rqlite/rqlite/releases/download/v8.37.0/rqlite-v8.37.0-linux-amd64.tar.gz | tar -xz && \
+    mv rqlite-v8.37.0-linux-amd64/rqlited /usr/local/bin/rqlited && \
+    mv rqlite-v8.37.0-linux-amd64/rqlite /usr/local/bin/rqlite && \
+    rm -rf rqlite-v8.37.0-linux-amd64
 
 # Set up working directory
 WORKDIR /workspace

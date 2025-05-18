@@ -833,7 +833,6 @@ func (u *UDQueue) PostRecv() error {
 		C.uint32_t(MRSize+GRHSize),
 		u.RecvMR.lkey,
 	)
-
 	if ret != 0 {
 		log.Error().
 			Str("device", u.RNIC.DeviceName).
@@ -842,11 +841,6 @@ func (u *UDQueue) PostRecv() error {
 			Msg("PostRecv: ibv_post_recv failed")
 		return fmt.Errorf("ibv_post_recv failed: %d", ret)
 	}
-
-	log.Debug().
-		Str("device", u.RNIC.DeviceName).
-		Uint32("qpn", u.QPN).
-		Msg("PostRecv: Successfully posted receive buffer")
 	return nil
 }
 
@@ -1359,6 +1353,7 @@ func (u *UDQueue) Destroy() {
 // Close releases all resources associated with the RDMA manager
 func (m *RDMAManager) Close() {
 	for gid, udQueue := range m.UDQueues {
+		log.Debug().Str("gid", gid).Msg("Destroying UD queue pair")
 		udQueue.Destroy()
 		delete(m.UDQueues, gid)
 	}

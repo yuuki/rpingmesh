@@ -1,10 +1,9 @@
-package metrics
+package telemetry
 
 import (
 	"context"
 	"time"
 
-	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/metric"
@@ -111,11 +110,6 @@ func NewMetrics(ctx context.Context, agentID, collectorAddr string) (*Metrics, e
 	if err != nil {
 		return nil, err
 	}
-
-	log.Info().
-		Str("agent_id", agentID).
-		Str("collector_addr", collectorAddr).
-		Msg("OpenTelemetry metrics initialized")
 
 	return &Metrics{
 		provider:                provider,

@@ -23,7 +23,6 @@ type Prober struct {
 	stopCh       chan struct{}
 	wg           sync.WaitGroup
 	running      bool
-	mutex        sync.Mutex
 }
 
 // NewProber creates a new prober
@@ -41,9 +40,6 @@ func NewProber(rdmaManager *rdma.RDMAManager, agentState *state.AgentState, time
 
 // Start starts the prober
 func (p *Prober) Start() error {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
 	if p.running {
 		return nil
 	}
@@ -69,9 +65,6 @@ func (p *Prober) Start() error {
 
 // Stop stops the prober
 func (p *Prober) Stop() {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
 	if !p.running {
 		return
 	}

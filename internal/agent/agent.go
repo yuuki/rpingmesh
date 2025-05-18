@@ -145,7 +145,7 @@ func (a *Agent) Start() error {
 
 	// Set context for tracer
 	if a.tracer != nil {
-	a.tracer.SetContext(a.ctx)
+		a.tracer.SetContext(a.ctx)
 	}
 
 	// Start periodic traceroute if interval is set
@@ -163,12 +163,12 @@ func (a *Agent) Start() error {
 				log.Warn().Err(err).Msg("Failed to get pinglist for traceroute targets, will use localhost")
 				// Fallback to localhost if we can't get targets
 				if a.tracer != nil {
-				a.tracer.StartPeriodicTracingToLocalhost(a.ctx, primaryRnic.GID, a.config.TracerouteIntervalMS)
+					a.tracer.StartPeriodicTracingToLocalhost(a.ctx, primaryRnic.GID, a.config.TracerouteIntervalMS)
 				}
 			} else {
 				// Start periodic tracing to targets
 				if a.tracer != nil {
-				a.tracer.StartPeriodicTracing(a.ctx, primaryRnic.GID, targets, a.config.TracerouteIntervalMS, 3)
+					a.tracer.StartPeriodicTracing(a.ctx, primaryRnic.GID, targets, a.config.TracerouteIntervalMS, 3)
 				}
 			}
 		}
@@ -274,15 +274,15 @@ func (a *Agent) resultHandler() {
 			// If it's a timeout, maybe run a traceroute
 			if result.Status == 1 && a.config.TracerouteOnTimeout {
 				if a.tracer != nil {
-				log.Debug().
-					Str("dst_gid", result.FiveTuple.DstGid).
-					Msg("Timeout detected, initiating traceroute")
+					log.Debug().
+						Str("dst_gid", result.FiveTuple.DstGid).
+						Msg("Timeout detected, initiating traceroute")
 
-				go func(fiveTuple *agent_analyzer.ProbeFiveTuple) {
-					if err := a.tracer.Trace(a.ctx, fiveTuple); err != nil {
-						log.Error().Err(err).Msg("Failed to run traceroute")
-					}
-				}(result.FiveTuple)
+					go func(fiveTuple *agent_analyzer.ProbeFiveTuple) {
+						if err := a.tracer.Trace(a.ctx, fiveTuple); err != nil {
+							log.Error().Err(err).Msg("Failed to run traceroute")
+						}
+					}(result.FiveTuple)
 				} else {
 					log.Debug().Msg("Traceroute on timeout is configured, but tracer is disabled. Skipping traceroute.")
 				}
@@ -416,12 +416,16 @@ func (a *Agent) Stop() {
 	// Stop components in reverse order
 	if a.uploader != nil && a.config.AnalyzerEnabled {
 		log.Debug().Msg("Closing uploader")
-		_ = a.uploader.Close()
+		if err := a.uploader.Close(); err != nil {
+			log.Error().Err(err).Msg("Failed to close uploader")
+		}
 	}
 
 	if a.tracer != nil {
 		log.Debug().Msg("Closing tracer")
-		_ = a.tracer.Close()
+		if err := a.tracer.Close(); err != nil {
+			log.Error().Err(err).Msg("Failed to close tracer")
+		}
 	}
 
 	if a.clusterMonitor != nil {
@@ -431,12 +435,16 @@ func (a *Agent) Stop() {
 
 	if a.prober != nil {
 		log.Debug().Msg("Closing prober")
-		a.prober.Close()
+		if err := a.prober.Close(); err != nil {
+			log.Error().Err(err).Msg("Failed to close prober")
+		}
 	}
 
 	if a.controllerClient != nil {
 		log.Debug().Msg("Closing controller client")
-		_ = a.controllerClient.Close()
+		if err := a.controllerClient.Close(); err != nil {
+			log.Error().Err(err).Msg("Failed to close controller client")
+		}
 	}
 
 	// Shutdown metrics if enabled

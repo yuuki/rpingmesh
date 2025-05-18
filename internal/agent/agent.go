@@ -12,7 +12,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/agent/controller_client"
-	"github.com/yuuki/rpingmesh/internal/agent/metrics"
+	"github.com/yuuki/rpingmesh/internal/agent/telemetry"
 	"github.com/yuuki/rpingmesh/internal/config"
 	"github.com/yuuki/rpingmesh/internal/monitor"
 	"github.com/yuuki/rpingmesh/internal/probe"
@@ -36,7 +36,7 @@ type Agent struct {
 	clusterMonitor   *monitor.ClusterMonitor
 	tracer           *tracer.Tracer
 	uploader         *upload.Uploader
-	metrics          *metrics.Metrics
+	metrics          *telemetry.Metrics
 	wg               sync.WaitGroup
 }
 
@@ -116,12 +116,15 @@ func (a *Agent) Start() error {
 
 	// Initialize metrics if enabled
 	if a.config.MetricsEnabled {
-		metricsInstance, err := metrics.NewMetrics(a.ctx, a.agentState.GetAgentID(), a.config.OtelCollectorAddr)
+		metricsInstance, err := telemetry.NewMetrics(a.ctx, a.agentState.GetAgentID(), a.config.OtelCollectorAddr)
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to initialize metrics, continuing without metrics")
 		} else {
 			a.metrics = metricsInstance
-			log.Info().Msg("Metrics initialized")
+			log.Info().
+				Str("agent_id", a.agentState.GetAgentID()).
+				Str("collector_addr", a.config.OtelCollectorAddr).
+				Msg("OpenTelemetry metrics initialized")
 		}
 	}
 

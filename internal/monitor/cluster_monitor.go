@@ -1,7 +1,6 @@
 package monitor
 
 import (
-	"context"
 	"net"
 	"sync"
 	"time"
@@ -33,8 +32,6 @@ type ClusterMonitor struct {
 	pinglist   []PingTarget
 	stopCh     chan struct{}
 	wg         sync.WaitGroup
-	ctx        context.Context
-	cancel     context.CancelFunc
 	running    bool
 	mutex      sync.Mutex
 }
@@ -45,24 +42,18 @@ func NewClusterMonitor(
 	prober *probe.Prober,
 	intervalMs uint32,
 ) *ClusterMonitor {
-	ctx, cancel := context.WithCancel(context.Background())
 	return &ClusterMonitor{
 		agentState: agentState,
 		prober:     prober,
 		intervalMs: intervalMs,
 		pinglist:   make([]PingTarget, 0),
 		stopCh:     make(chan struct{}),
-		ctx:        ctx,
-		cancel:     cancel,
 		running:    false,
 	}
 }
 
 // Start starts the cluster monitor
 func (c *ClusterMonitor) Start() error {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
 	if c.running {
 		return nil
 	}
@@ -84,7 +75,6 @@ func (c *ClusterMonitor) Stop() {
 		return
 	}
 
-	c.cancel()
 	close(c.stopCh)
 	c.wg.Wait()
 	c.running = false

@@ -170,9 +170,6 @@ func (a *AgentState) FindRNICByIP(ipAddress string) *rdma.RNIC {
 
 // Close releases all resources
 func (a *AgentState) Close() {
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
-
 	if a.rdmaManager != nil {
 		a.rdmaManager.Close()
 		a.rdmaManager = nil

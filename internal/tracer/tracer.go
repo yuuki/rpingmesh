@@ -21,7 +21,6 @@ import (
 // Tracer performs path tracing to diagnose network issues
 type Tracer struct {
 	traceResults chan *agent_analyzer.PathInfo
-	mutex        sync.Mutex
 	ctx          context.Context
 	periodicWg   sync.WaitGroup
 }
@@ -315,9 +314,6 @@ func (t *Tracer) StartPeriodicTracingToLocalhost(
 
 // Close cleans up resources
 func (t *Tracer) Close() error {
-	t.mutex.Lock()
-	defer t.mutex.Unlock()
-
 	// Wait for all periodic traceroute goroutines to complete
 	t.periodicWg.Wait()
 

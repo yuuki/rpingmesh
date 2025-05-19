@@ -1420,9 +1420,15 @@ func (u *UDQueue) Destroy() {
 	u.StopCQPoller()
 
 	// Close channels
-	close(u.sendCompChan)
-	close(u.recvCompChan)
-	close(u.errChan)
+	if u.sendCompChan != nil {
+		close(u.sendCompChan)
+	}
+	if u.recvCompChan != nil {
+		close(u.recvCompChan)
+	}
+	if u.errChan != nil {
+		close(u.errChan)
+	}
 
 	if u.RecvMR != nil {
 		C.ibv_dereg_mr(u.RecvMR)

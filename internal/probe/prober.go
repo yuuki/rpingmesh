@@ -58,12 +58,13 @@ func (p *Prober) Start() error {
 	log.Debug().Int("count", len(detectedRNICs)).Msg("RNICs detected by AgentState for Prober.Start")
 	for _, rnic := range detectedRNICs {
 		log.Debug().Str("rnic_gid", rnic.GID).Str("rnic_device_name", rnic.DeviceName).Msg("Processing RNIC in Prober.Start")
-		udq := p.agentState.GetUDQueue(rnic.GID)
+		// Get the RESPONDER UDQueue for handling incoming probes
+		udq := p.agentState.GetResponderUDQueue(rnic.GID)
 		if udq != nil {
 			p.wg.Add(1)
 			go p.responderLoop(udq)
 		} else {
-			log.Warn().Str("rnic_gid", rnic.GID).Str("rnic_device_name", rnic.DeviceName).Msg("UDQueue is nil for this RNIC in Prober.Start, responderLoop will not start")
+			log.Warn().Str("rnic_gid", rnic.GID).Str("rnic_device_name", rnic.DeviceName).Msg("Responder UDQueue is nil for this RNIC in Prober.Start, responderLoop will not start")
 		}
 	}
 	return nil
@@ -94,10 +95,10 @@ func (p *Prober) ProbeTarget(
 	// Increment sequence number
 	seqNum := atomic.AddUint64(&p.sequenceNum, 1)
 
-	// Get the UDQueue for the source RNIC
-	srcUdQueue := p.agentState.GetUDQueue(sourceRnic.GID)
+	// Get the SENDER UDQueue for the source RNIC (for sending probes and receiving ACKs)
+	srcUdQueue := p.agentState.GetSenderUDQueue(sourceRnic.GID)
 	if srcUdQueue == nil {
-		log.Error().Str("gid", sourceRnic.GID).Msg("Failed to get UDQueue for source RNIC in ProbeTarget")
+		log.Error().Str("gid", sourceRnic.GID).Msg("Failed to get sender UDQueue for source RNIC in ProbeTarget")
 		return
 	}
 
@@ -197,9 +198,11 @@ func (p *Prober) ProbeTarget(
 			Uint32("srcQPN", srcUdQueue.QPN).
 			Str("dstGID", targetGID).
 			Uint32("dstQPN", targetQPN).
+			Str("receivedPacketSGID", workComp.SGID).
+			Uint32("receivedPacketSrcQPN", workComp.SrcQP).
 			Msg("Received invalid first ACK packet, ignoring")
 
-		result.Status = agent_analyzer.ProbeResult_UNKNOWN
+		result.Status = agent_analyzer.ProbeResult_ERROR
 		p.probeResults <- result
 		return
 	}
@@ -235,6 +238,12 @@ func (p *Prober) ProbeTarget(
 			Uint64("receivedSeq", ackPacket2.SequenceNum).
 			Bool("isAck", ackPacket2.IsAck == 1).
 			Uint8("ackType", ackPacket2.AckType).
+			Str("srcGID", sourceRnic.GID).
+			Uint32("srcQPN", srcUdQueue.QPN).
+			Str("dstGID", targetGID).
+			Uint32("dstQPN", targetQPN).
+			Str("receivedPacketSGID", workComp2.SGID).
+			Uint32("receivedPacketSrcQPN", workComp2.SrcQP).
 			Msg("Received invalid second ACK packet, ignoring")
 
 		result.Status = agent_analyzer.ProbeResult_TIMEOUT
@@ -314,7 +323,8 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 		Str("device", udq.RNIC.DeviceName).
 		Uint32("qpn", udq.QPN).
 		Str("gid", udq.RNIC.GID).
-		Msg("Starting responder loop to handle incoming probe packets on specific UDQueue")
+		Str("queueType", "Responder").
+		Msg("Starting responder loop to handle incoming probe packets on responder UDQueue")
 
 	// Track statistics for debugging
 	var (

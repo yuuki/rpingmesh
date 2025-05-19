@@ -95,9 +95,14 @@ func (c *ControllerClient) RegisterAgent(
 	// Create request
 	rnicInfos := make([]*controller_agent.RnicInfo, 0, len(rnics))
 	for _, rnic := range rnics {
+		if rnic.ResponderQueue == nil {
+			return fmt.Errorf("no responder queue found for RNIC %s, device %s", rnic.GID, rnic.DeviceName)
+		}
 		rnicInfos = append(rnicInfos, &controller_agent.RnicInfo{
-			Gid:        rnic.GID,
-			Qpn:        rnic.UDQueues[rnic.GID].QPN,
+			Gid: rnic.GID,
+			// Use the responder queue for registration not the sender queue
+			// because the other agents send probes to this agent via the responder queue
+			Qpn:        rnic.ResponderQueue.QPN,
 			IpAddress:  rnic.IPAddr,
 			HostName:   agentID,
 			DeviceName: rnic.DeviceName,
@@ -141,11 +146,31 @@ func (c *ControllerClient) GetPinglist(
 		return nil, 0, 0, fmt.Errorf("not connected to controller")
 	}
 
+	// UDキューの分離実装に対応: SenderQueueを使用
+	var qpn uint32
+	if requesterRnic.SenderQueue != nil {
+		qpn = requesterRnic.SenderQueue.QPN
+	} else if requesterRnic.UDQueues != nil && len(requesterRnic.UDQueues) > 0 {
+		// 後方互換性のためのフォールバック
+		// 古い方式のマップからも確認する
+		for _, udq := range requesterRnic.UDQueues {
+			if udq != nil {
+				qpn = udq.QPN
+				break
+			}
+		}
+	}
+
+	// QPNが取得できなかった場合はエラーを返す
+	if qpn == 0 {
+		return nil, 0, 0, fmt.Errorf("no valid QPN found for RNIC with GID %s", requesterRnic.GID)
+	}
+
 	// Create request
 	req := &controller_agent.PinglistRequest{
 		RequesterRnic: &controller_agent.RnicInfo{
 			Gid:       requesterRnic.GID,
-			Qpn:       requesterRnic.UDQueues[requesterRnic.GID].QPN,
+			Qpn:       qpn,
 			IpAddress: requesterRnic.IPAddr,
 			HostName:  requesterRnic.DeviceName,
 			TorId:     "", // This would need to be set from config

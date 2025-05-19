@@ -15,22 +15,24 @@ const (
 
 // AgentState holds the current state of the agent
 type AgentState struct {
-	agentID       string
-	agentIP       string
-	localTorID    string
-	rdmaManager   *rdma.RDMAManager
-	primaryRNIC   *rdma.RNIC
-	detectedRNICs []*rdma.RNIC
-	udQueues      map[string]*rdma.UDQueue // Map of GID to UDQueue
-	mutex         sync.RWMutex
+	agentID         string
+	agentIP         string
+	localTorID      string
+	rdmaManager     *rdma.RDMAManager
+	primaryRNIC     *rdma.RNIC
+	detectedRNICs   []*rdma.RNIC
+	senderQueues    map[string]*rdma.UDQueue // Map of GID to Sender UDQueue
+	responderQueues map[string]*rdma.UDQueue // Map of GID to Responder UDQueue
+	mutex           sync.RWMutex
 }
 
 // NewAgentState creates a new agent state
 func NewAgentState(agentID, localTorID string) *AgentState {
 	return &AgentState{
-		agentID:    agentID,
-		localTorID: DefaultLocalTorID,
-		udQueues:   make(map[string]*rdma.UDQueue),
+		agentID:         agentID,
+		localTorID:      DefaultLocalTorID,
+		senderQueues:    make(map[string]*rdma.UDQueue),
+		responderQueues: make(map[string]*rdma.UDQueue),
 	}
 }
 
@@ -72,14 +74,15 @@ func (a *AgentState) Initialize() error {
 		return err
 	}
 
-	// Create UD queues for each RNIC
+	// Create separate UD queues for each RNIC - one for sending probes, one for receiving probes
 	for _, rnic := range a.detectedRNICs {
-		udQueue, err := a.rdmaManager.CreateUDQueue(rnic)
+		err := a.rdmaManager.CreateSenderAndResponderQueues(rnic)
 		if err != nil {
-			log.Error().Err(err).Str("device", rnic.DeviceName).Msg("Failed to create UD queue")
+			log.Error().Err(err).Str("device", rnic.DeviceName).Msg("Failed to create sender and responder UD queues")
 			continue
 		}
-		a.udQueues[rnic.GID] = udQueue
+		a.senderQueues[rnic.GID] = rnic.SenderQueue
+		a.responderQueues[rnic.GID] = rnic.ResponderQueue
 	}
 
 	log.Info().
@@ -134,11 +137,18 @@ func (a *AgentState) GetDetectedRNICs() []*rdma.RNIC {
 	return a.detectedRNICs
 }
 
-// GetUDQueue returns the UD queue for the given RNIC GID
-func (a *AgentState) GetUDQueue(gid string) *rdma.UDQueue {
+// GetSenderUDQueue returns the sender UD queue for the given RNIC GID
+func (a *AgentState) GetSenderUDQueue(gid string) *rdma.UDQueue {
 	a.mutex.RLock()
 	defer a.mutex.RUnlock()
-	return a.udQueues[gid]
+	return a.senderQueues[gid]
+}
+
+// GetResponderUDQueue returns the responder UD queue for the given RNIC GID
+func (a *AgentState) GetResponderUDQueue(gid string) *rdma.UDQueue {
+	a.mutex.RLock()
+	defer a.mutex.RUnlock()
+	return a.responderQueues[gid]
 }
 
 // GetRDMAManager returns the RDMA manager
@@ -182,7 +192,8 @@ func (a *AgentState) Close() {
 
 	a.primaryRNIC = nil
 	a.detectedRNICs = nil
-	a.udQueues = nil
+	a.senderQueues = nil
+	a.responderQueues = nil
 }
 
 // getLocalIP returns the non-loopback IP address of the host

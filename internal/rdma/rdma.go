@@ -574,15 +574,6 @@ func (u *UDQueue) StartCQPoller() {
 				for i := 0; i < int(ne); i++ {
 					completion := wc[i]
 
-					log.Debug().
-						Str("device", u.RNIC.DeviceName).
-						Uint32("qpn", u.QPN).                           // Log the QPN of the UDQueue this poller is for
-						Uint32("wc_qp_num", uint32(completion.qp_num)). // Log QP number from WC
-						Uint32("wc_status", uint32(completion.status)).
-						Uint32("wc_opcode", uint32(completion.opcode)).
-						Uint32("byte_len", uint32(completion.byte_len)).
-						Msg("CQPoller: Polled a completion event")
-
 					// First check for errors
 					if completion.status != C.IBV_WC_SUCCESS {
 						u.errChan <- fmt.Errorf("completion failed: status=%d, vendor_err=%d, qp_num=%d",
@@ -596,12 +587,6 @@ func (u *UDQueue) StartCQPoller() {
 						wcCopy := completion
 						select {
 						case u.sendCompChan <- &wcCopy:
-							log.Debug().
-								Str("device", u.RNIC.DeviceName).
-								Uint32("qpn", u.QPN).
-								Uint32("wc_opcode", completion.opcode).
-								Uint32("byte_len", uint32(completion.byte_len)).
-								Msg("Send completion event dispatched to sendCompChan")
 						default:
 							// Channel is blocked (no receiver)
 							log.Warn().
@@ -616,12 +601,6 @@ func (u *UDQueue) StartCQPoller() {
 						wcCopy := completion
 						select {
 						case u.recvCompChan <- &wcCopy:
-							log.Debug().
-								Str("device", u.RNIC.DeviceName).
-								Uint32("qpn", u.QPN).
-								Uint32("wc_opcode", completion.opcode).
-								Uint32("byte_len", uint32(completion.byte_len)).
-								Msg("Receive completion event dispatched to recvCompChan")
 						default:
 							// Channel is blocked (no receiver)
 							log.Warn().
@@ -935,19 +914,9 @@ func (u *UDQueue) CreateAddressHandle(targetGID string, flowLabel uint32) (*C.st
 	// Copy IPv6 GID bytes to ahAttr.grh.dgid using our C helper function
 	C.copy_to_gid_raw(&ahAttr.grh.dgid, unsafe.Pointer(&ipv6[0]), 16)
 
-	log.Debug().
-		Uint8("ah.is_global", uint8(ahAttr.is_global)).
-		Uint8("ah.port_num", uint8(ahAttr.port_num)).
-		Uint32("ah.grh.flow_label", uint32(ahAttr.grh.flow_label)).
-		Uint8("ah.grh.sgid_index", uint8(ahAttr.grh.sgid_index)).
-		Uint8("ah.grh.hop_limit", uint8(ahAttr.grh.hop_limit)).
-		Uint8("ah.grh.traffic_class", uint8(ahAttr.grh.traffic_class)).
-		Bytes("ah.grh.dgid", ipv6). // Log the dgid as bytes for verification
-		Msg("CreateAddressHandle: ah_attr parameters before ibv_create_ah")
-
 	ah := C.ibv_create_ah(u.RNIC.PD, &ahAttr)
 	if ah == nil {
-		return nil, fmt.Errorf("failed to create address handle for GID %s", targetGID)
+		return nil, fmt.Errorf("failed to create address handle for GID %s, device: %s, targetGID: %s", u.RNIC.GID, u.RNIC.DeviceName, targetGID)
 	}
 
 	return ah, nil
@@ -1052,9 +1021,6 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 		const ipv4HeaderOffset = 20
 		const ipv4HeaderMinLength = 20 // Standard IPv4 header length
 		ipv4HeaderBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(u.RecvBuf)+uintptr(ipv4HeaderOffset))), ipv4HeaderMinLength)
-
-		log.Debug().Bytes("ipv4_header_bytes_for_parsing", ipv4HeaderBytes).Msg("Bytes from offset 20, assumed to be IPv4 header")
-
 		ipv4Header, err := ipv4.ParseHeader(ipv4HeaderBytes)
 		if err != nil {
 			log.Warn().Err(err).Bytes("data", ipv4HeaderBytes).Msg("Failed to parse bytes from offset 20 as IPv4 header.")
@@ -1082,14 +1048,6 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 		workComp.SGID = formatGIDString(srcMappedIPv6Bytes) // formatGIDString expects 16 bytes and will add ::ffff if bytes 10,11 are ff
 		workComp.DGID = formatGIDString(dstMappedIPv6Bytes)
 
-		log.Debug(). // Changed to Info for better visibility of this custom path
-				Str("CustomParsed_SGID", workComp.SGID).
-				Str("CustomParsed_DGID", workComp.DGID).
-				Str("Original_IPv4_Src", srcIPv4.String()).
-				Str("Original_IPv4_Dst", dstIPv4.String()).
-				Uint32("SrcQP", workComp.SrcQP).
-				Msg("Successfully parsed SGID/DGID from IPv4 header in GRH region (custom logic)")
-
 		// The payload is still after the full GRHSize (40 bytes)
 		actualPayloadLength = uint32(wc.byte_len) - GRHSize
 		packetDataPtr = unsafe.Pointer(uintptr(u.RecvBuf) + uintptr(GRHSize))
@@ -1116,6 +1074,9 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 			Uint64("t1", packet.T1).
 			Uint64("t3", packet.T3).
 			Uint64("t4", packet.T4).
+			Str("srcGID", workComp.SGID).
+			Str("dstGID", workComp.DGID).
+			Uint32("srcQP", workComp.SrcQP).
 			Msg("Received packet data")
 
 		// If an ACK requires the sender's GID, and GRH was not present (so SGID is unknown from GRH)
@@ -1186,15 +1147,6 @@ func (u *UDQueue) SendFirstAckPacket(
 	packet.AckType = 1 // First ACK
 	packet.Flags = 0
 
-	// Log more details about the send operation
-	log.Debug().
-		Str("targetGID", targetGID).
-		Uint32("targetQPN", targetQPN).
-		Uint64("sequenceNum", packet.SequenceNum).
-		Uint32("qkey", qkey).
-		Uint32("flowLabel", flowLabel).
-		Msg("Sending first ACK packet")
-
 	// Use the C helper function to post a send WR from C-allocated memory
 	if ret := C.post_send(
 		u.QP,
@@ -1262,16 +1214,6 @@ func (u *UDQueue) SendSecondAckPacket(
 	packet.IsAck = 1
 	packet.AckType = 2 // Second ACK with processing delay
 	packet.Flags = 0
-
-	// Log more details about the send operation
-	log.Debug().
-		Str("targetGID", targetGID).
-		Uint32("targetQPN", targetQPN).
-		Uint64("sequenceNum", packet.SequenceNum).
-		Int64("processingDelay", t4-t3).
-		Uint32("qkey", qkey).
-		Uint32("flowLabel", flowLabel).
-		Msg("Sending second ACK packet with processing delay")
 
 	// Use the C helper function to post a send WR from C-allocated memory
 	if ret := C.post_send(

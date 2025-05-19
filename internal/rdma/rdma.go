@@ -825,6 +825,28 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC) (*UDQueue, error) {
 	// Start CQ polling goroutine
 	udQueue.StartCQPoller()
 
+	// Post initial receive buffers
+	numInitialRecvBuffers := 32 // Increased initial buffers slightly
+	log.Info().
+		Str("device", rnic.DeviceName).
+		Uint32("qpn", udQueue.QPN).
+		Int("num_initial_recv_buffers_to_post", numInitialRecvBuffers).
+		Msg("Attempting to post initial receive buffers")
+
+	for i := 0; i < numInitialRecvBuffers; i++ {
+		if err := udQueue.PostRecv(); err != nil {
+			log.Error().Err(err).
+				Str("device", rnic.DeviceName).
+				Uint32("qpn", udQueue.QPN).
+				Int("posted_count", i).
+				Int("total_to_post", numInitialRecvBuffers).
+				Msg("Failed to post an initial receive buffer")
+			// Cleanup and return error
+			udQueue.Destroy() // Important to clean up partially created queue
+			return nil, fmt.Errorf("failed to post initial receive buffer %d/%d for device %s qpn %d: %w", i+1, numInitialRecvBuffers, rnic.DeviceName, udQueue.QPN, err)
+		}
+	}
+
 	log.Info().
 		Str("device", rnic.DeviceName).
 		Uint32("qpn", udQueue.QPN).
@@ -971,14 +993,6 @@ func (u *UDQueue) SendProbePacket(
 
 // ReceivePacket waits for and processes a received packet using completion channel
 func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *WorkCompletion, error) {
-	// Post another receive buffer to ensure we don't run out
-	if err := u.PostRecv(); err != nil {
-		log.Warn().Err(err).
-			Str("device", u.RNIC.DeviceName).
-			Uint32("qpn", u.QPN).
-			Msg("Failed to post additional receive buffer before waiting for completion")
-	}
-
 	// Wait for completion notification from CQ poller
 	select {
 	case wc := <-u.recvCompChan:
@@ -1098,6 +1112,15 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 		// If GRH was present but SGID is still invalid (e.g. "::"), it's a problem for ACKs.
 		// This was handled inside the grhPresent block partially.
 		// The CreateAddressHandle will fail if SGID is invalid.
+
+		// Replenish the receive buffer for the one just consumed
+		if errPost := u.PostRecv(); errPost != nil {
+			log.Warn().Err(errPost).
+				Str("device", u.RNIC.DeviceName).
+				Uint32("qpn", u.QPN).
+				Msg("Failed to post replacement receive buffer after processing packet")
+			// Non-fatal for this received packet, but indicates a potential issue
+		}
 
 		return &packetCopy, receiveTime, workComp, nil
 

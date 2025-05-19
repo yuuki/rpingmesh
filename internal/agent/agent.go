@@ -136,12 +136,6 @@ func (a *Agent) Start() error {
 		return fmt.Errorf("no RDMA devices available")
 	}
 
-	udQueue := a.agentState.GetUDQueue(primaryRnic.GID)
-	if udQueue == nil {
-		return fmt.Errorf("no UD queue available for RNIC %s", primaryRnic.GID)
-	}
-	log.Debug().Str("primary_rnic_gid", primaryRnic.GID).Msg("Got primary RNIC and UD queue")
-
 	// Initialize metrics if enabled
 	if a.config.MetricsEnabled {
 		metricsInstance, err := telemetry.NewMetrics(a.ctx, a.agentState.GetAgentID(), a.config.OtelCollectorAddr)

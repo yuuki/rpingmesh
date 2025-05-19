@@ -213,6 +213,16 @@ func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target P
 		return
 	}
 
+	// Verify that a sender UDQueue is available for this RNIC
+	senderUDQueue := c.agentState.GetSenderUDQueue(localRnic.GID)
+	if senderUDQueue == nil {
+		log.Error().
+			Str("localRnic.GID", localRnic.GID).
+			Str("localRnic.DeviceName", localRnic.DeviceName).
+			Msg("No sender UDQueue available for this RNIC, cannot probe target")
+		return
+	}
+
 	// Create rate limiter for this target
 	limiter := ratelimit.New(ProbeRatePerSecond)
 

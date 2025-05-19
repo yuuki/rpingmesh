@@ -358,7 +358,7 @@ func TestEndToEndWithRealHardware(t *testing.T) {
 	}
 
 	// Create UDQueue (requires real RDMA device)
-	udQueue, err := manager.CreateUDQueue(device)
+	udQueue, err := manager.CreateUDQueue(device, UDQueueTypeSender)
 	if err != nil {
 		t.Skipf("Could not create UDQueue: %v", err)
 	}

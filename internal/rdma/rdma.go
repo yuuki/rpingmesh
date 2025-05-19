@@ -141,6 +141,16 @@ const (
 	IPv4HeaderMinLength = 20 // Minimum length of an IPv4 header
 )
 
+// UDQueueType defines the role of the UDQueue
+type UDQueueType int
+
+const (
+	// UDQueueTypeSender is used for sending probes and receiving ACKs
+	UDQueueTypeSender UDQueueType = iota
+	// UDQueueTypeResponder is used for receiving probes and sending ACKs
+	UDQueueTypeResponder
+)
+
 // RNIC represents an RDMA NIC device
 type RNIC struct {
 	Context        *C.struct_ibv_context
@@ -150,9 +160,11 @@ type RNIC struct {
 	IPAddr         string
 	PD             *C.struct_ibv_pd
 	IsOpen         bool
-	UDQueues       map[string]*UDQueue // Map of GID to UDQueue
 	ActiveGIDIndex uint8               // Added to store the active GID index
 	ActivePortNum  uint8               // Added to store the active port number
+	SenderQueue    *UDQueue            // Queue for sending probes and receiving ACKs
+	ResponderQueue *UDQueue            // Queue for receiving probes and sending ACKs
+	UDQueues       map[string]*UDQueue // Map of keys to UDQueue for backward compatibility
 }
 
 // UDQueue represents a UD QP and associated resources
@@ -166,6 +178,7 @@ type UDQueue struct {
 	SendBuf     unsafe.Pointer
 	RecvBuf     unsafe.Pointer
 	QPN         uint32
+	QueueType   UDQueueType // Type of queue (sender or responder)
 
 	// Channels for CQ completion event notifications
 	sendCompChan chan *C.struct_ibv_wc // Channel for send completion events
@@ -197,8 +210,10 @@ type WorkCompletionEvent struct {
 
 // RDMAManager manages RDMA devices and operations
 type RDMAManager struct {
-	Devices  []*RNIC
-	UDQueues map[string]*UDQueue // Map of GID to UDQueue
+	Devices           []*RNIC
+	SenderUDQueues    map[string]*UDQueue // Map of GID to sender UDQueue
+	ResponderUDQueues map[string]*UDQueue // Map of GID to responder UDQueue
+	UDQueues          map[string]*UDQueue // Map of unique keys to UDQueue for backward compatibility
 }
 
 // ProbePacket represents the format of a probe packet
@@ -240,7 +255,9 @@ func NewRDMAManager() (*RDMAManager, error) {
 	rand.Seed(time.Now().UnixNano())
 
 	manager := &RDMAManager{
-		UDQueues: make(map[string]*UDQueue),
+		SenderUDQueues:    make(map[string]*UDQueue),
+		ResponderUDQueues: make(map[string]*UDQueue),
+		UDQueues:          make(map[string]*UDQueue),
 	}
 
 	// Get list of RDMA devices
@@ -269,7 +286,6 @@ func NewRDMAManager() (*RDMAManager, error) {
 			Device:     device,
 			DeviceName: deviceName,
 			IsOpen:     false,
-			UDQueues:   make(map[string]*UDQueue),
 		}
 		manager.Devices = append(manager.Devices, rnic)
 	}
@@ -648,31 +664,118 @@ func (u *UDQueue) StopCQPoller() {
 }
 
 // CreateUDQueue creates a UD queue pair for sending and receiving probe packets
-func (m *RDMAManager) CreateUDQueue(rnic *RNIC) (*UDQueue, error) {
+func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType) (*UDQueue, error) {
 	if !rnic.IsOpen {
 		if err := rnic.OpenDevice(); err != nil {
 			return nil, err
 		}
 	}
 
+	// Lazy initialization of RNIC's UDQueues map
+	if rnic.UDQueues == nil {
+		rnic.UDQueues = make(map[string]*UDQueue)
+	}
+
+	// Step 1: Create QP resources
+	qp, cq, compChannel, psn, err := m.createQueuePair(rnic)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 2: Allocate memory resources
+	sendBuf, recvBuf, sendMR, recvMR, err := m.allocateMemoryResources(rnic, qp, cq, compChannel)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 3: Create UDQueue struct
+	udQueue := &UDQueue{
+		RNIC:         rnic,
+		QP:           qp,
+		CQ:           cq,
+		CompChannel:  compChannel,
+		SendMR:       sendMR,
+		RecvMR:       recvMR,
+		SendBuf:      sendBuf,
+		RecvBuf:      recvBuf,
+		QPN:          uint32(qp.qp_num),
+		QueueType:    queueType,
+		sendCompChan: make(chan *C.struct_ibv_wc, SendCompChanBufferSize), // Buffered channel
+		recvCompChan: make(chan *C.struct_ibv_wc, RecvCompChanBufferSize), // Buffered channel
+		errChan:      make(chan error, ErrChanBufferSize),                 // Buffered channel
+		cqPollerDone: make(chan struct{}),
+	}
+
+	// Store the UDQueue in the maps based on its type
+	mapKey := rnic.GID
+	if queueType == UDQueueTypeSender {
+		mapKey = mapKey + "_sender"
+		rnic.SenderQueue = udQueue
+		m.SenderUDQueues[rnic.GID] = udQueue
+	} else {
+		mapKey = mapKey + "_responder"
+		rnic.ResponderQueue = udQueue
+		m.ResponderUDQueues[rnic.GID] = udQueue
+	}
+
+	m.UDQueues[mapKey] = udQueue
+	rnic.UDQueues[mapKey] = udQueue
+
+	// Start CQ polling goroutine
+	udQueue.StartCQPoller()
+
+	// Post initial receive buffers
+	numInitialRecvBuffers := InitialRecvBuffers // Using the constant
+	log.Info().
+		Str("device", rnic.DeviceName).
+		Uint32("qpn", udQueue.QPN).
+		Str("queueType", getQueueTypeString(queueType)).
+		Int("num_initial_recv_buffers_to_post", numInitialRecvBuffers).
+		Msg("Attempting to post initial receive buffers")
+
+	for i := 0; i < numInitialRecvBuffers; i++ {
+		if err := udQueue.PostRecv(); err != nil {
+			log.Error().Err(err).
+				Str("device", rnic.DeviceName).
+				Uint32("qpn", udQueue.QPN).
+				Str("queueType", getQueueTypeString(queueType)).
+				Int("posted_count", i).
+				Int("total_to_post", numInitialRecvBuffers).
+				Msg("Failed to post an initial receive buffer")
+			// Cleanup and return error
+			udQueue.Destroy() // Important to clean up partially created queue
+			return nil, fmt.Errorf("failed to post initial receive buffer %d/%d for device %s qpn %d: %w", i+1, numInitialRecvBuffers, rnic.DeviceName, udQueue.QPN, err)
+		}
+	}
+
+	log.Info().
+		Str("device", rnic.DeviceName).
+		Uint32("qpn", udQueue.QPN).
+		Uint32("psn", psn).
+		Uint32("qkey", DefaultQKey).
+		Str("queueType", getQueueTypeString(queueType)).
+		Msg("Created UD queue pair")
+
+	return udQueue, nil
+}
+
+// createQueuePair creates a Queue Pair and puts it in the RTS state
+func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_ibv_cq, *C.struct_ibv_comp_channel, uint32, error) {
 	// Create a completion event channel
 	compChannel := C.ibv_create_comp_channel(rnic.Context)
 	if compChannel == nil {
-		return nil, fmt.Errorf("failed to create completion channel for device %s", rnic.DeviceName)
+		return nil, nil, nil, 0, fmt.Errorf("failed to create completion channel for device %s", rnic.DeviceName)
 	}
 
 	// Create completion queue with more entries for better throughput
 	cq := C.ibv_create_cq(rnic.Context, CQSize, nil, compChannel, 0)
 	if cq == nil {
 		C.ibv_destroy_comp_channel(compChannel)
-		return nil, fmt.Errorf("failed to create CQ for device %s", rnic.DeviceName)
+		return nil, nil, nil, 0, fmt.Errorf("failed to create CQ for device %s", rnic.DeviceName)
 	}
 
 	// Generate random PSN as in ud_pingpong.c (24 bit value)
 	psn := uint32(rand.Int31n(1 << 24))
-
-	// Use standard QKey for UD operations (0x11111111 as in ud_pingpong.c)
-	const qkey uint32 = DefaultQKey
 
 	// QP creation attribute setting to standard
 	var qpInitAttr C.struct_ibv_qp_init_attr
@@ -692,22 +795,47 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC) (*UDQueue, error) {
 	if qp == nil {
 		C.ibv_destroy_cq(cq)
 		C.ibv_destroy_comp_channel(compChannel)
-		return nil, fmt.Errorf("failed to create QP for device %s", rnic.DeviceName)
+		return nil, nil, nil, 0, fmt.Errorf("failed to create QP for device %s", rnic.DeviceName)
 	}
 
 	// Modify QP to INIT state
+	if err := m.modifyQPToInit(rnic, qp); err != nil {
+		C.ibv_destroy_qp(qp)
+		C.ibv_destroy_cq(cq)
+		C.ibv_destroy_comp_channel(compChannel)
+		return nil, nil, nil, 0, err
+	}
+
+	// Modify QP to RTR state
+	if err := m.modifyQPToRTR(rnic, qp); err != nil {
+		C.ibv_destroy_qp(qp)
+		C.ibv_destroy_cq(cq)
+		C.ibv_destroy_comp_channel(compChannel)
+		return nil, nil, nil, 0, err
+	}
+
+	// Modify QP to RTS state
+	if err := m.modifyQPToRTS(rnic, qp, psn); err != nil {
+		C.ibv_destroy_qp(qp)
+		C.ibv_destroy_cq(cq)
+		C.ibv_destroy_comp_channel(compChannel)
+		return nil, nil, nil, 0, err
+	}
+
+	return qp, cq, compChannel, psn, nil
+}
+
+// modifyQPToInit transitions the QP to INIT state
+func (m *RDMAManager) modifyQPToInit(rnic *RNIC, qp *C.struct_ibv_qp) error {
 	var qpAttr C.struct_ibv_qp_attr
 	qpAttr.qp_state = C.IBV_QPS_INIT
 	qpAttr.pkey_index = 0
 	qpAttr.port_num = C.uint8_t(rnic.ActivePortNum) // Use active port number from RNIC with cast
-	qpAttr.qkey = C.uint32_t(qkey)
+	qpAttr.qkey = C.uint32_t(DefaultQKey)
 
 	if ret := C.ibv_modify_qp(qp, &qpAttr,
 		C.IBV_QP_STATE|C.IBV_QP_PKEY_INDEX|C.IBV_QP_PORT|C.IBV_QP_QKEY); ret != 0 {
-		C.ibv_destroy_qp(qp)
-		C.ibv_destroy_cq(cq)
-		C.ibv_destroy_comp_channel(compChannel)
-		return nil, fmt.Errorf("failed to modify QP to INIT: %d", ret)
+		return fmt.Errorf("failed to modify QP to INIT: %d", ret)
 	}
 	log.Debug().Str("device", rnic.DeviceName).Uint32("qpn", uint32(qp.qp_num)).Msg("QP state changed to INIT")
 
@@ -720,72 +848,75 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC) (*UDQueue, error) {
 		log.Warn().Str("device", rnic.DeviceName).Uint32("qpn", uint32(qp.qp_num)).Msg("Failed to query QP state after INIT")
 	}
 
-	// Modify QP to RTR state
+	return nil
+}
+
+// modifyQPToRTR transitions the QP to RTR state
+func (m *RDMAManager) modifyQPToRTR(rnic *RNIC, qp *C.struct_ibv_qp) error {
+	var qpAttr C.struct_ibv_qp_attr
 	qpAttr.qp_state = C.IBV_QPS_RTR
 	if ret := C.ibv_modify_qp(qp, &qpAttr, C.IBV_QP_STATE); ret != 0 {
-		C.ibv_destroy_qp(qp)
-		C.ibv_destroy_cq(cq)
-		C.ibv_destroy_comp_channel(compChannel)
-		return nil, fmt.Errorf("failed to modify QP to RTR: %d", ret)
+		return fmt.Errorf("failed to modify QP to RTR: %d", ret)
 	}
 	log.Debug().Str("device", rnic.DeviceName).Uint32("qpn", uint32(qp.qp_num)).Msg("QP state changed to RTR")
 
 	// Query QP state after RTR
+	var queriedQPAttr C.struct_ibv_qp_attr
+	var queriedQPInitAttr C.struct_ibv_qp_init_attr
 	if C.ibv_query_qp(qp, &queriedQPAttr, C.IBV_QP_STATE, &queriedQPInitAttr) == 0 {
 		log.Debug().Str("device", rnic.DeviceName).Uint32("qpn", uint32(qp.qp_num)).Uint32("state", uint32(queriedQPAttr.qp_state)).Msg("Queried QP state after RTR")
 	} else {
 		log.Warn().Str("device", rnic.DeviceName).Uint32("qpn", uint32(qp.qp_num)).Msg("Failed to query QP state after RTR")
 	}
 
-	// Modify QP to RTS state
+	return nil
+}
+
+// modifyQPToRTS transitions the QP to RTS state
+func (m *RDMAManager) modifyQPToRTS(rnic *RNIC, qp *C.struct_ibv_qp, psn uint32) error {
+	var qpAttr C.struct_ibv_qp_attr
 	qpAttr.qp_state = C.IBV_QPS_RTS
 	qpAttr.sq_psn = C.uint32_t(psn)
 	if ret := C.ibv_modify_qp(qp, &qpAttr, C.IBV_QP_STATE|C.IBV_QP_SQ_PSN); ret != 0 {
-		C.ibv_destroy_qp(qp)
-		C.ibv_destroy_cq(cq)
-		C.ibv_destroy_comp_channel(compChannel)
-		return nil, fmt.Errorf("failed to modify QP to RTS: %d", ret)
+		return fmt.Errorf("failed to modify QP to RTS: %d", ret)
 	}
 	log.Debug().Str("device", rnic.DeviceName).Uint32("qpn", uint32(qp.qp_num)).Msg("QP state changed to RTS")
 
 	// Query QP state after RTS
+	var queriedQPAttr C.struct_ibv_qp_attr
+	var queriedQPInitAttr C.struct_ibv_qp_init_attr
 	if C.ibv_query_qp(qp, &queriedQPAttr, C.IBV_QP_STATE, &queriedQPInitAttr) == 0 {
 		log.Debug().Str("device", rnic.DeviceName).Uint32("qpn", uint32(qp.qp_num)).Uint32("state", uint32(queriedQPAttr.qp_state)).Msg("Queried QP state after RTS")
 	} else {
 		log.Warn().Str("device", rnic.DeviceName).Uint32("qpn", uint32(qp.qp_num)).Msg("Failed to query QP state after RTS")
 	}
 
+	return nil
+}
+
+// allocateMemoryResources allocates memory buffers and registers memory regions
+func (m *RDMAManager) allocateMemoryResources(rnic *RNIC, qp *C.struct_ibv_qp, cq *C.struct_ibv_cq, compChannel *C.struct_ibv_comp_channel) (unsafe.Pointer, unsafe.Pointer, *C.struct_ibv_mr, *C.struct_ibv_mr, error) {
 	// Allocate send buffers
 	bufferSize := C.size_t(MRSize + GRHSize)
 	sendBuf := C.aligned_alloc(C.size_t(os.Getpagesize()), bufferSize)
 	if sendBuf == nil {
-		C.ibv_destroy_qp(qp)
-		C.ibv_destroy_cq(cq)
-		C.ibv_destroy_comp_channel(compChannel)
-		return nil, fmt.Errorf("failed to allocate send buffer")
+		return nil, nil, nil, nil, fmt.Errorf("failed to allocate send buffer")
 	}
 	C.memset(sendBuf, 0, bufferSize)
 
 	recvBuf := C.aligned_alloc(C.size_t(os.Getpagesize()), bufferSize)
 	if recvBuf == nil {
 		C.free(sendBuf)
-		C.ibv_destroy_qp(qp)
-		C.ibv_destroy_cq(cq)
-		C.ibv_destroy_comp_channel(compChannel)
-		return nil, fmt.Errorf("failed to allocate receive buffer")
+		return nil, nil, nil, nil, fmt.Errorf("failed to allocate receive buffer")
 	}
 	C.memset(recvBuf, 0, bufferSize)
 
 	// Register memory regions with all necessary access flags
-	sendMR := C.ibv_reg_mr(rnic.PD, sendBuf, bufferSize,
-		C.IBV_ACCESS_LOCAL_WRITE)
+	sendMR := C.ibv_reg_mr(rnic.PD, sendBuf, bufferSize, C.IBV_ACCESS_LOCAL_WRITE)
 	if sendMR == nil {
 		C.free(recvBuf)
 		C.free(sendBuf)
-		C.ibv_destroy_qp(qp)
-		C.ibv_destroy_cq(cq)
-		C.ibv_destroy_comp_channel(compChannel)
-		return nil, fmt.Errorf("failed to register send buffer MR")
+		return nil, nil, nil, nil, fmt.Errorf("failed to register send buffer MR")
 	}
 
 	recvMR := C.ibv_reg_mr(rnic.PD, recvBuf, bufferSize, C.IBV_ACCESS_LOCAL_WRITE)
@@ -793,67 +924,52 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC) (*UDQueue, error) {
 		C.ibv_dereg_mr(sendMR)
 		C.free(recvBuf)
 		C.free(sendBuf)
-		C.ibv_destroy_qp(qp)
-		C.ibv_destroy_cq(cq)
-		C.ibv_destroy_comp_channel(compChannel)
-		return nil, fmt.Errorf("failed to register receive buffer MR")
+		return nil, nil, nil, nil, fmt.Errorf("failed to register receive buffer MR")
 	}
 
-	// Initialize the UDQueue with all settings
-	udQueue := &UDQueue{
-		RNIC:         rnic,
-		QP:           qp,
-		CQ:           cq,
-		CompChannel:  compChannel,
-		SendMR:       sendMR,
-		RecvMR:       recvMR,
-		SendBuf:      sendBuf,
-		RecvBuf:      recvBuf,
-		QPN:          uint32(qp.qp_num),
-		sendCompChan: make(chan *C.struct_ibv_wc, SendCompChanBufferSize), // Buffered channel
-		recvCompChan: make(chan *C.struct_ibv_wc, RecvCompChanBufferSize), // Buffered channel
-		errChan:      make(chan error, ErrChanBufferSize),                 // Buffered channel
-		cqPollerDone: make(chan struct{}),
-	}
+	return sendBuf, recvBuf, sendMR, recvMR, nil
+}
 
-	// Store the UDQueue in the maps
-	m.UDQueues[rnic.GID] = udQueue
-	rnic.UDQueues[rnic.GID] = udQueue
-
-	// Start CQ polling goroutine
-	udQueue.StartCQPoller()
-
-	// Post initial receive buffers
-	numInitialRecvBuffers := 32 // Increased initial buffers slightly
-	log.Info().
-		Str("device", rnic.DeviceName).
-		Uint32("qpn", udQueue.QPN).
-		Int("num_initial_recv_buffers_to_post", numInitialRecvBuffers).
-		Msg("Attempting to post initial receive buffers")
-
-	for i := 0; i < numInitialRecvBuffers; i++ {
-		if err := udQueue.PostRecv(); err != nil {
-			log.Error().Err(err).
-				Str("device", rnic.DeviceName).
-				Uint32("qpn", udQueue.QPN).
-				Int("posted_count", i).
-				Int("total_to_post", numInitialRecvBuffers).
-				Msg("Failed to post an initial receive buffer")
-			// Cleanup and return error
-			udQueue.Destroy() // Important to clean up partially created queue
-			return nil, fmt.Errorf("failed to post initial receive buffer %d/%d for device %s qpn %d: %w", i+1, numInitialRecvBuffers, rnic.DeviceName, udQueue.QPN, err)
+// CreateSenderAndResponderQueues creates both sender and responder UDQueues for a given RNIC
+func (m *RDMAManager) CreateSenderAndResponderQueues(rnic *RNIC) error {
+	if !rnic.IsOpen {
+		if err := rnic.OpenDevice(); err != nil {
+			return err
 		}
 	}
 
-	log.Info().
-		Str("device", rnic.DeviceName).
-		Uint32("qpn", udQueue.QPN).
-		Uint32("psn", psn).
-		Uint32("qkey", qkey).
-		Int("bufferSize", int(bufferSize)).
-		Msg("Created UD queue pair")
+	// Create sender queue
+	senderQueue, err := m.CreateUDQueue(rnic, UDQueueTypeSender)
+	if err != nil {
+		return fmt.Errorf("failed to create sender queue for device %s: %w", rnic.DeviceName, err)
+	}
+	log.Info().Str("device", rnic.DeviceName).Uint32("qpn", senderQueue.QPN).Msg("Created sender queue")
 
-	return udQueue, nil
+	// Create responder queue
+	responderQueue, err := m.CreateUDQueue(rnic, UDQueueTypeResponder)
+	if err != nil {
+		// Clean up sender queue if responder queue creation fails
+		senderQueue.Destroy()
+		return fmt.Errorf("failed to create responder queue for device %s: %w", rnic.DeviceName, err)
+	}
+	log.Info().Str("device", rnic.DeviceName).Uint32("qpn", responderQueue.QPN).Msg("Created responder queue")
+
+	rnic.SenderQueue = senderQueue
+	rnic.ResponderQueue = responderQueue
+
+	return nil
+}
+
+// getQueueTypeString returns the string representation of the UDQueueType
+func getQueueTypeString(queueType UDQueueType) string {
+	switch queueType {
+	case UDQueueTypeSender:
+		return "Sender"
+	case UDQueueTypeResponder:
+		return "Responder"
+	default:
+		return "Unknown"
+	}
 }
 
 // PostRecv posts a receive work request

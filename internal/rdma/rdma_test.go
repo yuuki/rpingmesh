@@ -1,6 +1,7 @@
 package rdma
 
 import (
+	"context"
 	"os"
 	"testing"
 	"time"
@@ -383,7 +384,9 @@ func TestEndToEndWithRealHardware(t *testing.T) {
 			t.Logf("Successfully sent probe packet at %v", sendTime)
 
 			// Try to receive the packet (with short timeout)
-			packet, receiveTime, wc, err := udQueue.ReceivePacket(100 * time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			packet, receiveTime, wc, err := udQueue.ReceivePacket(ctx)
 			if err != nil {
 				t.Logf("Receive failed (may be expected): %v", err)
 			} else if packet != nil {

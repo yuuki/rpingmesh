@@ -25,6 +25,34 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
+// Constants
+const (
+	// Uploader constants
+	UploaderBatchSize    = 1000
+	UploaderMaxQueueSize = 10000
+
+	// Goroutine counts
+	NumBackgroundGoroutines = 2
+
+	// Timing constants
+	PinglistUpdateInterval = 5 * time.Minute
+	MetricsShutdownTimeout = 3 * time.Second
+
+	// Tracer constants
+	PeriodicTraceHopLimit = 3
+
+	// Signal constants
+	ShutdownSignals = "SIGINT, SIGTERM"
+)
+
+// Log levels
+const (
+	LogLevelDebug = "debug"
+	LogLevelInfo  = "info"
+	LogLevelWarn  = "warn"
+	LogLevelError = "error"
+)
+
 // Agent represents the RPingMesh agent
 type Agent struct {
 	ctx              context.Context
@@ -171,7 +199,7 @@ func (a *Agent) Start() error {
 			} else {
 				// Start periodic tracing to targets
 				if a.tracer != nil {
-					a.tracer.StartPeriodicTracing(a.ctx, primaryRnic.GID, targets, a.config.TracerouteIntervalMS, 3)
+					a.tracer.StartPeriodicTracing(a.ctx, primaryRnic.GID, targets, a.config.TracerouteIntervalMS, PeriodicTraceHopLimit)
 				}
 			}
 		}
@@ -182,8 +210,8 @@ func (a *Agent) Start() error {
 		a.config.AnalyzerAddr,
 		a.agentState.GetAgentID(),
 		a.config.DataUploadIntervalMS,
-		1000,  // Batch size
-		10000, // Max queue size
+		UploaderBatchSize,    // Batch size
+		UploaderMaxQueueSize, // Max queue size
 	)
 	log.Debug().Msg("Uploader created")
 
@@ -199,7 +227,7 @@ func (a *Agent) Start() error {
 	}
 
 	// Start background goroutines
-	a.wg.Add(2)
+	a.wg.Add(NumBackgroundGoroutines)
 	go a.resultHandler()
 	go a.pinglistUpdater()
 	log.Debug().Msg("Background goroutines started")
@@ -352,7 +380,7 @@ func (a *Agent) pinglistUpdater() {
 	a.updatePinglist()
 
 	// Set up periodic update
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(PinglistUpdateInterval)
 	defer ticker.Stop()
 
 	for {
@@ -464,7 +492,7 @@ func (a *Agent) Stop() {
 	// Shutdown metrics if enabled
 	if a.metrics != nil {
 		log.Debug().Msg("Shutting down metrics")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), MetricsShutdownTimeout)
 		defer cancel()
 		if err := a.metrics.Shutdown(shutdownCtx); err != nil {
 			log.Error().Err(err).Msg("Failed to shutdown metrics properly")
@@ -529,13 +557,13 @@ func initLogging(level string) {
 
 	// Set log level based on config
 	switch level {
-	case "debug":
+	case LogLevelDebug:
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
-	case "info":
+	case LogLevelInfo:
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	case "warn":
+	case LogLevelWarn:
 		zerolog.SetGlobalLevel(zerolog.WarnLevel)
-	case "error":
+	case LogLevelError:
 		zerolog.SetGlobalLevel(zerolog.ErrorLevel)
 	default:
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)

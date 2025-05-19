@@ -26,13 +26,18 @@ type Prober struct {
 	running      bool
 }
 
+const (
+	probeResultChanBufferSize = 1000
+	responderStatsInterval    = 30 * time.Second
+)
+
 // NewProber creates a new prober
 func NewProber(rdmaManager *rdma.RDMAManager, agentState *state.AgentState, timeoutMs uint32) *Prober {
 	return &Prober{
 		rdmaManager:  rdmaManager,
 		agentState:   agentState,
 		sequenceNum:  0,
-		probeResults: make(chan *agent_analyzer.ProbeResult, 1000),
+		probeResults: make(chan *agent_analyzer.ProbeResult, probeResultChanBufferSize),
 		timeout:      time.Duration(timeoutMs) * time.Millisecond,
 		stopCh:       make(chan struct{}),
 		running:      false,
@@ -97,7 +102,7 @@ func (p *Prober) ProbeTarget(
 	// Pre-post a receive buffer *before* we send the probe to avoid a race where the
 	// responder's ACK arrives earlier than our first PostRecv inside ReceivePacket.
 	if err := srcUdQueue.PostRecv(); err != nil {
-		log.Error().Err(err).
+		log.Warn().Err(err).
 			Str("gid", sourceRnic.GID).
 			Uint32("qpn", srcUdQueue.QPN).
 			Msg("ProbeTarget: failed to pre-post receive buffer")
@@ -277,7 +282,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 	)
 
 	// Log stats periodically
-	statsTicker := time.NewTicker(30 * time.Second)
+	statsTicker := time.NewTicker(responderStatsInterval)
 	defer statsTicker.Stop()
 
 	for {

@@ -99,15 +99,6 @@ func (p *Prober) ProbeTarget(
 		log.Error().Str("gid", sourceRnic.GID).Msg("Failed to get UDQueue for source RNIC in ProbeTarget")
 		return
 	}
-	// Pre-post a receive buffer *before* we send the probe to avoid a race where the
-	// responder's ACK arrives earlier than our first PostRecv inside ReceivePacket.
-	if err := srcUdQueue.PostRecv(); err != nil {
-		log.Warn().Err(err).
-			Str("gid", sourceRnic.GID).
-			Uint32("qpn", srcUdQueue.QPN).
-			Msg("ProbeTarget: failed to pre-post receive buffer")
-		// We can still continue; ReceivePacket will attempt again, but chances of race increase.
-	}
 
 	// Create result object
 	result := &agent_analyzer.ProbeResult{
@@ -261,16 +252,6 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 		Uint32("qpn", udq.QPN).
 		Str("gid", udq.RNIC.GID).
 		Msg("Starting responder loop to handle incoming probe packets on specific UDQueue")
-
-	// Post initial receive buffer for this UDQueue
-	if err := udq.PostRecv(); err != nil {
-		log.Error().
-			Err(err).
-			Str("device", udq.RNIC.DeviceName).
-			Uint32("qpn", udq.QPN).
-			Msg("ResponderLoop: Failed to post initial receive buffer")
-		return // Or handle error appropriately, e.g., retry or stop this specific responder
-	}
 
 	// Track statistics for debugging
 	var (

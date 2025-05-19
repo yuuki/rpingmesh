@@ -102,6 +102,7 @@ package rdma
 import "C"
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"net"
@@ -570,47 +571,59 @@ func (u *UDQueue) StartCQPoller() {
 						continue
 					}
 
-					// Distinguish between send and receive
-					// If byte_len is 0, it's a send completion, otherwise it's a receive completion
-					if completion.byte_len == 0 {
+					// Distinguish between send and receive based on opcode
+					if completion.opcode == C.IBV_WC_SEND {
 						// Send completion event
-						// Copy the original wc and send it
 						wcCopy := completion
 						select {
 						case u.sendCompChan <- &wcCopy:
-							// Send completed
 							log.Debug().
 								Str("device", u.RNIC.DeviceName).
 								Uint32("qpn", u.QPN).
+								Uint32("wc_opcode", completion.opcode).
 								Uint32("byte_len", uint32(completion.byte_len)).
-								Msg("Send completion event")
+								Msg("Send completion event dispatched to sendCompChan")
 						default:
 							// Channel is blocked (no receiver)
 							log.Warn().
 								Str("device", u.RNIC.DeviceName).
 								Uint32("qpn", u.QPN).
+								Uint32("wc_opcode", completion.opcode).
 								Uint32("byte_len", uint32(completion.byte_len)).
-								Msg("Send completion channel is blocked, discarding event")
+								Msg("Send completion channel (sendCompChan) is blocked, discarding event")
 						}
-					} else {
+					} else if completion.opcode == C.IBV_WC_RECV {
 						// Receive completion event
-						// Copy the original wc and send it
 						wcCopy := completion
 						select {
 						case u.recvCompChan <- &wcCopy:
 							log.Debug().
 								Str("device", u.RNIC.DeviceName).
 								Uint32("qpn", u.QPN).
+								Uint32("wc_opcode", completion.opcode).
 								Uint32("byte_len", uint32(completion.byte_len)).
-								Msg("Received completion event")
+								Msg("Receive completion event dispatched to recvCompChan")
 						default:
 							// Channel is blocked (no receiver)
 							log.Warn().
 								Str("device", u.RNIC.DeviceName).
 								Uint32("qpn", u.QPN).
+								Uint32("wc_opcode", completion.opcode).
 								Uint32("byte_len", uint32(completion.byte_len)).
-								Msg("Receive completion channel is blocked, discarding event")
+								Msg("Receive completion channel (recvCompChan) is blocked, discarding event")
 						}
+					} else {
+						// Handle other completion types or log an error/warning
+						log.Error().
+							Str("device", u.RNIC.DeviceName).
+							Uint32("qpn", u.QPN).
+							Uint32("wc_qp_num", uint32(completion.qp_num)).
+							Uint32("wc_status", uint32(completion.status)).
+							Uint32("wc_opcode", completion.opcode).
+							Uint32("byte_len", uint32(completion.byte_len)).
+							Msgf("CQPoller: Polled an event with unhandled opcode: %d", completion.opcode)
+						// Optionally, push to errChan if this is considered a critical error for the application
+						// u.errChan <- fmt.Errorf("unhandled completion opcode: %d on QPN %d", opcodeValue, u.QPN)
 					}
 				}
 			}
@@ -962,7 +975,7 @@ func (u *UDQueue) SendProbePacket(
 }
 
 // ReceivePacket waits for and processes a received packet using completion channel
-func (u *UDQueue) ReceivePacket(timeout time.Duration) (*ProbePacket, time.Time, *WorkCompletion, error) {
+func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *WorkCompletion, error) {
 	// Post another receive buffer to ensure we don't run out
 	if err := u.PostRecv(); err != nil {
 		log.Warn().Err(err).Msg("Failed to post additional receive buffer before waiting for completion")
@@ -1092,8 +1105,8 @@ func (u *UDQueue) ReceivePacket(timeout time.Duration) (*ProbePacket, time.Time,
 
 	case err := <-u.errChan:
 		return nil, time.Time{}, nil, fmt.Errorf("error during receive: %w", err)
-	case <-time.After(timeout):
-		return nil, time.Time{}, nil, fmt.Errorf("receive timeout after %v", timeout)
+	case <-ctx.Done(): // Context cancelled or timed out
+		return nil, time.Time{}, nil, ctx.Err()
 	}
 }
 
@@ -1243,7 +1256,7 @@ func (u *UDQueue) SendSecondAckPacket(
 	case err := <-u.errChan:
 		// Error occurred
 		return fmt.Errorf("error during Second ACK send: %w", err)
-	case <-time.After(5 * time.Second): // Timeout
+	case <-time.After(10 * time.Millisecond): // Timeout
 		return fmt.Errorf("timeout waiting for Second ACK send completion")
 	}
 }
@@ -1297,7 +1310,7 @@ func (u *UDQueue) SendAckPacket(
 	case err := <-u.errChan:
 		// Error occurred
 		return fmt.Errorf("error during ACK send: %w", err)
-	case <-time.After(5 * time.Second): // Timeout
+	case <-time.After(10 * time.Millisecond): // Timeout
 		return fmt.Errorf("timeout waiting for ACK send completion")
 	}
 }

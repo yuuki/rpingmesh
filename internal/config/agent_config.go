@@ -36,7 +36,7 @@ func SetupAgentFlags(flagSet *pflag.FlagSet) {
 	flagSet.String("controller-addr", "localhost:50051", "Controller address")
 	flagSet.String("analyzer-addr", "localhost:50052", "Analyzer address")
 	flagSet.String("log-level", "info", "Log level (debug, info, warn, error)")
-	flagSet.Uint32("probe-interval-ms", 1000, "Probe interval in milliseconds")
+	flagSet.Uint32("probe-interval-ms", 500, "Probe interval in milliseconds")
 	flagSet.Uint32("timeout-ms", 500, "Timeout in milliseconds")
 	flagSet.Uint32("data-upload-interval-ms", 10000, "Data upload interval in milliseconds")
 	flagSet.Uint32("traceroute-interval-ms", 300000, "Traceroute interval in milliseconds")

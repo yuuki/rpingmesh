@@ -1,9 +1,7 @@
-.PHONY: build agent-up debugfs-volume generate-config generate-bpf test-controller test-agent test clean-compose clean build-local
+.PHONY: build agent-up debugfs-volume generate-config generate-bpf test-controller test-agent test clean-compose build-local
 
 # Default configuration
-IMAGE_NAME := rpingmesh-agent
 VERSION := 0.1.0
-TAG := $(IMAGE_NAME):$(VERSION)
 KERNEL_VERSION := 5.10.0-34
 
 build: build-controller build-agent
@@ -13,16 +11,16 @@ build-controller:
 	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml build controller-builder
 	@echo "Copying controller binary from container..."
 	@chmod +x scripts/copy-from-image.sh
-	@./scripts/copy-from-image.sh rpingmesh-controller-builder controller-temp /app/controller ./bin/controller
-	@./scripts/copy-from-image.sh rpingmesh-controller-builder controller-temp /app/controller.yaml ./bin/controller.yaml
+	@./scripts/copy-from-image.sh rpingmesh-controller-builder controller-temp /app/controller ./bin/rpingmesh-controller
+	@./scripts/copy-from-image.sh rpingmesh-controller-builder controller-temp /app/controller.yaml ./bin/rpingmesh-controller.yaml
 
 build-agent:
 	@echo "Building agent with Docker Compose"
 	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml build agent-builder
 	@echo "Copying agent binary from container..."
 	@chmod +x scripts/copy-from-image.sh
-	@./scripts/copy-from-image.sh rpingmesh-agent-builder agent-temp /app/agent ./bin/agent
-	@./scripts/copy-from-image.sh rpingmesh-agent-builder agent-temp /app/agent.yaml ./bin/agent.yaml
+	@./scripts/copy-from-image.sh rpingmesh-agent-builder agent-temp /app/agent ./bin/rpingmesh-agent
+	@./scripts/copy-from-image.sh rpingmesh-agent-builder agent-temp /app/agent.yaml ./bin/rpingmesh-agent.yaml
 
 # Run with Docker Compose
 agent-up:
@@ -46,15 +44,10 @@ clean-compose:
 	@docker compose down -v
 	@docker compose rm -f
 
-# Clean up Docker images
-clean:
-	@echo "Removing Docker image: $(TAG)"
-	@docker rmi $(TAG) || true
-
 build-local:
 	@echo "Building controller and agent locally"
-	@go build -buildvcs=false -o ./bin/controller ./cmd/controller
-	@go build -buildvcs=false -o ./bin/agent ./cmd/agent
+	@go build -buildvcs=false -o ./bin/rpingmesh-controller ./cmd/controller
+	@go build -buildvcs=false -o ./bin/rpingmesh-agent ./cmd/agent
 
 # Generate bpf2go code locally (requires local dependencies)
 ARCH_SUFFIX := $(shell if [ -d /usr/include/$$(uname -m)-linux-gnu ]; then echo "$$(uname -m)-linux-gnu"; fi)

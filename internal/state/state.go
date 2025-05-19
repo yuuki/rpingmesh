@@ -8,6 +8,11 @@ import (
 	"github.com/yuuki/rpingmesh/internal/rdma"
 )
 
+// Constants
+const (
+	DefaultLocalTorID = "" // Default value for local Tor ID
+)
+
 // AgentState holds the current state of the agent
 type AgentState struct {
 	agentID       string
@@ -24,7 +29,7 @@ type AgentState struct {
 func NewAgentState(agentID, localTorID string) *AgentState {
 	return &AgentState{
 		agentID:    agentID,
-		localTorID: localTorID,
+		localTorID: DefaultLocalTorID,
 		udQueues:   make(map[string]*rdma.UDQueue),
 	}
 }

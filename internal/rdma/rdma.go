@@ -115,11 +115,30 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-// Constants for RDMA operations
+// Constants
 const (
-	MRSize   = 4096 // Size of memory region for send/recv buffers
-	GRHSize  = 40   // Size of GRH header
-	GIDIndex = 3    // GID index for IPv4-mapped IPv6 addresses  TODO: make it configurable
+	// Protocol constants
+	DefaultQKey uint32 = 0x11111111 // Standard QKey for UD operations
+	GRHSize            = 40         // Size of GRH header
+	GIDIndex           = 3          // GID index for IPv4-mapped IPv6 addresses
+
+	// Buffer and Queue sizes
+	MRSize                 = 4096                  // Size of memory region for send/recv buffers
+	CQSize                 = 50                    // Size of Completion Queue
+	InitialRecvBuffers     = 32                    // Number of initial receive buffers to post
+	CQPollerSleepDuration  = 10 * time.Microsecond // Sleep duration in CQ poller when no events
+	SendCompChanBufferSize = 100                   // Buffer size for send completion channel
+	RecvCompChanBufferSize = 100                   // Buffer size for receive completion channel
+	ErrChanBufferSize      = 100                   // Buffer size for error channel
+	MaxWorkCompletions     = 10                    // Max number of work completions to poll at once
+
+	// Timeout durations
+	SendCompletionTimeout = 5 * time.Second       // Timeout for waiting for send completion
+	AckSendTimeout        = 10 * time.Millisecond // Timeout for waiting for ACK send completion
+
+	// GRH/IPv4 parsing constants
+	IPv4HeaderOffset    = 20 // Offset to the supposed IPv4 header within the GRH region
+	IPv4HeaderMinLength = 20 // Minimum length of an IPv4 header
 )
 
 // RNIC represents an RDMA NIC device
@@ -547,7 +566,7 @@ func (u *UDQueue) StartCQPoller() {
 				if ne == 0 {
 					// No completion events
 					// Add a short sleep to reduce CPU usage
-					time.Sleep(10 * time.Microsecond)
+					time.Sleep(CQPollerSleepDuration)
 					continue
 				}
 
@@ -664,7 +683,7 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC) (*UDQueue, error) {
 	}
 
 	// Create completion queue with more entries for better throughput
-	cq := C.ibv_create_cq(rnic.Context, 50, nil, compChannel, 0)
+	cq := C.ibv_create_cq(rnic.Context, CQSize, nil, compChannel, 0)
 	if cq == nil {
 		C.ibv_destroy_comp_channel(compChannel)
 		return nil, fmt.Errorf("failed to create CQ for device %s", rnic.DeviceName)
@@ -674,7 +693,7 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC) (*UDQueue, error) {
 	psn := uint32(rand.Int31n(1 << 24))
 
 	// Use standard QKey for UD operations (0x11111111 as in ud_pingpong.c)
-	const qkey uint32 = 0x11111111
+	const qkey uint32 = DefaultQKey
 
 	// QP creation attribute setting to standard
 	var qpInitAttr C.struct_ibv_qp_init_attr
@@ -812,9 +831,9 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC) (*UDQueue, error) {
 		SendBuf:      sendBuf,
 		RecvBuf:      recvBuf,
 		QPN:          uint32(qp.qp_num),
-		sendCompChan: make(chan *C.struct_ibv_wc, 100), // Buffered channel
-		recvCompChan: make(chan *C.struct_ibv_wc, 100), // Buffered channel
-		errChan:      make(chan error, 100),            // Buffered channel
+		sendCompChan: make(chan *C.struct_ibv_wc, SendCompChanBufferSize), // Buffered channel
+		recvCompChan: make(chan *C.struct_ibv_wc, RecvCompChanBufferSize), // Buffered channel
+		errChan:      make(chan error, ErrChanBufferSize),                 // Buffered channel
 		cqPollerDone: make(chan struct{}),
 	}
 
@@ -970,7 +989,7 @@ func (u *UDQueue) SendProbePacket(
 		u.SendMR.lkey,
 		ah,
 		C.uint32_t(targetQPN),
-		C.uint32_t(0x11111111),
+		C.uint32_t(DefaultQKey),
 	); ret != 0 {
 		return time.Time{}, fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
@@ -986,7 +1005,7 @@ func (u *UDQueue) SendProbePacket(
 	case err := <-u.errChan:
 		// Error occurred
 		return time.Time{}, fmt.Errorf("error during send: %w", err)
-	case <-time.After(5 * time.Second): // Timeout
+	case <-time.After(SendCompletionTimeout): // Timeout
 		return time.Time{}, fmt.Errorf("timeout waiting for send completion")
 	}
 }
@@ -1140,7 +1159,7 @@ func (u *UDQueue) SendFirstAckPacket(
 	receiveTime time.Time,
 ) (time.Time, error) {
 	// Use consistent QKey across all UD operations (0x11111111 as in ud_pingpong.c)
-	const qkey uint32 = 0x11111111
+	const qkey uint32 = DefaultQKey
 
 	// Use the same flow label from the original packet to ensure the response follows the same path
 	// In production environment, might need to use 0 for all responses to avoid ECMP issues
@@ -1199,7 +1218,7 @@ func (u *UDQueue) SendFirstAckPacket(
 	case err := <-u.errChan:
 		// Error occurred
 		return time.Time{}, fmt.Errorf("error during First ACK send: %w", err)
-	case <-time.After(5 * time.Second): // Timeout
+	case <-time.After(AckSendTimeout): // Timeout
 		return time.Time{}, fmt.Errorf("timeout waiting for First ACK send completion")
 	}
 }
@@ -1214,7 +1233,7 @@ func (u *UDQueue) SendSecondAckPacket(
 	sendCompletionTime time.Time,
 ) error {
 	// Use consistent QKey across all UD operations (0x11111111 as in ud_pingpong.c)
-	const qkey uint32 = 0x11111111
+	const qkey uint32 = DefaultQKey
 
 	// Use flow label 0 for ACK packets to ensure consistent path
 	flowLabel := uint32(0)
@@ -1277,7 +1296,7 @@ func (u *UDQueue) SendSecondAckPacket(
 	case err := <-u.errChan:
 		// Error occurred
 		return fmt.Errorf("error during Second ACK send: %w", err)
-	case <-time.After(10 * time.Millisecond): // Timeout
+	case <-time.After(AckSendTimeout): // Timeout
 		return fmt.Errorf("timeout waiting for Second ACK send completion")
 	}
 }
@@ -1291,7 +1310,7 @@ func (u *UDQueue) SendAckPacket(
 	receiveTime time.Time,
 ) error {
 	// Use standard QKey for UD operations (0x11111111 as in ud_pingpong.c)
-	const qkey uint32 = 0x11111111
+	const qkey uint32 = DefaultQKey
 
 	ah, err := u.CreateAddressHandle(targetGID, 0)
 	if err != nil {
@@ -1331,7 +1350,7 @@ func (u *UDQueue) SendAckPacket(
 	case err := <-u.errChan:
 		// Error occurred
 		return fmt.Errorf("error during ACK send: %w", err)
-	case <-time.After(10 * time.Millisecond): // Timeout
+	case <-time.After(AckSendTimeout): // Timeout
 		return fmt.Errorf("timeout waiting for ACK send completion")
 	}
 }

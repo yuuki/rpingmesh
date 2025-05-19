@@ -12,6 +12,17 @@ import (
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
+// Constants
+const (
+	// Probe Types
+	ProbeTypeTorMesh  = "TOR_MESH"
+	ProbeTypeInterTor = "INTER_TOR"
+
+	// Default Values
+	DefaultFlowLabel = 0  // Default flow label for ACK packets
+	EmptyIPString    = "" // Empty string for IP address checks
+)
+
 // PingTarget represents a target for probing
 type PingTarget struct {
 	GID        string
@@ -151,9 +162,9 @@ func (c *ClusterMonitor) probeAllTargets() {
 		// Determine probe type based on TOR relationship
 		var probeType string
 		if target.TorID == c.agentState.GetLocalTorID() {
-			probeType = "TOR_MESH"
+			probeType = ProbeTypeTorMesh
 		} else {
-			probeType = "INTER_TOR"
+			probeType = ProbeTypeInterTor
 		}
 
 		// Create target RNIC info for the result
@@ -174,7 +185,7 @@ func (c *ClusterMonitor) probeAllTargets() {
 			// If target.GID is an IP, prefer looking up by target.IPAddress first as it's more explicit.
 			// If target.IPAddress is empty or also an IP, then use target.GID (which is an IP) for lookup if different.
 			lookupIP := target.IPAddress
-			if lookupIP == "" || net.ParseIP(lookupIP) == nil { // If target.IPAddress is not a valid IP, fallback to GID if it's an IP
+			if lookupIP == EmptyIPString || net.ParseIP(lookupIP) == nil { // If target.IPAddress is not a valid IP, fallback to GID if it's an IP
 				lookupIP = target.GID
 			}
 

@@ -377,7 +377,9 @@ func TestEndToEndWithRealHardware(t *testing.T) {
 	// Only attempt to send to self if we have proper permissions and this is not a CI environment
 	if os.Getenv("TEST_RDMA_LOOPBACK") == "1" {
 		// Send a probe to ourselves (loopback test) - requires special permissions
-		sendTime, err := udQueue.SendProbePacket(device.GID, udQueue.QPN, 12345, 0, 0)
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		sendTime, err := udQueue.SendProbePacket(ctx, device.GID, udQueue.QPN, 12345, 0, 0)
 		if err != nil {
 			t.Logf("Send probe failed (expected in some environments): %v", err)
 		} else {

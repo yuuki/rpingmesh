@@ -21,8 +21,8 @@ type testUDQueue struct {
 }
 
 // SendProbePacket implements the needed method for probing
-func (m *testUDQueue) SendProbePacket(targetGID string, targetQPN uint32, sequenceNum uint64, sourcePort uint32, flowLabel uint32) (time.Time, error) {
-	args := m.Called(targetGID, targetQPN, sequenceNum, sourcePort, flowLabel)
+func (m *testUDQueue) SendProbePacket(ctx context.Context, targetGID string, targetQPN uint32, sequenceNum uint64, sourcePort uint32, flowLabel uint32) (time.Time, error) {
+	args := m.Called(ctx, targetGID, targetQPN, sequenceNum, sourcePort, flowLabel)
 	return args.Get(0).(time.Time), args.Error(1)
 }
 

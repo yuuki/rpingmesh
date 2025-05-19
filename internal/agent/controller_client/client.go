@@ -3,7 +3,6 @@ package controller_client
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -19,7 +18,6 @@ type ControllerClient struct {
 	addr   string
 	conn   *grpc.ClientConn
 	client controller_agent.ControllerServiceClient
-	mutex  sync.Mutex
 }
 
 // NewControllerClient creates a new controller client
@@ -31,9 +29,6 @@ func NewControllerClient(addr string) *ControllerClient {
 
 // Connect connects to the controller service
 func (c *ControllerClient) Connect() error {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
 	// If already connected, return
 	if c.conn != nil {
 		return nil
@@ -76,9 +71,6 @@ func (c *ControllerClient) Connect() error {
 
 // Close closes the connection to the controller
 func (c *ControllerClient) Close() error {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
 	if c.conn != nil {
 		if err := c.conn.Close(); err != nil {
 			return err
@@ -96,9 +88,6 @@ func (c *ControllerClient) RegisterAgent(
 	agentIP string,
 	rnics []*rdma.RNIC,
 ) error {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
 	if c.client == nil {
 		return fmt.Errorf("not connected to controller")
 	}
@@ -148,9 +137,6 @@ func (c *ControllerClient) GetPinglist(
 	requesterRnic *rdma.RNIC,
 	pinglistType controller_agent.PinglistRequest_PinglistType,
 ) ([]*controller_agent.PingTarget, uint32, uint32, error) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
 	if c.client == nil {
 		return nil, 0, 0, fmt.Errorf("not connected to controller")
 	}
@@ -193,9 +179,6 @@ func (c *ControllerClient) GetPinglist(
 
 // GetTargetRnicInfo gets the target RNIC info from the controller
 func (c *ControllerClient) GetTargetRnicInfo(targetIP string, targetGID string) (*controller_agent.RnicInfo, error) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
 	if c.client == nil {
 		return nil, fmt.Errorf("not connected to controller")
 	}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/probe"
+	"github.com/yuuki/rpingmesh/internal/rdma"
 	"github.com/yuuki/rpingmesh/internal/state"
 	"github.com/yuuki/rpingmesh/proto/agent_analyzer"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
@@ -144,14 +145,37 @@ func (c *ClusterMonitor) probeAllTargets() {
 		return
 	}
 
-	// Get local RNIC
-	localRnic := c.agentState.GetPrimaryRNIC()
-	if localRnic == nil {
-		log.Error().Msg("No local RNIC available for probing")
+	// Get all local RNICs
+	localRnics := c.agentState.GetDetectedRNICs()
+	if len(localRnics) == 0 {
+		log.Error().Msg("No local RNICs available for probing")
 		return
 	}
 
-	// Probe each target
+	// Create a wait group to track the completion of all goroutines
+	var wg sync.WaitGroup
+
+	// For each local RNIC, create a goroutine to probe targets
+	for _, localRnic := range localRnics {
+		// Skip if the RNIC is nil or doesn't have a valid GID
+		if localRnic == nil || localRnic.GID == "" {
+			continue
+		}
+
+		// Launch a goroutine for each RNIC
+		wg.Add(1)
+		go func(rnic *rdma.RNIC) {
+			defer wg.Done()
+			c.probeTargetsFromRnic(rnic, pinglist)
+		}(localRnic)
+	}
+
+	// Wait for all probing goroutines to complete
+	wg.Wait()
+}
+
+// probeTargetsFromRnic sends probes to all targets from a specific source RNIC
+func (c *ClusterMonitor) probeTargetsFromRnic(localRnic *rdma.RNIC, pinglist []PingTarget) {
 	for _, target := range pinglist {
 		// Skip probing ourselves
 		if target.GID == localRnic.GID { // Initial check, might be comparing IP string to GID string

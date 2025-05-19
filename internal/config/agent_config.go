@@ -24,6 +24,7 @@ type AgentConfig struct {
 	MetricsEnabled       bool
 	AnalyzerEnabled      bool
 	TracerEnabled        bool
+	AllowedDeviceNames   []string
 }
 
 // SetupAgentFlags sets up the command line flags for the agent
@@ -46,6 +47,7 @@ func SetupAgentFlags(flagSet *pflag.FlagSet) {
 	flagSet.Bool("metrics-enabled", true, "Enable OpenTelemetry metrics")
 	flagSet.Bool("analyzer-enabled", false, "Enable data upload to Analyzer")
 	flagSet.Bool("tracer-enabled", false, "Enable traceroute functionality")
+	flagSet.StringSlice("allowed-device-names", []string{}, "List of allowed device names for pinglist filtering (whitelist)")
 }
 
 // LoadAgentConfig loads the configuration for an agent from a file or environment variables
@@ -87,6 +89,7 @@ func LoadAgentConfig(flagSet *pflag.FlagSet) (*AgentConfig, error) {
 		MetricsEnabled:       v.GetBool("metrics-enabled"),
 		AnalyzerEnabled:      v.GetBool("analyzer-enabled"),
 		TracerEnabled:        v.GetBool("tracer-enabled"),
+		AllowedDeviceNames:   v.GetStringSlice("allowed-device-names"),
 	}
 
 	return config, nil
@@ -112,6 +115,7 @@ func WriteDefaultConfig(path string) error {
 	v.Set("metrics-enabled", true)
 	v.Set("analyzer-enabled", false)
 	v.Set("tracer-enabled", false)
+	v.Set("allowed-device-names", []string{})
 
 	// Write the config file
 	if err := v.WriteConfig(); err != nil {

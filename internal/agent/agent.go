@@ -109,11 +109,22 @@ func New(cfg *config.AgentConfig) (*Agent, error) {
 func (a *Agent) Start() error {
 	log.Debug().Msg("Starting agent")
 
-	// Initialize agent state
-	if err := a.agentState.Initialize(); err != nil {
+	// Initialize agent state, passing allowed device names for pre-filtering
+	if err := a.agentState.Initialize(a.config.AllowedDeviceNames); err != nil {
 		return fmt.Errorf("failed to initialize agent state: %w", err)
 	}
 	log.Debug().Msg("Agent state initialized")
+
+	// After Initialize (which now includes filtering), check if any RNICs are available.
+	if len(a.agentState.GetDetectedRNICs()) == 0 {
+		var errStr string
+		if len(a.config.AllowedDeviceNames) > 0 {
+			errStr = fmt.Sprintf("No RNIC devices available after filtering by AllowedDeviceNames: %v. Agent cannot start.", a.config.AllowedDeviceNames)
+		} else {
+			errStr = "No RNIC devices detected or initialized successfully. Agent cannot start."
+		}
+		return fmt.Errorf("%s", errStr)
+	}
 
 	// Connect to controller
 	if err := a.controllerClient.Connect(); err != nil {
@@ -133,7 +144,16 @@ func (a *Agent) Start() error {
 
 	primaryRnic := a.agentState.GetPrimaryRNIC()
 	if primaryRnic == nil {
-		return fmt.Errorf("no RDMA devices available")
+		// This case should ideally be caught after filtering if AllowedDeviceNames is used.
+		// If AllowedDeviceNames is empty, this means no devices were found or initialized properly.
+		var errMsg string
+		if len(a.config.AllowedDeviceNames) > 0 {
+			errMsg = fmt.Sprintf("no primary RDMA device available after filtering with allowed names: %v", a.config.AllowedDeviceNames)
+		} else {
+			errMsg = "no primary RDMA device available or none initialized successfully"
+		}
+		log.Error().Msg(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	// Initialize metrics if enabled

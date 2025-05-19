@@ -1,7 +1,8 @@
 package probe
 
 import (
-	"strings"
+	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -160,12 +161,16 @@ func (p *Prober) ProbeTarget(
 		Msg("Probe sent successfully, waiting for ACK")
 
 	// Step 2: Modified to wait for a single ACK
-	ackPacket, t5Time, workComp, err := srcUdQueue.ReceivePacket(p.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
+	ackPacket, t5Time, workComp, err := srcUdQueue.ReceivePacket(ctx)
+	cancel()
 	if err != nil {
-		log.Debug().Err(err).
-			Str("targetGID", targetGID).
-			Uint32("targetQPN", targetQPN).
-			Msg("Timeout or error waiting for ACK")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			log.Debug().Err(err).
+				Str("targetGID", targetGID).
+				Uint32("targetQPN", targetQPN).
+				Msg("Timeout or error waiting for ACK")
+		}
 
 		result.Status = agent_analyzer.ProbeResult_TIMEOUT
 		p.probeResults <- result
@@ -298,11 +303,12 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				Msg("Responder loop stats")
 
 		default:
-			// Wait for incoming packets using Completion Channel
-			packet, receiveTime, workComp, err := udq.ReceivePacket(1 * time.Second)
+			// Create a context with timeout for ReceivePacket
+			ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
+			packet, receiveTime, workComp, err := udq.ReceivePacket(ctx)
+			cancel() // Important to call cancel to free resources associated with the context
 			if err != nil {
-				// Log timeout errors at debug level if the error message contains "receive timeout"
-				if !strings.Contains(err.Error(), "receive timeout") {
+				if !errors.Is(err, context.DeadlineExceeded) {
 					log.Error().Err(err).
 						Str("device", udq.RNIC.DeviceName).
 						Uint32("qpn", udq.QPN).

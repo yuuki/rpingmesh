@@ -464,7 +464,7 @@ func (a *Agent) Stop() {
 	// Shutdown metrics if enabled
 	if a.metrics != nil {
 		log.Debug().Msg("Shutting down metrics")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if err := a.metrics.Shutdown(shutdownCtx); err != nil {
 			log.Error().Err(err).Msg("Failed to shutdown metrics properly")

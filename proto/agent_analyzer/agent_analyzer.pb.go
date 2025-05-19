@@ -28,6 +28,7 @@ const (
 	ProbeResult_OK      ProbeResult_ProbeStatus = 0
 	ProbeResult_TIMEOUT ProbeResult_ProbeStatus = 1
 	ProbeResult_ERROR   ProbeResult_ProbeStatus = 2
+	ProbeResult_UNKNOWN ProbeResult_ProbeStatus = 3
 )
 
 // Enum value maps for ProbeResult_ProbeStatus.
@@ -36,11 +37,13 @@ var (
 		0: "OK",
 		1: "TIMEOUT",
 		2: "ERROR",
+		3: "UNKNOWN",
 	}
 	ProbeResult_ProbeStatus_value = map[string]int32{
 		"OK":      0,
 		"TIMEOUT": 1,
 		"ERROR":   2,
+		"UNKNOWN": 3,
 	}
 )
 

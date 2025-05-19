@@ -188,14 +188,18 @@ func (p *Prober) ProbeTarget(
 
 	// Verify this is the first ACK we're waiting for
 	if ackPacket1.IsAck != 1 || ackPacket1.AckType != 1 || ackPacket1.SequenceNum != seqNum {
-		log.Debug().
+		log.Warn().
 			Uint64("expectedSeq", seqNum).
 			Uint64("receivedSeq", ackPacket1.SequenceNum).
 			Bool("isAck", ackPacket1.IsAck == 1).
 			Uint8("ackType", ackPacket1.AckType).
+			Str("srcGID", sourceRnic.GID).
+			Uint32("srcQPN", srcUdQueue.QPN).
+			Str("dstGID", targetGID).
+			Uint32("dstQPN", targetQPN).
 			Msg("Received invalid first ACK packet, ignoring")
 
-		result.Status = agent_analyzer.ProbeResult_TIMEOUT
+		result.Status = agent_analyzer.ProbeResult_UNKNOWN
 		p.probeResults <- result
 		return
 	}
@@ -420,14 +424,6 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				continue
 			}
 
-			log.Debug().
-				Str("sourceGID", sourceGID).
-				Uint32("sourceQPN", sourceQPN).
-				Uint64("seqNum", packet.SequenceNum).
-				Time("receive", receiveTime).
-				Time("firstAckCompletion", firstAckCompletionTime).
-				Msg("Successfully sent first ACK packet")
-
 			// Step 3: Send second ACK packet with processing delay information
 			err = udq.SendSecondAckPacket(sourceGID, sourceQPN, packet, receiveTime, firstAckCompletionTime)
 			if err != nil {
@@ -438,14 +434,6 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 					Msg("Failed to send second ACK packet")
 				continue
 			}
-
-			log.Debug().
-				Str("sourceGID", sourceGID).
-				Uint32("sourceQPN", sourceQPN).
-				Uint64("seqNum", packet.SequenceNum).
-				Time("receive", receiveTime).
-				Time("firstAckCompletion", firstAckCompletionTime).
-				Msg("Successfully sent second ACK packet with processing delay")
 		}
 	}
 }

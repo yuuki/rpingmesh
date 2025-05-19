@@ -46,6 +46,7 @@ message ProbeResult {
     OK = 0;
     TIMEOUT = 1;
     ERROR = 2;
+    UNKNOWN = 3;
   }
   ProbeStatus status = 12;
 

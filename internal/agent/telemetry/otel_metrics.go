@@ -2,10 +2,14 @@ package telemetry
 
 import (
 	"context"
+	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -30,6 +34,31 @@ type Metrics struct {
 
 // NewMetrics creates a new metrics instance
 func NewMetrics(ctx context.Context, agentID, collectorAddr string) (*Metrics, error) {
+	// Parse the collector address
+	parsedURL, err := url.Parse(collectorAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse otel-collector-addr '%s': %w", collectorAddr, err)
+	}
+
+	// Determine exporter endpoint (host and port)
+	exporterEndpoint := parsedURL.Host
+	if parsedURL.Host == "" { // If host is empty (e.g. schemeless addr like "localhost:4317")
+		if parsedURL.Path != "" && !strings.Contains(parsedURL.Path, "/") { // Path might contain host:port
+			exporterEndpoint = parsedURL.Path
+		} else if parsedURL.Opaque != "" && !strings.Contains(parsedURL.Opaque, "/") { // Opaque might contain host:port for some schemeless URIs
+			exporterEndpoint = parsedURL.Opaque
+		} else if collectorAddr != "" && !strings.Contains(collectorAddr, "/") && strings.Contains(collectorAddr, ":") { // Original addr as last resort if it looks like host:port
+			exporterEndpoint = collectorAddr
+		} else {
+			return nil, fmt.Errorf("otel-collector-addr '%s' is missing a host or is not a valid schemeless address (e.g. localhost:4317)", collectorAddr)
+		}
+	}
+
+	// Default scheme to grpc if not specified and we derived a valid endpoint
+	if parsedURL.Scheme == "" {
+		parsedURL.Scheme = "grpc"
+	}
+
 	// Create a resource that identifies our agent
 	res, err := resource.Merge(
 		resource.Default(),
@@ -44,14 +73,34 @@ func NewMetrics(ctx context.Context, agentID, collectorAddr string) (*Metrics, e
 		return nil, err
 	}
 
-	// Create OTLP exporter
-	exporter, err := otlpmetricgrpc.New(
-		ctx,
-		otlpmetricgrpc.WithEndpoint(collectorAddr),
-		otlpmetricgrpc.WithInsecure(),
-	)
+	// Create OTLP exporter based on configuration
+	var exporter sdkmetric.Exporter
+	switch strings.ToLower(parsedURL.Scheme) {
+	case "grpc":
+		exporter, err = otlpmetricgrpc.New(
+			ctx,
+			otlpmetricgrpc.WithEndpoint(exporterEndpoint),
+			otlpmetricgrpc.WithInsecure(),
+		)
+	case "grpcs":
+		exporter, err = otlpmetricgrpc.New(
+			ctx,
+			otlpmetricgrpc.WithEndpoint(exporterEndpoint),
+		)
+	case "http", "https":
+		options := []otlpmetrichttp.Option{
+			otlpmetrichttp.WithEndpoint(exporterEndpoint),
+		}
+		if parsedURL.Scheme == "http" {
+			options = append(options, otlpmetrichttp.WithInsecure())
+		} // For https, secure transport is default
+		exporter, err = otlpmetrichttp.New(ctx, options...)
+	default:
+		return nil, fmt.Errorf("unsupported OTLP exporter protocol scheme: '%s' in %s. Use 'grpc', 'grpcs', 'http', or 'https'", parsedURL.Scheme, collectorAddr)
+	}
+
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create OTLP exporter (%s://%s): %w", parsedURL.Scheme, exporterEndpoint, err)
 	}
 
 	// Create meter provider with the exporter

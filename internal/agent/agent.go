@@ -261,9 +261,20 @@ func (a *Agent) resultHandler() {
 					// Record processing delays with RecordOption
 					a.metrics.RecordProberDelay(a.ctx, result.ProberDelay, metric.WithAttributeSet(commonAttrs))
 					a.metrics.RecordResponderDelay(a.ctx, result.ResponderDelay, metric.WithAttributeSet(commonAttrs))
+					log.Debug().
+						Str("src_gid", result.FiveTuple.SrcGid).
+						Str("dst_gid", result.FiveTuple.DstGid).
+						Int32("status", int32(result.Status)).
+						Float64("rtt_ms", float64(result.NetworkRtt)/1000000.0).
+						Msg("Recorded RTT metrics")
 				} else if result.Status == agent_analyzer.ProbeResult_TIMEOUT {
 					// Record timeout with AddOption
 					a.metrics.RecordTimeout(a.ctx, metric.WithAttributeSet(commonAttrs))
+					log.Debug().
+						Str("src_gid", result.FiveTuple.SrcGid).
+						Str("dst_gid", result.FiveTuple.DstGid).
+						Int32("status", int32(result.Status)).
+						Msg("Recorded timeout metrics")
 				}
 			}
 
@@ -275,7 +286,7 @@ func (a *Agent) resultHandler() {
 			}
 
 			// If it's a timeout, maybe run a traceroute
-			if result.Status == 1 && a.config.TracerouteOnTimeout {
+			if result.Status == agent_analyzer.ProbeResult_TIMEOUT && a.config.TracerouteOnTimeout {
 				if a.tracer != nil {
 					log.Debug().
 						Str("dst_gid", result.FiveTuple.DstGid).

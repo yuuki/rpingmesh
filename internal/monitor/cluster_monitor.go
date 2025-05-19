@@ -224,7 +224,7 @@ func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target P
 	}
 
 	// Create rate limiter for this target
-	limiter := ratelimit.New(ProbeRatePerSecond)
+	limiter := ratelimit.New(ProbeRatePerSecond, ratelimit.WithoutSlack)
 
 	// Main probing loop with rate limiting
 	for {

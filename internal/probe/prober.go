@@ -143,14 +143,14 @@ func (p *Prober) ProbeTarget(
 			log.Debug().Err(err).
 				Str("targetGID", targetGID).
 				Uint32("targetQPN", targetQPN).
-				Msg("Timeout or error waiting for probe packet")
+				Msg("[prober]: Timeout or error waiting for probe packet")
 			result.Status = agent_analyzer.ProbeResult_TIMEOUT
 			p.probeResults <- result
 		} else {
 			log.Error().Err(err).
 				Str("targetGID", targetGID).
 				Uint32("targetQPN", targetQPN).
-				Msg("Failed to send probe packet")
+				Msg("[prober]: Failed to send probe packet")
 			result.Status = agent_analyzer.ProbeResult_ERROR
 		}
 		return
@@ -163,24 +163,23 @@ func (p *Prober) ProbeTarget(
 		Uint32("targetQPN", targetQPN).
 		Time("t1", t1).
 		Time("t2", t2Time).
-		Msg("Probe sent successfully, waiting for first ACK")
+		Msg("[prober]: Probe sent successfully, waiting for first ACK")
 
 	// Step 4: Wait for the first ACK
-	// Use parent context with timeout
 	ackPacket1, t5Time, workComp, err := srcUdQueue.ReceivePacket(ctx)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			log.Debug().Err(err).
 				Str("targetGID", targetGID).
 				Uint32("targetQPN", targetQPN).
-				Msg("Timeout or error waiting for first ACK")
+				Msg("[prober]: Timeout or error waiting for first ACK")
 			result.Status = agent_analyzer.ProbeResult_TIMEOUT
 			p.probeResults <- result
 		} else {
 			log.Error().Err(err).
 				Str("targetGID", targetGID).
 				Uint32("targetQPN", targetQPN).
-				Msg("Error waiting for first ACK")
+				Msg("[prober]: Error waiting for first ACK")
 			result.Status = agent_analyzer.ProbeResult_ERROR
 			p.probeResults <- result
 		}
@@ -200,9 +199,9 @@ func (p *Prober) ProbeTarget(
 			Uint32("dstQPN", targetQPN).
 			Str("receivedPacketSGID", workComp.SGID).
 			Uint32("receivedPacketSrcQPN", workComp.SrcQP).
-			Msg("Received invalid first ACK packet, ignoring")
+			Msg("[prober]: Received invalid first ACK packet, ignoring")
 
-		result.Status = agent_analyzer.ProbeResult_ERROR
+		result.Status = agent_analyzer.ProbeResult_UNKNOWN
 		p.probeResults <- result
 		return
 	}
@@ -217,14 +216,14 @@ func (p *Prober) ProbeTarget(
 			log.Debug().Err(err).
 				Str("targetGID", targetGID).
 				Uint32("targetQPN", targetQPN).
-				Msg("Timeout or error waiting for second ACK")
+				Msg("[prober]: Timeout or error waiting for second ACK")
 			result.Status = agent_analyzer.ProbeResult_TIMEOUT
 			p.probeResults <- result
 		} else {
 			log.Error().Err(err).
 				Str("targetGID", targetGID).
 				Uint32("targetQPN", targetQPN).
-				Msg("Error waiting for second ACK")
+				Msg("[prober]: Error waiting for second ACK")
 			result.Status = agent_analyzer.ProbeResult_ERROR
 			p.probeResults <- result
 		}
@@ -244,28 +243,11 @@ func (p *Prober) ProbeTarget(
 			Uint32("dstQPN", targetQPN).
 			Str("receivedPacketSGID", workComp2.SGID).
 			Uint32("receivedPacketSrcQPN", workComp2.SrcQP).
-			Msg("Received invalid second ACK packet, ignoring")
+			Msg("[prober]: Received invalid second ACK packet, ignoring")
 
-		result.Status = agent_analyzer.ProbeResult_TIMEOUT
+		result.Status = agent_analyzer.ProbeResult_UNKNOWN
 		p.probeResults <- result
 		return
-	}
-
-	// Additional debug info about the received work completion
-	if workComp != nil {
-		log.Debug().
-			Str("recvSGID", workComp.SGID).
-			Str("recvDGID", workComp.DGID).
-			Uint32("recvSrcQP", workComp.SrcQP).
-			Msg("Work completion details for first ACK")
-	}
-
-	if workComp2 != nil {
-		log.Debug().
-			Str("recvSGID", workComp2.SGID).
-			Str("recvDGID", workComp2.DGID).
-			Uint32("recvSrcQP", workComp2.SrcQP).
-			Msg("Work completion details for second ACK")
 	}
 
 	// Get the timestamps from the second ACK which contains both T3 and T4
@@ -304,7 +286,7 @@ func (p *Prober) ProbeTarget(
 		Int64("networkRTT_ns", result.NetworkRtt).
 		Int64("proberDelay_ns", result.ProberDelay).
 		Int64("responderDelay_ns", result.ResponderDelay).
-		Msg("Probe completed successfully")
+		Msg("[prober]: Probe completed successfully")
 
 	// Send result to channel for upload
 	p.probeResults <- result
@@ -324,13 +306,12 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 		Uint32("qpn", udq.QPN).
 		Str("gid", udq.RNIC.GID).
 		Str("queueType", "Responder").
-		Msg("Starting responder loop to handle incoming probe packets on responder UDQueue")
+		Msg("[responder]: Starting responder loop to handle incoming probe packets on responder UDQueue")
 
 	// Track statistics for debugging
 	var (
 		totalPackets   uint64
 		probePackets   uint64
-		ackPackets     uint64
 		invalidPackets uint64
 		errorPackets   uint64
 	)
@@ -345,7 +326,6 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 			log.Info().
 				Uint64("totalPackets", totalPackets).
 				Uint64("probePackets", probePackets).
-				Uint64("ackPackets", ackPackets).
 				Uint64("invalidPackets", invalidPackets).
 				Uint64("errorPackets", errorPackets).
 				Msg("Stopping responder loop")
@@ -356,7 +336,6 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 			log.Info().
 				Uint64("totalPackets", totalPackets).
 				Uint64("probePackets", probePackets).
-				Uint64("ackPackets", ackPackets).
 				Uint64("invalidPackets", invalidPackets).
 				Uint64("errorPackets", errorPackets).
 				Msg("Responder loop stats")
@@ -372,7 +351,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 						Str("device", udq.RNIC.DeviceName).
 						Uint32("qpn", udq.QPN).
 						Str("gid", udq.RNIC.GID).
-						Msg("ResponderLoop: Error receiving packet")
+						Msg("[responder]: Error receiving packet")
 					atomic.AddUint64(&errorPackets, 1)
 				}
 				continue
@@ -381,22 +360,15 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 			// Count packets
 			atomic.AddUint64(&totalPackets, 1)
 
-			log.Debug().
-				Uint8("isAck", packet.IsAck).
-				Uint64("seqNum", packet.SequenceNum).
-				Str("sgid", workComp.SGID).
-				Uint32("srcQP", workComp.SrcQP).
-				Msg("Received RDMA packet")
-
 			if packet.IsAck != 0 {
-				// ACK packet processing
-				atomic.AddUint64(&ackPackets, 1)
-				log.Debug().
+				log.Warn().
+					Str("device", udq.RNIC.DeviceName).
+					Str("gid", udq.RNIC.GID).
+					Uint32("qpn", udq.QPN).
 					Uint64("seqNum", packet.SequenceNum).
-					Msg("Received ACK packet (not processing as responder)")
+					Msg("[responder]: Received ACK packet (this is invalid, ignoring)")
 				continue
 			}
-
 			atomic.AddUint64(&probePackets, 1)
 
 			// Get source information
@@ -410,7 +382,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 					Str("sourceGID", sourceGID).
 					Uint32("sourceQPN", sourceQPN).
 					Uint64("seqNum", packet.SequenceNum).
-					Msg("Invalid source GID or QPN in work completion, cannot send ACK")
+					Msg("[responder]: Invalid source GID or QPN in work completion, cannot send ACK")
 				continue
 			}
 
@@ -421,7 +393,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				Str("target_gid", sourceGID).
 				Uint32("target_qpn", sourceQPN).
 				Uint64("seqNum", packet.SequenceNum).
-				Msg("ResponderLoop: Received probe packet, sending ACKs")
+				Msg("[responder]: Received probe packet, sending ACKs")
 
 			// Step 2: Send first ACK packet immediately (without processing delay info)
 			firstAckCompletionTime, err := udq.SendFirstAckPacket(sourceGID, sourceQPN, packet, receiveTime)
@@ -430,7 +402,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				log.Error().Err(err).
 					Str("sourceGID", sourceGID).
 					Uint32("sourceQPN", sourceQPN).
-					Msg("Failed to send first ACK packet")
+					Msg("[responder]: Failed to send first ACK packet")
 				continue
 			}
 
@@ -441,7 +413,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				log.Error().Err(err).
 					Str("sourceGID", sourceGID).
 					Uint32("sourceQPN", sourceQPN).
-					Msg("Failed to send second ACK packet")
+					Msg("[responder]: Failed to send second ACK packet")
 				continue
 			}
 		}

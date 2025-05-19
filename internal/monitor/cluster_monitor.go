@@ -276,7 +276,7 @@ func (c *ClusterMonitor) resolveTargetGID(target PingTarget) string {
 
 	foundRnic := c.agentState.FindRNICByIP(lookupIP)
 	if foundRnic == nil {
-		log.Warn().
+		log.Debug().
 			Str("lookupIP", lookupIP).
 			Msg("Could not find matching RNIC for target IP. Using original GID/IP in registry.")
 		return actualTargetGID

@@ -123,14 +123,13 @@ const (
 	GIDIndex           = 3          // GID index for IPv4-mapped IPv6 addresses
 
 	// Buffer and Queue sizes
-	MRSize                 = 4096                  // Size of memory region for send/recv buffers
-	CQSize                 = 50                    // Size of Completion Queue
-	InitialRecvBuffers     = 32                    // Number of initial receive buffers to post
-	CQPollerSleepDuration  = 10 * time.Microsecond // Sleep duration in CQ poller when no events
-	SendCompChanBufferSize = 100                   // Buffer size for send completion channel
-	RecvCompChanBufferSize = 100                   // Buffer size for receive completion channel
-	ErrChanBufferSize      = 100                   // Buffer size for error channel
-	MaxWorkCompletions     = 10                    // Max number of work completions to poll at once
+	MRSize                 = 4096 // Size of memory region for send/recv buffers
+	CQSize                 = 50   // Size of Completion Queue
+	InitialRecvBuffers     = 32   // Number of initial receive buffers to post
+	SendCompChanBufferSize = 100  // Buffer size for send completion channel
+	RecvCompChanBufferSize = 100  // Buffer size for receive completion channel
+	ErrChanBufferSize      = 100  // Buffer size for error channel
+	MaxWorkCompletions     = 10   // Max number of work completions to poll at once
 
 	// Timeout durations
 	SendCompletionTimeout = 5 * time.Second       // Timeout for waiting for send completion
@@ -550,6 +549,7 @@ func (u *UDQueue) StartCQPoller() {
 		log.Debug().
 			Str("device", u.RNIC.DeviceName).
 			Uint32("qpn", u.QPN).
+			Str("queueType", getQueueTypeString(u.QueueType)).
 			Msg("Starting CQ poller goroutine")
 
 		defer func() {
@@ -580,9 +580,6 @@ func (u *UDQueue) StartCQPoller() {
 				}
 
 				if ne == 0 {
-					// No completion events
-					// Add a short sleep to reduce CPU usage
-					time.Sleep(CQPollerSleepDuration)
 					continue
 				}
 

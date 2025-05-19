@@ -555,7 +555,7 @@ func (a *Agent) Run() error {
 // initLogging initializes the logging configuration
 func initLogging(level string) {
 	// Configure zerolog
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMicro
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
 	// Set log level based on config

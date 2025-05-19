@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"net"
 	"sync"
 	"time"
@@ -233,7 +234,10 @@ func (c *ClusterMonitor) probeTargetsFromRnic(localRnic *rdma.RNIC, pinglist []P
 		}
 
 		// Send probe
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.intervalMs)*time.Millisecond)
+		defer cancel()
 		c.prober.ProbeTarget(
+			ctx,
 			localRnic,
 			actualTargetGID, // Use the potentially resolved GID
 			target.QPN,

@@ -82,6 +82,7 @@ func (p *Prober) Stop() {
 
 // ProbeTarget sends a probe to a target and waits for a response
 func (p *Prober) ProbeTarget(
+	ctx context.Context,
 	sourceRnic *rdma.RNIC,
 	targetGID string,
 	targetQPN uint32,
@@ -135,15 +136,22 @@ func (p *Prober) ProbeTarget(
 	result.T1 = timestamppb.New(t1)
 
 	// Step 1: Send probe packet
-	t2Time, err := srcUdQueue.SendProbePacket(targetGID, targetQPN, seqNum, sourcePort, flowLabel)
+	t2Time, err := srcUdQueue.SendProbePacket(ctx, targetGID, targetQPN, seqNum, sourcePort, flowLabel)
 	if err != nil {
-		log.Error().Err(err).
-			Str("targetGID", targetGID).
-			Uint32("targetQPN", targetQPN).
-			Msg("Failed to send probe packet")
-
-		result.Status = agent_analyzer.ProbeResult_ERROR
-		p.probeResults <- result
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			log.Debug().Err(err).
+				Str("targetGID", targetGID).
+				Uint32("targetQPN", targetQPN).
+				Msg("Timeout or error waiting for probe packet")
+			result.Status = agent_analyzer.ProbeResult_TIMEOUT
+			p.probeResults <- result
+		} else {
+			log.Error().Err(err).
+				Str("targetGID", targetGID).
+				Uint32("targetQPN", targetQPN).
+				Msg("Failed to send probe packet")
+			result.Status = agent_analyzer.ProbeResult_ERROR
+		}
 		return
 	}
 
@@ -157,19 +165,24 @@ func (p *Prober) ProbeTarget(
 		Msg("Probe sent successfully, waiting for first ACK")
 
 	// Step 4: Wait for the first ACK
-	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
+	// Use parent context with timeout
 	ackPacket1, t5Time, workComp, err := srcUdQueue.ReceivePacket(ctx)
-	cancel()
 	if err != nil {
-		if !errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			log.Debug().Err(err).
 				Str("targetGID", targetGID).
 				Uint32("targetQPN", targetQPN).
 				Msg("Timeout or error waiting for first ACK")
+			result.Status = agent_analyzer.ProbeResult_TIMEOUT
+			p.probeResults <- result
+		} else {
+			log.Error().Err(err).
+				Str("targetGID", targetGID).
+				Uint32("targetQPN", targetQPN).
+				Msg("Error waiting for first ACK")
+			result.Status = agent_analyzer.ProbeResult_ERROR
+			p.probeResults <- result
 		}
-
-		result.Status = agent_analyzer.ProbeResult_TIMEOUT
-		p.probeResults <- result
 		return
 	}
 
@@ -191,19 +204,23 @@ func (p *Prober) ProbeTarget(
 	result.T5 = timestamppb.New(t5Time)
 
 	// Step 5: Wait for the second ACK with processing delay information
-	ctx, cancel = context.WithTimeout(context.Background(), p.timeout)
 	ackPacket2, _, workComp2, err := srcUdQueue.ReceivePacket(ctx)
-	cancel()
 	if err != nil {
-		if !errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			log.Debug().Err(err).
 				Str("targetGID", targetGID).
 				Uint32("targetQPN", targetQPN).
 				Msg("Timeout or error waiting for second ACK")
+			result.Status = agent_analyzer.ProbeResult_TIMEOUT
+			p.probeResults <- result
+		} else {
+			log.Error().Err(err).
+				Str("targetGID", targetGID).
+				Uint32("targetQPN", targetQPN).
+				Msg("Error waiting for second ACK")
+			result.Status = agent_analyzer.ProbeResult_ERROR
+			p.probeResults <- result
 		}
-
-		result.Status = agent_analyzer.ProbeResult_TIMEOUT
-		p.probeResults <- result
 		return
 	}
 

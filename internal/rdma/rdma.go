@@ -955,6 +955,7 @@ func (u *UDQueue) CreateAddressHandle(targetGID string, flowLabel uint32) (*C.st
 
 // SendProbePacket sends a probe packet to the target
 func (u *UDQueue) SendProbePacket(
+	ctx context.Context,
 	targetGID string,
 	targetQPN uint32,
 	sequenceNum uint64,
@@ -1005,8 +1006,8 @@ func (u *UDQueue) SendProbePacket(
 	case err := <-u.errChan:
 		// Error occurred
 		return time.Time{}, fmt.Errorf("error during send: %w", err)
-	case <-time.After(SendCompletionTimeout): // Timeout
-		return time.Time{}, fmt.Errorf("timeout waiting for send completion")
+	case <-ctx.Done(): // Context cancelled or timed out
+		return time.Time{}, fmt.Errorf("send probe to (%s, %d, %d) timed out: %w", targetGID, targetQPN, sequenceNum, ctx.Err())
 	}
 }
 

@@ -187,11 +187,9 @@ func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target P
 	defer c.wg.Done()
 
 	// Determine probe type based on TOR relationship
-	var probeType string
+	probeType := ProbeTypeInterTor
 	if target.TorID == c.agentState.GetLocalTorID() {
 		probeType = ProbeTypeTorMesh
-	} else {
-		probeType = ProbeTypeInterTor
 	}
 
 	// Create target RNIC info for the result
@@ -203,35 +201,15 @@ func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target P
 		TorId:     target.TorID,
 	}
 
-	// Attempt to use the GID from the target first.
-	// If it looks like an IP address, try to find the corresponding RNIC GID from local state.
-	actualTargetGID := target.GID
-	// Check if target.GID is a valid IP address. If so, it might be an IPv4 representation.
-	ipFromGID := net.ParseIP(target.GID)
-	if ipFromGID != nil {
-		// If target.GID is an IP, prefer looking up by target.IPAddress first as it's more explicit.
-		// If target.IPAddress is empty or also an IP, then use target.GID (which is an IP) for lookup if different.
-		lookupIP := target.IPAddress
-		if lookupIP == EmptyIPString || net.ParseIP(lookupIP) == nil { // If target.IPAddress is not a valid IP, fallback to GID if it's an IP
-			lookupIP = target.GID
-		}
-
-		log.Debug().Str("originalGID", target.GID).Str("lookupIPForGIDResolution", lookupIP).Msg("Target GID might be an IP address, attempting to find IPv6 GID from local RNICs by IP.")
-		foundRnic := c.agentState.FindRNICByIP(lookupIP)
-		if foundRnic != nil && foundRnic.GID != "" && net.ParseIP(foundRnic.GID) != nil && net.ParseIP(foundRnic.GID).To16() != nil && net.ParseIP(foundRnic.GID).To4() == nil {
-			actualTargetGID = foundRnic.GID
-			log.Debug().Str("originalGIDOrIP", target.GID).Str("resolvedIPv6GID", actualTargetGID).Msg("Found matching IPv6 GID for target IP.")
-		} else {
-			log.Warn().Str("originalGIDOrIP", target.GID).Str("lookupIP", lookupIP).Msg("Could not find matching IPv6 GID for target IP, or found GID is not IPv6. Using original GID/IP. This might fail.")
-		}
-	} else {
-		// target.GID is not a parseable IP, assume it's a proper GID (hopefully IPv6)
-		log.Debug().Str("targetGID", target.GID).Msg("Target GID does not look like an IP address, using as is.")
-	}
+	// Resolve the actual GID to use for the target
+	actualTargetGID := c.resolveTargetGID(target)
 
 	// Final check to skip probing ourselves after GID resolution
 	if actualTargetGID == localRnic.GID {
-		log.Debug().Str("actualTargetGID", actualTargetGID).Str("localRnic.GID", localRnic.GID).Msg("Skipping probe to self (after GID resolution)")
+		log.Debug().
+			Str("actualTargetGID", actualTargetGID).
+			Str("localRnic.GID", localRnic.GID).
+			Msg("Skipping probe to self (after GID resolution)")
 		return
 	}
 
@@ -252,7 +230,7 @@ func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target P
 			c.prober.ProbeTarget(
 				ctx,
 				localRnic,
-				actualTargetGID, // Use the potentially resolved GID
+				actualTargetGID,
 				target.QPN,
 				target.SourcePort,
 				target.FlowLabel,
@@ -262,4 +240,36 @@ func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target P
 			cancel()
 		}
 	}
+}
+
+// resolveTargetGID resolves the actual GID to use for a target
+// It handles cases where the target.GID might be an IP address
+func (c *ClusterMonitor) resolveTargetGID(target PingTarget) string {
+	actualTargetGID := target.GID
+
+	// Check if target.GID is a valid IP address
+	ipFromGID := net.ParseIP(target.GID)
+	if ipFromGID == nil {
+		// Not an IP address, use as is
+		log.Debug().
+			Str("targetGID", target.GID).
+			Msg("Target GID does not look like an IP address, using as is")
+		return actualTargetGID
+	}
+
+	// It's an IP address, try to find corresponding GID
+	lookupIP := target.IPAddress
+	if lookupIP == EmptyIPString || net.ParseIP(lookupIP) == nil {
+		// If target.IPAddress is not valid, fallback to GID
+		lookupIP = target.GID
+	}
+
+	foundRnic := c.agentState.FindRNICByIP(lookupIP)
+	if foundRnic == nil {
+		log.Warn().
+			Str("lookupIP", lookupIP).
+			Msg("Could not find matching RNIC for target IP. Using original GID/IP in registry.")
+		return actualTargetGID
+	}
+	return foundRnic.GID
 }

@@ -684,8 +684,8 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC) (*UDQueue, error) {
 	qpInitAttr.recv_cq = cq
 
 	// Set appropriate capacity for performance
-	qpInitAttr.cap.max_send_wr = 1
-	qpInitAttr.cap.max_recv_wr = 50
+	qpInitAttr.cap.max_send_wr = C.uint32_t(len(m.Devices) * 100)
+	qpInitAttr.cap.max_recv_wr = C.uint32_t(len(m.Devices) * 100)
 	qpInitAttr.cap.max_send_sge = 1
 	qpInitAttr.cap.max_recv_sge = 1
 
@@ -847,11 +847,6 @@ func (u *UDQueue) PostRecv() error {
 		u.RecvMR.lkey,
 	)
 	if ret != 0 {
-		log.Error().
-			Str("device", u.RNIC.DeviceName).
-			Uint32("qpn", u.QPN).
-			Int("ret_code", int(ret)).
-			Msg("PostRecv: ibv_post_recv failed")
 		return fmt.Errorf("ibv_post_recv failed: %d", ret)
 	}
 	return nil
@@ -978,7 +973,10 @@ func (u *UDQueue) SendProbePacket(
 func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *WorkCompletion, error) {
 	// Post another receive buffer to ensure we don't run out
 	if err := u.PostRecv(); err != nil {
-		log.Warn().Err(err).Msg("Failed to post additional receive buffer before waiting for completion")
+		log.Warn().Err(err).
+			Str("device", u.RNIC.DeviceName).
+			Uint32("qpn", u.QPN).
+			Msg("Failed to post additional receive buffer before waiting for completion")
 	}
 
 	// Wait for completion notification from CQ poller

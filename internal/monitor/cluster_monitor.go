@@ -12,6 +12,7 @@ import (
 	"github.com/yuuki/rpingmesh/internal/state"
 	"github.com/yuuki/rpingmesh/proto/agent_analyzer"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
+	"go.uber.org/ratelimit"
 )
 
 // Constants
@@ -23,6 +24,9 @@ const (
 	// Default Values
 	DefaultFlowLabel = 0  // Default flow label for ACK packets
 	EmptyIPString    = "" // Empty string for IP address checks
+
+	// Rate limit configuration
+	ProbeRatePerSecond = 10 // Probes per second per target
 )
 
 // PingTarget represents a target for probing
@@ -46,7 +50,9 @@ type ClusterMonitor struct {
 	stopCh     chan struct{}
 	wg         sync.WaitGroup
 	running    bool
-	mutex      sync.Mutex
+
+	// For rate limiting and controlling goroutines
+	targetChans map[string]chan struct{}
 }
 
 // NewClusterMonitor creates a new ClusterMonitor
@@ -56,12 +62,13 @@ func NewClusterMonitor(
 	intervalMs uint32,
 ) *ClusterMonitor {
 	return &ClusterMonitor{
-		agentState: agentState,
-		prober:     prober,
-		intervalMs: intervalMs,
-		pinglist:   make([]PingTarget, 0),
-		stopCh:     make(chan struct{}),
-		running:    false,
+		agentState:  agentState,
+		prober:      prober,
+		intervalMs:  intervalMs,
+		pinglist:    make([]PingTarget, 0),
+		stopCh:      make(chan struct{}),
+		running:     false,
+		targetChans: make(map[string]chan struct{}),
 	}
 }
 
@@ -74,9 +81,22 @@ func (c *ClusterMonitor) Start() error {
 	c.running = true
 	c.stopCh = make(chan struct{})
 
-	// Start probing goroutine
+	// Start the monitor goroutine
 	c.wg.Add(1)
-	go c.monitorLoop()
+	go func() {
+		defer c.wg.Done()
+		// Start probe workers for each target
+		c.runAllProbeWorkers()
+
+		// Wait for stop signal
+		<-c.stopCh
+
+		// Stop all target goroutines
+		for _, stopCh := range c.targetChans {
+			close(stopCh)
+		}
+		c.targetChans = make(map[string]chan struct{})
+	}()
 
 	log.Info().Msg("Cluster monitor started")
 	return nil
@@ -96,9 +116,13 @@ func (c *ClusterMonitor) Stop() {
 
 // UpdatePinglist updates the list of targets to ping
 func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
+	// Stop existing probe workers
+	for _, stopCh := range c.targetChans {
+		close(stopCh)
+	}
+	c.targetChans = make(map[string]chan struct{})
 
+	// Update pinglist
 	c.pinglist = make([]PingTarget, 0, len(pinglist))
 	for _, target := range pinglist {
 		c.pinglist = append(c.pinglist, PingTarget{
@@ -113,138 +137,129 @@ func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget)
 		})
 	}
 
+	// If the monitor is running, start new probe workers
+	if c.running {
+		c.runAllProbeWorkers()
+	}
+
 	log.Info().Int("targets", len(c.pinglist)).Msg("Updated cluster monitoring pinglist")
 }
 
-// monitorLoop is the main loop for cluster monitoring
-func (c *ClusterMonitor) monitorLoop() {
-	defer c.wg.Done()
-
-	ticker := time.NewTicker(time.Duration(c.intervalMs) * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.stopCh:
-			return
-		case <-ticker.C:
-			c.probeAllTargets()
-		}
-	}
-}
-
-// probeAllTargets sends probes to all targets in the pinglist
-func (c *ClusterMonitor) probeAllTargets() {
-	// Make a copy of the pinglist to avoid holding the mutex during probing
-	c.mutex.Lock()
-	pinglist := make([]PingTarget, len(c.pinglist))
-	copy(pinglist, c.pinglist)
-	c.mutex.Unlock()
-
-	if len(pinglist) == 0 {
-		// No targets to probe
-		return
-	}
-
-	// Get all local RNICs
+// runAllProbeWorkers starts goroutines for each target in the pinglist
+func (c *ClusterMonitor) runAllProbeWorkers() {
+	// Get local RNICs
 	localRnics := c.agentState.GetDetectedRNICs()
 	if len(localRnics) == 0 {
 		log.Error().Msg("No local RNICs available for probing")
 		return
 	}
 
-	// Create a wait group to track the completion of all goroutines
-	var wg sync.WaitGroup
+	// For each target in the pinglist, create a goroutine
+	for _, target := range c.pinglist {
+		for _, localRnic := range localRnics {
+			// Skip if the RNIC is nil or doesn't have a valid GID
+			if localRnic == nil || localRnic.GID == "" {
+				continue
+			}
 
-	// For each local RNIC, create a goroutine to probe targets
-	for _, localRnic := range localRnics {
-		// Skip if the RNIC is nil or doesn't have a valid GID
-		if localRnic == nil || localRnic.GID == "" {
-			continue
+			// Skip probing ourselves (initial check)
+			if target.GID == localRnic.GID {
+				log.Debug().Str("target.GID", target.GID).Str("localRnic.GID", localRnic.GID).Msg("Skipping probe to self (initial check)")
+				continue
+			}
+
+			// Create a unique key for this source-target pair
+			key := localRnic.GID + "_" + target.GID
+
+			// Create a stop channel for this target
+			stopCh := make(chan struct{})
+			c.targetChans[key] = stopCh
+
+			// Start a goroutine for this target
+			c.wg.Add(1)
+			go c.probeTargetWithRateLimit(localRnic, target, stopCh)
 		}
-
-		// Launch a goroutine for each RNIC
-		wg.Add(1)
-		go func(rnic *rdma.RNIC) {
-			defer wg.Done()
-			c.probeTargetsFromRnic(rnic, pinglist)
-		}(localRnic)
 	}
-
-	// Wait for all probing goroutines to complete
-	wg.Wait()
 }
 
-// probeTargetsFromRnic sends probes to all targets from a specific source RNIC
-func (c *ClusterMonitor) probeTargetsFromRnic(localRnic *rdma.RNIC, pinglist []PingTarget) {
-	for _, target := range pinglist {
-		// Skip probing ourselves
-		if target.GID == localRnic.GID { // Initial check, might be comparing IP string to GID string
-			log.Debug().Str("target.GID", target.GID).Str("localRnic.GID", localRnic.GID).Msg("Skipping probe to self (initial check)")
-			continue
+// probeTargetWithRateLimit continuously probes a target with rate limiting
+func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target PingTarget, stopCh chan struct{}) {
+	defer c.wg.Done()
+
+	// Determine probe type based on TOR relationship
+	var probeType string
+	if target.TorID == c.agentState.GetLocalTorID() {
+		probeType = ProbeTypeTorMesh
+	} else {
+		probeType = ProbeTypeInterTor
+	}
+
+	// Create target RNIC info for the result
+	targetRnicInfo := &agent_analyzer.RnicIdentifier{
+		Gid:       target.GID,
+		Qpn:       target.QPN,
+		IpAddress: target.IPAddress,
+		HostName:  target.HostName,
+		TorId:     target.TorID,
+	}
+
+	// Attempt to use the GID from the target first.
+	// If it looks like an IP address, try to find the corresponding RNIC GID from local state.
+	actualTargetGID := target.GID
+	// Check if target.GID is a valid IP address. If so, it might be an IPv4 representation.
+	ipFromGID := net.ParseIP(target.GID)
+	if ipFromGID != nil {
+		// If target.GID is an IP, prefer looking up by target.IPAddress first as it's more explicit.
+		// If target.IPAddress is empty or also an IP, then use target.GID (which is an IP) for lookup if different.
+		lookupIP := target.IPAddress
+		if lookupIP == EmptyIPString || net.ParseIP(lookupIP) == nil { // If target.IPAddress is not a valid IP, fallback to GID if it's an IP
+			lookupIP = target.GID
 		}
 
-		// Determine probe type based on TOR relationship
-		var probeType string
-		if target.TorID == c.agentState.GetLocalTorID() {
-			probeType = ProbeTypeTorMesh
+		log.Debug().Str("originalGID", target.GID).Str("lookupIPForGIDResolution", lookupIP).Msg("Target GID might be an IP address, attempting to find IPv6 GID from local RNICs by IP.")
+		foundRnic := c.agentState.FindRNICByIP(lookupIP)
+		if foundRnic != nil && foundRnic.GID != "" && net.ParseIP(foundRnic.GID) != nil && net.ParseIP(foundRnic.GID).To16() != nil && net.ParseIP(foundRnic.GID).To4() == nil {
+			actualTargetGID = foundRnic.GID
+			log.Debug().Str("originalGIDOrIP", target.GID).Str("resolvedIPv6GID", actualTargetGID).Msg("Found matching IPv6 GID for target IP.")
 		} else {
-			probeType = ProbeTypeInterTor
+			log.Warn().Str("originalGIDOrIP", target.GID).Str("lookupIP", lookupIP).Msg("Could not find matching IPv6 GID for target IP, or found GID is not IPv6. Using original GID/IP. This might fail.")
 		}
+	} else {
+		// target.GID is not a parseable IP, assume it's a proper GID (hopefully IPv6)
+		log.Debug().Str("targetGID", target.GID).Msg("Target GID does not look like an IP address, using as is.")
+	}
 
-		// Create target RNIC info for the result
-		targetRnicInfo := &agent_analyzer.RnicIdentifier{
-			Gid:       target.GID,
-			Qpn:       target.QPN,
-			IpAddress: target.IPAddress,
-			HostName:  target.HostName,
-			TorId:     target.TorID,
+	// Final check to skip probing ourselves after GID resolution
+	if actualTargetGID == localRnic.GID {
+		log.Debug().Str("actualTargetGID", actualTargetGID).Str("localRnic.GID", localRnic.GID).Msg("Skipping probe to self (after GID resolution)")
+		return
+	}
+
+	// Create rate limiter for this target
+	limiter := ratelimit.New(ProbeRatePerSecond)
+
+	// Main probing loop with rate limiting
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+			// Take a token from the rate limiter (this blocks until the rate limit allows)
+			limiter.Take()
+
+			// Send probe with a timeout context
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.intervalMs)*time.Millisecond)
+			c.prober.ProbeTarget(
+				ctx,
+				localRnic,
+				actualTargetGID, // Use the potentially resolved GID
+				target.QPN,
+				target.SourcePort,
+				target.FlowLabel,
+				probeType,
+				targetRnicInfo,
+			)
+			cancel()
 		}
-
-		// Attempt to use the GID from the target first.
-		// If it looks like an IP address, try to find the corresponding RNIC GID from local state.
-		actualTargetGID := target.GID
-		// Check if target.GID is a valid IP address. If so, it might be an IPv4 representation.
-		ipFromGID := net.ParseIP(target.GID)
-		if ipFromGID != nil {
-			// If target.GID is an IP, prefer looking up by target.IPAddress first as it's more explicit.
-			// If target.IPAddress is empty or also an IP, then use target.GID (which is an IP) for lookup if different.
-			lookupIP := target.IPAddress
-			if lookupIP == EmptyIPString || net.ParseIP(lookupIP) == nil { // If target.IPAddress is not a valid IP, fallback to GID if it's an IP
-				lookupIP = target.GID
-			}
-
-			log.Debug().Str("originalGID", target.GID).Str("lookupIPForGIDResolution", lookupIP).Msg("Target GID might be an IP address, attempting to find IPv6 GID from local RNICs by IP.")
-			foundRnic := c.agentState.FindRNICByIP(lookupIP)
-			if foundRnic != nil && foundRnic.GID != "" && net.ParseIP(foundRnic.GID) != nil && net.ParseIP(foundRnic.GID).To16() != nil && net.ParseIP(foundRnic.GID).To4() == nil {
-				actualTargetGID = foundRnic.GID
-				log.Debug().Str("originalGIDOrIP", target.GID).Str("resolvedIPv6GID", actualTargetGID).Msg("Found matching IPv6 GID for target IP.")
-			} else {
-				log.Warn().Str("originalGIDOrIP", target.GID).Str("lookupIP", lookupIP).Msg("Could not find matching IPv6 GID for target IP, or found GID is not IPv6. Using original GID/IP. This might fail.")
-			}
-		} else {
-			// target.GID is not a parseable IP, assume it's a proper GID (hopefully IPv6)
-			log.Debug().Str("targetGID", target.GID).Msg("Target GID does not look like an IP address, using as is.")
-		}
-
-		// Final check to skip probing ourselves after GID resolution
-		if actualTargetGID == localRnic.GID {
-			log.Debug().Str("actualTargetGID", actualTargetGID).Str("localRnic.GID", localRnic.GID).Msg("Skipping probe to self (after GID resolution)")
-			continue
-		}
-
-		// Send probe
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.intervalMs)*time.Millisecond)
-		defer cancel()
-		c.prober.ProbeTarget(
-			ctx,
-			localRnic,
-			actualTargetGID, // Use the potentially resolved GID
-			target.QPN,
-			target.SourcePort,
-			target.FlowLabel,
-			probeType,
-			targetRnicInfo,
-		)
 	}
 }

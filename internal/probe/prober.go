@@ -98,7 +98,11 @@ func (p *Prober) ProbeTarget(
 	// Get the SENDER UDQueue for the source RNIC (for sending probes and receiving ACKs)
 	srcUdQueue := p.agentState.GetSenderUDQueue(sourceRnic.GID)
 	if srcUdQueue == nil {
-		log.Error().Str("gid", sourceRnic.GID).Msg("Failed to get sender UDQueue for source RNIC in ProbeTarget")
+		log.Error().
+			Str("gid", sourceRnic.GID).
+			Uint32("qpn", srcUdQueue.QPN).
+			Uint64("seqNum", seqNum).
+			Msg("Failed to get sender UDQueue for source RNIC in ProbeTarget")
 		return
 	}
 
@@ -143,6 +147,7 @@ func (p *Prober) ProbeTarget(
 			log.Debug().Err(err).
 				Str("targetGID", targetGID).
 				Uint32("targetQPN", targetQPN).
+				Uint64("seqNum", seqNum).
 				Msg("[prober]: Timeout or error waiting for probe packet")
 			result.Status = agent_analyzer.ProbeResult_TIMEOUT
 			p.probeResults <- result
@@ -150,6 +155,7 @@ func (p *Prober) ProbeTarget(
 			log.Error().Err(err).
 				Str("targetGID", targetGID).
 				Uint32("targetQPN", targetQPN).
+				Uint64("seqNum", seqNum).
 				Msg("[prober]: Failed to send probe packet")
 			result.Status = agent_analyzer.ProbeResult_ERROR
 		}
@@ -163,96 +169,148 @@ func (p *Prober) ProbeTarget(
 		Uint32("targetQPN", targetQPN).
 		Time("t1", t1).
 		Time("t2", t2Time).
-		Msg("[prober]: Probe sent successfully, waiting for first ACK")
+		Uint64("seqNum", seqNum).
+		Msg("[prober]: Probe sent successfully, waiting for ACKs")
 
-	// Step 4: Wait for the first ACK
-	ackPacket1, t5Time, workComp, err := srcUdQueue.ReceivePacket(ctx)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			log.Debug().Err(err).
+	var (
+		ack2Packet *rdma.ProbePacket
+		t5Time     time.Time
+	)
+	ack1Received := false
+	ack2Received := false
+	result.Status = agent_analyzer.ProbeResult_UNKNOWN // Initialize status, will be updated
+
+	// Loop to receive both ACKs. The overall timeout is handled by the input context 'ctx'.
+	for !(ack1Received && ack2Received) {
+		select {
+		case <-ctx.Done():
+			log.Debug().Err(ctx.Err()).
 				Str("targetGID", targetGID).
 				Uint32("targetQPN", targetQPN).
-				Msg("[prober]: Timeout or error waiting for first ACK")
+				Bool("ack1Received", ack1Received).
+				Bool("ack2Received", ack2Received).
+				Uint64("seqNum", seqNum).
+				Msg("[prober]: Context cancelled or timed out while waiting for ACKs")
 			result.Status = agent_analyzer.ProbeResult_TIMEOUT
 			p.probeResults <- result
-		} else {
-			log.Error().Err(err).
-				Str("targetGID", targetGID).
-				Uint32("targetQPN", targetQPN).
-				Msg("[prober]: Error waiting for first ACK")
-			result.Status = agent_analyzer.ProbeResult_ERROR
-			p.probeResults <- result
+			return
+		default:
+			// Non-blocking check for context, proceed to receive.
 		}
-		return
-	}
 
-	// Verify this is the first ACK we're waiting for
-	if ackPacket1.IsAck != 1 || ackPacket1.AckType != 1 || ackPacket1.SequenceNum != seqNum {
-		log.Warn().
-			Uint64("expectedSeq", seqNum).
-			Uint64("receivedSeq", ackPacket1.SequenceNum).
-			Bool("isAck", ackPacket1.IsAck == 1).
-			Uint8("ackType", ackPacket1.AckType).
-			Str("srcGID", sourceRnic.GID).
-			Uint32("srcQPN", srcUdQueue.QPN).
-			Str("dstGID", targetGID).
-			Uint32("dstQPN", targetQPN).
-			Str("receivedPacketSGID", workComp.SGID).
-			Uint32("receivedPacketSrcQPN", workComp.SrcQP).
-			Msg("[prober]: Received invalid first ACK packet, ignoring")
+		receivedPacket, receivedTime, workComp, err := srcUdQueue.ReceivePacket(ctx)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				log.Debug().Err(err).
+					Str("targetGID", targetGID).
+					Uint32("targetQPN", targetQPN).
+					Bool("ack1Received", ack1Received).
+					Bool("ack2Received", ack2Received).
+					Uint64("seqNum", seqNum).
+					Msg("[prober]: Timeout waiting for an ACK")
+				result.Status = agent_analyzer.ProbeResult_TIMEOUT
+			} else {
+				log.Error().Err(err).
+					Str("targetGID", targetGID).
+					Uint32("targetQPN", targetQPN).
+					Uint64("seqNum", seqNum).
+					Msg("[prober]: Error waiting for an ACK")
+				result.Status = agent_analyzer.ProbeResult_ERROR
+			}
+			p.probeResults <- result
+			return
+		}
 
-		result.Status = agent_analyzer.ProbeResult_UNKNOWN
+		if receivedPacket.IsAck != 1 {
+			log.Warn().
+				Uint64("receivedSeq", receivedPacket.SequenceNum).
+				Uint8("ackType", receivedPacket.AckType).
+				Str("srcGID", sourceRnic.GID).
+				Str("dstGID", targetGID).
+				Str("receivedPacketSGID", workComp.SGID).
+				Uint32("receivedPacketSrcQPN", workComp.SrcQP).
+				Uint64("seqNum", seqNum).
+				Msg("[prober]: Received a packet that is not an ACK, ignoring")
+			continue
+		}
+
+		if receivedPacket.SequenceNum != seqNum {
+			log.Warn().
+				Uint64("expectedSeq", seqNum).
+				Uint64("receivedSeq", receivedPacket.SequenceNum).
+				Uint8("ackType", receivedPacket.AckType).
+				Str("srcGID", sourceRnic.GID).
+				Str("dstGID", targetGID).
+				Str("receivedPacketSGID", workComp.SGID).
+				Uint32("receivedPacketSrcQPN", workComp.SrcQP).
+				Msg("[prober]: Received ACK with mismatched sequence number, ignoring")
+			continue
+		}
+
+		switch receivedPacket.AckType {
+		case 1:
+			if !ack1Received {
+				t5Time = receivedTime
+				ack1Received = true
+				log.Debug().
+					Uint64("seqNum", seqNum).
+					Str("targetGID", targetGID).
+					Msg("[prober]: Received first ACK (type 1)")
+			} else {
+				log.Warn().
+					Uint64("seqNum", seqNum).
+					Str("targetGID", targetGID).
+					Msg("[prober]: Received duplicate first ACK (type 1), ignoring")
+			}
+		case 2:
+			if !ack2Received {
+				ack2Packet = receivedPacket
+				ack2Received = true
+				log.Debug().
+					Uint64("seqNum", seqNum).
+					Str("targetGID", targetGID).
+					Msg("[prober]: Received second ACK (type 2)")
+			} else {
+				log.Warn().
+					Uint64("seqNum", seqNum).
+					Str("targetGID", targetGID).
+					Msg("[prober]: Received duplicate second ACK (type 2), ignoring")
+			}
+		default:
+			log.Warn().
+				Uint64("seqNum", seqNum).
+				Uint8("ackType", receivedPacket.AckType).
+				Str("targetGID", targetGID).
+				Str("receivedPacketSGID", workComp.SGID).
+				Uint32("receivedPacketSrcQPN", workComp.SrcQP).
+				Msg("[prober]: Received ACK with unknown AckType, ignoring")
+		}
+	} // End of ACK receive loop
+
+	// At this point, if we haven't returned, the loop exited because (ack1Received && ack2Received) is true.
+	// Or, in a very unlikely scenario, the loop condition was met but ctx.Done() was simultaneously true.
+	// The select case for ctx.Done() should handle timeout/cancellation primarily.
+
+	// Double-check that both ACKs were actually processed and packets stored if logic depends on them beyond flags.
+	if !ack1Received || !ack2Received {
+		// This should not be reached if the loop and timeout logic is correct.
+		// If it is, it implies a logic flaw or an unhandled exit from the loop.
+		log.Error().
+			Uint64("seqNum", seqNum).
+			Str("targetGID", targetGID).
+			Bool("ack1Received", ack1Received).
+			Bool("ack2Received", ack2Received).
+			Msg("[prober]: Logic error: exited ACK loop but not all ACKs received and no timeout/error reported.")
+		result.Status = agent_analyzer.ProbeResult_ERROR // Indicate an internal logic error
 		p.probeResults <- result
 		return
 	}
 
-	// Record T5 timestamp from first ACK
-	result.T5 = timestamppb.New(t5Time)
+	result.T5 = timestamppb.New(t5Time) // t5Time is set when ackType=1 is received
 
-	// Step 5: Wait for the second ACK with processing delay information
-	ackPacket2, _, workComp2, err := srcUdQueue.ReceivePacket(ctx)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			log.Debug().Err(err).
-				Str("targetGID", targetGID).
-				Uint32("targetQPN", targetQPN).
-				Msg("[prober]: Timeout or error waiting for second ACK")
-			result.Status = agent_analyzer.ProbeResult_TIMEOUT
-			p.probeResults <- result
-		} else {
-			log.Error().Err(err).
-				Str("targetGID", targetGID).
-				Uint32("targetQPN", targetQPN).
-				Msg("[prober]: Error waiting for second ACK")
-			result.Status = agent_analyzer.ProbeResult_ERROR
-			p.probeResults <- result
-		}
-		return
-	}
-
-	// Verify this is the second ACK we're waiting for
-	if ackPacket2.IsAck != 1 || ackPacket2.AckType != 2 || ackPacket2.SequenceNum != seqNum {
-		log.Debug().
-			Uint64("expectedSeq", seqNum).
-			Uint64("receivedSeq", ackPacket2.SequenceNum).
-			Bool("isAck", ackPacket2.IsAck == 1).
-			Uint8("ackType", ackPacket2.AckType).
-			Str("srcGID", sourceRnic.GID).
-			Uint32("srcQPN", srcUdQueue.QPN).
-			Str("dstGID", targetGID).
-			Uint32("dstQPN", targetQPN).
-			Str("receivedPacketSGID", workComp2.SGID).
-			Uint32("receivedPacketSrcQPN", workComp2.SrcQP).
-			Msg("[prober]: Received invalid second ACK packet, ignoring")
-
-		result.Status = agent_analyzer.ProbeResult_UNKNOWN
-		p.probeResults <- result
-		return
-	}
-
-	// Get the timestamps from the second ACK which contains both T3 and T4
-	t3Time := time.Unix(0, int64(ackPacket2.T3))
-	t4Time := time.Unix(0, int64(ackPacket2.T4))
+	// ack2Packet should be non-nil if ack2Received is true
+	t3Time := time.Unix(0, int64(ack2Packet.T3))
+	t4Time := time.Unix(0, int64(ack2Packet.T4))
 	result.T3 = timestamppb.New(t3Time)
 	result.T4 = timestamppb.New(t4Time)
 
@@ -286,7 +344,8 @@ func (p *Prober) ProbeTarget(
 		Int64("networkRTT_ns", result.NetworkRtt).
 		Int64("proberDelay_ns", result.ProberDelay).
 		Int64("responderDelay_ns", result.ResponderDelay).
-		Msg("[prober]: Probe completed successfully")
+		Uint64("seqNum", seqNum).
+		Msg("[prober]: Probe completed successfully with unordered ACKs")
 
 	// Send result to channel for upload
 	p.probeResults <- result

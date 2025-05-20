@@ -109,24 +109,42 @@ func New(cfg *config.AgentConfig) (*Agent, error) {
 func (a *Agent) Start() error {
 	log.Debug().Msg("Starting agent")
 
-	// Initialize agent state, passing allowed device names.
-	// The GIDIndex is now set during NewAgentState, so it's already part of agentState.
-	// Initialize will use the GIDIndex stored in agentState.
-	if err := a.agentState.Initialize(a.config.AllowedDeviceNames); err != nil {
-		return fmt.Errorf("failed to initialize agent state: %w", err)
+	// Initialize agent state's RDMA infrastructure first.
+	if err := a.agentState.InitializeRDMAInfrastructure(a.config.AllowedDeviceNames); err != nil {
+		return fmt.Errorf("failed to initialize agent RDMA infrastructure: %w", err)
 	}
-	log.Debug().Msg("Agent state initialized")
+	log.Debug().Msg("Agent RDMA infrastructure initialized")
 
-	// After Initialize (which now includes filtering), check if any RNICs are available.
+	// After RDMA infra is up, check if any RNICs are available before proceeding.
 	if len(a.agentState.GetDetectedRNICs()) == 0 {
 		var errStr string
 		if len(a.config.AllowedDeviceNames) > 0 {
-			errStr = fmt.Sprintf("No RNIC devices available after filtering by AllowedDeviceNames: %v. Agent cannot start.", a.config.AllowedDeviceNames)
+			errStr = fmt.Sprintf("No RNIC devices available after RDMA infra initialization and filtering by AllowedDeviceNames: %v. Agent cannot start.", a.config.AllowedDeviceNames)
 		} else {
-			errStr = "No RNIC devices detected or initialized successfully. Agent cannot start."
+			errStr = "No RNIC devices detected or initialized successfully in RDMA infra. Agent cannot start."
 		}
 		return fmt.Errorf("%s", errStr)
 	}
+
+	// Create prober - Prober itself does not start its loops yet.
+	a.prober = probe.NewProber(a.agentState.GetRDMAManager(), a.agentState, a.config.TimeoutMS)
+	log.Debug().Msg("Prober instance created")
+
+	// Set the ACK handler in AgentState now that prober is created.
+	a.agentState.SetAckHandler(a.prober.HandleIncomingRDMAPacket)
+	log.Debug().Msg("ACK handler set in AgentState")
+
+	// Now initialize UD Queues in AgentState, it will use the handler set above.
+	if err := a.agentState.InitializeUDQueues(); err != nil {
+		return fmt.Errorf("failed to initialize agent UD queues: %w", err)
+	}
+	log.Debug().Msg("Agent UD queues initialized with ACK handler")
+
+	// Now that UD queues are ready (including those for the prober), start the prober's internal loops.
+	if err := a.prober.Start(); err != nil {
+		return fmt.Errorf("failed to start prober: %w", err)
+	}
+	log.Debug().Msg("Prober started")
 
 	// Connect to controller
 	if err := a.controllerClient.Connect(); err != nil {
@@ -171,13 +189,6 @@ func (a *Agent) Start() error {
 				Msg("OpenTelemetry metrics initialized")
 		}
 	}
-
-	// Create prober
-	a.prober = probe.NewProber(a.agentState.GetRDMAManager(), a.agentState, a.config.TimeoutMS)
-	if err := a.prober.Start(); err != nil {
-		return fmt.Errorf("failed to start prober: %w", err)
-	}
-	log.Debug().Msg("Prober started")
 
 	// Create cluster monitor
 	a.clusterMonitor = monitor.NewClusterMonitor(

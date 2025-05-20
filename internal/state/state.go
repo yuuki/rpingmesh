@@ -26,21 +26,137 @@ type AgentState struct {
 	responderQueues map[string]*rdma.UDQueue // Map of GID to Responder UDQueue
 	gidIndex        int                      // Changed: preferredGIDIndex to gidIndex
 	mutex           sync.RWMutex
+	ackHandler      rdma.AckHandlerFunc // Store the ACK handler directly
 }
 
 // NewAgentState creates a new agent state
 func NewAgentState(agentID, localTorID string, gidIndex int) *AgentState {
 	return &AgentState{
 		agentID:         agentID,
-		localTorID:      DefaultLocalTorID, // Assuming localTorID might be set later or from elsewhere
+		localTorID:      DefaultLocalTorID,
 		senderQueues:    make(map[string]*rdma.UDQueue),
 		responderQueues: make(map[string]*rdma.UDQueue),
-		gidIndex:        gidIndex, // Store GID Index
+		gidIndex:        gidIndex,
 	}
 }
 
-// Initialize initializes the agent state
-func (a *AgentState) Initialize(allowedDeviceNames []string) error {
+// SetAckHandler sets the ACK handler function for the agent state.
+func (a *AgentState) SetAckHandler(handler rdma.AckHandlerFunc) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	a.ackHandler = handler
+}
+
+// InitializeRDMAInfrastructure initializes the RDMA manager, detects and opens RNIC devices.
+func (a *AgentState) InitializeRDMAInfrastructure(allowedDeviceNames []string) error {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	// Get the agent's IP address
+	ip, err := getLocalIP()
+	if err != nil {
+		return err
+	}
+	a.agentIP = ip.String()
+
+	// Initialize RDMA manager
+	rdmaManager, err := rdma.NewRDMAManager()
+	if err != nil {
+		return err
+	}
+	a.rdmaManager = rdmaManager
+
+	// Filter devices by name BEFORE opening them or creating queues
+	var devicesToProcess []*rdma.RNIC
+	if len(allowedDeviceNames) > 0 {
+		log.Info().Strs("allowed_devices", allowedDeviceNames).Msg("Pre-filtering RNIC devices by name")
+		nameSet := make(map[string]struct{})
+		for _, name := range allowedDeviceNames {
+			nameSet[name] = struct{}{}
+		}
+		for _, rnic := range rdmaManager.Devices {
+			if _, ok := nameSet[rnic.DeviceName]; ok {
+				devicesToProcess = append(devicesToProcess, rnic)
+			} else {
+				log.Debug().Str("device_name", rnic.DeviceName).Msg("RNIC device skipped due to whitelist filter (before open)")
+			}
+		}
+		if len(devicesToProcess) == 0 {
+			log.Error().Strs("allowed_devices", allowedDeviceNames).Msg("No RNIC devices match the allowed list. Agent cannot use any RDMA devices.")
+			// Return an error here or let it be caught by the check after device opening
+		}
+	} else {
+		devicesToProcess = rdmaManager.Devices
+	}
+
+	// Detect and open RDMA devices from the filtered list
+	for _, rnic := range devicesToProcess {
+		// Pass gidIndex to OpenDevice
+		if err := rnic.OpenDevice(a.gidIndex); err != nil {
+			log.Error().Err(err).Str("device", rnic.DeviceName).Msg("Failed to open RDMA device")
+			continue
+		}
+
+		a.detectedRNICs = append(a.detectedRNICs, rnic)
+
+		// Select the first device as the primary RNIC
+		if a.primaryRNIC == nil {
+			a.primaryRNIC = rnic
+		}
+	}
+
+	if len(a.detectedRNICs) == 0 {
+		if len(allowedDeviceNames) > 0 {
+			return fmt.Errorf("no RDMA devices available after filtering by allowed names: %v", allowedDeviceNames)
+		}
+		return fmt.Errorf("no RDMA devices found or initialized successfully")
+	}
+
+	log.Info().Msg("Agent RDMA infrastructure initialized")
+	return nil
+}
+
+// InitializeUDQueues creates UD queues for all detected RNICs.
+// This should be called after InitializeRDMAInfrastructure and after SetAckHandler has been called.
+func (a *AgentState) InitializeUDQueues() error {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if a.ackHandler == nil {
+		return fmt.Errorf("ackHandler not set in AgentState, cannot initialize UD queues with ACK handler. Call SetAckHandler first.")
+	}
+	if len(a.detectedRNICs) == 0 {
+		return fmt.Errorf("no detected RNICs to initialize UD queues for")
+	}
+	if a.rdmaManager == nil {
+		return fmt.Errorf("RDMA manager not initialized")
+	}
+
+	// Create separate UD queues for each RNIC - one for sending probes, one for receiving probes
+	for _, rnic := range a.detectedRNICs {
+		err := a.rdmaManager.CreateSenderAndResponderQueues(rnic, a.ackHandler)
+		if err != nil {
+			log.Error().Err(err).Str("device", rnic.DeviceName).Msg("Failed to create sender and responder UD queues")
+			continue // Or collect errors and return them
+		}
+		a.senderQueues[rnic.GID] = rnic.SenderQueue
+		a.responderQueues[rnic.GID] = rnic.ResponderQueue
+	}
+
+	log.Info().
+		Str("agentID", a.agentID).
+		Str("agentIP", a.agentIP).
+		Str("torID", a.localTorID).
+		Int("rnics_with_queues", len(a.detectedRNICs)). // Assuming queues are created for all detected if no error
+		Msg("Agent UD queues initialized")
+
+	return nil
+}
+
+// Initialize initializes the agent state - DEPRECATED or to be simplified
+// For now, let's comment it out to ensure new methods are used.
+/*
+func (a *AgentState) Initialize(allowedDeviceNames []string, proberAckHandler rdma.AckHandlerFunc) error {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
@@ -105,7 +221,7 @@ func (a *AgentState) Initialize(allowedDeviceNames []string) error {
 
 	// Create separate UD queues for each RNIC - one for sending probes, one for receiving probes
 	for _, rnic := range a.detectedRNICs {
-		err := a.rdmaManager.CreateSenderAndResponderQueues(rnic)
+		err := a.rdmaManager.CreateSenderAndResponderQueues(rnic, proberAckHandler) // Pass the handler
 		if err != nil {
 			log.Error().Err(err).Str("device", rnic.DeviceName).Msg("Failed to create sender and responder UD queues")
 			continue
@@ -123,6 +239,7 @@ func (a *AgentState) Initialize(allowedDeviceNames []string) error {
 
 	return nil
 }
+*/
 
 // GetLocalTorID returns the local ToR ID
 func (a *AgentState) GetLocalTorID() string {

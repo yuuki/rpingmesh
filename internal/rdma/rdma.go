@@ -141,6 +141,28 @@ const (
 	IPv4HeaderMinLength = 20 // Minimum length of an IPv4 header
 )
 
+// GRHHeaderInfo holds extracted information from the GRH.
+type GRHHeaderInfo struct {
+	SourceGID string
+	DestGID   string
+	FlowLabel uint32
+	// Add other relevant GRH fields if needed by the handler
+}
+
+// IncomingAckInfo holds information about a received ACK packet to be passed to the handler.
+type IncomingAckInfo struct {
+	Packet      *ProbePacket     // The deserialized ProbePacket
+	ReceivedAt  time.Time        // Timestamp when the ACK was processed by the CQ poller
+	GRHInfo     *GRHHeaderInfo   // Information from GRH, if present
+	SourceQP    uint32           // Source QP from the work completion (remote QPN)
+	RawWC       *C.struct_ibv_wc // Raw work completion for any other details. Use with caution.
+	AckStatusOK bool             // True if the RDMA work completion for this ACK was successful.
+}
+
+// AckHandlerFunc is a callback function type for processing incoming ACK packets.
+// It's called by the CQ poller when an ACK is received on a sender queue.
+type AckHandlerFunc func(ackInfo *IncomingAckInfo)
+
 // UDQueueType defines the role of the UDQueue
 type UDQueueType int
 
@@ -182,13 +204,16 @@ type UDQueue struct {
 
 	// Channels for CQ completion event notifications
 	sendCompChan chan *C.struct_ibv_wc // Channel for send completion events
-	recvCompChan chan *C.struct_ibv_wc // Channel for receive completion events
+	recvCompChan chan *C.struct_ibv_wc // Channel for receive completion events (non-ACKs or if no handler)
 	errChan      chan error            // Channel for error notifications
 
 	// CQ polling goroutine control
 	cqPollerRunning bool
 	cqPollerDone    chan struct{}
 	cqPollerMutex   sync.Mutex
+
+	// ACK handler for sender queues
+	ackHandler AckHandlerFunc
 }
 
 // CompletionType defines the type of work completion
@@ -580,7 +605,12 @@ func (u *UDQueue) StartCQPoller() {
 				ne := C.ibv_poll_cq(u.CQ, maxCompletions, &wc[0])
 				if ne < 0 {
 					// Polling error
-					u.errChan <- fmt.Errorf("ibv_poll_cq failed: %d", ne)
+					log.Error().Err(fmt.Errorf("ibv_poll_cq failed: %d", ne)).
+						Str("device", u.RNIC.DeviceName).
+						Uint32("qpn", u.QPN).
+						Msg("CQ Poller: Polling error")
+					// Consider whether to send to u.errChan or just log
+					// u.errChan <- fmt.Errorf("ibv_poll_cq failed: %d", ne)
 					continue
 				}
 
@@ -590,19 +620,29 @@ func (u *UDQueue) StartCQPoller() {
 
 				// Process received completion events
 				for i := 0; i < int(ne); i++ {
-					completion := wc[i]
+					wcCopy := wc[i] // Make a copy for safe concurrent access if passed via channel/handler
 
 					// First check for errors
-					if completion.status != C.IBV_WC_SUCCESS {
-						u.errChan <- fmt.Errorf("completion failed: status=%d, vendor_err=%d, qp_num=%d",
-							completion.status, completion.vendor_err, completion.qp_num)
+					if wcCopy.status != C.IBV_WC_SUCCESS {
+						log.Error().
+							Str("device", u.RNIC.DeviceName).
+							Uint32("qpn", u.QPN).
+							Uint32("wc_status", uint32(wcCopy.status)).
+							Uint32("wc_vendor_err", uint32(wcCopy.vendor_err)).
+							Uint32("wc_qp_num", uint32(wcCopy.qp_num)).
+							Msg("CQPoller: Completion failed")
+						select {
+						case u.errChan <- fmt.Errorf("completion failed: status=%d, vendor_err=%d, qp_num=%d",
+							wcCopy.status, wcCopy.vendor_err, wcCopy.qp_num):
+						default:
+							log.Warn().Msg("Error channel blocked, discarding completion error event")
+						}
 						continue
 					}
 
 					// Distinguish between send and receive based on opcode
-					if completion.opcode == C.IBV_WC_SEND {
+					if wcCopy.opcode == C.IBV_WC_SEND {
 						// Send completion event
-						wcCopy := completion
 						select {
 						case u.sendCompChan <- &wcCopy:
 						default:
@@ -610,34 +650,126 @@ func (u *UDQueue) StartCQPoller() {
 							log.Warn().
 								Str("device", u.RNIC.DeviceName).
 								Uint32("qpn", u.QPN).
-								Uint32("wc_opcode", completion.opcode).
-								Uint32("byte_len", uint32(completion.byte_len)).
+								Uint32("wc_opcode", wcCopy.opcode).
+								Uint32("byte_len", uint32(wcCopy.byte_len)).
 								Msg("Send completion channel (sendCompChan) is blocked, discarding event")
 						}
-					} else if completion.opcode == C.IBV_WC_RECV {
-						// Receive completion event
-						wcCopy := completion
-						select {
-						case u.recvCompChan <- &wcCopy:
-						default:
-							// Channel is blocked (no receiver)
-							log.Warn().
-								Str("device", u.RNIC.DeviceName).
-								Uint32("qpn", u.QPN).
-								Uint32("wc_opcode", completion.opcode).
-								Uint32("byte_len", uint32(completion.byte_len)).
-								Msg("Receive completion channel (recvCompChan) is blocked, discarding event")
+					} else if wcCopy.opcode == C.IBV_WC_RECV {
+						receiveTime := time.Now()
+						grhPresent := (wcCopy.wc_flags & C.IBV_WC_GRH) == C.IBV_WC_GRH
+						var packetDataPtr unsafe.Pointer
+						var actualPayloadLength uint32
+						expectedMinimumPayloadSize := uint32(unsafe.Sizeof(ProbePacket{}))
+
+						if grhPresent {
+							if uint32(wcCopy.byte_len) < GRHSize+expectedMinimumPayloadSize {
+								log.Warn().Uint32("wc_byte_len", uint32(wcCopy.byte_len)).Msg("GRH present, but wc.byte_len too small for GRH + ProbePacket.")
+								// Post recv and continue, this is not a valid probe/ack
+								if errPost := u.PostRecv(); errPost != nil {
+									log.Warn().Err(errPost).Str("device", u.RNIC.DeviceName).Uint32("qpn", u.QPN).Msg("CQPoller: Failed to post replacement receive buffer after small GRH packet")
+								}
+								continue
+							}
+							actualPayloadLength = uint32(wcCopy.byte_len) - GRHSize
+							packetDataPtr = unsafe.Pointer(uintptr(u.RecvBuf) + uintptr(GRHSize))
+						} else {
+							if uint32(wcCopy.byte_len) < expectedMinimumPayloadSize {
+								log.Warn().Uint32("wc_byte_len", uint32(wcCopy.byte_len)).Msg("No GRH, and wc.byte_len too small for ProbePacket.")
+								// Post recv and continue
+								if errPost := u.PostRecv(); errPost != nil {
+									log.Warn().Err(errPost).Str("device", u.RNIC.DeviceName).Uint32("qpn", u.QPN).Msg("CQPoller: Failed to post replacement receive buffer after small non-GRH packet")
+								}
+								continue
+							}
+							actualPayloadLength = uint32(wcCopy.byte_len)
+							packetDataPtr = u.RecvBuf
+						}
+						// At this point, actualPayloadLength >= expectedMinimumPayloadSize
+						packet := (*ProbePacket)(packetDataPtr)
+
+						// If it's a sender queue, has an ackHandler, and is an ACK packet, use the handler
+						if u.QueueType == UDQueueTypeSender && u.ackHandler != nil && packet.IsAck == 1 {
+							log.Debug().Uint32("payloadLength", actualPayloadLength).Msg("CQPoller: ACK packet received, invoking handler.") // Use actualPayloadLength
+							ackInfo := &IncomingAckInfo{
+								Packet:      packet, // Note: This is a pointer to RecvBuf, handler should copy if needed long-term
+								ReceivedAt:  receiveTime,
+								SourceQP:    uint32(wcCopy.src_qp),
+								RawWC:       &wcCopy,                           // Pass the raw WC if Prober might need other fields, but encourage using abstracted fields.
+								AckStatusOK: wcCopy.status == C.IBV_WC_SUCCESS, // Populate the status field
+							}
+
+							if grhPresent {
+								grhBytes := unsafe.Slice((*byte)(u.RecvBuf), GRHSize)
+								ipVersion := (grhBytes[0] >> 4) & 0x0F
+								grhInfo := &GRHHeaderInfo{}
+
+								if ipVersion == 6 { // Standard RoCEv2 GRH (IPv6 Format)
+									sgidSlice := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(u.RecvBuf)+8)), 16)
+									dgidSlice := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(u.RecvBuf)+24)), 16)
+									grhInfo.SourceGID = formatGIDString(sgidSlice)
+									grhInfo.DestGID = formatGIDString(dgidSlice)
+									ipv6Header, err := ipv6.ParseHeader(grhBytes)
+									if err == nil && ipv6Header != nil {
+										grhInfo.FlowLabel = uint32(ipv6Header.FlowLabel)
+									} else {
+										log.Warn().Err(err).Msg("CQPoller: Failed to parse GRH as IPv6 header for FlowLabel (ACK path).")
+									}
+								} else if ipVersion == 4 { // Custom IPv4-in-GRH handling
+									// This logic is based on previous ReceivePacket; adapt if GRH interpretation for ACK differs
+									const ipv4HeaderOffsetInGRH = 20
+									const ipv4HeaderMinLength = 20
+									if GRHSize >= ipv4HeaderOffsetInGRH+ipv4HeaderMinLength {
+										ipv4HeaderBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(u.RecvBuf)+uintptr(ipv4HeaderOffsetInGRH))), ipv4HeaderMinLength)
+										parsedIPv4Header, err := ipv4.ParseHeader(ipv4HeaderBytes)
+										if err == nil && parsedIPv4Header != nil && parsedIPv4Header.Src != nil && parsedIPv4Header.Dst != nil {
+											srcIPv4 := parsedIPv4Header.Src.To4()
+											dstIPv4 := parsedIPv4Header.Dst.To4()
+											if srcIPv4 != nil && dstIPv4 != nil {
+												srcMappedIPv6Bytes := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, srcIPv4[0], srcIPv4[1], srcIPv4[2], srcIPv4[3]}
+												dstMappedIPv6Bytes := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, dstIPv4[0], dstIPv4[1], dstIPv4[2], dstIPv4[3]}
+												grhInfo.SourceGID = formatGIDString(srcMappedIPv6Bytes)
+												grhInfo.DestGID = formatGIDString(dstMappedIPv6Bytes)
+												// FlowLabel might not be directly available/meaningful in this custom IPv4 case unless derived differently
+											}
+										} else {
+											log.Warn().Err(err).Msg("CQPoller: Failed to parse custom IPv4 header from GRH (ACK path).")
+										}
+									} else {
+										log.Warn().Msg("CQPoller: GRH too small for custom IPv4 header offset (ACK path).")
+									}
+								} else {
+									log.Warn().Uint8("ipVersion", ipVersion).Msg("CQPoller: GRH has an unknown or unsupported IP Version (ACK path).")
+								}
+								ackInfo.GRHInfo = grhInfo
+							}
+							u.ackHandler(ackInfo)
+							// ACK handled, post new recv buffer
+							if errPost := u.PostRecv(); errPost != nil {
+								log.Warn().Err(errPost).Str("device", u.RNIC.DeviceName).Uint32("qpn", u.QPN).Msg("CQPoller: Failed to post replacement receive buffer after ACK handled by callback")
+							}
+						} else {
+							// Not an ACK, or no handler, or responder queue: send to recvCompChan
+							select {
+							case u.recvCompChan <- &wcCopy:
+							default:
+								log.Warn().
+									Str("device", u.RNIC.DeviceName).
+									Uint32("qpn", u.QPN).
+									Uint32("wc_opcode", wcCopy.opcode).
+									Uint32("byte_len", uint32(wcCopy.byte_len)).
+									Msg("Receive completion channel (recvCompChan) is blocked, discarding event")
+							}
 						}
 					} else {
 						// Handle other completion types or log an error/warning
 						log.Error().
 							Str("device", u.RNIC.DeviceName).
 							Uint32("qpn", u.QPN).
-							Uint32("wc_qp_num", uint32(completion.qp_num)).
-							Uint32("wc_status", uint32(completion.status)).
-							Uint32("wc_opcode", completion.opcode).
-							Uint32("byte_len", uint32(completion.byte_len)).
-							Msgf("CQPoller: Polled an event with unhandled opcode: %d", completion.opcode)
+							Uint32("wc_qp_num", uint32(wcCopy.qp_num)).
+							Uint32("wc_status", uint32(wcCopy.status)).
+							Uint32("wc_opcode", wcCopy.opcode).
+							Uint32("byte_len", uint32(wcCopy.byte_len)).
+							Msgf("CQPoller: Polled an event with unhandled opcode: %d", wcCopy.opcode)
 						// Optionally, push to errChan if this is considered a critical error for the application
 						// u.errChan <- fmt.Errorf("unhandled completion opcode: %d on QPN %d", opcodeValue, u.QPN)
 					}
@@ -666,7 +798,7 @@ func (u *UDQueue) StopCQPoller() {
 }
 
 // CreateUDQueue creates a UD queue pair for sending and receiving probe packets
-func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType) (*UDQueue, error) {
+func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandler AckHandlerFunc) (*UDQueue, error) {
 	if !rnic.IsOpen {
 		// If RNIC is not open, it implies OpenDevice was not called from AgentState with a specific GID index.
 		// Opening it here without a gidIndex from config is problematic.
@@ -688,6 +820,16 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType) (*UDQueue
 	// Step 2: Allocate memory resources
 	sendBuf, recvBuf, sendMR, recvMR, err := m.allocateMemoryResources(rnic, qp, cq, compChannel)
 	if err != nil {
+		// Ensure resources from Step 1 are cleaned up if Step 2 fails
+		if qp != nil {
+			C.ibv_destroy_qp(qp)
+		}
+		if cq != nil {
+			C.ibv_destroy_cq(cq)
+		}
+		if compChannel != nil {
+			C.ibv_destroy_comp_channel(compChannel)
+		}
 		return nil, err
 	}
 
@@ -707,6 +849,15 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType) (*UDQueue
 		recvCompChan: make(chan *C.struct_ibv_wc, RecvCompChanBufferSize), // Buffered channel
 		errChan:      make(chan error, ErrChanBufferSize),                 // Buffered channel
 		cqPollerDone: make(chan struct{}),
+		ackHandler:   ackHandler,
+	}
+
+	// Set ackHandler only for Sender queues
+	if queueType == UDQueueTypeSender {
+		udQueue.ackHandler = ackHandler
+		if ackHandler == nil {
+			log.Warn().Str("device", rnic.DeviceName).Uint32("qpn", udQueue.QPN).Msg("Creating Sender UDQueue without an ACK handler. ACKs will be sent to recvCompChan.")
+		}
 	}
 
 	// Store the UDQueue in the maps based on its type
@@ -934,21 +1085,21 @@ func (m *RDMAManager) allocateMemoryResources(rnic *RNIC, qp *C.struct_ibv_qp, c
 }
 
 // CreateSenderAndResponderQueues creates both sender and responder UDQueues for a given RNIC
-func (m *RDMAManager) CreateSenderAndResponderQueues(rnic *RNIC) error {
+func (m *RDMAManager) CreateSenderAndResponderQueues(rnic *RNIC, senderAckHandler AckHandlerFunc) error {
 	if !rnic.IsOpen {
 		// Similar to CreateUDQueue, RNIC should be opened by AgentState with a specific GID index.
 		return fmt.Errorf("RNIC device %s is not open. CreateSenderAndResponderQueues requires an already opened RNIC.", rnic.DeviceName)
 	}
 
 	// Create sender queue
-	senderQueue, err := m.CreateUDQueue(rnic, UDQueueTypeSender)
+	senderQueue, err := m.CreateUDQueue(rnic, UDQueueTypeSender, senderAckHandler)
 	if err != nil {
 		return fmt.Errorf("failed to create sender queue for device %s: %w", rnic.DeviceName, err)
 	}
 	log.Info().Str("device", rnic.DeviceName).Uint32("qpn", senderQueue.QPN).Msg("Created sender queue")
 
-	// Create responder queue
-	responderQueue, err := m.CreateUDQueue(rnic, UDQueueTypeResponder)
+	// Create responder queue (no ack handler for responder)
+	responderQueue, err := m.CreateUDQueue(rnic, UDQueueTypeResponder, nil)
 	if err != nil {
 		// Clean up sender queue if responder queue creation fails
 		senderQueue.Destroy()

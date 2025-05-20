@@ -14,6 +14,26 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+// PingSession holds the state for a single probe transaction.
+type PingSession struct {
+	SequenceNum   uint64
+	SourceRnicGid string
+	TargetGid     string
+	FlowLabel     uint32 // For logging/debugging
+
+	Ack1Chan chan *ackEvent // Receives the first ACK (type 1)
+	Ack2Chan chan *ackEvent // Receives the second ACK (type 2)
+
+	CreationTime time.Time
+}
+
+// ackEvent is a wrapper for ACK data received.
+type ackEvent struct {
+	Packet     *rdma.ProbePacket
+	ReceivedAt time.Time
+	WorkComp   *rdma.WorkCompletion
+}
+
 // Prober is responsible for sending probes to targets and processing their responses
 type Prober struct {
 	rdmaManager  *rdma.RDMAManager
@@ -24,6 +44,8 @@ type Prober struct {
 	stopCh       chan struct{}
 	wg           sync.WaitGroup
 	running      bool
+
+	pendingSessions *sync.Map // Key: sequence number
 }
 
 const (
@@ -34,13 +56,14 @@ const (
 // NewProber creates a new prober
 func NewProber(rdmaManager *rdma.RDMAManager, agentState *state.AgentState, timeoutMs uint32) *Prober {
 	return &Prober{
-		rdmaManager:  rdmaManager,
-		agentState:   agentState,
-		sequenceNum:  0,
-		probeResults: make(chan *agent_analyzer.ProbeResult, probeResultChanBufferSize),
-		timeout:      time.Duration(timeoutMs) * time.Millisecond,
-		stopCh:       make(chan struct{}),
-		running:      false,
+		rdmaManager:     rdmaManager,
+		agentState:      agentState,
+		sequenceNum:     0,
+		probeResults:    make(chan *agent_analyzer.ProbeResult, probeResultChanBufferSize),
+		timeout:         time.Duration(timeoutMs) * time.Millisecond,
+		stopCh:          make(chan struct{}),
+		running:         false,
+		pendingSessions: new(sync.Map),
 	}
 }
 
@@ -53,18 +76,27 @@ func (p *Prober) Start() error {
 	p.running = true
 	p.stopCh = make(chan struct{})
 
-	// Log all detected RNICs by AgentState
 	detectedRNICs := p.agentState.GetDetectedRNICs()
 	log.Debug().Int("count", len(detectedRNICs)).Msg("RNICs detected by AgentState for Prober.Start")
+
 	for _, rnic := range detectedRNICs {
 		log.Debug().Str("rnic_gid", rnic.GID).Str("rnic_device_name", rnic.DeviceName).Msg("Processing RNIC in Prober.Start")
-		// Get the RESPONDER UDQueue for handling incoming probes
-		udq := p.agentState.GetResponderUDQueue(rnic.GID)
-		if udq != nil {
+
+		// Start responderLoop for RESPONDER UDQueues
+		responderUdq := p.agentState.GetResponderUDQueue(rnic.GID)
+		if responderUdq != nil {
 			p.wg.Add(1)
-			go p.responderLoop(udq)
+			go p.responderLoop(responderUdq)
 		} else {
-			log.Warn().Str("rnic_gid", rnic.GID).Str("rnic_device_name", rnic.DeviceName).Msg("Responder UDQueue is nil for this RNIC in Prober.Start, responderLoop will not start")
+			log.Warn().Str("rnic_gid", rnic.GID).Str("rnic_device_name", rnic.DeviceName).Msg("Responder UDQueue is nil for this RNIC, responderLoop will not start")
+		}
+
+		// Start ackDispatcherLoop for SENDER UDQueues
+		senderUdq := p.agentState.GetSenderUDQueue(rnic.GID)
+		if senderUdq != nil {
+			log.Info().Str("rnic_gid", rnic.GID).Msg("Sender UDQueue found; ACK handler should be registered by AgentState.")
+		} else {
+			log.Warn().Str("rnic_gid", rnic.GID).Str("rnic_device_name", rnic.DeviceName).Msg("Sender UDQueue is nil for this RNIC, ACK handler cannot be set up here.")
 		}
 	}
 	return nil
@@ -83,7 +115,7 @@ func (p *Prober) Stop() {
 
 // ProbeTarget sends a probe to a target and waits for a response
 func (p *Prober) ProbeTarget(
-	ctx context.Context,
+	ctx context.Context, // Overall timeout for this probe operation
 	sourceRnic *rdma.RNIC,
 	targetGID string,
 	targetQPN uint32,
@@ -92,28 +124,53 @@ func (p *Prober) ProbeTarget(
 	probeType string,
 	targetRnicInfo *agent_analyzer.RnicIdentifier,
 ) {
-	// Increment sequence number
 	seqNum := atomic.AddUint64(&p.sequenceNum, 1)
 
-	// Get the SENDER UDQueue for the source RNIC (for sending probes and receiving ACKs)
 	srcUdQueue := p.agentState.GetSenderUDQueue(sourceRnic.GID)
 	if srcUdQueue == nil {
 		log.Error().
 			Str("gid", sourceRnic.GID).
-			Uint32("qpn", srcUdQueue.QPN).
 			Uint64("seqNum", seqNum).
 			Msg("Failed to get sender UDQueue for source RNIC in ProbeTarget")
 		return
 	}
 
-	// Create result object
+	// Create and register the session
+	session := &PingSession{
+		SequenceNum:   seqNum,
+		SourceRnicGid: sourceRnic.GID,
+		TargetGid:     targetGID,
+		FlowLabel:     flowLabel,
+		Ack1Chan:      make(chan *ackEvent, 1), // Buffered to allow dispatcher to send without blocking if ProbeTarget is slow
+		Ack2Chan:      make(chan *ackEvent, 1), // Same buffering reason
+		CreationTime:  time.Now(),
+	}
+
+	p.pendingSessions.Store(flowLabel, session)
+
+	// Ensure session is cleaned up
+	defer func() {
+		p.pendingSessions.Delete(flowLabel)
+
+		// Close channels to unblock dispatcher if it's trying to send to a timed-out session,
+		// and to prevent leaks.
+		// The dispatcher has a non-blocking send attempt (select with default).
+		if session.Ack1Chan != nil { // Check if already nilled out by ACK processing
+			close(session.Ack1Chan)
+		}
+		if session.Ack2Chan != nil { // Check if already nilled out
+			close(session.Ack2Chan)
+		}
+		log.Debug().Uint32("flowLabel", flowLabel).Msg("Cleaned up session")
+	}()
+
 	result := &agent_analyzer.ProbeResult{
 		SourceRnic: &agent_analyzer.RnicIdentifier{
 			Gid:       sourceRnic.GID,
-			Qpn:       srcUdQueue.QPN,
+			Qpn:       srcUdQueue.QPN, // Safe now as srcUdQueue is not nil
 			IpAddress: sourceRnic.IPAddr,
 			HostName:  sourceRnic.DeviceName,
-			TorId:     "", // This would need to be populated from config or controller
+			// TorId:     "", // Populate if available
 		},
 		DestinationRnic: targetRnicInfo,
 		FiveTuple: &agent_analyzer.ProbeFiveTuple{
@@ -124,6 +181,7 @@ func (p *Prober) ProbeTarget(
 			FlowLabel: flowLabel,
 		},
 		ProbeType: probeType,
+		Status:    agent_analyzer.ProbeResult_UNKNOWN, // Initial status
 	}
 
 	log.Debug().
@@ -134,220 +192,189 @@ func (p *Prober) ProbeTarget(
 		Uint32("flowLabel", flowLabel).
 		Str("probeType", probeType).
 		Uint64("seqNum", seqNum).
-		Msg("Starting probe to target")
+		Msg("Starting probe to target (session based)")
 
-	// Record T1 timestamp (post send time)
 	t1 := time.Now()
 	result.T1 = timestamppb.New(t1)
 
-	// Step 1: Send probe packet
-	t2Time, err := srcUdQueue.SendProbePacket(ctx, targetGID, targetQPN, seqNum, sourcePort, flowLabel)
+	// Send probe packet
+	// The context passed to SendProbePacket should be derived from the overall 'ctx' for ProbeTarget
+	// or be a shorter one specific to the send operation if needed.
+	// For now, let's use a derived context that respects the overall timeout for this specific send.
+	sendCtx, sendCancel := context.WithTimeout(ctx, p.timeout) // Use prober's general timeout for the send itself
+	t2Time, err := srcUdQueue.SendProbePacket(sendCtx, targetGID, targetQPN, seqNum, sourcePort, flowLabel)
+	sendCancel() // Release sendCtx resources
+
 	if err != nil {
+		log.Error().Err(err).
+			Str("srcGID", sourceRnic.GID).
+			Uint32("srcQPN", srcUdQueue.QPN).
+			Str("targetGID", targetGID).
+			Uint64("seqNum", seqNum).
+			Uint32("flowLabel", flowLabel).
+			Msg("[prober]: Failed to send probe packet")
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			log.Debug().Err(err).
-				Str("targetGID", targetGID).
-				Uint32("targetQPN", targetQPN).
-				Uint64("seqNum", seqNum).
-				Msg("[prober]: Timeout or error waiting for probe packet")
-			result.Status = agent_analyzer.ProbeResult_TIMEOUT
-			p.probeResults <- result
+			result.Status = agent_analyzer.ProbeResult_TIMEOUT // Or a more specific send timeout error
 		} else {
-			log.Error().Err(err).
-				Str("targetGID", targetGID).
-				Uint32("targetQPN", targetQPN).
-				Uint64("seqNum", seqNum).
-				Msg("[prober]: Failed to send probe packet")
 			result.Status = agent_analyzer.ProbeResult_ERROR
 		}
+		p.probeResults <- result
 		return
 	}
-
-	// Record T2 timestamp (prober CQE time)
 	result.T2 = timestamppb.New(t2Time)
+
 	log.Debug().
+		Str("srcGID", sourceRnic.GID).
+		Uint32("srcQPN", srcUdQueue.QPN).
 		Str("targetGID", targetGID).
-		Uint32("targetQPN", targetQPN).
-		Time("t1", t1).
-		Time("t2", t2Time).
 		Uint64("seqNum", seqNum).
-		Msg("[prober]: Probe sent successfully, waiting for ACKs")
+		Uint32("flowLabel", flowLabel).
+		Msg("[prober]: Probe sent, waiting for ACKs via session channels")
 
-	var (
-		ack2Packet *rdma.ProbePacket
-		t5Time     time.Time
-	)
-	ack1Received := false
-	ack2Received := false
-	result.Status = agent_analyzer.ProbeResult_UNKNOWN // Initialize status, will be updated
+	var ack1Event, ack2Event *ackEvent
+	ack1Received, ack2Received := false, false
 
-	// Loop to receive both ACKs. The overall timeout is handled by the input context 'ctx'.
 	for !(ack1Received && ack2Received) {
+		// Define local copies of channel references for the select statement.
+		// This allows nilling them out after an ACK is received to prevent re-selection.
+		currentAck1Chan := session.Ack1Chan
+		currentAck2Chan := session.Ack2Chan
+
+		if ack1Received { // If already received, don't select on it.
+			currentAck1Chan = nil
+		}
+		if ack2Received {
+			currentAck2Chan = nil
+		}
+		// If both channels are nil (both ACKs received), the loop condition handles exit.
+		// If one is nil, select will ignore it.
+
 		select {
-		case <-ctx.Done():
+		case <-ctx.Done(): // Overall timeout for ProbeTarget
 			log.Debug().Err(ctx.Err()).
+				Uint64("seqNum", seqNum).
+				Str("srcGID", sourceRnic.GID).
+				Uint32("srcQPN", srcUdQueue.QPN).
 				Str("targetGID", targetGID).
 				Uint32("targetQPN", targetQPN).
-				Bool("ack1Received", ack1Received).
-				Bool("ack2Received", ack2Received).
-				Uint64("seqNum", seqNum).
-				Msg("[prober]: Context cancelled or timed out while waiting for ACKs")
+				Uint32("flowLabel", flowLabel).
+				Bool("ack1Rcvd", ack1Received).
+				Bool("ack2Rcvd", ack2Received).
+				Msg("[prober]: Context timed out/cancelled while waiting for ACKs")
 			result.Status = agent_analyzer.ProbeResult_TIMEOUT
 			p.probeResults <- result
-			return
-		default:
-			// Non-blocking check for context, proceed to receive.
-		}
+			return // Exit ProbeTarget
 
-		receivedPacket, receivedTime, workComp, err := srcUdQueue.ReceivePacket(ctx)
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				log.Debug().Err(err).
-					Str("targetGID", targetGID).
-					Uint32("targetQPN", targetQPN).
-					Bool("ack1Received", ack1Received).
-					Bool("ack2Received", ack2Received).
+		case event, ok := <-currentAck1Chan: // currentAck1Chan could be nil
+			if !ok { // Channel closed by defer or dispatcher
+				log.Warn().
 					Uint64("seqNum", seqNum).
-					Msg("[prober]: Timeout waiting for an ACK")
-				result.Status = agent_analyzer.ProbeResult_TIMEOUT
-			} else {
-				log.Error().Err(err).
-					Str("targetGID", targetGID).
-					Uint32("targetQPN", targetQPN).
-					Uint64("seqNum", seqNum).
-					Msg("[prober]: Error waiting for an ACK")
-				result.Status = agent_analyzer.ProbeResult_ERROR
+					Uint32("flowLabel", flowLabel).
+					Msg("[prober]: Ack1Chan closed unexpectedly")
+				session.Ack1Chan = nil // Ensure it's nil for future selects if loop somehow continues
+				if !ack1Received {     // If we genuinely needed it, this is a problem
+					result.Status = agent_analyzer.ProbeResult_ERROR // Indicate missing ACK
+					p.probeResults <- result
+					return
+				}
+				continue // Re-evaluate loop condition
 			}
-			p.probeResults <- result
-			return
-		}
-
-		if receivedPacket.IsAck != 1 {
-			log.Warn().
-				Uint64("receivedSeq", receivedPacket.SequenceNum).
-				Uint8("ackType", receivedPacket.AckType).
-				Str("srcGID", sourceRnic.GID).
-				Str("dstGID", targetGID).
-				Str("receivedPacketSGID", workComp.SGID).
-				Uint32("receivedPacketSrcQPN", workComp.SrcQP).
-				Uint64("seqNum", seqNum).
-				Msg("[prober]: Received a packet that is not an ACK, ignoring")
-			continue
-		}
-
-		if receivedPacket.SequenceNum != seqNum {
-			log.Warn().
-				Uint64("expectedSeq", seqNum).
-				Uint64("receivedSeq", receivedPacket.SequenceNum).
-				Uint8("ackType", receivedPacket.AckType).
-				Str("srcGID", sourceRnic.GID).
-				Str("dstGID", targetGID).
-				Str("receivedPacketSGID", workComp.SGID).
-				Uint32("receivedPacketSrcQPN", workComp.SrcQP).
-				Msg("[prober]: Received ACK with mismatched sequence number, ignoring")
-			continue
-		}
-
-		switch receivedPacket.AckType {
-		case 1:
-			if !ack1Received {
-				t5Time = receivedTime
+			if !ack1Received { // Process only the first one
+				ack1Event = event
 				ack1Received = true
 				log.Debug().
 					Uint64("seqNum", seqNum).
-					Str("targetGID", targetGID).
+					Uint32("flowLabel", flowLabel).
 					Msg("[prober]: Received first ACK (type 1)")
+				// session.Ack1Chan = nil // Done with this channel, effectively handled by currentAck1Chan logic
 			} else {
 				log.Warn().
 					Uint64("seqNum", seqNum).
-					Str("targetGID", targetGID).
-					Msg("[prober]: Received duplicate first ACK (type 1), ignoring")
+					Uint32("flowLabel", flowLabel).
+					Msg("[prober]: Received duplicate/late first ACK on Ack1Chan")
 			}
-		case 2:
+
+		case event, ok := <-currentAck2Chan: // currentAck2Chan could be nil
+			if !ok {
+				log.Warn().
+					Uint64("seqNum", seqNum).
+					Uint32("flowLabel", flowLabel).
+					Msg("[prober]: Ack2Chan closed unexpectedly")
+				session.Ack2Chan = nil
+				if !ack2Received {
+					result.Status = agent_analyzer.ProbeResult_ERROR
+					p.probeResults <- result
+					return
+				}
+				continue
+			}
 			if !ack2Received {
-				ack2Packet = receivedPacket
+				ack2Event = event
 				ack2Received = true
 				log.Debug().
 					Uint64("seqNum", seqNum).
-					Str("targetGID", targetGID).
+					Uint32("flowLabel", flowLabel).
 					Msg("[prober]: Received second ACK (type 2)")
+				// session.Ack2Chan = nil
 			} else {
 				log.Warn().
 					Uint64("seqNum", seqNum).
-					Str("targetGID", targetGID).
-					Msg("[prober]: Received duplicate second ACK (type 2), ignoring")
+					Uint32("flowLabel", flowLabel).
+					Msg("[prober]: Received duplicate/late second ACK on Ack2Chan")
 			}
-		default:
-			log.Warn().
-				Uint64("seqNum", seqNum).
-				Uint8("ackType", receivedPacket.AckType).
-				Str("targetGID", targetGID).
-				Str("receivedPacketSGID", workComp.SGID).
-				Uint32("receivedPacketSrcQPN", workComp.SrcQP).
-				Msg("[prober]: Received ACK with unknown AckType, ignoring")
 		}
-	} // End of ACK receive loop
+	} // End of ackLoop
 
-	// At this point, if we haven't returned, the loop exited because (ack1Received && ack2Received) is true.
-	// Or, in a very unlikely scenario, the loop condition was met but ctx.Done() was simultaneously true.
-	// The select case for ctx.Done() should handle timeout/cancellation primarily.
+	// If we exited the loop, it means ack1Received and ack2Received are true.
+	// Or, a channel closed and we errored out (handled above).
+	// Or, ctx.Done() was hit (handled above).
 
-	// Double-check that both ACKs were actually processed and packets stored if logic depends on them beyond flags.
-	if !ack1Received || !ack2Received {
-		// This should not be reached if the loop and timeout logic is correct.
-		// If it is, it implies a logic flaw or an unhandled exit from the loop.
-		log.Error().
-			Uint64("seqNum", seqNum).
-			Str("targetGID", targetGID).
-			Bool("ack1Received", ack1Received).
-			Bool("ack2Received", ack2Received).
-			Msg("[prober]: Logic error: exited ACK loop but not all ACKs received and no timeout/error reported.")
-		result.Status = agent_analyzer.ProbeResult_ERROR // Indicate an internal logic error
+	if !(ack1Received && ack2Received) {
+		// This path should ideally not be reached if timeout/error handling in select is correct.
+		// It implies the loop condition was met without both ACKs, or an unhandled case.
+		if result.Status == agent_analyzer.ProbeResult_UNKNOWN || result.Status == agent_analyzer.ProbeResult_OK { // If not already set to TIMEOUT or ERROR
+			log.Error().
+				Uint64("seqNum", seqNum).
+				Bool("ack1", ack1Received).
+				Bool("ack2", ack2Received).
+				Msg("[prober]: Exited ACK loop logic error: not all ACKs received and not due to reported timeout/error.")
+			result.Status = agent_analyzer.ProbeResult_ERROR
+		}
 		p.probeResults <- result
 		return
 	}
 
-	result.T5 = timestamppb.New(t5Time) // t5Time is set when ackType=1 is received
+	// Process ACKs
+	result.T5 = timestamppb.New(ack1Event.ReceivedAt) // T5 is receive time of first ACK at prober
 
-	// ack2Packet should be non-nil if ack2Received is true
-	t3Time := time.Unix(0, int64(ack2Packet.T3))
-	t4Time := time.Unix(0, int64(ack2Packet.T4))
+	t3Time := time.Unix(0, int64(ack2Event.Packet.T3))
+	t4Time := time.Unix(0, int64(ack2Event.Packet.T4))
 	result.T3 = timestamppb.New(t3Time)
 	result.T4 = timestamppb.New(t4Time)
 
-	// Record T6 timestamp
-	t6 := time.Now()
+	t6 := time.Now() // T6 is prober's post-processing time
 	result.T6 = timestamppb.New(t6)
 
-	// Network RTT = (T5-T2)-(T4-T3)
-	networkRTT := t5Time.Sub(t2Time) - (t4Time.Sub(t3Time))
+	// Calculations
+	networkRTT := ack1Event.ReceivedAt.Sub(t2Time) - (t4Time.Sub(t3Time))
 	result.NetworkRtt = networkRTT.Nanoseconds()
 
-	// Prober delay = (T6-T1)-(T5-T2)
-	proberDelay := t6.Sub(t1) - t5Time.Sub(t2Time)
+	proberDelay := t6.Sub(t1) - ack1Event.ReceivedAt.Sub(t2Time)
 	result.ProberDelay = proberDelay.Nanoseconds()
 
-	// Responder delay = (T4-T3)
 	responderDelay := t4Time.Sub(t3Time)
 	result.ResponderDelay = responderDelay.Nanoseconds()
 
 	result.Status = agent_analyzer.ProbeResult_OK
 
 	log.Debug().
+		Uint64("seqNum", seqNum).
 		Str("targetGID", targetGID).
-		Uint32("targetQPN", targetQPN).
-		Time("t1", t1).
-		Time("t2", t2Time).
-		Time("t3", t3Time).
-		Time("t4", t4Time).
-		Time("t5", t5Time).
-		Time("t6", t6).
 		Int64("networkRTT_ns", result.NetworkRtt).
 		Int64("proberDelay_ns", result.ProberDelay).
 		Int64("responderDelay_ns", result.ResponderDelay).
-		Uint64("seqNum", seqNum).
-		Msg("[prober]: Probe completed successfully with unordered ACKs")
+		Msg("[prober]: Probe completed successfully")
 
-	// Send result to channel for upload
 	p.probeResults <- result
 }
 
@@ -422,8 +449,9 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 			if packet.IsAck != 0 {
 				log.Warn().
 					Str("device", udq.RNIC.DeviceName).
-					Str("gid", udq.RNIC.GID).
-					Uint32("qpn", udq.QPN).
+					Str("GID", udq.RNIC.GID).
+					Uint32("QPN", udq.QPN).
+					Uint32("flowLabel", workComp.FlowLabel).
 					Uint64("seqNum", packet.SequenceNum).
 					Msg("[responder]: Received ACK packet (this is invalid, ignoring)")
 				continue
@@ -440,6 +468,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				log.Error().
 					Str("sourceGID", sourceGID).
 					Uint32("sourceQPN", sourceQPN).
+					Uint32("flowLabel", workComp.FlowLabel).
 					Uint64("seqNum", packet.SequenceNum).
 					Msg("[responder]: Invalid source GID or QPN in work completion, cannot send ACK")
 				continue
@@ -447,10 +476,11 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 
 			log.Debug().
 				Str("sending_device", udq.RNIC.DeviceName).
-				Uint32("sending_qpn", udq.QPN).
-				Str("sending_gid", udq.RNIC.GID).
-				Str("target_gid", sourceGID).
-				Uint32("target_qpn", sourceQPN).
+				Uint32("sendingQPN", udq.QPN).
+				Str("sendingGID", udq.RNIC.GID).
+				Str("targetGID", sourceGID).
+				Uint32("targetQPN", sourceQPN).
+				Uint32("flowLabel", workComp.FlowLabel).
 				Uint64("seqNum", packet.SequenceNum).
 				Msg("[responder]: Received probe packet, sending ACKs")
 
@@ -461,6 +491,10 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				log.Error().Err(err).
 					Str("sourceGID", sourceGID).
 					Uint32("sourceQPN", sourceQPN).
+					Str("targetGID", sourceGID).
+					Uint32("targetQPN", sourceQPN).
+					Uint32("flowLabel", workComp.FlowLabel).
+					Uint64("seqNum", packet.SequenceNum).
 					Msg("[responder]: Failed to send first ACK packet")
 				continue
 			}
@@ -472,6 +506,10 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				log.Error().Err(err).
 					Str("sourceGID", sourceGID).
 					Uint32("sourceQPN", sourceQPN).
+					Str("targetGID", sourceGID).
+					Uint32("targetQPN", sourceQPN).
+					Uint32("flowLabel", workComp.FlowLabel).
+					Uint64("seqNum", packet.SequenceNum).
 					Msg("[responder]: Failed to send second ACK packet")
 				continue
 			}
@@ -484,4 +522,89 @@ func (p *Prober) Close() error {
 	p.Stop()
 	close(p.probeResults)
 	return nil
+}
+
+// HandleIncomingRDMAPacket is the callback function for rdma.AckHandlerFunc.
+// It processes ACK packets received by the RDMA layer and dispatches them to the correct session.
+func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
+	if ackInfo == nil || ackInfo.Packet == nil {
+		log.Error().Msg("[prober_handler]: Received nil ackInfo or ackInfo.Packet")
+		return
+	}
+
+	// The user's latest change indicates FlowLabel from GRH is used as the session key.
+	// Ensure GRHInfo is present and FlowLabel is valid.
+	if ackInfo.GRHInfo == nil {
+		log.Warn().Uint64("seqNum_from_packet", ackInfo.Packet.SequenceNum).Msg("[prober_handler]: ACK packet missing GRHInfo, cannot determine FlowLabel for session lookup.")
+		return
+	}
+	sessionKey := ackInfo.GRHInfo.FlowLabel // Using FlowLabel as the key, per user's latest changes.
+
+	log.Debug().
+		Uint32("sessionKey_flowLabel", sessionKey).
+		Uint64("packet_seqNum", ackInfo.Packet.SequenceNum).
+		Uint8("packet_ackType", ackInfo.Packet.AckType).
+		Str("source_gid_from_grh", ackInfo.GRHInfo.SourceGID).
+		Uint32("source_qp_from_wc", ackInfo.SourceQP).
+		Msg("[prober_handler]: Processing incoming ACK packet via callback")
+
+	rawSession, exists := p.pendingSessions.Load(sessionKey)
+	if exists {
+		session, _ := rawSession.(*PingSession) // ignore ok because ok always becomes false
+		// Construct probe.ackEvent from rdma.IncomingAckInfo
+		// Note: ackInfo.Packet is a pointer into RDMA recv buffer. If Prober needs to hold onto it
+		// beyond the scope of this handler call, it *must* be deep-copied.
+		// For now, we assume PingSession channels consume it quickly or copy if needed.
+		probeEvent := &ackEvent{
+			Packet:     ackInfo.Packet, // This is a direct pointer, be cautious.
+			ReceivedAt: ackInfo.ReceivedAt,
+			WorkComp: &rdma.WorkCompletion{ // Populate with available info
+				// Status:    uint32(ackInfo.RawWC.status), // Avoid direct access to C struct fields
+				// Instead, rdma.IncomingAckInfo should provide a Go-friendly status, e.g., AckStatusOK bool
+				Status:    0, // Placeholder, to be replaced by a status from IncomingAckInfo if needed beyond simple success
+				SrcQP:     ackInfo.SourceQP,
+				SGID:      ackInfo.GRHInfo.SourceGID,
+				DGID:      ackInfo.GRHInfo.DestGID, // Assuming DestGID is populated in GRHInfo
+				FlowLabel: ackInfo.GRHInfo.FlowLabel,
+			},
+		}
+
+		// Check if the ACK itself was successful based on a field from IncomingAckInfo
+		if !ackInfo.AckStatusOK { // Now use the AckStatusOK field from rdma.IncomingAckInfo
+			log.Error().Uint32("sessionKey_flowLabel", sessionKey).Msg("[prober_handler]: Received ACK but RDMA completion status was not OK.")
+			return
+		}
+
+		var targetChan chan *ackEvent
+		var chanName string
+
+		if ackInfo.Packet.AckType == 1 {
+			targetChan = session.Ack1Chan
+			chanName = "Ack1Chan"
+		} else if ackInfo.Packet.AckType == 2 {
+			targetChan = session.Ack2Chan
+			chanName = "Ack2Chan"
+		} else {
+			log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Uint8("ackType", ackInfo.Packet.AckType).Msg("[prober_handler]: Received ACK with unknown type")
+			return
+		}
+
+		if targetChan == nil {
+			log.Warn().
+				Uint32("sessionKey_flowLabel", sessionKey).
+				Str("chan", chanName).
+				Msg("[prober_handler]: Session channel is nil. Session likely ended or cleaned up.")
+			return
+		}
+
+		// Non-blocking send to the session channel
+		select {
+		case targetChan <- probeEvent:
+			log.Debug().Uint32("sessionKey_flowLabel", sessionKey).Str("chan", chanName).Msg("[prober_handler]: Successfully sent ACK event to session channel")
+		default:
+			log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Str("chan", chanName).Msg("[prober_handler]: Session channel blocked or closed (likely late ACK or session ended).")
+		}
+	} else {
+		log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Uint64("packet_seqNum", ackInfo.Packet.SequenceNum).Msg("[prober_handler]: Received ACK for non-existent or already cleaned-up session")
+	}
 }

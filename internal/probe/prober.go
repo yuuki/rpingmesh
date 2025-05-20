@@ -455,7 +455,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				Msg("[responder]: Received probe packet, sending ACKs")
 
 			// Step 2: Send first ACK packet immediately (without processing delay info)
-			firstAckCompletionTime, err := udq.SendFirstAckPacket(sourceGID, sourceQPN, packet, receiveTime)
+			firstAckCompletionTime, err := udq.SendFirstAckPacket(sourceGID, sourceQPN, workComp.FlowLabel, packet, receiveTime)
 			if err != nil {
 				atomic.AddUint64(&errorPackets, 1)
 				log.Error().Err(err).
@@ -466,7 +466,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 			}
 
 			// Step 3: Send second ACK packet with processing delay information
-			err = udq.SendSecondAckPacket(sourceGID, sourceQPN, packet, receiveTime, firstAckCompletionTime)
+			err = udq.SendSecondAckPacket(sourceGID, sourceQPN, workComp.FlowLabel, packet, receiveTime, firstAckCompletionTime)
 			if err != nil {
 				atomic.AddUint64(&errorPackets, 1)
 				log.Error().Err(err).

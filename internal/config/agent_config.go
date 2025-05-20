@@ -25,6 +25,7 @@ type AgentConfig struct {
 	AnalyzerEnabled      bool
 	TracerEnabled        bool
 	AllowedDeviceNames   []string
+	GIDIndex             int
 }
 
 // SetupAgentFlags sets up the command line flags for the agent
@@ -48,6 +49,7 @@ func SetupAgentFlags(flagSet *pflag.FlagSet) {
 	flagSet.Bool("analyzer-enabled", false, "Enable data upload to Analyzer")
 	flagSet.Bool("tracer-enabled", false, "Enable traceroute functionality")
 	flagSet.StringSlice("allowed-device-names", []string{}, "List of allowed device names for pinglist filtering (whitelist)")
+	flagSet.Int("gid-index", 0, "GID Index to use for RDMA devices (default: 0). Must be >= 0.")
 }
 
 // LoadAgentConfig loads the configuration for an agent from a file or environment variables
@@ -90,6 +92,11 @@ func LoadAgentConfig(flagSet *pflag.FlagSet) (*AgentConfig, error) {
 		AnalyzerEnabled:      v.GetBool("analyzer-enabled"),
 		TracerEnabled:        v.GetBool("tracer-enabled"),
 		AllowedDeviceNames:   v.GetStringSlice("allowed-device-names"),
+		GIDIndex:             v.GetInt("gid-index"),
+	}
+
+	if config.GIDIndex < 0 {
+		return nil, fmt.Errorf("gid-index must be greater than or equal to 0, got: %d", config.GIDIndex)
 	}
 
 	return config, nil
@@ -116,6 +123,7 @@ func WriteDefaultConfig(path string) error {
 	v.Set("analyzer-enabled", false)
 	v.Set("tracer-enabled", false)
 	v.Set("allowed-device-names", []string{})
+	v.Set("gid-index", 0)
 
 	// Write the config file
 	if err := v.WriteConfig(); err != nil {

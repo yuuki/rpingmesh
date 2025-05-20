@@ -113,6 +113,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // Constants
@@ -120,7 +121,7 @@ const (
 	// Protocol constants
 	DefaultQKey uint32 = 0x11111111 // Standard QKey for UD operations
 	GRHSize            = 40         // Size of GRH header
-	GIDIndex           = 3          // GID index for IPv4-mapped IPv6 addresses
+	// GIDIndex           = 3          // GID index for IPv4-mapped IPv6 addresses // Commented out: Now handled by preferredGIDIndex or fallback
 
 	// Buffer and Queue sizes
 	MRSize                 = 4096 // Size of memory region for send/recv buffers
@@ -235,6 +236,7 @@ type WorkCompletion struct {
 	DGID      string
 	IMM       uint32
 	VendorErr uint32
+	FlowLabel uint32
 }
 
 // Placeholder structure for go build to succeed even if we don't have the actual header
@@ -310,50 +312,6 @@ func formatGIDString(gidBytes []byte) string {
 	return net.IP(gidBytes).String()
 }
 
-// findPreferredGID searches for a preferred GID (IPv4-mapped IPv6 on Ethernet port)
-// Returns port number, GID index, GID data, and whether a preferred GID was found
-func (r *RNIC) findPreferredGID(physPortCnt C.uint8_t) (C.uint8_t, C.int, C.union_ibv_gid, bool) {
-	// Iterate over physical ports to find an active one with an IPv4-mapped IPv6 GID on Ethernet
-	for portNum := C.uint8_t(1); portNum <= physPortCnt; portNum++ {
-		var portAttr C.struct_ibv_port_attr
-		if ret := C.my_ibv_query_port(r.Context, portNum, &portAttr); ret != 0 {
-			log.Warn().Str("device", r.DeviceName).Uint8("port", uint8(portNum)).Msg("Failed to query port, skipping")
-			continue
-		}
-
-		if portAttr.state != C.IBV_PORT_ACTIVE {
-			log.Debug().Str("device", r.DeviceName).Uint8("port", uint8(portNum)).Msg("Port is not active, skipping")
-			continue
-		}
-
-		// Check if link layer is Ethernet (common for RoCE v2)
-		// enum ibv_link_layer { IBV_LINK_LAYER_UNSPECIFIED, IBV_LINK_LAYER_INFINIBAND, IBV_LINK_LAYER_ETHERNET };
-		// IBV_LINK_LAYER_ETHERNET is typically 2
-		if portAttr.link_layer == C.IBV_LINK_LAYER_ETHERNET {
-			log.Debug().Str("device", r.DeviceName).Uint8("port", uint8(portNum)).Msg("Port is Ethernet. Iterating GIDs for IPv4-mapped RoCE v2 type.")
-			var gid C.union_ibv_gid
-			if ret := C.ibv_query_gid(r.Context, portNum, C.int(GIDIndex), &gid); ret == 0 {
-				gidBytes := unsafe.Slice((*byte)(unsafe.Pointer(&gid)), C.sizeof_union_ibv_gid)
-				log.Debug().Str("device", r.DeviceName).Uint8("port", uint8(portNum)).Int("gid_index", int(GIDIndex)).Str("gid", formatGIDString(gidBytes)).Msg("Found GID")
-
-				// Detect IPv4-mapped IPv6 address by byte pattern
-				if isIPv4MappedIPv6(gidBytes) {
-					log.Info().
-						Str("device", r.DeviceName).
-						Uint8("port", uint8(portNum)).
-						Int("gid_index", int(GIDIndex)).
-						Str("gid", formatGIDString(gidBytes)).
-						Msg("Found preferred IPv4-mapped GID on Ethernet port.")
-					return portNum, GIDIndex, gid, true
-				}
-			} else {
-				log.Warn().Str("device", r.DeviceName).Uint8("port", uint8(portNum)).Int("gid_index", int(GIDIndex)).Msg("Failed to query GID on active Ethernet port.")
-			}
-		}
-	}
-	return 0, -1, C.union_ibv_gid{}, false
-}
-
 // releaseDeviceResources deallocates PD and closes device context
 func (r *RNIC) releaseDeviceResources() {
 	if r.PD != nil {
@@ -366,10 +324,14 @@ func (r *RNIC) releaseDeviceResources() {
 	}
 }
 
-// OpenDevice opens the RDMA device and initializes its resources
-func (r *RNIC) OpenDevice() error {
+// OpenDevice opens the RDMA device and initializes its resources using the specified GID index.
+func (r *RNIC) OpenDevice(gidIndex int) error {
 	if r.IsOpen {
 		return nil
+	}
+
+	if gidIndex < 0 {
+		return fmt.Errorf("gidIndex must be >= 0, got %d for device %s", gidIndex, r.DeviceName)
 	}
 
 	// Open device context
@@ -389,31 +351,74 @@ func (r *RNIC) OpenDevice() error {
 
 	// Query device attributes to get the number of physical ports
 	var physPortCnt C.uint8_t
-	if C.get_phys_port_cnt(r.Context, &physPortCnt) != 0 { // Use new helper
+	if C.get_phys_port_cnt(r.Context, &physPortCnt) != 0 {
 		r.releaseDeviceResources()
 		return fmt.Errorf("failed to query device attributes for %s", r.DeviceName)
 	}
 
-	// Validate that the device has physical ports
 	if physPortCnt == 0 {
 		r.releaseDeviceResources()
 		return fmt.Errorf("device %s has 0 physical ports", r.DeviceName)
 	}
 
-	// Try to find a preferred GID (IPv4-mapped IPv6 on Ethernet port)
-	activePort, activeGIDIndex, gid, found := r.findPreferredGID(physPortCnt)
+	var activePortNumFound C.uint8_t = 0
+	var gidFound C.union_ibv_gid
+	var usableGIDFound bool = false
 
-	// If no suitable GID was found, fail
-	if !found || activePort == 0 || activeGIDIndex == -1 {
-		r.releaseDeviceResources()
-		return fmt.Errorf("no active port with a usable GID found for device %s", r.DeviceName)
+	// Iterate over physical ports to find an active one and use the specified gidIndex
+	for portNum := C.uint8_t(1); portNum <= physPortCnt; portNum++ {
+		var portAttr C.struct_ibv_port_attr
+		if ret := C.my_ibv_query_port(r.Context, portNum, &portAttr); ret != 0 {
+			log.Warn().Str("device", r.DeviceName).Uint8("port", uint8(portNum)).Int("gid_index", gidIndex).Msg("Failed to query port, skipping port.")
+			continue
+		}
+
+		if portAttr.state != C.IBV_PORT_ACTIVE {
+			log.Debug().Str("device", r.DeviceName).Uint8("port", uint8(portNum)).Int("gid_index", gidIndex).Msg("Port not active, skipping port.")
+			continue
+		}
+
+		// Port is active, try to query the GID at the specified index
+		var currentGid C.union_ibv_gid
+		if ret := C.ibv_query_gid(r.Context, portNum, C.int(gidIndex), &currentGid); ret == 0 {
+			gidBytes := unsafe.Slice((*byte)(unsafe.Pointer(&currentGid)), C.sizeof_union_ibv_gid)
+			// Basic validation: ensure GID is not all zeros
+			isZeroGid := true
+			for _, b := range gidBytes {
+				if b != 0 {
+					isZeroGid = false
+					break
+				}
+			}
+			if !isZeroGid {
+				log.Info().
+					Str("device", r.DeviceName).
+					Uint8("port", uint8(portNum)).
+					Int("gid_index", gidIndex).
+					Str("gid", formatGIDString(gidBytes)).
+					Msg("Found and using GID from specified GID index on active port.")
+				activePortNumFound = portNum
+				gidFound = currentGid
+				usableGIDFound = true
+				break // Found a usable GID on an active port, stop searching
+			} else {
+				log.Warn().Str("device", r.DeviceName).Uint8("port", uint8(portNum)).Int("gid_index", gidIndex).Msg("Specified GID index resulted in a zero GID on this active port.")
+			}
+		} else {
+			log.Warn().Str("device", r.DeviceName).Uint8("port", uint8(portNum)).Int("gid_index", gidIndex).Msg("Failed to query GID at specified GID index on this active port.")
+		}
 	}
 
-	r.ActiveGIDIndex = uint8(activeGIDIndex) // Store the GID index
-	r.ActivePortNum = uint8(activePort)      // Store the active port number
+	if !usableGIDFound {
+		r.releaseDeviceResources()
+		return fmt.Errorf("no usable GID found for device %s on any active port with GID index %d", r.DeviceName, gidIndex)
+	}
+
+	r.ActiveGIDIndex = uint8(gidIndex) // Store the specified GID index
+	r.ActivePortNum = uint8(activePortNumFound)
 
 	// Get GID bytes and format GID string
-	gidBytes := unsafe.Slice((*byte)(unsafe.Pointer(&gid)), C.sizeof_union_ibv_gid)
+	gidBytes := unsafe.Slice((*byte)(unsafe.Pointer(&gidFound)), C.sizeof_union_ibv_gid)
 	r.GID = formatGIDString(gidBytes)
 
 	// Extract IPv6 for address resolution
@@ -423,7 +428,7 @@ func (r *RNIC) OpenDevice() error {
 	r.IPAddr = r.getIPAddress(ipv6)
 
 	r.IsOpen = true
-	log.Info().Str("device", r.DeviceName).Str("gid", r.GID).Str("ip", r.IPAddr).Msg("Opened RDMA device")
+	log.Info().Str("device", r.DeviceName).Str("gid", r.GID).Str("ip", r.IPAddr).Int("used_gid_index", int(r.ActiveGIDIndex)).Msg("Opened RDMA device")
 	return nil
 }
 
@@ -663,9 +668,10 @@ func (u *UDQueue) StopCQPoller() {
 // CreateUDQueue creates a UD queue pair for sending and receiving probe packets
 func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType) (*UDQueue, error) {
 	if !rnic.IsOpen {
-		if err := rnic.OpenDevice(); err != nil {
-			return nil, err
-		}
+		// If RNIC is not open, it implies OpenDevice was not called from AgentState with a specific GID index.
+		// Opening it here without a gidIndex from config is problematic.
+		// Consider making it mandatory for RNIC to be open before this call.
+		return nil, fmt.Errorf("RNIC device %s is not open. CreateUDQueue requires an already opened RNIC.", rnic.DeviceName)
 	}
 
 	// Lazy initialization of RNIC's UDQueues map
@@ -930,9 +936,8 @@ func (m *RDMAManager) allocateMemoryResources(rnic *RNIC, qp *C.struct_ibv_qp, c
 // CreateSenderAndResponderQueues creates both sender and responder UDQueues for a given RNIC
 func (m *RDMAManager) CreateSenderAndResponderQueues(rnic *RNIC) error {
 	if !rnic.IsOpen {
-		if err := rnic.OpenDevice(); err != nil {
-			return err
-		}
+		// Similar to CreateUDQueue, RNIC should be opened by AgentState with a specific GID index.
+		return fmt.Errorf("RNIC device %s is not open. CreateSenderAndResponderQueues requires an already opened RNIC.", rnic.DeviceName)
 	}
 
 	// Create sender queue
@@ -1111,61 +1116,92 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 		grhPresent := (wc.wc_flags & C.IBV_WC_GRH) == C.IBV_WC_GRH
 
 		if grhPresent {
-			// GRH is present according to wc_flags.
-			// User hypothesis: actual L3 info is in an IPv4 header at offset 20 of the GRH area.
-			log.Debug().Msg("IBV_WC_GRH is set. Attempting to parse IPv4 header from offset 20 of GRH area.")
+			log.Debug().Msg("IBV_WC_GRH is set. Parsing GRH.")
+
+			if uint32(wc.byte_len) < GRHSize { // GRHSize is 40
+				log.Error().Uint32("wc_byte_len", uint32(wc.byte_len)).Msg("IBV_WC_GRH is set, but wc.byte_len is less than GRHSize (40 bytes).")
+				return nil, receiveTime, workComp, fmt.Errorf("IBV_WC_GRH set but wc.byte_len (%d) < GRHSize (%d)", wc.byte_len, GRHSize)
+			}
+
+			// GRH is at the beginning of u.RecvBuf
+			grhBytes := unsafe.Slice((*byte)(u.RecvBuf), GRHSize)
+			ipVersion := (grhBytes[0] >> 4) & 0x0F
+
+			if ipVersion == 4 {
+				// User's "current IPv4 processing" - assumes IPv4 header info is at offset 20 within GRH
+				// This interpretation of GRH for IPv4 is unusual. Standard RoCEv2 GRH is IPv6-formatted.
+				log.Debug().Msg("GRH IP Version field is 4. Applying custom IPv4 header parsing logic (from GRH offset 20).")
+
+				const ipv4HeaderOffsetInGRH = 20 // Current code's assumption
+				const ipv4HeaderMinLength = 20   // Standard IPv4 header length
+
+				if GRHSize < ipv4HeaderOffsetInGRH+ipv4HeaderMinLength {
+					log.Error().Int("GRHSize", GRHSize).Int("ipv4HeaderOffsetInGRH", ipv4HeaderOffsetInGRH).Int("ipv4HeaderMinLength", ipv4HeaderMinLength).Msg("GRH is too small to contain an IPv4 header at the specified offset.")
+					return nil, receiveTime, workComp, fmt.Errorf("GRH too small for IPv4 header at offset %d", ipv4HeaderOffsetInGRH)
+				}
+
+				ipv4HeaderBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(u.RecvBuf)+uintptr(ipv4HeaderOffsetInGRH))), ipv4HeaderMinLength)
+				parsedIPv4Header, err := ipv4.ParseHeader(ipv4HeaderBytes)
+				if err != nil {
+					log.Warn().Err(err).Bytes("data", ipv4HeaderBytes).Msg("Failed to parse bytes from GRH offset 20 as IPv4 header.")
+					return nil, receiveTime, workComp, fmt.Errorf("failed to parse GRH region's IPv4 header part (offset 20): %w", err)
+				}
+
+				if parsedIPv4Header.Src == nil || parsedIPv4Header.Dst == nil {
+					log.Error().Msg("Parsed IPv4 header from GRH offset 20, but Src or Dst IP is nil.")
+					return nil, receiveTime, workComp, fmt.Errorf("parsed IPv4 header from GRH (offset 20), but Src/Dst IP is nil")
+				}
+				log.Debug().Str("parsed_ipv4_header", parsedIPv4Header.String()).Msg("Successfully parsed IPv4 Header from GRH offset 20")
+
+				srcIPv4 := parsedIPv4Header.Src.To4()
+				dstIPv4 := parsedIPv4Header.Dst.To4()
+
+				if srcIPv4 == nil || dstIPv4 == nil {
+					log.Error().Str("ipv4.Src", parsedIPv4Header.Src.String()).Str("ipv4.Dst", parsedIPv4Header.Dst.String()).Msg("Could not convert parsed Src/Dst IP (from GRH offset 20) to IPv4.")
+					return nil, receiveTime, workComp, fmt.Errorf("could not convert GRH region's IPv4 Src/Dst (offset 20) to 4-byte format")
+				}
+
+				// Convert to IPv4-mapped IPv6 GID strings for workComp
+				srcMappedIPv6Bytes := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, srcIPv4[0], srcIPv4[1], srcIPv4[2], srcIPv4[3]}
+				dstMappedIPv6Bytes := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, dstIPv4[0], dstIPv4[1], dstIPv4[2], dstIPv4[3]}
+				workComp.SGID = formatGIDString(srcMappedIPv6Bytes)
+				workComp.DGID = formatGIDString(dstMappedIPv6Bytes)
+
+			} else if ipVersion == 6 {
+				log.Debug().Msg("GRH IP Version field is 6. Parsing SGID/DGID from standard GRH fields.")
+				// Standard RoCEv2 GRH (IPv6 Format)
+				// Source GID: GRH bytes 8-23
+				sgidSlice := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(u.RecvBuf)+8)), 16)
+				// Destination GID: GRH bytes 24-39
+				dgidSlice := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(u.RecvBuf)+24)), 16)
+
+				workComp.SGID = formatGIDString(sgidSlice)
+				workComp.DGID = formatGIDString(dgidSlice)
+
+				// Optionally parse IPv6 header fields for flow label, etc.
+				ipv6Header, err := ipv6.ParseHeader(grhBytes) // Parse the whole GRH as an IPv6 header
+				if err == nil && ipv6Header != nil {
+					workComp.FlowLabel = uint32(ipv6Header.FlowLabel)
+					log.Debug().Str("sgid", workComp.SGID).Str("dgid", workComp.DGID).Uint32("flow_label", workComp.FlowLabel).Msg("Parsed IPv6 GRH")
+				} else {
+					log.Warn().Err(err).Msg("Failed to parse GRH as IPv6 header to get FlowLabel, but SGID/DGID extracted directly.")
+				}
+
+			} else {
+				log.Error().Uint8("ip_version", ipVersion).Msg("GRH has an unknown or unsupported IP Version in its first byte.")
+				return nil, receiveTime, workComp, fmt.Errorf("GRH has unknown IP version: %d", ipVersion)
+			}
+			// Payload is after GRH
+			actualPayloadLength = uint32(wc.byte_len) - GRHSize
+			packetDataPtr = unsafe.Pointer(uintptr(u.RecvBuf) + uintptr(GRHSize))
+
+		} else { // GRH not present
+			log.Debug().Msg("IBV_WC_GRH is NOT set. Assuming payload starts at the beginning of the buffer.")
+			actualPayloadLength = uint32(wc.byte_len)
+			packetDataPtr = u.RecvBuf
 		}
 
-		// Log the full content of u.RecvBuf up to wc.byte_len for context
-		if byteLenLog := uint32(wc.byte_len); byteLenLog > 0 {
-			fullRecvBufContent := unsafe.Slice((*byte)(u.RecvBuf), byteLenLog)
-			log.Debug().
-				Bytes("u_RecvBuf_full_content_on_grh_custom_parse", fullRecvBufContent).
-				Uint32("wc_byte_len", byteLenLog).
-				Msg("Full content of u.RecvBuf (custom GRH parsing logic)")
-		}
-
-		if uint32(wc.byte_len) < GRHSize { // GRHSize is 40
-			log.Error().Uint32("wc_byte_len", uint32(wc.byte_len)).Msg("IBV_WC_GRH is set, but wc.byte_len is less than GRHSize (40 bytes). Cannot apply custom IPv4 parsing.")
-			return nil, receiveTime, workComp, fmt.Errorf("IBV_WC_GRH set but wc.byte_len (%d) < GRHSize (%d)", wc.byte_len, GRHSize)
-		}
-
-		// Extract the supposed IPv4 header part (offset 20, length 20)
-		const ipv4HeaderOffset = 20
-		const ipv4HeaderMinLength = 20 // Standard IPv4 header length
-		ipv4HeaderBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(u.RecvBuf)+uintptr(ipv4HeaderOffset))), ipv4HeaderMinLength)
-		ipv4Header, err := ipv4.ParseHeader(ipv4HeaderBytes)
-		if err != nil {
-			log.Warn().Err(err).Bytes("data", ipv4HeaderBytes).Msg("Failed to parse bytes from offset 20 as IPv4 header.")
-			return nil, receiveTime, workComp, fmt.Errorf("failed to parse GRH region's IPv4 header part: %w", err)
-		}
-
-		// Successfully parsed IPv4 header. Extract Src and Dst IP.
-		if ipv4Header.Src == nil || ipv4Header.Dst == nil {
-			log.Error().Msg("Parsed IPv4 header, but Src or Dst IP is nil.")
-			return nil, receiveTime, workComp, fmt.Errorf("parsed IPv4 header from GRH region, but Src/Dst IP is nil")
-		}
-
-		srcIPv4 := ipv4Header.Src.To4()
-		dstIPv4 := ipv4Header.Dst.To4()
-
-		if srcIPv4 == nil || dstIPv4 == nil {
-			log.Error().Str("ipv4.Src", ipv4Header.Src.String()).Str("ipv4.Dst", ipv4Header.Dst.String()).Msg("Could not convert parsed Src/Dst IP to IPv4 (To4() returned nil).")
-			return nil, receiveTime, workComp, fmt.Errorf("could not convert GRH region's IPv4 Src/Dst to 4-byte format")
-		}
-
-		// Convert to IPv4-mapped IPv6 GID strings
-		srcMappedIPv6Bytes := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, srcIPv4[0], srcIPv4[1], srcIPv4[2], srcIPv4[3]}
-		dstMappedIPv6Bytes := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, dstIPv4[0], dstIPv4[1], dstIPv4[2], dstIPv4[3]}
-
-		workComp.SGID = formatGIDString(srcMappedIPv6Bytes) // formatGIDString expects 16 bytes and will add ::ffff if bytes 10,11 are ff
-		workComp.DGID = formatGIDString(dstMappedIPv6Bytes)
-
-		// The payload is still after the full GRHSize (40 bytes)
-		actualPayloadLength = uint32(wc.byte_len) - GRHSize
-		packetDataPtr = unsafe.Pointer(uintptr(u.RecvBuf) + uintptr(GRHSize))
-
-		// Now check the actualPayloadLength against the expected size
+		// Now check the actualPayloadLength against the expected size for ProbePacket
 		if actualPayloadLength < expectedMinimumPayloadSize {
 			log.Warn().
 				Uint32("actualPayloadLength", actualPayloadLength).
@@ -1173,6 +1209,9 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 				Uint32("wc_byte_len", uint32(wc.byte_len)).
 				Bool("grh_present", grhPresent).
 				Msg("Actual received payload is smaller than ProbePacket size. Ignoring packet.")
+			if errPost := u.PostRecv(); errPost != nil {
+				log.Warn().Err(errPost).Str("device", u.RNIC.DeviceName).Uint32("qpn", u.QPN).Msg("Failed to post replacement receive buffer after small/bad packet")
+			}
 			return nil, receiveTime, workComp, fmt.Errorf("actual received payload too small (len: %d), expected at least %d", actualPayloadLength, expectedMinimumPayloadSize)
 		}
 
@@ -1187,33 +1226,21 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 			Uint64("t1", packet.T1).
 			Uint64("t3", packet.T3).
 			Uint64("t4", packet.T4).
-			Str("srcGID", workComp.SGID).
-			Str("dstGID", workComp.DGID).
+			Str("workComp_SGID", workComp.SGID).
+			Str("workComp_DGID", workComp.DGID).
+			Uint32("workComp_FlowLabel", workComp.FlowLabel).
 			Uint32("srcQP", workComp.SrcQP).
-			Msg("Received packet data")
+			Msg("Received packet data (ProbePacket content)")
 
-		// If an ACK requires the sender's GID, and GRH was not present (so SGID is unknown from GRH)
-		if !grhPresent && (workComp.SGID == "" || workComp.SGID == "::") {
-			// This error is returned if GID from GRH is critical for an ACK.
-			// Depending on the application, wc.src_qp might be used if a mapping to GID exists,
-			// but typically for UD, AH creation for the ACK needs the peer's GID.
-			log.Error().Msg("IBV_WC_GRH not set, and SGID could not be determined from GRH. Cannot send ACK if GID is required.")
-			// Decide if this is a fatal error for ReceivePacket or if the caller handles it.
-			// The original code returned an error here.
-			return nil, receiveTime, workComp, fmt.Errorf("IBV_WC_GRH not set, cannot reliably determine sender GID for ACK")
+		if packet.IsAck == 0 && (workComp.SGID == "" || workComp.SGID == "::") {
+			log.Warn().Msg("Received a probe, but SGID could not be determined (e.g. no GRH or GRH parsing issue). Sending ACK might fail if SGID is required for AH creation.")
 		}
-		// SGID/SrcQP validation:
-		// If GRH was present but SGID is still invalid (e.g. "::"), it's a problem for ACKs.
-		// This was handled inside the grhPresent block partially.
-		// The CreateAddressHandle will fail if SGID is invalid.
 
-		// Replenish the receive buffer for the one just consumed
 		if errPost := u.PostRecv(); errPost != nil {
 			log.Warn().Err(errPost).
 				Str("device", u.RNIC.DeviceName).
 				Uint32("qpn", u.QPN).
 				Msg("Failed to post replacement receive buffer after processing packet")
-			// Non-fatal for this received packet, but indicates a potential issue
 		}
 
 		return &packetCopy, receiveTime, workComp, nil
@@ -1236,11 +1263,7 @@ func (u *UDQueue) SendFirstAckPacket(
 	// Use consistent QKey across all UD operations (0x11111111 as in ud_pingpong.c)
 	const qkey uint32 = DefaultQKey
 
-	// Use the same flow label from the original packet to ensure the response follows the same path
-	// In production environment, might need to use 0 for all responses to avoid ECMP issues
-	flowLabel := uint32(0) // Set to 0 for ACK packets to ensure consistent path
-
-	ah, err := u.CreateAddressHandle(targetGID, flowLabel)
+	ah, err := u.CreateAddressHandle(targetGID, 0)
 	if err != nil {
 		return time.Time{}, err
 	}

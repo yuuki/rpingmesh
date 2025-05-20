@@ -79,7 +79,7 @@ func New(cfg *config.AgentConfig) (*Agent, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create agent state
-	agentState := state.NewAgentState(cfg.AgentID, "")
+	agentState := state.NewAgentState(cfg.AgentID, "", cfg.GIDIndex)
 
 	// Initialize controller client
 	controllerClient := controller_client.NewControllerClient(cfg.ControllerAddr)
@@ -109,7 +109,9 @@ func New(cfg *config.AgentConfig) (*Agent, error) {
 func (a *Agent) Start() error {
 	log.Debug().Msg("Starting agent")
 
-	// Initialize agent state, passing allowed device names for pre-filtering
+	// Initialize agent state, passing allowed device names.
+	// The GIDIndex is now set during NewAgentState, so it's already part of agentState.
+	// Initialize will use the GIDIndex stored in agentState.
 	if err := a.agentState.Initialize(a.config.AllowedDeviceNames); err != nil {
 		return fmt.Errorf("failed to initialize agent state: %w", err)
 	}

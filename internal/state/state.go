@@ -24,16 +24,18 @@ type AgentState struct {
 	detectedRNICs   []*rdma.RNIC
 	senderQueues    map[string]*rdma.UDQueue // Map of GID to Sender UDQueue
 	responderQueues map[string]*rdma.UDQueue // Map of GID to Responder UDQueue
+	gidIndex        int                      // Changed: preferredGIDIndex to gidIndex
 	mutex           sync.RWMutex
 }
 
 // NewAgentState creates a new agent state
-func NewAgentState(agentID, localTorID string) *AgentState {
+func NewAgentState(agentID, localTorID string, gidIndex int) *AgentState {
 	return &AgentState{
 		agentID:         agentID,
-		localTorID:      DefaultLocalTorID,
+		localTorID:      DefaultLocalTorID, // Assuming localTorID might be set later or from elsewhere
 		senderQueues:    make(map[string]*rdma.UDQueue),
 		responderQueues: make(map[string]*rdma.UDQueue),
+		gidIndex:        gidIndex, // Store GID Index
 	}
 }
 
@@ -73,7 +75,6 @@ func (a *AgentState) Initialize(allowedDeviceNames []string) error {
 		}
 		if len(devicesToProcess) == 0 {
 			log.Error().Strs("allowed_devices", allowedDeviceNames).Msg("No RNIC devices match the allowed list. Agent cannot use any RDMA devices.")
-			// No need to return error here, subsequent checks for detectedRNICs will handle this
 		}
 	} else {
 		devicesToProcess = rdmaManager.Devices
@@ -81,7 +82,8 @@ func (a *AgentState) Initialize(allowedDeviceNames []string) error {
 
 	// Detect and open RDMA devices from the filtered list
 	for _, rnic := range devicesToProcess {
-		if err := rnic.OpenDevice(); err != nil {
+		// Pass gidIndex to OpenDevice
+		if err := rnic.OpenDevice(a.gidIndex); err != nil {
 			log.Error().Err(err).Str("device", rnic.DeviceName).Msg("Failed to open RDMA device")
 			continue
 		}
@@ -95,11 +97,10 @@ func (a *AgentState) Initialize(allowedDeviceNames []string) error {
 	}
 
 	if len(a.detectedRNICs) == 0 {
-		// If allowedDeviceNames was used and resulted in zero devices, this error will be more specific.
 		if len(allowedDeviceNames) > 0 {
 			return fmt.Errorf("no RDMA devices available after filtering by allowed names: %v", allowedDeviceNames)
 		}
-		return fmt.Errorf("no RDMA devices found or initialized successfully") // Keep original error message if no filter was applied
+		return fmt.Errorf("no RDMA devices found or initialized successfully")
 	}
 
 	// Create separate UD queues for each RNIC - one for sending probes, one for receiving probes

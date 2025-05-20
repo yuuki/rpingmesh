@@ -1257,13 +1257,14 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 func (u *UDQueue) SendFirstAckPacket(
 	targetGID string,
 	targetQPN uint32,
+	flowLabel uint32,
 	originalPacket *ProbePacket,
 	receiveTime time.Time,
 ) (time.Time, error) {
 	// Use consistent QKey across all UD operations (0x11111111 as in ud_pingpong.c)
 	const qkey uint32 = DefaultQKey
 
-	ah, err := u.CreateAddressHandle(targetGID, 0)
+	ah, err := u.CreateAddressHandle(targetGID, flowLabel)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -1317,15 +1318,13 @@ func (u *UDQueue) SendFirstAckPacket(
 func (u *UDQueue) SendSecondAckPacket(
 	targetGID string,
 	targetQPN uint32,
+	flowLabel uint32,
 	originalPacket *ProbePacket,
 	receiveTime time.Time,
 	sendCompletionTime time.Time,
 ) error {
 	// Use consistent QKey across all UD operations (0x11111111 as in ud_pingpong.c)
 	const qkey uint32 = DefaultQKey
-
-	// Use flow label 0 for ACK packets to ensure consistent path
-	flowLabel := uint32(0)
 
 	ah, err := u.CreateAddressHandle(targetGID, flowLabel)
 	if err != nil {
@@ -1385,13 +1384,14 @@ func (u *UDQueue) SendSecondAckPacket(
 func (u *UDQueue) SendAckPacket(
 	targetGID string,
 	targetQPN uint32,
+	flowLabel uint32,
 	originalPacket *ProbePacket,
 	receiveTime time.Time,
 ) error {
 	// Use standard QKey for UD operations (0x11111111 as in ud_pingpong.c)
 	const qkey uint32 = DefaultQKey
 
-	ah, err := u.CreateAddressHandle(targetGID, 0)
+	ah, err := u.CreateAddressHandle(targetGID, flowLabel)
 	if err != nil {
 		return err
 	}

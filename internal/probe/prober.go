@@ -194,16 +194,15 @@ func (p *Prober) ProbeTarget(
 		Uint64("seqNum", seqNum).
 		Msg("Starting probe to target (session based)")
 
-	t1 := time.Now()
-	result.T1 = timestamppb.New(t1)
-
 	// Send probe packet
 	// The context passed to SendProbePacket should be derived from the overall 'ctx' for ProbeTarget
 	// or be a shorter one specific to the send operation if needed.
 	// For now, let's use a derived context that respects the overall timeout for this specific send.
 	sendCtx, sendCancel := context.WithTimeout(ctx, p.timeout) // Use prober's general timeout for the send itself
-	t2Time, err := srcUdQueue.SendProbePacket(sendCtx, targetGID, targetQPN, seqNum, sourcePort, flowLabel)
+	t1, t2, err := srcUdQueue.SendProbePacket(sendCtx, targetGID, targetQPN, seqNum, sourcePort, flowLabel)
 	sendCancel() // Release sendCtx resources
+	result.T1 = timestamppb.New(t1)
+	result.T2 = timestamppb.New(t2)
 
 	if err != nil {
 		log.Error().Err(err).
@@ -221,9 +220,9 @@ func (p *Prober) ProbeTarget(
 		p.probeResults <- result
 		return
 	}
-	result.T2 = timestamppb.New(t2Time)
+	result.T2 = timestamppb.New(t2)
 
-	log.Debug().
+	log.Trace().
 		Str("srcGID", sourceRnic.GID).
 		Uint32("srcQPN", srcUdQueue.QPN).
 		Str("targetGID", targetGID).
@@ -356,10 +355,10 @@ func (p *Prober) ProbeTarget(
 	result.T6 = timestamppb.New(t6)
 
 	// Calculations
-	networkRTT := ack1Event.ReceivedAt.Sub(t2Time) - (t4Time.Sub(t3Time))
+	networkRTT := ack1Event.ReceivedAt.Sub(t2) - (t4Time.Sub(t3Time))
 	result.NetworkRtt = networkRTT.Nanoseconds()
 
-	proberDelay := t6.Sub(t1) - ack1Event.ReceivedAt.Sub(t2Time)
+	proberDelay := t6.Sub(t1) - ack1Event.ReceivedAt.Sub(t2)
 	result.ProberDelay = proberDelay.Nanoseconds()
 
 	responderDelay := t4Time.Sub(t3Time)
@@ -419,7 +418,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 
 		case <-statsTicker.C:
 			// Log stats periodically
-			log.Info().
+			log.Debug().
 				Uint64("totalPackets", totalPackets).
 				Uint64("probePackets", probePackets).
 				Uint64("invalidPackets", invalidPackets).

@@ -47,6 +47,7 @@ const (
 
 // Log levels
 const (
+	LogLevelTrace = "trace"
 	LogLevelDebug = "debug"
 	LogLevelInfo  = "info"
 	LogLevelWarn  = "warn"
@@ -581,6 +582,8 @@ func initLogging(level string) {
 		zerolog.SetGlobalLevel(zerolog.WarnLevel)
 	case LogLevelError:
 		zerolog.SetGlobalLevel(zerolog.ErrorLevel)
+	case LogLevelTrace:
+		zerolog.SetGlobalLevel(zerolog.TraceLevel)
 	default:
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	}

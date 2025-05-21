@@ -1,5 +1,12 @@
 {
 	"files.associations": {
 		"vmlinux.h": "c"
+	},
+	"gopls": {
+		"analyses": {
+			"cgo": {
+				"enabled": false
+			}
+		}
 	}
 }

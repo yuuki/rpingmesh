@@ -1,104 +1,94 @@
 package rdma
 
-/*
-#cgo LDFLAGS: -libverbs
-#include <stdlib.h>
-#include <infiniband/verbs.h> // Use standard verbs.h
-// #include <infiniband/verbs_exp.h> // EXPERIMENTAL - DO NOT USE UNLESS NEEDED AND AVAILABLE
-#include <string.h>
-#include <arpa/inet.h>
-#include <errno.h>
-
-static int get_errno(void) {
-    return errno;
-}
-
-int my_ibv_query_port(struct ibv_context *context, uint8_t port_num, struct ibv_port_attr *port_attr) {
-    return ibv_query_port(context, port_num, port_attr);
-}
-
-int get_phys_port_cnt(struct ibv_context *context, uint8_t *phys_port_cnt) {
-    struct ibv_device_attr device_attr;
-    if (ibv_query_device(context, &device_attr)) {
-        return -1;
-    }
-    *phys_port_cnt = device_attr.phys_port_cnt;
-    return 0;
-}
-
-void copy_to_gid_raw(union ibv_gid *gid, const void *src, size_t n) {
-    memcpy(gid->raw, src, n);
-}
-
-void set_ud_send_params(struct ibv_send_wr *wr, struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey) {
-    wr->wr.ud.ah = ah;
-    wr->wr.ud.remote_qpn = remote_qpn;
-    wr->wr.ud.remote_qkey = remote_qkey;
-}
-
-int post_recv(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey) {
-    struct ibv_sge sge;
-    struct ibv_recv_wr wr;
-    struct ibv_recv_wr *bad_wr = NULL;
-
-    memset(&sge, 0, sizeof(sge));
-    sge.addr = addr;
-    sge.length = length;
-    sge.lkey = lkey;
-
-    memset(&wr, 0, sizeof(wr));
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-
-    return ibv_post_recv(qp, &wr, &bad_wr);
-}
-
-int post_send(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey,
-             struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey) {
-    struct ibv_sge sge;
-    struct ibv_send_wr wr;
-    struct ibv_send_wr *bad_wr = NULL;
-
-    memset(&sge, 0, sizeof(sge));
-    sge.addr = addr;
-    sge.length = length;
-    sge.lkey = lkey;
-
-    memset(&wr, 0, sizeof(wr));
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-    wr.opcode = IBV_WR_SEND;
-    wr.send_flags = IBV_SEND_SIGNALED;
-    wr.wr.ud.ah = ah;
-    wr.wr.ud.remote_qpn = remote_qpn;
-    wr.wr.ud.remote_qkey = remote_qkey;
-
-    return ibv_post_send(qp, &wr, &bad_wr);
-}
-
-int post_send_new_api(struct ibv_qp_ex *qpx, uint64_t addr, uint32_t length, uint32_t lkey,
-                      struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey, uint64_t wr_id) {
-    ibv_wr_start(qpx);
-
-    qpx->wr_id = wr_id;
-    qpx->wr_flags = IBV_SEND_SIGNALED;
-
-    ibv_wr_set_sge(qpx, lkey, addr, length);
-    ibv_wr_set_ud_addr(qpx, ah, remote_qpn, remote_qkey);
-
-    return ibv_wr_complete(qpx);
-}
-
-int get_port_state(struct ibv_context *context, uint8_t port_num, enum ibv_port_state *port_state) {
-    struct ibv_port_attr port_attr;
-    if (ibv_query_port(context, port_num, &port_attr)) {
-        return -1;
-    }
-    *port_state = port_attr.state;
-    return 0;
-}
-
-*/
+// #cgo LDFLAGS: -libverbs
+// #include <stdlib.h>
+// #include <infiniband/verbs.h>
+// #include <string.h>
+// #include <arpa/inet.h>
+// #include <errno.h>
+//
+// static int get_errno(void) {
+//     return errno;
+// }
+//
+// // Helper function to access ibv_port_attr safely
+// int my_ibv_query_port(struct ibv_context *context, uint8_t port_num, struct ibv_port_attr *port_attr) {
+//     return ibv_query_port(context, port_num, port_attr);
+// }
+//
+// // Helper function to get phys_port_cnt
+// int get_phys_port_cnt(struct ibv_context *context, uint8_t *phys_port_cnt) {
+//     struct ibv_device_attr device_attr; // Declared and used only within C
+//     if (ibv_query_device(context, &device_attr)) {
+//         return -1; // Error
+//     }
+//     *phys_port_cnt = device_attr.phys_port_cnt;
+//     return 0; // Success
+// }
+//
+// // Helper function to copy bytes to a GID's raw field
+// void copy_to_gid_raw(union ibv_gid *gid, const void *src, size_t n) {
+//     memcpy(gid->raw, src, n);
+// }
+//
+// // Helper functions for UD operations
+// void set_ud_send_params(struct ibv_send_wr *wr, struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey) {
+//     wr->wr.ud.ah = ah;
+//     wr->wr.ud.remote_qpn = remote_qpn;
+//     wr->wr.ud.remote_qkey = remote_qkey;
+// }
+//
+// // Helper function to post receive WR without Go pointers
+// int post_recv(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey) {
+//     struct ibv_sge sge;
+//     struct ibv_recv_wr wr;
+//     struct ibv_recv_wr *bad_wr = NULL;
+//
+//     memset(&sge, 0, sizeof(sge));
+//     sge.addr = addr;
+//     sge.length = length;
+//     sge.lkey = lkey;
+//
+//     memset(&wr, 0, sizeof(wr));
+//     wr.sg_list = &sge;
+//     wr.num_sge = 1;
+//
+//     return ibv_post_recv(qp, &wr, &bad_wr);
+// }
+//
+// // Helper function to post send WR without Go pointers
+// int post_send(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey,
+//              struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey) {
+//     struct ibv_sge sge;
+//     struct ibv_send_wr wr;
+//     struct ibv_send_wr *bad_wr = NULL;
+//
+//     memset(&sge, 0, sizeof(sge));
+//     sge.addr = addr;
+//     sge.length = length;
+//     sge.lkey = lkey;
+//
+//     memset(&wr, 0, sizeof(wr));
+//     wr.sg_list = &sge;
+//     wr.num_sge = 1;
+//     wr.opcode = IBV_WR_SEND;
+//     wr.send_flags = IBV_SEND_SIGNALED;
+//     wr.wr.ud.ah = ah;
+//     wr.wr.ud.remote_qpn = remote_qpn;
+//     wr.wr.ud.remote_qkey = remote_qkey;
+//
+//     return ibv_post_send(qp, &wr, &bad_wr);
+// }
+//
+// // Helper function to get port state
+// int get_port_state(struct ibv_context *context, uint8_t port_num, enum ibv_port_state *port_state) {
+//     struct ibv_port_attr port_attr;
+//     if (ibv_query_port(context, port_num, &port_attr)) {
+//         return -1; // Error
+//     }
+//     *port_state = port_attr.state;
+//     return 0; // Success
+// }
 import "C"
 
 import (
@@ -194,7 +184,6 @@ type RNIC struct {
 type UDQueue struct {
 	RNIC        *RNIC
 	QP          *C.struct_ibv_qp
-	QPEx        *C.struct_ibv_qp_ex // Added for new send API
 	CQ          *C.struct_ibv_cq_ex
 	CompChannel *C.struct_ibv_comp_channel
 	SendMR      *C.struct_ibv_mr
@@ -859,6 +848,7 @@ func (u *UDQueue) StartCQPoller() {
 			return
 		}
 
+		var ibvPollCqAttr C.struct_ibv_poll_cq_attr
 		for {
 			select {
 			case <-u.cqPollerDone:
@@ -930,7 +920,7 @@ func (u *UDQueue) StartCQPoller() {
 			}
 
 			// Use ibv_start_poll, processCQCompletions, ibv_end_poll pattern
-			retStartPoll := C.ibv_start_poll(u.CQ, nil) // Pass nil instead of &ibvPollCqAttr
+			retStartPoll := C.ibv_start_poll(u.CQ, &ibvPollCqAttr)
 			if retStartPoll == 0 {
 				log.Trace().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Str("type", getQueueTypeString(u.QueueType)).Msg("ibv_start_poll successful, processing completions.")
 				u.processCQCompletions(u.CQ)
@@ -1017,7 +1007,6 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 	udQueue := &UDQueue{
 		RNIC:         rnic,
 		QP:           qp,
-		QPEx:         C.ibv_qp_to_qp_ex(qp), // Initialize QPEx
 		CQ:           cq,
 		CompChannel:  compChannel,
 		SendMR:       sendMR,
@@ -1123,39 +1112,38 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 	// Generate random PSN as in ud_pingpong.c (24 bit value)
 	psn := uint32(rand.Int31n(1 << 24))
 
-	// QP creation using ibv_create_qp_ex
-	var initAttrEx C.struct_ibv_qp_init_attr_ex
-	C.memset(unsafe.Pointer(&initAttrEx), 0, C.sizeof_struct_ibv_qp_init_attr_ex)
-
+	// QP creation attribute setting to standard
+	var qpInitAttr C.struct_ibv_qp_init_attr
+	qpInitAttr.qp_type = C.IBV_QPT_UD
+	qpInitAttr.sq_sig_all = 0 // Set to 0 to match standard (flags specified in each WR)
 	base_send_cq := C.ibv_cq_ex_to_cq(cqEx)
 	base_recv_cq := C.ibv_cq_ex_to_cq(cqEx)
 	if base_send_cq == nil || base_recv_cq == nil {
 		C.ibv_destroy_comp_channel(compChannel)
+		// If cqEx was created, try to destroy its base part
 		if cqEx != nil {
-			base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx)
+			base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx) // Direct call
 			if base_cq_to_destroy != nil {
 				C.ibv_destroy_cq(base_cq_to_destroy)
 			} else {
-				log.Error().Msg("Failed to get base CQ from non-nil extended CQ during QP_EX creation failure path")
+				// This case should ideally not happen if cqEx itself is not nil
+				log.Error().Msg("Failed to get base CQ from non-nil extended CQ during QP creation failure path")
 			}
 		}
-		return nil, nil, nil, 0, fmt.Errorf("failed to get base CQ from extended CQ for device %s (for qp_ex)", rnic.DeviceName)
+		return nil, nil, nil, 0, fmt.Errorf("failed to get base CQ from extended CQ for device %s", rnic.DeviceName)
 	}
+	qpInitAttr.send_cq = base_send_cq
+	qpInitAttr.recv_cq = base_recv_cq
 
-	initAttrEx.send_cq = base_send_cq
-	initAttrEx.recv_cq = base_recv_cq
-	initAttrEx.cap.max_send_wr = C.uint32_t(len(m.Devices) * 100) // TODO: Review capacity, maybe use a const
-	initAttrEx.cap.max_recv_wr = C.uint32_t(len(m.Devices) * 100) // TODO: Review capacity
-	initAttrEx.cap.max_send_sge = 1
-	initAttrEx.cap.max_recv_sge = 1
-	initAttrEx.qp_type = C.IBV_QPT_UD
-	initAttrEx.comp_mask |= C.IBV_QP_INIT_ATTR_PD | C.IBV_QP_INIT_ATTR_SEND_OPS_FLAGS
-	initAttrEx.pd = rnic.PD
-	initAttrEx.send_ops_flags = C.IBV_QP_EX_WITH_SEND
+	// Set appropriate capacity for performance
+	qpInitAttr.cap.max_send_wr = C.uint32_t(len(m.Devices) * 100)
+	qpInitAttr.cap.max_recv_wr = C.uint32_t(len(m.Devices) * 100)
+	qpInitAttr.cap.max_send_sge = 1
+	qpInitAttr.cap.max_recv_sge = 1
 
-	qp := C.ibv_create_qp_ex(rnic.Context, &initAttrEx)
+	// Create the QP
+	qp := C.ibv_create_qp(rnic.PD, &qpInitAttr)
 	if qp == nil {
-		errno := C.get_errno()
 		base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx) // Direct call
 		if base_cq_to_destroy != nil {
 			C.ibv_destroy_cq(base_cq_to_destroy)
@@ -1163,7 +1151,7 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 			log.Error().Str("device", rnic.DeviceName).Msg("Failed to get base CQ from extended CQ for destruction during QP creation failure")
 		}
 		C.ibv_destroy_comp_channel(compChannel)
-		return nil, nil, nil, 0, fmt.Errorf("failed to create QP for device %s: %s", rnic.DeviceName, syscall.Errno(errno).Error())
+		return nil, nil, nil, 0, fmt.Errorf("failed to create QP for device %s", rnic.DeviceName)
 	}
 
 	// Modify QP to INIT state
@@ -1450,17 +1438,16 @@ func (u *UDQueue) SendProbePacket(
 	packet.T1 = uint64(time.Now().UnixNano())
 	packet.IsAck = 0 // Not an ACK
 
-	if ret := C.post_send_new_api(
-		u.QPEx,
+	if ret := C.post_send(
+		u.QP,
 		C.uint64_t(uintptr(u.SendBuf)),
 		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
 		u.SendMR.lkey,
 		ah,
 		C.uint32_t(targetQPN),
 		C.uint32_t(DefaultQKey),
-		1, // wr_id, can be any unique ID for the WR
 	); ret != 0 {
-		return time.Time{}, fmt.Errorf("ibv_post_send_new_api failed: %d", ret)
+		return time.Time{}, fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
 
 	log.Trace().
@@ -1469,7 +1456,7 @@ func (u *UDQueue) SendProbePacket(
 		Uint32("source_port", sourcePort).
 		Uint32("flow_label", flowLabel).
 		Uint64("sequence_num", sequenceNum).
-		Msg("post_send_new_api successful")
+		Msg("post_send successful")
 
 	// Wait for completion notification from CQ poller
 	select {
@@ -1674,17 +1661,16 @@ func (u *UDQueue) SendFirstAckPacket(
 	packet.Flags = 0
 
 	// Use the C helper function to post a send WR from C-allocated memory
-	if ret := C.post_send_new_api(
-		u.QPEx,
+	if ret := C.post_send(
+		u.QP,
 		C.uint64_t(uintptr(u.SendBuf)),
 		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
 		u.SendMR.lkey,
 		ah,
 		C.uint32_t(targetQPN),
 		C.uint32_t(qkey),
-		2, // wr_id for first ack
 	); ret != 0 {
-		return time.Time{}, fmt.Errorf("ibv_post_send_new_api (First ACK) failed: %d", ret)
+		return time.Time{}, fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
 
 	// Wait for completion notification from CQ poller
@@ -1741,17 +1727,16 @@ func (u *UDQueue) SendSecondAckPacket(
 	packet.Flags = 0
 
 	// Use the C helper function to post a send WR from C-allocated memory
-	if ret := C.post_send_new_api(
-		u.QPEx,
+	if ret := C.post_send(
+		u.QP,
 		C.uint64_t(uintptr(u.SendBuf)),
 		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
 		u.SendMR.lkey,
 		ah,
 		C.uint32_t(targetQPN),
 		C.uint32_t(qkey),
-		3, // wr_id for second ack
 	); ret != 0 {
-		return fmt.Errorf("ibv_post_send_new_api (Second ACK) failed: %d", ret)
+		return fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
 
 	// Wait for completion notification from CQ poller
@@ -1797,17 +1782,16 @@ func (u *UDQueue) SendAckPacket(
 	packet.T4 = uint64(time.Now().UnixNano())
 	packet.IsAck = 1
 
-	if ret := C.post_send_new_api(
-		u.QPEx,
+	if ret := C.post_send(
+		u.QP,
 		C.uint64_t(uintptr(u.SendBuf)),
 		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
 		u.SendMR.lkey,
 		ah,
 		C.uint32_t(targetQPN),
 		C.uint32_t(qkey),
-		4, // wr_id for legacy ack
 	); ret != 0 {
-		return fmt.Errorf("ibv_post_send_new_api (ACK) failed: %d", ret)
+		return fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
 
 	// Wait for completion notification from CQ poller
@@ -1862,12 +1846,9 @@ func (u *UDQueue) Destroy() {
 		u.SendBuf = nil
 	}
 
-	// QPEx is derived from QP, so destroying QP should be enough.
-	// No explicit destroy for QPEx.
 	if u.QP != nil {
 		C.ibv_destroy_qp(u.QP)
 		u.QP = nil
-		u.QPEx = nil // Also nil out QPEx
 	}
 
 	if u.CQ != nil {

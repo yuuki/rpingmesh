@@ -1,4 +1,4 @@
-.PHONY: build agent-up debugfs-volume generate-config generate-bpf test-controller test-agent test clean-compose build-local
+.PHONY: build agent-up debugfs-volume generate-config generate-bpf test-controller test-agent test clean-compose build-local build-debug
 
 # Default configuration
 VERSION := 0.1.0
@@ -48,6 +48,23 @@ build-local:
 	@echo "Building controller and agent locally"
 	@go build -buildvcs=false -o ./bin/rpingmesh-controller ./cmd/controller
 	@go build -buildvcs=false -o ./bin/rpingmesh-agent ./cmd/agent
+
+# Debug build targets
+build-debug-controller:
+	@echo "Building controller for debug locally"
+	@export CGO_ENABLED=1
+	@export CGO_CFLAGS="-g -O0"
+	@export CGO_LDFLAGS="-g"
+	@go build -o ./bin/rpingmesh-controller.debug -gcflags "all=-N -l" -ldflags "-compressdwarf=false" ./cmd/controller
+
+build-debug-agent:
+	@echo "Building agent for debug locally"
+	@export CGO_ENABLED=1
+	@export CGO_CFLAGS="-g -O0"
+	@export CGO_LDFLAGS="-g"
+	@go build -o ./bin/rpingmesh-agent.debug -gcflags "all=-N -l" -ldflags "-compressdwarf=false" ./cmd/agent
+
+build-debug: build-debug-controller build-debug-agent
 
 # Generate bpf2go code locally (requires local dependencies)
 ARCH_SUFFIX := $(shell if [ -d /usr/include/$$(uname -m)-linux-gnu ]; then echo "$$(uname -m)-linux-gnu"; fi)
@@ -99,6 +116,7 @@ help:
 	@echo "Available targets:"
 	@echo "  build            - Build the Docker image with Docker Compose"
 	@echo "  build-local      - Build the controller and agent binaries locally"
+	@echo "  build-debug      - Build the controller and agent binaries for debugging locally"
 	@echo "  agent-up         - Run the agent container with Docker Compose"
 	@echo "  debugfs-volume   - Create debugfs volume for Docker Desktop"
 	@echo "  generate-config  - Generate default configuration file with Docker Compose"

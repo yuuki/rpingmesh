@@ -639,8 +639,6 @@ func (u *UDQueue) handleWCError(gwc *GoWorkCompletion) {
 }
 
 func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx from args
-	// Software timestamp for comparison or fallback
-	// receivedAtSw := time.Now()
 	log.Debug().
 		Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 		Str("type", getQueueTypeString(u.QueueType)).
@@ -729,7 +727,7 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 
 		ackInfo := &IncomingAckInfo{
 			Packet:      probePkt,
-			ReceivedAt:  time.Now(),
+			ReceivedAt:  time.Unix(0, int64(gwc.CompletionWallclockNS)), // use HW timestamp
 			GRHInfo:     grhInfo,
 			SourceQP:    gwc.SrcQP,
 			RawWC:       gwc, // Pass original wc (not wcCopy) for inspection. Handler should not store this pointer.
@@ -1414,7 +1412,7 @@ func (u *UDQueue) SendProbePacket(
 	sequenceNum uint64,
 	sourcePort uint32,
 	flowLabel uint32,
-) (time.Time, error) {
+) (time.Time, time.Time, error) {
 	log.Debug().
 		Str("target_dest_rnic_gid", targetGID).
 		Uint32("target_dest_rnic_qpn", targetQPN).
@@ -1425,7 +1423,7 @@ func (u *UDQueue) SendProbePacket(
 
 	ah, err := u.CreateAddressHandle(targetGID, flowLabel)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, time.Time{}, err
 	}
 	defer C.ibv_destroy_ah(ah)
 
@@ -1433,7 +1431,8 @@ func (u *UDQueue) SendProbePacket(
 	packet := (*ProbePacket)(u.SendBuf)
 	C.memset(u.SendBuf, 0, C.size_t(unsafe.Sizeof(ProbePacket{})))
 	packet.SequenceNum = sequenceNum
-	packet.T1 = uint64(time.Now().UnixNano())
+	t1 := time.Now()
+	packet.T1 = uint64(t1.UnixNano())
 	packet.IsAck = 0 // Not an ACK
 
 	if ret := C.post_send(
@@ -1445,7 +1444,7 @@ func (u *UDQueue) SendProbePacket(
 		C.uint32_t(targetQPN),
 		C.uint32_t(DefaultQKey),
 	); ret != 0 {
-		return time.Time{}, fmt.Errorf("ibv_post_send failed: %d", ret)
+		return time.Time{}, time.Time{}, fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
 
 	log.Trace().
@@ -1461,14 +1460,15 @@ func (u *UDQueue) SendProbePacket(
 	case wc := <-u.sendCompChan:
 		// Received send completion event
 		if wc.Status != C.IBV_WC_SUCCESS {
-			return time.Time{}, fmt.Errorf("send completion failed: %d", wc.Status)
+			return time.Time{}, time.Time{}, fmt.Errorf("send completion failed: %d", wc.Status)
 		}
-		return time.Now(), nil
+		t2 := time.Unix(0, int64(wc.CompletionWallclockNS))
+		return t1, t2, nil
 	case err := <-u.errChan:
 		// Error occurred
-		return time.Time{}, fmt.Errorf("error during send: %w", err)
+		return time.Time{}, time.Time{}, fmt.Errorf("error during send: %w", err)
 	case <-ctx.Done(): // Context cancelled or timed out
-		return time.Time{}, fmt.Errorf("send probe to (%s, %d, %d) timed out: %w", targetGID, targetQPN, sequenceNum, ctx.Err())
+		return time.Time{}, time.Time{}, fmt.Errorf("send probe to (%s, %d, %d) timed out: %w", targetGID, targetQPN, sequenceNum, ctx.Err())
 	}
 }
 
@@ -1477,7 +1477,7 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 	// Wait for completion notification from CQ poller
 	select {
 	case wc := <-u.recvCompChan:
-		receiveTime := time.Now()
+		receiveTime := time.Unix(0, int64(wc.CompletionWallclockNS)) // use HW timestamp
 		workComp := &WorkCompletion{
 			Status:    uint32(wc.Status),
 			SrcQP:     uint32(wc.SrcQP),
@@ -1504,7 +1504,7 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 			if ipVersion == 4 {
 				// User's "current IPv4 processing" - assumes IPv4 header info is at offset 20 within GRH
 				// This interpretation of GRH for IPv4 is unusual. Standard RoCEv2 GRH is IPv6-formatted.
-				log.Debug().Msg("GRH IP Version field is 4. Applying custom IPv4 header parsing logic (from GRH offset 20).")
+				log.Trace().Msg("GRH IP Version field is 4. Applying custom IPv4 header parsing logic (from GRH offset 20).")
 
 				const ipv4HeaderOffsetInGRH = 20 // Current code's assumption
 				const ipv4HeaderMinLength = 20   // Standard IPv4 header length
@@ -1525,7 +1525,7 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 					log.Error().Msg("Parsed IPv4 header from GRH offset 20, but Src or Dst IP is nil.")
 					return nil, receiveTime, workComp, fmt.Errorf("parsed IPv4 header from GRH (offset 20), but Src/Dst IP is nil")
 				}
-				log.Debug().Str("parsed_ipv4_header", parsedIPv4Header.String()).Msg("Successfully parsed IPv4 Header from GRH offset 20")
+				log.Trace().Str("parsed_ipv4_header", parsedIPv4Header.String()).Msg("Successfully parsed IPv4 Header from GRH offset 20")
 
 				srcIPv4 := parsedIPv4Header.Src.To4()
 				dstIPv4 := parsedIPv4Header.Dst.To4()
@@ -1542,7 +1542,7 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 				workComp.DGID = formatGIDString(dstMappedIPv6Bytes)
 
 			} else if ipVersion == 6 {
-				log.Debug().Msg("GRH IP Version field is 6. Parsing SGID/DGID from standard GRH fields.")
+				log.Trace().Msg("GRH IP Version field is 6. Parsing SGID/DGID from standard GRH fields.")
 				// Standard RoCEv2 GRH (IPv6 Format)
 				// Source GID: GRH bytes 8-23
 				sgidSlice := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(u.RecvBuf)+8)), 16)
@@ -1593,7 +1593,7 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 		packet := (*ProbePacket)(packetDataPtr)
 		packetCopy := *packet // Make a copy
 
-		log.Debug().
+		log.Trace().
 			Uint64("seqNum", packet.SequenceNum).
 			Uint8("isAck", packet.IsAck).
 			Uint8("ackType", packet.AckType).
@@ -1678,9 +1678,9 @@ func (u *UDQueue) SendFirstAckPacket(
 		if wc.Status != C.IBV_WC_SUCCESS {
 			return time.Time{}, fmt.Errorf("First ACK send completion failed: %d", wc.Status)
 		}
-		return time.Now(), nil
+		sendCompletionTime := time.Unix(0, int64(wc.CompletionWallclockNS)) // use HW timestamp
+		return sendCompletionTime, nil
 	case err := <-u.errChan:
-		// Error occurred
 		return time.Time{}, fmt.Errorf("error during First ACK send: %w", err)
 	case <-time.After(AckSendTimeout): // Timeout
 		return time.Time{}, fmt.Errorf("timeout waiting for First ACK send completion")

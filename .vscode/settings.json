@@ -4,9 +4,7 @@
 	},
 	"gopls": {
 		"analyses": {
-			"cgo": {
-				"enabled": false
-			}
+			"cgo": false
 		}
 	}
 }

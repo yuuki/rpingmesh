@@ -754,7 +754,6 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 				Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 				Str("type", getQueueTypeString(u.QueueType)).
 				Msg("Receive completion channel full, dropping WC_RECV event. gwc will be freed.")
-			C.free(unsafe.Pointer(gwc))
 		}
 	}
 
@@ -785,7 +784,6 @@ func (u *UDQueue) handleSendCompletion(gwc *GoWorkCompletion) {
 			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 			Str("type", getQueueTypeString(u.QueueType)).
 			Msg("Send completion channel full, dropping WC_SEND event. gwc will be freed.")
-		C.free(unsafe.Pointer(gwc))
 	}
 }
 

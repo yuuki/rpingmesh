@@ -161,7 +161,7 @@ func (p *Prober) ProbeTarget(
 		if session.Ack2Chan != nil { // Check if already nilled out
 			close(session.Ack2Chan)
 		}
-		log.Debug().Uint32("flowLabel", flowLabel).Msg("Cleaned up session")
+		log.Trace().Uint32("flowLabel", flowLabel).Msg("Cleaned up session")
 	}()
 
 	result := &agent_analyzer.ProbeResult{
@@ -192,7 +192,7 @@ func (p *Prober) ProbeTarget(
 		Uint32("flowLabel", flowLabel).
 		Str("probeType", probeType).
 		Uint64("seqNum", seqNum).
-		Msg("Starting probe to target (session based)")
+		Msg("Starting probe to target")
 
 	// Send probe packet
 	// The context passed to SendProbePacket should be derived from the overall 'ctx' for ProbeTarget
@@ -281,7 +281,7 @@ func (p *Prober) ProbeTarget(
 			if !ack1Received { // Process only the first one
 				ack1Event = event
 				ack1Received = true
-				log.Debug().
+				log.Trace().
 					Uint64("seqNum", seqNum).
 					Uint32("flowLabel", flowLabel).
 					Msg("[prober]: Received first ACK (type 1)")
@@ -310,7 +310,7 @@ func (p *Prober) ProbeTarget(
 			if !ack2Received {
 				ack2Event = event
 				ack2Received = true
-				log.Debug().
+				log.Trace().
 					Uint64("seqNum", seqNum).
 					Uint32("flowLabel", flowLabel).
 					Msg("[prober]: Received second ACK (type 2)")
@@ -473,7 +473,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				continue
 			}
 
-			log.Debug().
+			log.Trace().
 				Str("sending_device", udq.RNIC.DeviceName).
 				Uint32("sendingQPN", udq.QPN).
 				Str("sendingGID", udq.RNIC.GID).
@@ -498,6 +498,13 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				continue
 			}
 
+			log.Trace().
+				Str("sourceGID", sourceGID).
+				Uint32("sourceQPN", sourceQPN).
+				Uint32("flowLabel", workComp.FlowLabel).
+				Uint64("seqNum", packet.SequenceNum).
+				Msg("[responder]: Sent first ACK packet")
+
 			// Step 3: Send second ACK packet with processing delay information
 			err = udq.SendSecondAckPacket(sourceGID, sourceQPN, workComp.FlowLabel, packet, receiveTime, firstAckCompletionTime)
 			if err != nil {
@@ -512,6 +519,13 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 					Msg("[responder]: Failed to send second ACK packet")
 				continue
 			}
+
+			log.Trace().
+				Str("sourceGID", sourceGID).
+				Uint32("sourceQPN", sourceQPN).
+				Uint32("flowLabel", workComp.FlowLabel).
+				Uint64("seqNum", packet.SequenceNum).
+				Msg("[responder]: Sent second ACK packet")
 		}
 	}
 }
@@ -539,7 +553,7 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 	}
 	sessionKey := ackInfo.GRHInfo.FlowLabel // Using FlowLabel as the key, per user's latest changes.
 
-	log.Debug().
+	log.Trace().
 		Uint32("sessionKey_flowLabel", sessionKey).
 		Uint64("packet_seqNum", ackInfo.Packet.SequenceNum).
 		Uint8("packet_ackType", ackInfo.Packet.AckType).
@@ -599,9 +613,11 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 		// Non-blocking send to the session channel
 		select {
 		case targetChan <- probeEvent:
-			log.Debug().Uint32("sessionKey_flowLabel", sessionKey).Str("chan", chanName).Msg("[prober_handler]: Successfully sent ACK event to session channel")
+			log.Trace().Uint32("sessionKey_flowLabel", sessionKey).Str("chan", chanName).
+				Msg("[prober_handler]: Successfully sent ACK event to session channel")
 		default:
-			log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Str("chan", chanName).Msg("[prober_handler]: Session channel blocked or closed (likely late ACK or session ended).")
+			log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Str("chan", chanName).
+				Msg("[prober_handler]: Session channel blocked or closed (likely late ACK or session ended).")
 		}
 	} else {
 		log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Uint64("packet_seqNum", ackInfo.Packet.SequenceNum).Msg("[prober_handler]: Received ACK for non-existent or already cleaned-up session")

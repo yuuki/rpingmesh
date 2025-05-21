@@ -558,8 +558,11 @@ func (r *RNIC) CloseDevice() {
 
 // processCQCompletions polls for work completions and processes them.
 func (u *UDQueue) processCQCompletions(cqEx *C.struct_ibv_cq_ex) {
-	// This function is called after ibv_start_poll returns success.
-	// We now iterate with ibv_next_poll.
+	// ibv_start_poll was successful, so cqEx points to the first completion.
+	// Process the first completion.
+	u.processSingleWC(cqEx) // New helper function to process one WC
+
+	// Then, iterate with ibv_next_poll for subsequent completions.
 	for {
 		retNextPoll := C.ibv_next_poll(cqEx)
 		if retNextPoll == C.ENOENT { // No more completions in this batch
@@ -578,46 +581,52 @@ func (u *UDQueue) processCQCompletions(cqEx *C.struct_ibv_cq_ex) {
 			break // Stop processing this batch on error
 		}
 
-		// At this point, cqEx points to the current valid completion
-		// Fields like wr_id and status can be accessed directly from cqEx if it's defined to expose them.
-		// For extended WCs, typically we use the ibv_wc_read_* functions.
-		gwc := &GoWorkCompletion{
-			WRID:                  uint64(cqEx.wr_id),
-			Status:                int(cqEx.status),
-			Opcode:                int(C.ibv_wc_read_opcode(cqEx)),
-			VendorErr:             uint32(C.ibv_wc_read_vendor_err(cqEx)),
-			ByteLen:               uint32(C.ibv_wc_read_byte_len(cqEx)),
-			SrcQP:                 uint32(C.ibv_wc_read_src_qp(cqEx)),
-			WCFlags:               uint32(C.ibv_wc_read_wc_flags(cqEx)),
-			CompletionWallclockNS: uint64(C.ibv_wc_read_completion_wallclock_ns(cqEx)),
-		}
+		// cqEx now points to the next valid completion. Process it.
+		u.processSingleWC(cqEx)
+	}
+}
 
-		log.Trace().
+// processSingleWC extracts and handles a single Work Completion from cqEx.
+// cqEx must point to a valid WC when this function is called.
+func (u *UDQueue) processSingleWC(cqEx *C.struct_ibv_cq_ex) {
+	// At this point, cqEx points to the current valid completion
+	// Fields like wr_id and status can be accessed directly from cqEx if it's defined to expose them.
+	// For extended WCs, typically we use the ibv_wc_read_* functions.
+	gwc := &GoWorkCompletion{
+		WRID:                  uint64(cqEx.wr_id),
+		Status:                int(cqEx.status),
+		Opcode:                int(C.ibv_wc_read_opcode(cqEx)),
+		VendorErr:             uint32(C.ibv_wc_read_vendor_err(cqEx)),
+		ByteLen:               uint32(C.ibv_wc_read_byte_len(cqEx)),
+		SrcQP:                 uint32(C.ibv_wc_read_src_qp(cqEx)),
+		WCFlags:               uint32(C.ibv_wc_read_wc_flags(cqEx)),
+		CompletionWallclockNS: uint64(C.ibv_wc_read_completion_wallclock_ns(cqEx)),
+	}
+	log.Trace().
+		Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
+		Str("type", getQueueTypeString(u.QueueType)).
+		Int("status", gwc.Status).
+		Uint64("wr_id", gwc.WRID).
+		Int("opcode", gwc.Opcode).
+		Uint64("hw_ts_ns", gwc.CompletionWallclockNS).
+		Msg("Processing WC with HW Timestamp")
+
+	if gwc.Status != C.IBV_WC_SUCCESS {
+		u.handleWCError(gwc)
+		return
+	}
+
+	switch gwc.Opcode {
+	case C.IBV_WC_RECV:
+		u.handleRecvCompletion(gwc)
+	case C.IBV_WC_SEND:
+		u.handleSendCompletion(gwc)
+	default:
+		log.Warn().
 			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 			Str("type", getQueueTypeString(u.QueueType)).
-			Int("status", gwc.Status).
-			Uint64("wr_id", gwc.WRID).
 			Int("opcode", gwc.Opcode).
-			Uint64("hw_ts_ns", gwc.CompletionWallclockNS).
-			Msg("Processing WC with HW Timestamp")
-
-		if gwc.Status != C.IBV_WC_SUCCESS {
-			u.handleWCError(gwc)
-			continue
-		}
-
-		switch gwc.Opcode {
-		case C.IBV_WC_RECV:
-			u.handleRecvCompletion(gwc)
-		case C.IBV_WC_SEND:
-			u.handleSendCompletion(gwc)
-		default:
-			log.Warn().
-				Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
-				Str("type", getQueueTypeString(u.QueueType)).
-				Int("opcode", gwc.Opcode).
-				Msg("Received unknown WC opcode")
-		}
+			Msg("Received unknown WC opcode")
 	}
 }
 
@@ -639,7 +648,7 @@ func (u *UDQueue) handleWCError(gwc *GoWorkCompletion) {
 }
 
 func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx from args
-	log.Debug().
+	log.Trace().
 		Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 		Str("type", getQueueTypeString(u.QueueType)).
 		Uint32("bytes", gwc.ByteLen).
@@ -735,7 +744,7 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 		}
 		u.ackHandler(ackInfo)
 	} else {
-		log.Debug().
+		log.Trace().
 			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 			Str("type", getQueueTypeString(u.QueueType)).
 			Uint64("seq", func() uint64 { // Defensive access to SequenceNum
@@ -1356,7 +1365,7 @@ func (u *UDQueue) PostRecv() error {
 
 // CreateAddressHandle creates a UD address handle for the target
 func (u *UDQueue) CreateAddressHandle(targetGID string, flowLabel uint32) (*C.struct_ibv_ah, error) {
-	log.Debug().
+	log.Trace().
 		Str("targetGID_input", targetGID).
 		Uint8("portNum_input", u.RNIC.ActivePortNum). // Log active port from RNIC
 		Uint32("flowLabel_input", flowLabel).
@@ -1371,7 +1380,6 @@ func (u *UDQueue) CreateAddressHandle(targetGID string, flowLabel uint32) (*C.st
 		log.Error().Str("invalid_target_gid", targetGID).Msg("CreateAddressHandle: Failed to parse target GID as IP address for AH creation")
 		return nil, fmt.Errorf("failed to parse target GID '%s' as IP address for AH creation", targetGID)
 	}
-	log.Debug().Str("parsed_target_gid_for_ah", ipAddr.String()).Msg("CreateAddressHandle: Successfully parsed target GID for AH creation")
 
 	ahAttr := C.struct_ibv_ah_attr{}
 	ahAttr.is_global = 1
@@ -1413,7 +1421,7 @@ func (u *UDQueue) SendProbePacket(
 	sourcePort uint32,
 	flowLabel uint32,
 ) (time.Time, time.Time, error) {
-	log.Debug().
+	log.Trace().
 		Str("target_dest_rnic_gid", targetGID).
 		Uint32("target_dest_rnic_qpn", targetQPN).
 		Uint32("source_port", sourcePort).
@@ -1490,7 +1498,7 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 		grhPresent := (wc.WCFlags & C.IBV_WC_GRH) == C.IBV_WC_GRH
 
 		if grhPresent {
-			log.Debug().Msg("IBV_WC_GRH is set. Parsing GRH.")
+			log.Trace().Msg("IBV_WC_GRH is set. Parsing GRH.")
 
 			if uint32(wc.ByteLen) < GRHSize { // GRHSize is 40
 				log.Error().Uint32("wc_byte_len", uint32(wc.ByteLen)).Msg("IBV_WC_GRH is set, but wc.byte_len is less than GRHSize (40 bytes).")
@@ -1556,7 +1564,7 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 				ipv6Header, err := ipv6.ParseHeader(grhBytes) // Parse the whole GRH as an IPv6 header
 				if err == nil && ipv6Header != nil {
 					workComp.FlowLabel = uint32(ipv6Header.FlowLabel)
-					log.Debug().Str("sgid", workComp.SGID).Str("dgid", workComp.DGID).Uint32("flow_label", workComp.FlowLabel).Msg("Parsed IPv6 GRH")
+					log.Trace().Str("sgid", workComp.SGID).Str("dgid", workComp.DGID).Uint32("flow_label", workComp.FlowLabel).Msg("Parsed IPv6 GRH")
 				} else {
 					log.Warn().Err(err).Msg("Failed to parse GRH as IPv6 header to get FlowLabel, but SGID/DGID extracted directly.")
 				}

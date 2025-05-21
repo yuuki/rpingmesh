@@ -10,22 +10,23 @@ import (
 
 // AgentConfig holds configuration for the agent
 type AgentConfig struct {
-	AgentID              string
-	ControllerAddr       string
-	AnalyzerAddr         string
-	LogLevel             string
-	ProbeIntervalMS      uint32
-	TimeoutMS            uint32
-	DataUploadIntervalMS uint32
-	TracerouteIntervalMS uint32
-	TracerouteOnTimeout  bool
-	EBPFEnabled          bool
-	OtelCollectorAddr    string
-	MetricsEnabled       bool
-	AnalyzerEnabled      bool
-	TracerEnabled        bool
-	AllowedDeviceNames   []string
-	GIDIndex             int
+	AgentID                   string
+	ControllerAddr            string
+	AnalyzerAddr              string
+	LogLevel                  string
+	ProbeIntervalMS           uint32
+	TimeoutMS                 uint32
+	DataUploadIntervalMS      uint32
+	TracerouteIntervalMS      uint32
+	TracerouteOnTimeout       bool
+	EBPFEnabled               bool
+	OtelCollectorAddr         string
+	MetricsEnabled            bool
+	AnalyzerEnabled           bool
+	TracerEnabled             bool
+	AllowedDeviceNames        []string
+	GIDIndex                  int
+	PinglistUpdateIntervalSec uint32
 }
 
 // SetupAgentFlags sets up the command line flags for the agent
@@ -50,6 +51,7 @@ func SetupAgentFlags(flagSet *pflag.FlagSet) {
 	flagSet.Bool("tracer-enabled", false, "Enable traceroute functionality")
 	flagSet.StringSlice("allowed-device-names", []string{}, "List of allowed device names for pinglist filtering (whitelist)")
 	flagSet.Int("gid-index", 0, "GID Index to use for RDMA devices (default: 0). Must be >= 0.")
+	flagSet.Uint32("pinglist-update-interval-sec", 300, "Pinglist update interval in seconds (default: 5 minutes)")
 }
 
 // LoadAgentConfig loads the configuration for an agent from a file or environment variables
@@ -77,22 +79,23 @@ func LoadAgentConfig(flagSet *pflag.FlagSet) (*AgentConfig, error) {
 
 	// Create config
 	config := &AgentConfig{
-		AgentID:              v.GetString("agent-id"),
-		ControllerAddr:       v.GetString("controller-addr"),
-		AnalyzerAddr:         v.GetString("analyzer-addr"),
-		LogLevel:             v.GetString("log-level"),
-		ProbeIntervalMS:      v.GetUint32("probe-interval-ms"),
-		TimeoutMS:            v.GetUint32("timeout-ms"),
-		DataUploadIntervalMS: v.GetUint32("data-upload-interval-ms"),
-		TracerouteIntervalMS: v.GetUint32("traceroute-interval-ms"),
-		TracerouteOnTimeout:  v.GetBool("traceroute-on-timeout"),
-		EBPFEnabled:          v.GetBool("ebpf-enabled"),
-		OtelCollectorAddr:    v.GetString("otel-collector-addr"),
-		MetricsEnabled:       v.GetBool("metrics-enabled"),
-		AnalyzerEnabled:      v.GetBool("analyzer-enabled"),
-		TracerEnabled:        v.GetBool("tracer-enabled"),
-		AllowedDeviceNames:   v.GetStringSlice("allowed-device-names"),
-		GIDIndex:             v.GetInt("gid-index"),
+		AgentID:                   v.GetString("agent-id"),
+		ControllerAddr:            v.GetString("controller-addr"),
+		AnalyzerAddr:              v.GetString("analyzer-addr"),
+		LogLevel:                  v.GetString("log-level"),
+		ProbeIntervalMS:           v.GetUint32("probe-interval-ms"),
+		TimeoutMS:                 v.GetUint32("timeout-ms"),
+		DataUploadIntervalMS:      v.GetUint32("data-upload-interval-ms"),
+		TracerouteIntervalMS:      v.GetUint32("traceroute-interval-ms"),
+		TracerouteOnTimeout:       v.GetBool("traceroute-on-timeout"),
+		EBPFEnabled:               v.GetBool("ebpf-enabled"),
+		OtelCollectorAddr:         v.GetString("otel-collector-addr"),
+		MetricsEnabled:            v.GetBool("metrics-enabled"),
+		AnalyzerEnabled:           v.GetBool("analyzer-enabled"),
+		TracerEnabled:             v.GetBool("tracer-enabled"),
+		AllowedDeviceNames:        v.GetStringSlice("allowed-device-names"),
+		GIDIndex:                  v.GetInt("gid-index"),
+		PinglistUpdateIntervalSec: v.GetUint32("pinglist-update-interval-sec"),
 	}
 
 	if config.GIDIndex < 0 {
@@ -124,6 +127,7 @@ func WriteDefaultConfig(path string) error {
 	v.Set("tracer-enabled", false)
 	v.Set("allowed-device-names", []string{})
 	v.Set("gid-index", 0)
+	v.Set("pinglist-update-interval-sec", 300)
 
 	// Write the config file
 	if err := v.WriteConfig(); err != nil {

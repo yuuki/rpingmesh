@@ -35,7 +35,6 @@ const (
 	NumBackgroundGoroutines = 2
 
 	// Timing constants
-	PinglistUpdateInterval = 5 * time.Minute
 	MetricsShutdownTimeout = 3 * time.Second
 
 	// Tracer constants
@@ -257,7 +256,7 @@ func (a *Agent) Start() error {
 	// Start background goroutines
 	a.wg.Add(NumBackgroundGoroutines)
 	go a.resultHandler()
-	go a.pinglistUpdater()
+	go a.runPinglistUpdater()
 	log.Debug().Msg("Background goroutines started")
 
 	log.Info().Msg("Agent started successfully")
@@ -388,16 +387,13 @@ func (a *Agent) resultHandler() {
 	}
 }
 
-// pinglistUpdater periodically updates the pinglist from the controller
-func (a *Agent) pinglistUpdater() {
-	defer a.wg.Done()
-	log.Debug().Msg("Pinglist updater started")
-
-	// Initial update
+// runPinglistUpdater periodically updates the pinglist from the controller
+func (a *Agent) runPinglistUpdater() {
+	log.Info().Msg("Starting pinglist updater loop")
 	a.updatePinglist()
 
 	// Set up periodic update
-	ticker := time.NewTicker(PinglistUpdateInterval)
+	ticker := time.NewTicker(time.Duration(a.config.PinglistUpdateIntervalSec) * time.Second)
 	defer ticker.Stop()
 
 	for {

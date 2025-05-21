@@ -9,5 +9,4 @@ alwaysApply: false
 
 - RoCE v2を前提にしてください。
 - UD (Unreliable Datagram) を使用してください。
-- RDMAパケット送受信に関する最小限のコードをC言語で記述し、cgoでラップしてください。
 - RDMAのping/pongのGo言語のコード例については、@https://github.com/yuuki/go-rocev2-ud-pingpong/blob/main/main.go と @https://github.com/yuuki/go-rocev2-ud-pingpong/blob/main/rdma.go を参照してください。

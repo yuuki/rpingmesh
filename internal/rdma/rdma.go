@@ -1,105 +1,104 @@
 package rdma
 
-// #cgo LDFLAGS: -libverbs
-// #include <stdlib.h>
-// #include <infiniband/verbs.h>
-// #include <string.h>
-// #include <arpa/inet.h>
-// #include <errno.h>
-//
-// // Helper function to access ibv_port_attr safely
-// int my_ibv_query_port(struct ibv_context *context, uint8_t port_num, struct ibv_port_attr *port_attr) {
-//     return ibv_query_port(context, port_num, port_attr);
-// }
-//
-// // Helper function to get phys_port_cnt
-// int get_phys_port_cnt(struct ibv_context *context, uint8_t *phys_port_cnt) {
-//     struct ibv_device_attr device_attr; // Declared and used only within C
-//     if (ibv_query_device(context, &device_attr)) {
-//         return -1; // Error
-//     }
-//     *phys_port_cnt = device_attr.phys_port_cnt;
-//     return 0; // Success
-// }
-//
-// // Helper function to copy bytes to a GID's raw field
-// void copy_to_gid_raw(union ibv_gid *gid, const void *src, size_t n) {
-//     memcpy(gid->raw, src, n);
-// }
-//
-// // Helper functions for UD operations
-// void set_ud_send_params(struct ibv_send_wr *wr, struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey) {
-//     wr->wr.ud.ah = ah;
-//     wr->wr.ud.remote_qpn = remote_qpn;
-//     wr->wr.ud.remote_qkey = remote_qkey;
-// }
-//
-// // Helper function to post receive WR without Go pointers
-// int post_recv(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey) {
-//     struct ibv_sge sge;
-//     struct ibv_recv_wr wr;
-//     struct ibv_recv_wr *bad_wr = NULL;
-//
-//     memset(&sge, 0, sizeof(sge));
-//     sge.addr = addr;
-//     sge.length = length;
-//     sge.lkey = lkey;
-//
-//     memset(&wr, 0, sizeof(wr));
-//     wr.sg_list = &sge;
-//     wr.num_sge = 1;
-//
-//     return ibv_post_recv(qp, &wr, &bad_wr);
-// }
-//
-// // Helper function to post send WR without Go pointers
-// int post_send(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey,
-//              struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey) {
-//     struct ibv_sge sge;
-//     struct ibv_send_wr wr;
-//     struct ibv_send_wr *bad_wr = NULL;
-//
-//     memset(&sge, 0, sizeof(sge));
-//     sge.addr = addr;
-//     sge.length = length;
-//     sge.lkey = lkey;
-//
-//     memset(&wr, 0, sizeof(wr));
-//     wr.sg_list = &sge;
-//     wr.num_sge = 1;
-//     wr.opcode = IBV_WR_SEND;
-//     wr.send_flags = IBV_SEND_SIGNALED;
-//     wr.wr.ud.ah = ah;
-//     wr.wr.ud.remote_qpn = remote_qpn;
-//     wr.wr.ud.remote_qkey = remote_qkey;
-//
-//     return ibv_post_send(qp, &wr, &bad_wr);
-// }
-//
-// // Helper function to request notification on completion queue
-// int req_notify_cq(struct ibv_cq *cq, int solicited_only) {
-//     return ibv_req_notify_cq(cq, solicited_only);
-// }
-//
-// // Helper function to get a completion event
-// int get_cq_event(struct ibv_comp_channel *channel, struct ibv_cq **cq, void **cq_context) {
-//     return ibv_get_cq_event(channel, cq, cq_context);
-// }
-//
-// // Helper function to acknowledge completion events
-// void ack_cq_events(struct ibv_cq *cq, unsigned int nevents) {
-//     ibv_ack_cq_events(cq, nevents);
-// }
-//
-// // Helper function to get port state
-// int get_port_state(struct ibv_context *context, uint8_t port_num, enum ibv_port_state *port_state) {
-//     struct ibv_port_attr port_attr;
-//     if (ibv_query_port(context, port_num, &port_attr)) {
-//         return -1; // Error
-//     }
-//     *port_state = port_attr.state;
-//     return 0; // Success
-// }
+/*
+#cgo LDFLAGS: -libverbs
+#include <stdlib.h>
+#include <infiniband/verbs.h> // Use standard verbs.h
+// #include <infiniband/verbs_exp.h> // EXPERIMENTAL - DO NOT USE UNLESS NEEDED AND AVAILABLE
+#include <string.h>
+#include <arpa/inet.h>
+#include <errno.h>
+
+static int get_errno(void) {
+    return errno;
+}
+
+int my_ibv_query_port(struct ibv_context *context, uint8_t port_num, struct ibv_port_attr *port_attr) {
+    return ibv_query_port(context, port_num, port_attr);
+}
+
+int get_phys_port_cnt(struct ibv_context *context, uint8_t *phys_port_cnt) {
+    struct ibv_device_attr device_attr;
+    if (ibv_query_device(context, &device_attr)) {
+        return -1;
+    }
+    *phys_port_cnt = device_attr.phys_port_cnt;
+    return 0;
+}
+
+void copy_to_gid_raw(union ibv_gid *gid, const void *src, size_t n) {
+    memcpy(gid->raw, src, n);
+}
+
+void set_ud_send_params(struct ibv_send_wr *wr, struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey) {
+    wr->wr.ud.ah = ah;
+    wr->wr.ud.remote_qpn = remote_qpn;
+    wr->wr.ud.remote_qkey = remote_qkey;
+}
+
+int post_recv(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey) {
+    struct ibv_sge sge;
+    struct ibv_recv_wr wr;
+    struct ibv_recv_wr *bad_wr = NULL;
+
+    memset(&sge, 0, sizeof(sge));
+    sge.addr = addr;
+    sge.length = length;
+    sge.lkey = lkey;
+
+    memset(&wr, 0, sizeof(wr));
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    return ibv_post_recv(qp, &wr, &bad_wr);
+}
+
+int post_send(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey,
+             struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey) {
+    struct ibv_sge sge;
+    struct ibv_send_wr wr;
+    struct ibv_send_wr *bad_wr = NULL;
+
+    memset(&sge, 0, sizeof(sge));
+    sge.addr = addr;
+    sge.length = length;
+    sge.lkey = lkey;
+
+    memset(&wr, 0, sizeof(wr));
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.ud.ah = ah;
+    wr.wr.ud.remote_qpn = remote_qpn;
+    wr.wr.ud.remote_qkey = remote_qkey;
+
+    return ibv_post_send(qp, &wr, &bad_wr);
+}
+
+int post_send_new_api(struct ibv_qp_ex *qpx, uint64_t addr, uint32_t length, uint32_t lkey,
+                      struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey, uint64_t wr_id) {
+    ibv_wr_start(qpx);
+
+    qpx->wr_id = wr_id;
+    qpx->wr_flags = IBV_SEND_SIGNALED;
+
+    ibv_wr_set_sge(qpx, lkey, addr, length);
+    ibv_wr_set_ud_addr(qpx, ah, remote_qpn, remote_qkey);
+
+    return ibv_wr_complete(qpx);
+}
+
+int get_port_state(struct ibv_context *context, uint8_t port_num, enum ibv_port_state *port_state) {
+    struct ibv_port_attr port_attr;
+    if (ibv_query_port(context, port_num, &port_attr)) {
+        return -1;
+    }
+    *port_state = port_attr.state;
+    return 0;
+}
+
+*/
 import "C"
 
 import (
@@ -132,7 +131,7 @@ const (
 	SendCompChanBufferSize = 100  // Buffer size for send completion channel
 	RecvCompChanBufferSize = 100  // Buffer size for receive completion channel
 	ErrChanBufferSize      = 100  // Buffer size for error channel
-	MaxWorkCompletions     = 10   // Max number of work completions to poll at once
+	MaxWorkCompletions     = 10   // Max number of work completions to poll at once // Not directly used with ibv_next_poll iterator style
 
 	// Timeout durations
 	SendCompletionTimeout = 5 * time.Second       // Timeout for waiting for send completion
@@ -153,12 +152,12 @@ type GRHHeaderInfo struct {
 
 // IncomingAckInfo holds information about a received ACK packet to be passed to the handler.
 type IncomingAckInfo struct {
-	Packet      *ProbePacket     // The deserialized ProbePacket
-	ReceivedAt  time.Time        // Timestamp when the ACK was processed by the CQ poller
-	GRHInfo     *GRHHeaderInfo   // Information from GRH, if present
-	SourceQP    uint32           // Source QP from the work completion (remote QPN)
-	RawWC       *C.struct_ibv_wc // Raw work completion for any other details. Use with caution.
-	AckStatusOK bool             // True if the RDMA work completion for this ACK was successful.
+	Packet      *ProbePacket      // The deserialized ProbePacket
+	ReceivedAt  time.Time         // Timestamp when the ACK was processed by the CQ poller
+	GRHInfo     *GRHHeaderInfo    // Information from GRH, if present
+	SourceQP    uint32            // Source QP from the work completion (remote QPN)
+	RawWC       *GoWorkCompletion // Raw work completion for any other details. Use with caution.
+	AckStatusOK bool              // True if the RDMA work completion for this ACK was successful.
 }
 
 // AckHandlerFunc is a callback function type for processing incoming ACK packets.
@@ -195,7 +194,8 @@ type RNIC struct {
 type UDQueue struct {
 	RNIC        *RNIC
 	QP          *C.struct_ibv_qp
-	CQ          *C.struct_ibv_cq
+	QPEx        *C.struct_ibv_qp_ex // Added for new send API
+	CQ          *C.struct_ibv_cq_ex
 	CompChannel *C.struct_ibv_comp_channel
 	SendMR      *C.struct_ibv_mr
 	RecvMR      *C.struct_ibv_mr
@@ -205,9 +205,9 @@ type UDQueue struct {
 	QueueType   UDQueueType // Type of queue (sender or responder)
 
 	// Channels for CQ completion event notifications
-	sendCompChan chan *C.struct_ibv_wc // Channel for send completion events
-	recvCompChan chan *C.struct_ibv_wc // Channel for receive completion events (non-ACKs or if no handler)
-	errChan      chan error            // Channel for error notifications
+	sendCompChan chan *GoWorkCompletion // Channel for send completion events
+	recvCompChan chan *GoWorkCompletion // Channel for receive completion events (non-ACKs or if no handler)
+	errChan      chan error             // Channel for error notifications
 
 	// CQ polling goroutine control
 	cqPollerRunning bool
@@ -266,15 +266,17 @@ type WorkCompletion struct {
 	FlowLabel uint32
 }
 
-// Placeholder structure for go build to succeed even if we don't have the actual header
-type ibv_wc struct {
-	status     uint32
-	vendor_err uint32
-	byte_len   uint32
-	imm_data   uint32
-	qp_num     uint32
-	src_qp     uint32
-	wc_flags   uint32
+// GoWorkCompletion represents the Go version of C.struct_ibv_wc
+type GoWorkCompletion struct {
+	WRID                  uint64
+	Status                int // Using int for C.enum_ibv_wc_status
+	Opcode                int // Using int for C.enum_ibv_wc_opcode
+	VendorErr             uint32
+	ByteLen               uint32
+	SrcQP                 uint32
+	WCFlags               uint32
+	CompletionWallclockNS uint64 // Hardware wallclock timestamp in nanoseconds
+	// Add other fields as needed, e.g., imm_data, qp_num
 }
 
 // NewRDMAManager creates a new RDMA manager
@@ -566,73 +568,79 @@ func (r *RNIC) CloseDevice() {
 }
 
 // processCQCompletions polls for work completions and processes them.
-func (u *UDQueue) processCQCompletions(wc *C.struct_ibv_wc, numWCElements int) {
-	for i := 0; i < numWCElements; i++ {
-		// It's crucial to create a new C.struct_ibv_wc for each completion.
-		// Otherwise, if we pass &wc[i] directly to the channel,
-		// all channel receivers might end up with a pointer to the same memory location
-		// (the last element in the original wc array after the loop finishes),
-		// leading to incorrect data processing.
-		// C.memcpy ensures that we are copying the content of the work completion
-		// into a newly allocated memory for each event.
-		//
-		// The Go garbage collector is not aware of memory allocated by C.malloc.
-		// This memory must be explicitly freed using C.free() when it's no longer needed.
-		// In this CQ poller, the responsibility to free wcCopy lies with the goroutine
-		// that receives it from the sendCompChan or recvCompChan.
-		// For ACK packets processed by ackHandler, if rawWC is used, its lifetime
-		// must be managed carefully or copied into Go-managed memory.
-		wcSize := unsafe.Sizeof(C.struct_ibv_wc{})
-		wcCopy := (*C.struct_ibv_wc)(C.malloc((C.size_t)(wcSize)))
-		if wcCopy == nil {
-			log.Error().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Str("type", getQueueTypeString(u.QueueType)).Msg("Failed to allocate memory for wcCopy")
-			continue
+func (u *UDQueue) processCQCompletions(cqEx *C.struct_ibv_cq_ex) {
+	// This function is called after ibv_start_poll returns success.
+	// We now iterate with ibv_next_poll.
+	for {
+		retNextPoll := C.ibv_next_poll(cqEx)
+		if retNextPoll == C.ENOENT { // No more completions in this batch
+			log.Trace().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Str("type", getQueueTypeString(u.QueueType)).Msg("ibv_next_poll returned ENOENT, no more completions in this batch")
+			break
+		}
+		if retNextPoll != 0 { // An error occurred
+			// errno might be set by ibv_next_poll on error.
+			errMsg := fmt.Sprintf("CQ Poller: ibv_next_poll failed for QPN 0x%x, Type: %s, Ret: %d, Errno: %d. Stopping poll for this batch.", u.QPN, getQueueTypeString(u.QueueType), retNextPoll, syscall.Errno(retNextPoll))
+			log.Error().Msg(errMsg)
+			select {
+			case u.errChan <- fmt.Errorf(errMsg):
+			default:
+				log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping ibv_next_poll error")
+			}
+			break // Stop processing this batch on error
 		}
 
-		// Correct pointer arithmetic to access the i-th element of the C array wc
-		currentWc := (*C.struct_ibv_wc)(unsafe.Pointer(uintptr(unsafe.Pointer(wc)) + uintptr(i)*wcSize))
+		// At this point, cqEx points to the current valid completion
+		// Fields like wr_id and status can be accessed directly from cqEx if it's defined to expose them.
+		// For extended WCs, typically we use the ibv_wc_read_* functions.
+		gwc := &GoWorkCompletion{
+			WRID:                  uint64(cqEx.wr_id),
+			Status:                int(cqEx.status),
+			Opcode:                int(C.ibv_wc_read_opcode(cqEx)),
+			VendorErr:             uint32(C.ibv_wc_read_vendor_err(cqEx)),
+			ByteLen:               uint32(C.ibv_wc_read_byte_len(cqEx)),
+			SrcQP:                 uint32(C.ibv_wc_read_src_qp(cqEx)),
+			WCFlags:               uint32(C.ibv_wc_read_wc_flags(cqEx)),
+			CompletionWallclockNS: uint64(C.ibv_wc_read_completion_wallclock_ns(cqEx)),
+		}
 
-		C.memcpy(unsafe.Pointer(wcCopy), unsafe.Pointer(currentWc), (C.size_t)(wcSize))
-
-		// currentWc is already a pointer to the correct wc element due to the above calculation
 		log.Trace().
 			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 			Str("type", getQueueTypeString(u.QueueType)).
-			Uint32("status", (uint32)(currentWc.status)).
-			Uint64("wr_id", uint64(currentWc.wr_id)).
-			Uint32("opcode", uint32(currentWc.opcode)).
-			Msg("Processing WC")
+			Int("status", gwc.Status).
+			Uint64("wr_id", gwc.WRID).
+			Int("opcode", gwc.Opcode).
+			Uint64("hw_ts_ns", gwc.CompletionWallclockNS).
+			Msg("Processing WC with HW Timestamp")
 
-		if currentWc.status != C.IBV_WC_SUCCESS {
-			u.handleWCError(currentWc)
-			C.free(unsafe.Pointer(wcCopy)) // Free if there was an error and not sending
+		if gwc.Status != C.IBV_WC_SUCCESS {
+			u.handleWCError(gwc)
 			continue
 		}
 
-		switch currentWc.opcode {
+		switch gwc.Opcode {
 		case C.IBV_WC_RECV:
-			u.handleRecvCompletion(currentWc, wcCopy) // wcCopy is freed by handleRecvCompletion or receiver
+			u.handleRecvCompletion(gwc)
 		case C.IBV_WC_SEND:
-			u.handleSendCompletion(wcCopy) // wcCopy is freed by receiver
+			u.handleSendCompletion(gwc)
 		default:
 			log.Warn().
 				Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 				Str("type", getQueueTypeString(u.QueueType)).
-				Int("opcode", int(currentWc.opcode)).
+				Int("opcode", gwc.Opcode).
 				Msg("Received unknown WC opcode")
-			C.free(unsafe.Pointer(wcCopy)) // Free if not handled
 		}
 	}
 }
 
-func (u *UDQueue) handleWCError(wc *C.struct_ibv_wc) {
-	errMsg := fmt.Sprintf("CQ Poller: WC error for QPN 0x%x, Type: %s, Status: %s (%d), Vendor Syndrome: 0x%x, Opcode: %d",
+func (u *UDQueue) handleWCError(gwc *GoWorkCompletion) {
+	errMsg := fmt.Sprintf("CQ Poller: WC error for QPN 0x%x, Type: %s, Status: %s (%d), Vendor Syndrome: 0x%x, Opcode: %d, HWTimestamp: %d ns",
 		u.QPN,
 		getQueueTypeString(u.QueueType),
-		C.GoString(C.ibv_wc_status_str(wc.status)),
-		wc.status,
-		wc.vendor_err,
-		wc.opcode)
+		C.GoString(C.ibv_wc_status_str(C.enum_ibv_wc_status(gwc.Status))),
+		gwc.Status,
+		gwc.VendorErr,
+		gwc.Opcode,
+		gwc.CompletionWallclockNS)
 	log.Error().Msg(errMsg)
 	select {
 	case u.errChan <- fmt.Errorf(errMsg):
@@ -641,15 +649,17 @@ func (u *UDQueue) handleWCError(wc *C.struct_ibv_wc) {
 	}
 }
 
-func (u *UDQueue) handleRecvCompletion(wc *C.struct_ibv_wc, wcCopy *C.struct_ibv_wc) {
-	receivedAt := time.Now()
+func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx from args
+	// Software timestamp for comparison or fallback
+	// receivedAtSw := time.Now()
 	log.Debug().
 		Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 		Str("type", getQueueTypeString(u.QueueType)).
-		Uint32("bytes", (uint32)(wc.byte_len)).
-		Uint32("src_qp", (uint32)(wc.src_qp)).
-		Uint32("wc_flags", (uint32)(wc.wc_flags)).
-		Msg("IBV_WC_RECV")
+		Uint32("bytes", gwc.ByteLen).
+		Uint32("src_qp", gwc.SrcQP).
+		Uint32("wc_flags", gwc.WCFlags).
+		Uint64("hw_ts_ns", gwc.CompletionWallclockNS).
+		Msg("IBV_WC_RECV (HW Timestamp)")
 
 	var probePkt *ProbePacket
 	var grhInfo *GRHHeaderInfo
@@ -661,7 +671,7 @@ func (u *UDQueue) handleRecvCompletion(wc *C.struct_ibv_wc, wcCopy *C.struct_ibv
 	expectedMinLengthNoGRH := int(probePacketStructSize)
 
 	var currentExpectedMinLength int
-	if (wc.wc_flags & C.IBV_WC_GRH) == 0 {
+	if (gwc.WCFlags & C.IBV_WC_GRH) == 0 {
 		// If no GRH flag, assume packet starts immediately. This is unusual for UD but handle defensively.
 		currentExpectedMinLength = expectedMinLengthNoGRH
 		log.Warn().
@@ -672,23 +682,22 @@ func (u *UDQueue) handleRecvCompletion(wc *C.struct_ibv_wc, wcCopy *C.struct_ibv
 		currentExpectedMinLength = expectedMinLengthWithGRH
 	}
 
-	if wc.byte_len < C.uint32_t(currentExpectedMinLength) {
+	if gwc.ByteLen < uint32(currentExpectedMinLength) {
 		log.Error().
 			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 			Str("type", getQueueTypeString(u.QueueType)).
-			Uint32("received_bytes", (uint32)(wc.byte_len)).
+			Uint32("received_bytes", gwc.ByteLen).
 			Int("expected_min_bytes", currentExpectedMinLength). // Changed to Int
-			Bool("grh_flag_present", (wc.wc_flags&C.IBV_WC_GRH) != 0).
+			Bool("grh_flag_present", (gwc.WCFlags&C.IBV_WC_GRH) != 0).
 			Msg("Received packet too small")
-		C.free(unsafe.Pointer(wcCopy))
-		if err := u.PostRecv(); err != nil { // Attempt to repost buffer even on error
-			log.Error().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msgf("Failed to repost recv buffer after small packet error: %v", err)
+		if errPost := u.PostRecv(); errPost != nil { // Attempt to repost buffer even on error
+			log.Error().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msgf("Failed to repost recv buffer after small packet error: %v", errPost)
 		}
 		return
 	}
 
 	var payloadStartPtr unsafe.Pointer
-	if (wc.wc_flags & C.IBV_WC_GRH) != 0 {
+	if (gwc.WCFlags & C.IBV_WC_GRH) != 0 {
 		grhStartPtr := u.RecvBuf // Assuming RecvBuf points to the start of the received data including GRH for WR_ID.
 		payloadStartPtr = unsafe.Pointer(uintptr(grhStartPtr) + GRHSize)
 		probePkt = (*ProbePacket)(payloadStartPtr)
@@ -731,14 +740,13 @@ func (u *UDQueue) handleRecvCompletion(wc *C.struct_ibv_wc, wcCopy *C.struct_ibv
 
 		ackInfo := &IncomingAckInfo{
 			Packet:      probePkt,
-			ReceivedAt:  receivedAt,
+			ReceivedAt:  time.Now(),
 			GRHInfo:     grhInfo,
-			SourceQP:    uint32(wc.src_qp),
-			RawWC:       wc, // Pass original wc (not wcCopy) for inspection. Handler should not store this pointer.
+			SourceQP:    gwc.SrcQP,
+			RawWC:       gwc, // Pass original wc (not wcCopy) for inspection. Handler should not store this pointer.
 			AckStatusOK: true,
 		}
 		u.ackHandler(ackInfo)
-		C.free(unsafe.Pointer(wcCopy)) // Free wcCopy after handler returns.
 	} else {
 		log.Debug().
 			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
@@ -751,18 +759,18 @@ func (u *UDQueue) handleRecvCompletion(wc *C.struct_ibv_wc, wcCopy *C.struct_ibv
 			}()).
 			Msg("Non-ACK packet or no handler/responder queue, sending to recvCompChan")
 		select {
-		case u.recvCompChan <- wcCopy:
+		case u.recvCompChan <- gwc:
 		default:
 			log.Warn().
 				Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 				Str("type", getQueueTypeString(u.QueueType)).
-				Msg("Receive completion channel full, dropping WC_RECV event. wcCopy will be freed.")
-			C.free(unsafe.Pointer(wcCopy))
+				Msg("Receive completion channel full, dropping WC_RECV event. gwc will be freed.")
+			C.free(unsafe.Pointer(gwc))
 		}
 	}
 
-	if err := u.PostRecv(); err != nil {
-		errMsg := fmt.Sprintf("CQ Poller: Failed to repost receive buffer for QPN 0x%x, Type: %s: %v", u.QPN, getQueueTypeString(u.QueueType), err)
+	if errPost := u.PostRecv(); errPost != nil {
+		errMsg := fmt.Sprintf("CQ Poller: Failed to repost receive buffer for QPN 0x%x, Type: %s: %v", u.QPN, getQueueTypeString(u.QueueType), errPost)
 		log.Error().Msg(errMsg)
 		select {
 		case u.errChan <- fmt.Errorf(errMsg):
@@ -772,19 +780,23 @@ func (u *UDQueue) handleRecvCompletion(wc *C.struct_ibv_wc, wcCopy *C.struct_ibv
 	}
 }
 
-func (u *UDQueue) handleSendCompletion(wcCopy *C.struct_ibv_wc) {
-	log.Debug().
+func (u *UDQueue) handleSendCompletion(gwc *GoWorkCompletion) {
+	log.Trace().
 		Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 		Str("type", getQueueTypeString(u.QueueType)).
+		Uint32("bytes", gwc.ByteLen).
+		Uint32("src_qp", gwc.SrcQP).
+		Uint32("wc_flags", gwc.WCFlags).
+		Uint64("hw_ts_ns", gwc.CompletionWallclockNS).
 		Msg("IBV_WC_SEND")
 	select {
-	case u.sendCompChan <- wcCopy:
+	case u.sendCompChan <- gwc:
 	default:
 		log.Warn().
 			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 			Str("type", getQueueTypeString(u.QueueType)).
-			Msg("Send completion channel full, dropping WC_SEND event. wcCopy will be freed.")
-		C.free(unsafe.Pointer(wcCopy))
+			Msg("Send completion channel full, dropping WC_SEND event. gwc will be freed.")
+		C.free(unsafe.Pointer(gwc))
 	}
 }
 
@@ -812,8 +824,6 @@ func (u *UDQueue) StartCQPoller() {
 			u.cqPollerMutex.Unlock()
 		}()
 
-		wc := make([]C.struct_ibv_wc, MaxWorkCompletions)
-
 		if u.CompChannel == nil {
 			errMsg := fmt.Sprintf("CQ Poller: Completion channel is nil for QPN 0x%x, Type: %s. Poller cannot start.", u.QPN, getQueueTypeString(u.QueueType))
 			log.Error().Msg(errMsg)
@@ -825,10 +835,21 @@ func (u *UDQueue) StartCQPoller() {
 			return
 		}
 
-		// Initial request for CQ notification.
-		retValInitialNotify := C.ibv_req_notify_cq(u.CQ, 0) // 0 for any completion
-		if retValInitialNotify != 0 {
-			errMsg := fmt.Sprintf("CQ Poller: Failed to request initial CQ notification for QPN 0x%x, Type: %s: %s. Poller exiting.", u.QPN, getQueueTypeString(u.QueueType), syscall.Errno(retValInitialNotify).Error())
+		baseCQ := C.ibv_cq_ex_to_cq(u.CQ)
+		if baseCQ == nil {
+			errMsg := fmt.Sprintf("CQ Poller: Failed to get base CQ from extended CQ for QPN 0x%x, Type: %s. Poller exiting.", u.QPN, getQueueTypeString(u.QueueType))
+			log.Error().Msg(errMsg)
+			select {
+			case u.errChan <- fmt.Errorf(errMsg):
+			default:
+				log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping base CQ retrieval error")
+			}
+			return
+		}
+
+		// // Initial request for CQ notification
+		if C.ibv_req_notify_cq(baseCQ, 0) != 0 {
+			errMsg := fmt.Sprintf("CQ Poller: Failed to request initial CQ notification for QPN 0x%x, Type: %s: %s. Poller exiting.", u.QPN, getQueueTypeString(u.QueueType), syscall.Errno(C.get_errno()).Error())
 			log.Error().Msg(errMsg)
 			select {
 			case u.errChan <- fmt.Errorf(errMsg):
@@ -841,7 +862,8 @@ func (u *UDQueue) StartCQPoller() {
 		for {
 			select {
 			case <-u.cqPollerDone:
-				log.Info().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Str("type", getQueueTypeString(u.QueueType)).Msg("CQ poller received done signal. Exiting.")
+				log.Info().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Str("type", getQueueTypeString(u.QueueType)).
+					Msg("CQ poller received done signal. Exiting.")
 				return
 			default:
 				// Proceed to wait for CQ event.
@@ -854,57 +876,52 @@ func (u *UDQueue) StartCQPoller() {
 			retGetEvent := C.ibv_get_cq_event(u.CompChannel, &cqEv, &cqCtx)
 			if retGetEvent != 0 {
 				select {
-				case <-u.cqPollerDone: // Check if stopping, to suppress error spam during shutdown.
+				case <-u.cqPollerDone:
 					log.Info().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Str("type", getQueueTypeString(u.QueueType)).Msg("CQ poller: ibv_get_cq_event failed during shutdown. Normal.")
 					return
 				default:
-					// For ibv_get_cq_event, a non-zero return usually indicates an error with the comp_channel fd itself
 					log.Error().
 						Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 						Str("type", getQueueTypeString(u.QueueType)).
-						Int("ret", int(retGetEvent)). // Cast C int to Go int for logger
+						Int("ret", int(retGetEvent)).
+						Str("errno", syscall.Errno(C.get_errno()).Error()).
 						Msg("ibv_get_cq_event failed")
 					select {
-					case u.errChan <- fmt.Errorf("ibv_get_cq_event failed"):
+					case u.errChan <- fmt.Errorf("ibv_get_cq_event failed: %s", syscall.Errno(C.get_errno()).Error()):
 					default:
 						log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping ibv_get_cq_event error")
 					}
-					return
+					return // Critical error, poller stops
 				}
 			}
 
-			// It is important to check if cqEv is nil, or if it matches u.CQ.
-			// According to examples, cqEv should be the CQ associated with the event.
 			if cqEv == nil {
 				log.Error().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Str("type", getQueueTypeString(u.QueueType)).Msg("CQ Poller: ibv_get_cq_event returned nil cqEv. This is unexpected. Continuing after ack and re-arm.")
-				// Acknowledge on u.CQ if cqEv is nil, assuming it's for our CQ.
-				C.ibv_ack_cq_events(u.CQ, 1)
-				if C.ibv_req_notify_cq(u.CQ, 0) != 0 {
-					log.Error().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("CQ Poller: Failed to re-request CQ notification on u.CQ after nil cqEv.")
+				C.ibv_ack_cq_events(baseCQ, 1) // Ack on baseCQ as cqEv is nil
+				if C.ibv_req_notify_cq(baseCQ, 0) != 0 {
+					log.Error().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msgf("CQ Poller: Failed to re-request CQ notification on baseCQ after nil cqEv: %s", syscall.Errno(C.get_errno()).Error())
 				}
-				continue // Try to recover.
+				continue
 			}
 
-			if cqEv != u.CQ {
+			// Check if the event is for the CQ we are interested in.
+			if cqEv != baseCQ { // Compare with the base CQ derived from u.CQ
 				log.Warn().
 					Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 					Str("type", getQueueTypeString(u.QueueType)).
-					Msgf("CQ Poller: Event from cq %p does not match expected cq %p. Acking event on cqEv and re-arming u.CQ.", cqEv, u.CQ)
-				C.ibv_ack_cq_events(cqEv, 1)           // Ack on the CQ that generated the event.
-				if C.ibv_req_notify_cq(u.CQ, 0) != 0 { // Re-arm our CQ.
-					log.Error().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("CQ Poller: Failed to re-request CQ notification on u.CQ after mismatched event.")
+					Msgf("CQ Poller: Event from cq %p does not match expected base cq %p. Acking event on cqEv and re-arming baseCQ.", cqEv, baseCQ)
+				C.ibv_ack_cq_events(cqEv, 1)             // Ack on the CQ that generated the event.
+				if C.ibv_req_notify_cq(baseCQ, 0) != 0 { // Re-arm our CQ.
+					log.Error().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msgf("CQ Poller: Failed to re-request CQ notification on baseCQ after mismatched event: %s", syscall.Errno(C.get_errno()).Error())
 				}
-				continue // This situation is odd; continue and hope our CQ gets events.
+				continue
 			}
 
-			C.ibv_ack_cq_events(cqEv, 1) // Acknowledge the event on the correct CQ.
+			C.ibv_ack_cq_events(cqEv, 1) // Ack on the CQ that generated the event.
 
-			// Re-request notification for the next completion event.
-			retReNotify := C.ibv_req_notify_cq(u.CQ, 0)
-			if retReNotify != 0 {
-				errMsg := fmt.Sprintf("CQ Poller: Failed to re-request CQ notification for QPN 0x%x, Type: %s: %s. Continuing, but may miss events.", u.QPN, getQueueTypeString(u.QueueType), syscall.Errno(retReNotify).Error())
+			if C.ibv_req_notify_cq(baseCQ, 0) != 0 {
+				errMsg := fmt.Sprintf("CQ Poller: Failed to re-request CQ notification for QPN 0x%x, Type: %s: %s. Continuing, but may miss events.", u.QPN, getQueueTypeString(u.QueueType), syscall.Errno(C.get_errno()).Error())
 				log.Error().Msg(errMsg)
-				// Non-fatal, but log it. Polling might still pick up WCs already there.
 				select {
 				case u.errChan <- fmt.Errorf(errMsg):
 				default:
@@ -912,23 +929,26 @@ func (u *UDQueue) StartCQPoller() {
 				}
 			}
 
-			numWCElements := int(C.ibv_poll_cq(u.CQ, C.int(MaxWorkCompletions), &wc[0]))
-			if numWCElements < 0 {
-				errMsg := fmt.Sprintf("CQ Poller: ibv_poll_cq failed for QPN 0x%x, Type: %s, Return: %d. Poller exiting.", u.QPN, getQueueTypeString(u.QueueType), numWCElements)
+			// Use ibv_start_poll, processCQCompletions, ibv_end_poll pattern
+			retStartPoll := C.ibv_start_poll(u.CQ, nil) // Pass nil instead of &ibvPollCqAttr
+			if retStartPoll == 0 {
+				log.Trace().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Str("type", getQueueTypeString(u.QueueType)).Msg("ibv_start_poll successful, processing completions.")
+				u.processCQCompletions(u.CQ)
+				C.ibv_end_poll(u.CQ)
+			} else if retStartPoll == C.ENOENT {
+				log.Trace().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Str("type", getQueueTypeString(u.QueueType)).
+					Msg("CQ poller: ibv_start_poll returned ENOENT (no completions). This is normal after event if completions were already processed.")
+				// No need to call C.ibv_end_poll if C.ibv_start_poll didn't return 0
+			} else {
+				// An error other than ENOENT occurred with ibv_start_poll
+				errMsg := fmt.Sprintf("CQ Poller: ibv_start_poll failed for QPN 0x%x, Type: %s, Ret: %d, Errno: %d. Poller may miss events.", u.QPN, getQueueTypeString(u.QueueType), retStartPoll, syscall.Errno(retStartPoll))
 				log.Error().Msg(errMsg)
 				select {
 				case u.errChan <- fmt.Errorf(errMsg):
 				default:
-					log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping ibv_poll_cq error")
+					log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping ibv_start_poll error")
 				}
-				return
-			}
-
-			if numWCElements > 0 {
-				log.Debug().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Str("type", getQueueTypeString(u.QueueType)).Int("count", numWCElements).Msg("Polled work completions")
-				u.processCQCompletions(&wc[0], numWCElements)
-			} else {
-				log.Trace().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Str("type", getQueueTypeString(u.QueueType)).Msg("CQ poller: ibv_poll_cq returned 0 WCs after event.")
+				// No C.ibv_end_poll if C.ibv_start_poll failed with an error other than ENOENT
 			}
 		}
 	}()
@@ -980,7 +1000,12 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 			C.ibv_destroy_qp(qp)
 		}
 		if cq != nil {
-			C.ibv_destroy_cq(cq)
+			base_cq_to_destroy := C.ibv_cq_ex_to_cq(cq) // Direct call
+			if base_cq_to_destroy != nil {
+				C.ibv_destroy_cq(base_cq_to_destroy)
+			} else {
+				log.Error().Str("device", rnic.DeviceName).Msg("Failed to get base CQ from extended CQ during CreateUDQueue failure path")
+			}
 		}
 		if compChannel != nil {
 			C.ibv_destroy_comp_channel(compChannel)
@@ -992,6 +1017,7 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 	udQueue := &UDQueue{
 		RNIC:         rnic,
 		QP:           qp,
+		QPEx:         C.ibv_qp_to_qp_ex(qp), // Initialize QPEx
 		CQ:           cq,
 		CompChannel:  compChannel,
 		SendMR:       sendMR,
@@ -1000,9 +1026,9 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 		RecvBuf:      recvBuf,
 		QPN:          uint32(qp.qp_num),
 		QueueType:    queueType,
-		sendCompChan: make(chan *C.struct_ibv_wc, SendCompChanBufferSize), // Buffered channel
-		recvCompChan: make(chan *C.struct_ibv_wc, RecvCompChanBufferSize), // Buffered channel
-		errChan:      make(chan error, ErrChanBufferSize),                 // Buffered channel
+		sendCompChan: make(chan *GoWorkCompletion, SendCompChanBufferSize), // Buffered channel
+		recvCompChan: make(chan *GoWorkCompletion, RecvCompChanBufferSize), // Buffered channel
+		errChan:      make(chan error, ErrChanBufferSize),                  // Buffered channel
 		cqPollerDone: make(chan struct{}),
 		ackHandler:   ackHandler,
 	}
@@ -1069,48 +1095,86 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 }
 
 // createQueuePair creates a Queue Pair and puts it in the RTS state
-func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_ibv_cq, *C.struct_ibv_comp_channel, uint32, error) {
+func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_ibv_cq_ex, *C.struct_ibv_comp_channel, uint32, error) {
 	// Create a completion event channel
 	compChannel := C.ibv_create_comp_channel(rnic.Context)
 	if compChannel == nil {
 		return nil, nil, nil, 0, fmt.Errorf("failed to create completion channel for device %s", rnic.DeviceName)
 	}
 
-	// Create completion queue with more entries for better throughput
-	cq := C.ibv_create_cq(rnic.Context, CQSize, nil, compChannel, 0)
-	if cq == nil {
+	// Create extended completion queue
+	var cqAttr C.struct_ibv_cq_init_attr_ex
+	// It's good practice to zero out C structs allocated on Go side before filling them.
+	// However, C.memset might not be the most idiomatic way from Go if we fill all relevant fields.
+	// Explicitly setting fields ensures clarity.
+	cqAttr.cqe = C.uint32_t(CQSize) // Ensure correct type for cqe
+	cqAttr.cq_context = nil
+	cqAttr.channel = compChannel
+	cqAttr.comp_vector = 0
+	cqAttr.wc_flags = C.IBV_WC_EX_WITH_BYTE_LEN | C.IBV_WC_EX_WITH_SRC_QP | C.IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK
+	// All other fields in cqAttr will be zero by default Go struct initialization if not set.
+
+	cqEx := C.ibv_create_cq_ex(rnic.Context, &cqAttr)
+	if cqEx == nil {
 		C.ibv_destroy_comp_channel(compChannel)
-		return nil, nil, nil, 0, fmt.Errorf("failed to create CQ for device %s", rnic.DeviceName)
+		return nil, nil, nil, 0, fmt.Errorf("failed to create extended CQ for device %s: %s", rnic.DeviceName, syscall.Errno(C.get_errno()).Error())
 	}
 
 	// Generate random PSN as in ud_pingpong.c (24 bit value)
 	psn := uint32(rand.Int31n(1 << 24))
 
-	// QP creation attribute setting to standard
-	var qpInitAttr C.struct_ibv_qp_init_attr
-	qpInitAttr.qp_type = C.IBV_QPT_UD
-	qpInitAttr.sq_sig_all = 0 // Set to 0 to match standard (flags specified in each WR)
-	qpInitAttr.send_cq = cq
-	qpInitAttr.recv_cq = cq
+	// QP creation using ibv_create_qp_ex
+	var initAttrEx C.struct_ibv_qp_init_attr_ex
+	C.memset(unsafe.Pointer(&initAttrEx), 0, C.sizeof_struct_ibv_qp_init_attr_ex)
 
-	// Set appropriate capacity for performance
-	qpInitAttr.cap.max_send_wr = C.uint32_t(len(m.Devices) * 100)
-	qpInitAttr.cap.max_recv_wr = C.uint32_t(len(m.Devices) * 100)
-	qpInitAttr.cap.max_send_sge = 1
-	qpInitAttr.cap.max_recv_sge = 1
-
-	// Create the QP
-	qp := C.ibv_create_qp(rnic.PD, &qpInitAttr)
-	if qp == nil {
-		C.ibv_destroy_cq(cq)
+	base_send_cq := C.ibv_cq_ex_to_cq(cqEx)
+	base_recv_cq := C.ibv_cq_ex_to_cq(cqEx)
+	if base_send_cq == nil || base_recv_cq == nil {
 		C.ibv_destroy_comp_channel(compChannel)
-		return nil, nil, nil, 0, fmt.Errorf("failed to create QP for device %s", rnic.DeviceName)
+		if cqEx != nil {
+			base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx)
+			if base_cq_to_destroy != nil {
+				C.ibv_destroy_cq(base_cq_to_destroy)
+			} else {
+				log.Error().Msg("Failed to get base CQ from non-nil extended CQ during QP_EX creation failure path")
+			}
+		}
+		return nil, nil, nil, 0, fmt.Errorf("failed to get base CQ from extended CQ for device %s (for qp_ex)", rnic.DeviceName)
+	}
+
+	initAttrEx.send_cq = base_send_cq
+	initAttrEx.recv_cq = base_recv_cq
+	initAttrEx.cap.max_send_wr = C.uint32_t(len(m.Devices) * 100) // TODO: Review capacity, maybe use a const
+	initAttrEx.cap.max_recv_wr = C.uint32_t(len(m.Devices) * 100) // TODO: Review capacity
+	initAttrEx.cap.max_send_sge = 1
+	initAttrEx.cap.max_recv_sge = 1
+	initAttrEx.qp_type = C.IBV_QPT_UD
+	initAttrEx.comp_mask |= C.IBV_QP_INIT_ATTR_PD | C.IBV_QP_INIT_ATTR_SEND_OPS_FLAGS
+	initAttrEx.pd = rnic.PD
+	initAttrEx.send_ops_flags = C.IBV_QP_EX_WITH_SEND
+
+	qp := C.ibv_create_qp_ex(rnic.Context, &initAttrEx)
+	if qp == nil {
+		errno := C.get_errno()
+		base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx) // Direct call
+		if base_cq_to_destroy != nil {
+			C.ibv_destroy_cq(base_cq_to_destroy)
+		} else {
+			log.Error().Str("device", rnic.DeviceName).Msg("Failed to get base CQ from extended CQ for destruction during QP creation failure")
+		}
+		C.ibv_destroy_comp_channel(compChannel)
+		return nil, nil, nil, 0, fmt.Errorf("failed to create QP for device %s: %s", rnic.DeviceName, syscall.Errno(errno).Error())
 	}
 
 	// Modify QP to INIT state
 	if err := m.modifyQPToInit(rnic, qp); err != nil {
 		C.ibv_destroy_qp(qp)
-		C.ibv_destroy_cq(cq)
+		base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx) // Direct call
+		if base_cq_to_destroy != nil {
+			C.ibv_destroy_cq(base_cq_to_destroy)
+		} else {
+			log.Error().Str("device", rnic.DeviceName).Msg("Failed to get base CQ from extended CQ for destruction during INIT failure")
+		}
 		C.ibv_destroy_comp_channel(compChannel)
 		return nil, nil, nil, 0, err
 	}
@@ -1118,7 +1182,12 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 	// Modify QP to RTR state
 	if err := m.modifyQPToRTR(rnic, qp); err != nil {
 		C.ibv_destroy_qp(qp)
-		C.ibv_destroy_cq(cq)
+		base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx) // Direct call
+		if base_cq_to_destroy != nil {
+			C.ibv_destroy_cq(base_cq_to_destroy)
+		} else {
+			log.Error().Str("device", rnic.DeviceName).Msg("Failed to get base CQ from extended CQ for destruction during RTR failure")
+		}
 		C.ibv_destroy_comp_channel(compChannel)
 		return nil, nil, nil, 0, err
 	}
@@ -1126,12 +1195,17 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 	// Modify QP to RTS state
 	if err := m.modifyQPToRTS(rnic, qp, psn); err != nil {
 		C.ibv_destroy_qp(qp)
-		C.ibv_destroy_cq(cq)
+		base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx) // Direct call
+		if base_cq_to_destroy != nil {
+			C.ibv_destroy_cq(base_cq_to_destroy)
+		} else {
+			log.Error().Str("device", rnic.DeviceName).Msg("Failed to get base CQ from extended CQ for destruction during RTS failure")
+		}
 		C.ibv_destroy_comp_channel(compChannel)
 		return nil, nil, nil, 0, err
 	}
 
-	return qp, cq, compChannel, psn, nil
+	return qp, cqEx, compChannel, psn, nil
 }
 
 // modifyQPToInit transitions the QP to INIT state
@@ -1204,7 +1278,7 @@ func (m *RDMAManager) modifyQPToRTS(rnic *RNIC, qp *C.struct_ibv_qp, psn uint32)
 }
 
 // allocateMemoryResources allocates memory buffers and registers memory regions
-func (m *RDMAManager) allocateMemoryResources(rnic *RNIC, qp *C.struct_ibv_qp, cq *C.struct_ibv_cq, compChannel *C.struct_ibv_comp_channel) (unsafe.Pointer, unsafe.Pointer, *C.struct_ibv_mr, *C.struct_ibv_mr, error) {
+func (m *RDMAManager) allocateMemoryResources(rnic *RNIC, qp *C.struct_ibv_qp, cq *C.struct_ibv_cq_ex, compChannel *C.struct_ibv_comp_channel) (unsafe.Pointer, unsafe.Pointer, *C.struct_ibv_mr, *C.struct_ibv_mr, error) {
 	// Allocate send buffers
 	bufferSize := C.size_t(MRSize + GRHSize)
 	sendBuf := C.aligned_alloc(C.size_t(os.Getpagesize()), bufferSize)
@@ -1376,24 +1450,33 @@ func (u *UDQueue) SendProbePacket(
 	packet.T1 = uint64(time.Now().UnixNano())
 	packet.IsAck = 0 // Not an ACK
 
-	if ret := C.post_send(
-		u.QP,
+	if ret := C.post_send_new_api(
+		u.QPEx,
 		C.uint64_t(uintptr(u.SendBuf)),
 		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
 		u.SendMR.lkey,
 		ah,
 		C.uint32_t(targetQPN),
 		C.uint32_t(DefaultQKey),
+		1, // wr_id, can be any unique ID for the WR
 	); ret != 0 {
-		return time.Time{}, fmt.Errorf("ibv_post_send failed: %d", ret)
+		return time.Time{}, fmt.Errorf("ibv_post_send_new_api failed: %d", ret)
 	}
+
+	log.Trace().
+		Str("target_dest_rnic_gid", targetGID).
+		Uint32("target_dest_rnic_qpn", targetQPN).
+		Uint32("source_port", sourcePort).
+		Uint32("flow_label", flowLabel).
+		Uint64("sequence_num", sequenceNum).
+		Msg("post_send_new_api successful")
 
 	// Wait for completion notification from CQ poller
 	select {
 	case wc := <-u.sendCompChan:
 		// Received send completion event
-		if wc.status != C.IBV_WC_SUCCESS {
-			return time.Time{}, fmt.Errorf("send completion failed: %d", wc.status)
+		if wc.Status != C.IBV_WC_SUCCESS {
+			return time.Time{}, fmt.Errorf("send completion failed: %d", wc.Status)
 		}
 		return time.Now(), nil
 	case err := <-u.errChan:
@@ -1411,22 +1494,22 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 	case wc := <-u.recvCompChan:
 		receiveTime := time.Now()
 		workComp := &WorkCompletion{
-			Status:    uint32(wc.status),
-			SrcQP:     uint32(wc.src_qp),
-			VendorErr: uint32(wc.vendor_err),
+			Status:    uint32(wc.Status),
+			SrcQP:     uint32(wc.SrcQP),
+			VendorErr: uint32(wc.VendorErr),
 		}
 
 		var packetDataPtr unsafe.Pointer
 		var actualPayloadLength uint32
 		expectedMinimumPayloadSize := uint32(unsafe.Sizeof(ProbePacket{}))
-		grhPresent := (wc.wc_flags & C.IBV_WC_GRH) == C.IBV_WC_GRH
+		grhPresent := (wc.WCFlags & C.IBV_WC_GRH) == C.IBV_WC_GRH
 
 		if grhPresent {
 			log.Debug().Msg("IBV_WC_GRH is set. Parsing GRH.")
 
-			if uint32(wc.byte_len) < GRHSize { // GRHSize is 40
-				log.Error().Uint32("wc_byte_len", uint32(wc.byte_len)).Msg("IBV_WC_GRH is set, but wc.byte_len is less than GRHSize (40 bytes).")
-				return nil, receiveTime, workComp, fmt.Errorf("IBV_WC_GRH set but wc.byte_len (%d) < GRHSize (%d)", wc.byte_len, GRHSize)
+			if uint32(wc.ByteLen) < GRHSize { // GRHSize is 40
+				log.Error().Uint32("wc_byte_len", uint32(wc.ByteLen)).Msg("IBV_WC_GRH is set, but wc.byte_len is less than GRHSize (40 bytes).")
+				return nil, receiveTime, workComp, fmt.Errorf("IBV_WC_GRH set but wc.byte_len (%d) < GRHSize (%d)", wc.ByteLen, GRHSize)
 			}
 
 			// GRH is at the beginning of u.RecvBuf
@@ -1498,12 +1581,12 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 				return nil, receiveTime, workComp, fmt.Errorf("GRH has unknown IP version: %d", ipVersion)
 			}
 			// Payload is after GRH
-			actualPayloadLength = uint32(wc.byte_len) - GRHSize
+			actualPayloadLength = uint32(wc.ByteLen) - GRHSize
 			packetDataPtr = unsafe.Pointer(uintptr(u.RecvBuf) + uintptr(GRHSize))
 
 		} else { // GRH not present
 			log.Debug().Msg("IBV_WC_GRH is NOT set. Assuming payload starts at the beginning of the buffer.")
-			actualPayloadLength = uint32(wc.byte_len)
+			actualPayloadLength = uint32(wc.ByteLen)
 			packetDataPtr = u.RecvBuf
 		}
 
@@ -1512,7 +1595,7 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 			log.Warn().
 				Uint32("actualPayloadLength", actualPayloadLength).
 				Uint32("expectedMinimumPayloadSize", expectedMinimumPayloadSize).
-				Uint32("wc_byte_len", uint32(wc.byte_len)).
+				Uint32("wc_byte_len", uint32(wc.ByteLen)).
 				Bool("grh_present", grhPresent).
 				Msg("Actual received payload is smaller than ProbePacket size. Ignoring packet.")
 			if errPost := u.PostRecv(); errPost != nil {
@@ -1591,24 +1674,25 @@ func (u *UDQueue) SendFirstAckPacket(
 	packet.Flags = 0
 
 	// Use the C helper function to post a send WR from C-allocated memory
-	if ret := C.post_send(
-		u.QP,
+	if ret := C.post_send_new_api(
+		u.QPEx,
 		C.uint64_t(uintptr(u.SendBuf)),
 		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
 		u.SendMR.lkey,
 		ah,
 		C.uint32_t(targetQPN),
 		C.uint32_t(qkey),
+		2, // wr_id for first ack
 	); ret != 0 {
-		return time.Time{}, fmt.Errorf("ibv_post_send failed: %d", ret)
+		return time.Time{}, fmt.Errorf("ibv_post_send_new_api (First ACK) failed: %d", ret)
 	}
 
 	// Wait for completion notification from CQ poller
 	select {
 	case wc := <-u.sendCompChan:
 		// Received send completion event
-		if wc.status != C.IBV_WC_SUCCESS {
-			return time.Time{}, fmt.Errorf("First ACK send completion failed: %d", wc.status)
+		if wc.Status != C.IBV_WC_SUCCESS {
+			return time.Time{}, fmt.Errorf("First ACK send completion failed: %d", wc.Status)
 		}
 		return time.Now(), nil
 	case err := <-u.errChan:
@@ -1657,24 +1741,25 @@ func (u *UDQueue) SendSecondAckPacket(
 	packet.Flags = 0
 
 	// Use the C helper function to post a send WR from C-allocated memory
-	if ret := C.post_send(
-		u.QP,
+	if ret := C.post_send_new_api(
+		u.QPEx,
 		C.uint64_t(uintptr(u.SendBuf)),
 		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
 		u.SendMR.lkey,
 		ah,
 		C.uint32_t(targetQPN),
 		C.uint32_t(qkey),
+		3, // wr_id for second ack
 	); ret != 0 {
-		return fmt.Errorf("ibv_post_send failed: %d", ret)
+		return fmt.Errorf("ibv_post_send_new_api (Second ACK) failed: %d", ret)
 	}
 
 	// Wait for completion notification from CQ poller
 	select {
 	case wc := <-u.sendCompChan:
 		// Received send completion event
-		if wc.status != C.IBV_WC_SUCCESS {
-			return fmt.Errorf("Second ACK send completion failed: %d", wc.status)
+		if wc.Status != C.IBV_WC_SUCCESS {
+			return fmt.Errorf("Second ACK send completion failed: %d", wc.Status)
 		}
 		return nil
 	case err := <-u.errChan:
@@ -1712,24 +1797,25 @@ func (u *UDQueue) SendAckPacket(
 	packet.T4 = uint64(time.Now().UnixNano())
 	packet.IsAck = 1
 
-	if ret := C.post_send(
-		u.QP,
+	if ret := C.post_send_new_api(
+		u.QPEx,
 		C.uint64_t(uintptr(u.SendBuf)),
 		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
 		u.SendMR.lkey,
 		ah,
 		C.uint32_t(targetQPN),
 		C.uint32_t(qkey),
+		4, // wr_id for legacy ack
 	); ret != 0 {
-		return fmt.Errorf("ibv_post_send failed: %d", ret)
+		return fmt.Errorf("ibv_post_send_new_api (ACK) failed: %d", ret)
 	}
 
 	// Wait for completion notification from CQ poller
 	select {
 	case wc := <-u.sendCompChan:
 		// Received send completion event
-		if wc.status != C.IBV_WC_SUCCESS {
-			return fmt.Errorf("ACK send completion failed: %d", wc.status)
+		if wc.Status != C.IBV_WC_SUCCESS {
+			return fmt.Errorf("ACK send completion failed: %d", wc.Status)
 		}
 		return nil
 	case err := <-u.errChan:
@@ -1776,13 +1862,21 @@ func (u *UDQueue) Destroy() {
 		u.SendBuf = nil
 	}
 
+	// QPEx is derived from QP, so destroying QP should be enough.
+	// No explicit destroy for QPEx.
 	if u.QP != nil {
 		C.ibv_destroy_qp(u.QP)
 		u.QP = nil
+		u.QPEx = nil // Also nil out QPEx
 	}
 
 	if u.CQ != nil {
-		C.ibv_destroy_cq(u.CQ)
+		base_cq_to_destroy := C.ibv_cq_ex_to_cq(u.CQ) // Direct call
+		if base_cq_to_destroy != nil {
+			C.ibv_destroy_cq(base_cq_to_destroy)
+		} else {
+			log.Error().Str("device", u.RNIC.DeviceName).Uint32("qpn", u.QPN).Msg("Failed to get base CQ from extended CQ for destruction in UDQueue.Destroy")
+		}
 		u.CQ = nil
 	}
 

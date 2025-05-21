@@ -1753,61 +1753,6 @@ func (u *UDQueue) SendSecondAckPacket(
 	}
 }
 
-// SendAckPacket sends an ACK packet in response to a probe (legacy method)
-// Deprecated: Use SendFirstAckPacket and SendSecondAckPacket instead
-func (u *UDQueue) SendAckPacket(
-	targetGID string,
-	targetQPN uint32,
-	flowLabel uint32,
-	originalPacket *ProbePacket,
-	receiveTime time.Time,
-) error {
-	// Use standard QKey for UD operations (0x11111111 as in ud_pingpong.c)
-	const qkey uint32 = DefaultQKey
-
-	ah, err := u.CreateAddressHandle(targetGID, flowLabel)
-	if err != nil {
-		return err
-	}
-	defer C.ibv_destroy_ah(ah)
-
-	// Prepare a simple ACK packet
-	packet := (*ProbePacket)(u.SendBuf)
-	C.memset(u.SendBuf, 0, C.size_t(unsafe.Sizeof(ProbePacket{})))
-	packet.SequenceNum = originalPacket.SequenceNum
-	packet.T1 = originalPacket.T1
-	packet.T3 = uint64(receiveTime.UnixNano())
-	packet.T4 = uint64(time.Now().UnixNano())
-	packet.IsAck = 1
-
-	if ret := C.post_send(
-		u.QP,
-		C.uint64_t(uintptr(u.SendBuf)),
-		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
-		u.SendMR.lkey,
-		ah,
-		C.uint32_t(targetQPN),
-		C.uint32_t(qkey),
-	); ret != 0 {
-		return fmt.Errorf("ibv_post_send failed: %d", ret)
-	}
-
-	// Wait for completion notification from CQ poller
-	select {
-	case wc := <-u.sendCompChan:
-		// Received send completion event
-		if wc.Status != C.IBV_WC_SUCCESS {
-			return fmt.Errorf("ACK send completion failed: %d", wc.Status)
-		}
-		return nil
-	case err := <-u.errChan:
-		// Error occurred
-		return fmt.Errorf("error during ACK send: %w", err)
-	case <-time.After(AckSendTimeout): // Timeout
-		return fmt.Errorf("timeout waiting for ACK send completion")
-	}
-}
-
 // Destroy releases all resources associated with the UD queue
 func (u *UDQueue) Destroy() {
 	// Stop CQ polling goroutine

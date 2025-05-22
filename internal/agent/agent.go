@@ -79,7 +79,7 @@ func New(cfg *config.AgentConfig) (*Agent, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create agent state
-	agentState := state.NewAgentState(cfg.AgentID, "", cfg.GIDIndex)
+	agentState := state.NewAgentState(cfg.AgentID, cfg.HostName, "", cfg.GIDIndex)
 
 	// Initialize controller client
 	controllerClient := controller_client.NewControllerClient(cfg.ControllerAddr)
@@ -155,6 +155,7 @@ func (a *Agent) Start() error {
 	// Register with controller
 	if err := a.controllerClient.RegisterAgent(
 		a.agentState.GetAgentID(),
+		a.agentState.GetHostName(),
 		a.agentState.GetAgentIP(),
 		a.agentState.GetDetectedRNICs(),
 	); err != nil {

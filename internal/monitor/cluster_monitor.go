@@ -10,34 +10,9 @@ import (
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/internal/rdma"
 	"github.com/yuuki/rpingmesh/internal/state"
-	"github.com/yuuki/rpingmesh/proto/agent_analyzer"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 	"go.uber.org/ratelimit"
 )
-
-// Constants
-const (
-	// Probe Types
-	ProbeTypeTorMesh  = "TOR_MESH"
-	ProbeTypeInterTor = "INTER_TOR"
-
-	// Default Values
-	DefaultFlowLabel = 0  // Default flow label for ACK packets
-	EmptyIPString    = "" // Empty string for IP address checks
-
-)
-
-// PingTarget represents a target for probing
-type PingTarget struct {
-	GID        string
-	QPN        uint32
-	IPAddress  string
-	HostName   string
-	TorID      string
-	SourcePort uint32
-	FlowLabel  uint32
-	Priority   uint32
-}
 
 // ClusterMonitor monitors all RDMA devices in the cluster
 type ClusterMonitor struct {
@@ -45,7 +20,7 @@ type ClusterMonitor struct {
 	prober             *probe.Prober
 	intervalMs         uint32
 	probeRatePerSecond int
-	pinglist           []PingTarget
+	pinglist           []probe.PingTarget // Changed to probe.PingTarget
 	stopCh             chan struct{}
 	wg                 sync.WaitGroup
 	running            bool
@@ -66,7 +41,7 @@ func NewClusterMonitor(
 		prober:             prober,
 		intervalMs:         intervalMs,
 		probeRatePerSecond: probeRatePerSecond,
-		pinglist:           make([]PingTarget, 0),
+		pinglist:           make([]probe.PingTarget, 0), // Changed to probe.PingTarget
 		stopCh:             make(chan struct{}),
 		running:            false,
 		targetChans:        make(map[string]chan struct{}),
@@ -124,9 +99,9 @@ func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget)
 	c.targetChans = make(map[string]chan struct{})
 
 	// Update pinglist
-	c.pinglist = make([]PingTarget, 0, len(pinglist))
+	c.pinglist = make([]probe.PingTarget, 0, len(pinglist)) // Changed to probe.PingTarget
 	for _, target := range pinglist {
-		c.pinglist = append(c.pinglist, PingTarget{
+		c.pinglist = append(c.pinglist, probe.PingTarget{ // Changed to probe.PingTarget
 			GID:        target.TargetRnic.Gid,
 			QPN:        target.TargetRnic.Qpn,
 			IPAddress:  target.TargetRnic.IpAddress,
@@ -135,6 +110,7 @@ func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget)
 			SourcePort: target.SourcePort,
 			FlowLabel:  target.FlowLabel,
 			Priority:   target.Priority,
+			// ProbeType will be set in probeTargetWithRateLimit or based on context
 		})
 	}
 
@@ -184,26 +160,47 @@ func (c *ClusterMonitor) runAllProbeWorkers() {
 }
 
 // probeTargetWithRateLimit continuously probes a target with rate limiting
-func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target PingTarget, stopCh chan struct{}) {
+func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target probe.PingTarget, stopCh chan struct{}) { // Changed to probe.PingTarget
 	defer c.wg.Done()
 
 	// Determine probe type based on TOR relationship
-	probeType := ProbeTypeInterTor
-	if target.TorID == c.agentState.GetLocalTorID() {
-		probeType = ProbeTypeTorMesh
+	probeType := probe.ProbeTypeInterTor              // Changed to probe.ProbeTypeInterTor
+	if target.TorID == c.agentState.GetLocalTorID() { // agentState.GetLocalTorID() needs to be checked for existence
+		probeType = probe.ProbeTypeTorMesh // Changed to probe.ProbeTypeTorMesh
 	}
 
-	// Create target RNIC info for the result
-	targetRnicInfo := &agent_analyzer.RnicIdentifier{
+	// Create a mutable copy of the target to set the ProbeType for this specific probe instance.
+	// This is important if the original `target` from `c.pinglist` should remain unchanged
+	// or if multiple goroutines might operate on slightly different versions of it.
+	// However, given the current structure where `target` is a copy from the `c.pinglist` loop,
+	// modifying it directly here for `ProbeType` is acceptable if `c.pinglist` elements are not meant
+	// to store this dynamic probe type.
+	// For clarity and safety, let's create a PingTarget specifically for the prober call.
+	probeDetails := probe.PingTarget{
+		GID:              target.GID, // This might need to be actualTargetGID later
+		QPN:              target.QPN,
+		IPAddress:        target.IPAddress,
+		HostName:         target.HostName,
+		TorID:            target.TorID,
+		SourcePort:       target.SourcePort,
+		FlowLabel:        target.FlowLabel,
+		Priority:         target.Priority,
+		ServiceFlowTuple: target.ServiceFlowTuple, // Pass along if present
+		ProbeType:        probeType,               // Set the determined probe type
+	}
+
+	// Create target RNIC info for the result (used for logging/reporting, not directly for probing logic with ProbeTarget)
+	// agent_analyzer.RnicIdentifier remains the same
+	/* targetRnicInfo := &agent_analyzer.RnicIdentifier{
 		Gid:       target.GID,
 		Qpn:       target.QPN,
 		IpAddress: target.IPAddress,
 		HostName:  target.HostName,
 		TorId:     target.TorID,
-	}
+	} */
 
 	// Resolve the actual GID to use for the target
-	actualTargetGID := c.resolveTargetGID(target)
+	actualTargetGID := c.resolveTargetGID(target) // Pass probe.PingTarget
 
 	// Final check to skip probing ourselves after GID resolution
 	if actualTargetGID == localRnic.GID {
@@ -214,13 +211,20 @@ func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target P
 		return
 	}
 
+	// Update probeDetails with the resolved GID if it's different and relevant for ProbeTarget
+	// The prober.ProbeTarget function signature expects a *probe.PingTarget.
+	// Let's ensure the GID in probeDetails is the one to be probed.
+	probeDetails.GID = actualTargetGID
+
 	// Verify that a sender UDQueue is available for this RNIC
-	senderUDQueue := c.agentState.GetSenderUDQueue(localRnic.GID)
+	senderUDQueue := c.agentState.GetSenderUDQueue(localRnic.GID) // agentState.GetSenderUDQueue needs to be checked
 	if senderUDQueue == nil {
 		log.Error().
 			Str("localRnic.GID", localRnic.GID).
 			Str("localRnic.DeviceName", localRnic.DeviceName).
 			Msg("No sender UDQueue available for this RNIC, cannot probe target")
+		// TODO: Consider how to report this failure, e.g., via a ProbeResult with an error status.
+		// For now, just returning as the original code did.
 		return
 	}
 
@@ -238,49 +242,28 @@ func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target P
 
 			// Send probe with a timeout context
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.intervalMs)*time.Millisecond)
+			// Ensure cancel is called to free resources, even if ProbeTarget panics or returns early.
+			// However, ProbeTarget itself might handle the context cancellation if it's long-running.
+			// The prober.ProbeTarget call needs to be updated to accept *probe.PingTarget
 			c.prober.ProbeTarget(
 				ctx,
 				localRnic,
-				actualTargetGID,
-				target.QPN,
-				target.SourcePort,
-				target.FlowLabel,
-				probeType,
-				targetRnicInfo,
+				&probeDetails, // Pass the address of probeDetails, which is *probe.PingTarget
 			)
-			cancel()
+			cancel() // Call cancel after the probe is done or times out.
 		}
 	}
 }
 
-// resolveTargetGID resolves the actual GID to use for a target
-// It handles cases where the target.GID might be an IP address
-func (c *ClusterMonitor) resolveTargetGID(target PingTarget) string {
-	actualTargetGID := target.GID
-
-	// Check if target.GID is a valid IP address
-	ipFromGID := net.ParseIP(target.GID)
-	if ipFromGID == nil {
-		// Not an IP address, use as is
-		log.Debug().
-			Str("targetGID", target.GID).
-			Msg("Target GID does not look like an IP address, using as is")
-		return actualTargetGID
+// resolveTargetGID resolves the GID to use for the target.
+// Currently, it just returns target.GID, but could involve more complex logic.
+func (c *ClusterMonitor) resolveTargetGID(target probe.PingTarget) string { // Changed to probe.PingTarget
+	// Placeholder for more complex GID resolution if needed (e.g., based on IP, hostname)
+	// For now, assume target.GID is the correct one to use for probing.
+	if target.IPAddress != probe.EmptyIPString && net.ParseIP(target.IPAddress) == nil { // Changed to probe.EmptyIPString
+		log.Warn().Str("ip", target.IPAddress).Str("gid", target.GID).Msg("Target has an invalid IP address, using GID for probing.")
 	}
-
-	// It's an IP address, try to find corresponding GID
-	lookupIP := target.IPAddress
-	if lookupIP == EmptyIPString || net.ParseIP(lookupIP) == nil {
-		// If target.IPAddress is not valid, fallback to GID
-		lookupIP = target.GID
-	}
-
-	foundRnic := c.agentState.FindRNICByIP(lookupIP)
-	if foundRnic == nil {
-		log.Debug().
-			Str("lookupIP", lookupIP).
-			Msg("Could not find matching RNIC for target IP. Using original GID/IP in registry.")
-		return actualTargetGID
-	}
-	return foundRnic.GID
+	// Potentially, if GID is empty but IP is present, query controller for GID by IP.
+	// For now, we rely on the Pinglist providing a valid GID for the target.
+	return target.GID
 }

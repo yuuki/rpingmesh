@@ -24,6 +24,7 @@ type AgentConfig struct {
 	TracerouteIntervalMS      uint32
 	TracerouteOnTimeout       bool
 	EBPFEnabled               bool
+	ServiceFlowMonitorEnabled bool
 	OtelCollectorAddr         string
 	MetricsEnabled            bool
 	AnalyzerEnabled           bool
@@ -49,7 +50,8 @@ func SetupAgentFlags(flagSet *pflag.FlagSet) {
 	flagSet.Uint32("data-upload-interval-ms", 10000, "Data upload interval in milliseconds")
 	flagSet.Uint32("traceroute-interval-ms", 300000, "Traceroute interval in milliseconds")
 	flagSet.Bool("traceroute-on-timeout", true, "Run traceroute on probe timeout")
-	flagSet.Bool("ebpf-enabled", true, "Enable eBPF monitoring")
+	flagSet.Bool("ebpf-enabled", true, "Enable eBPF monitoring (required for Service Flow Monitor)")
+	flagSet.Bool("service-flow-monitor-enabled", true, "Enable Service Flow Monitoring via eBPF")
 	flagSet.String("otel-collector-addr", "grpc://localhost:4317", "OpenTelemetry collector address (e.g., grpc://localhost:4317, grpcs://localhost:4317, http://localhost:4318, https://localhost:4318)")
 	flagSet.Bool("metrics-enabled", true, "Enable OpenTelemetry metrics")
 	flagSet.Bool("analyzer-enabled", false, "Enable data upload to Analyzer")
@@ -111,6 +113,7 @@ func LoadAgentConfig(flagSet *pflag.FlagSet) (*AgentConfig, error) {
 		TracerouteIntervalMS:      v.GetUint32("traceroute-interval-ms"),
 		TracerouteOnTimeout:       v.GetBool("traceroute-on-timeout"),
 		EBPFEnabled:               v.GetBool("ebpf-enabled"),
+		ServiceFlowMonitorEnabled: v.GetBool("service-flow-monitor-enabled"),
 		OtelCollectorAddr:         v.GetString("otel-collector-addr"),
 		MetricsEnabled:            v.GetBool("metrics-enabled"),
 		AnalyzerEnabled:           v.GetBool("analyzer-enabled"),
@@ -144,6 +147,7 @@ func WriteDefaultConfig(path string) error {
 	v.Set("traceroute-interval-ms", 300000)
 	v.Set("traceroute-on-timeout", true)
 	v.Set("ebpf-enabled", true)
+	v.Set("service-flow-monitor-enabled", true)
 	v.Set("otel-collector-addr", "grpc://localhost:4317")
 	v.Set("metrics-enabled", true)
 	v.Set("analyzer-enabled", false)

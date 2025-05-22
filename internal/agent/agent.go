@@ -195,11 +195,15 @@ func (a *Agent) Start() error {
 		a.agentState,
 		a.prober,
 		a.config.ProbeIntervalMS,
+		a.config.ProbeRatePerSecond,
 	)
 	if err := a.clusterMonitor.Start(); err != nil {
 		return fmt.Errorf("failed to start cluster monitor: %w", err)
 	}
-	log.Debug().Uint32("probe_interval_ms", a.config.ProbeIntervalMS).Msg("Cluster monitor started")
+	log.Debug().
+		Uint32("probe_interval_ms", a.config.ProbeIntervalMS).
+		Int("probe_rate_per_second", a.config.ProbeRatePerSecond).
+		Msg("Cluster monitor started")
 
 	// Set context for tracer
 	if a.tracer != nil {

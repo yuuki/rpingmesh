@@ -25,8 +25,6 @@ const (
 	DefaultFlowLabel = 0  // Default flow label for ACK packets
 	EmptyIPString    = "" // Empty string for IP address checks
 
-	// Rate limit configuration
-	ProbeRatePerSecond = 10 // Probes per second per target
 )
 
 // PingTarget represents a target for probing
@@ -43,13 +41,14 @@ type PingTarget struct {
 
 // ClusterMonitor monitors all RDMA devices in the cluster
 type ClusterMonitor struct {
-	agentState *state.AgentState
-	prober     *probe.Prober
-	intervalMs uint32
-	pinglist   []PingTarget
-	stopCh     chan struct{}
-	wg         sync.WaitGroup
-	running    bool
+	agentState         *state.AgentState
+	prober             *probe.Prober
+	intervalMs         uint32
+	probeRatePerSecond int
+	pinglist           []PingTarget
+	stopCh             chan struct{}
+	wg                 sync.WaitGroup
+	running            bool
 
 	// For rate limiting and controlling goroutines
 	targetChans map[string]chan struct{}
@@ -60,15 +59,17 @@ func NewClusterMonitor(
 	agentState *state.AgentState,
 	prober *probe.Prober,
 	intervalMs uint32,
+	probeRatePerSecond int,
 ) *ClusterMonitor {
 	return &ClusterMonitor{
-		agentState:  agentState,
-		prober:      prober,
-		intervalMs:  intervalMs,
-		pinglist:    make([]PingTarget, 0),
-		stopCh:      make(chan struct{}),
-		running:     false,
-		targetChans: make(map[string]chan struct{}),
+		agentState:         agentState,
+		prober:             prober,
+		intervalMs:         intervalMs,
+		probeRatePerSecond: probeRatePerSecond,
+		pinglist:           make([]PingTarget, 0),
+		stopCh:             make(chan struct{}),
+		running:            false,
+		targetChans:        make(map[string]chan struct{}),
 	}
 }
 
@@ -223,8 +224,8 @@ func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target P
 		return
 	}
 
-	// Create rate limiter for this target
-	limiter := ratelimit.New(ProbeRatePerSecond, ratelimit.WithoutSlack)
+	// Create rate limiter for this target using configured rate
+	limiter := ratelimit.New(c.probeRatePerSecond, ratelimit.WithoutSlack)
 
 	// Main probing loop with rate limiting
 	for {

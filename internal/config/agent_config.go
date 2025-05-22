@@ -8,6 +8,8 @@ import (
 	"github.com/spf13/viper"
 )
 
+const DefaultProbeRatePerSecond = 10 // Default probes per second per target
+
 // AgentConfig holds configuration for the agent
 type AgentConfig struct {
 	AgentID                   string
@@ -27,6 +29,7 @@ type AgentConfig struct {
 	AllowedDeviceNames        []string
 	GIDIndex                  int
 	PinglistUpdateIntervalSec uint32
+	ProbeRatePerSecond        int
 }
 
 // SetupAgentFlags sets up the command line flags for the agent
@@ -52,6 +55,7 @@ func SetupAgentFlags(flagSet *pflag.FlagSet) {
 	flagSet.StringSlice("allowed-device-names", []string{}, "List of allowed device names for pinglist filtering (whitelist)")
 	flagSet.Int("gid-index", 0, "GID Index to use for RDMA devices (default: 0). Must be >= 0.")
 	flagSet.Uint32("pinglist-update-interval-sec", 300, "Pinglist update interval in seconds (default: 5 minutes)")
+	flagSet.Int("probe-rate-per-second", DefaultProbeRatePerSecond, "Probes per second for each target")
 }
 
 // LoadAgentConfig loads the configuration for an agent from a file or environment variables
@@ -96,6 +100,7 @@ func LoadAgentConfig(flagSet *pflag.FlagSet) (*AgentConfig, error) {
 		AllowedDeviceNames:        v.GetStringSlice("allowed-device-names"),
 		GIDIndex:                  v.GetInt("gid-index"),
 		PinglistUpdateIntervalSec: v.GetUint32("pinglist-update-interval-sec"),
+		ProbeRatePerSecond:        v.GetInt("probe-rate-per-second"),
 	}
 
 	if config.GIDIndex < 0 {
@@ -128,6 +133,7 @@ func WriteDefaultConfig(path string) error {
 	v.Set("allowed-device-names", []string{})
 	v.Set("gid-index", 0)
 	v.Set("pinglist-update-interval-sec", 300)
+	v.Set("probe-rate-per-second", DefaultProbeRatePerSecond)
 
 	// Write the config file
 	if err := v.WriteConfig(); err != nil {

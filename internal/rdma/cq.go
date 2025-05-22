@@ -19,11 +19,6 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-const (
-	// CQSize is the size of Completion Queue
-	CQSize = 50
-)
-
 // WorkCompletion contains extracted work completion info
 // Note: This is a Go representation, distinct from GoWorkCompletion which is closer to C.struct_ibv_wc
 type WorkCompletion struct {

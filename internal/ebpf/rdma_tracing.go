@@ -22,28 +22,48 @@ import (
 //go:embed bpf/*
 var bpfFS embed.FS
 
+// Event type constants matching eBPF definitions
+const (
+	RdmaEventCreate  = 1
+	RdmaEventModify  = 2
+	RdmaEventDestroy = 3
+)
+
+// Statistics keys matching eBPF definitions
+const (
+	StatCreateCount    = 0
+	StatModifyCount    = 1
+	StatDestroyCount   = 2
+	StatErrorCount     = 3
+	StatGidReadSuccess = 4
+	StatGidReadFailure = 5
+)
+
 // RdmaConnTuple represents RDMA connection 5-tuple information
+// Struct layout optimized to match eBPF struct with proper alignment
 type RdmaConnTuple struct {
 	Timestamp uint64   // Timestamp when the event occurred (nanoseconds)
-	EventType uint8    // Event type (1: create, 2: modify, 3: destroy)
+	SrcGID    [16]byte // Source Global Identifier (GID) - 16 bytes
+	DstGID    [16]byte // Destination Global Identifier (GID) - 16 bytes
 	SrcQPN    uint32   // Source Queue Pair Number
 	DstQPN    uint32   // Destination Queue Pair Number
-	SrcGID    [16]byte // Source Global Identifier (GID)
-	DstGID    [16]byte // Destination Global Identifier (GID)
-	QPState   int32    // QP state (valid only for modify_qp)
 	PID       uint32   // Process ID
 	TID       uint32   // Thread ID
+	QPState   int32    // QP state (valid only for modify_qp)
+	EventType uint8    // Event type (1: create, 2: modify, 3: destroy)
+	PortNum   uint8    // Port number for debugging
+	Reserved  [2]uint8 // Explicit padding for alignment
 	Comm      [16]byte // Process name
 }
 
 // EventTypeString returns the string representation of the event type
 func (t *RdmaConnTuple) EventTypeString() string {
 	switch t.EventType {
-	case 1:
+	case RdmaEventCreate:
 		return "CREATE"
-	case 2:
+	case RdmaEventModify:
 		return "MODIFY"
-	case 3:
+	case RdmaEventDestroy:
 		return "DESTROY"
 	default:
 		return "UNKNOWN"
@@ -60,10 +80,20 @@ func (t *RdmaConnTuple) DstGIDString() string {
 	return hex.EncodeToString(t.DstGID[:])
 }
 
+// CommString returns the process name as a trimmed string
+func (t *RdmaConnTuple) CommString() string {
+	return string(bytes.TrimRight(t.Comm[:], "\x00"))
+}
+
+// IsValidEvent returns true if the event type is known
+func (t *RdmaConnTuple) IsValidEvent() bool {
+	return t.EventType >= RdmaEventCreate && t.EventType <= RdmaEventDestroy
+}
+
 // String returns a human-readable representation of RdmaConnTuple
 func (t *RdmaConnTuple) String() string {
 	return fmt.Sprintf(
-		"Event: %s, Time: %s, Src QPN: %d, Dst QPN: %d, Src GID: %s, Dst GID: %s, QP State: %d, PID: %d, Comm: %s",
+		"Event: %s, Time: %s, Src QPN: %d, Dst QPN: %d, Src GID: %s, Dst GID: %s, QP State: %d, PID: %d, Port: %d, Comm: %s",
 		t.EventTypeString(),
 		time.Unix(0, int64(t.Timestamp)),
 		t.SrcQPN,
@@ -72,7 +102,8 @@ func (t *RdmaConnTuple) String() string {
 		t.DstGIDString(),
 		t.QPState,
 		t.PID,
-		string(bytes.TrimRight(t.Comm[:], "\x00")),
+		t.PortNum,
+		t.CommString(),
 	)
 }
 
@@ -185,6 +216,12 @@ func (t *ServiceTracer) processEvents() {
 			continue
 		}
 
+		// Validate event before sending
+		if !event.IsValidEvent() {
+			log.Printf("received invalid event type: %d", event.EventType)
+			continue
+		}
+
 		// Send event to channel
 		select {
 		case t.eventCh <- event:
@@ -200,19 +237,47 @@ func (t *ServiceTracer) Events() <-chan RdmaConnTuple {
 	return t.eventCh
 }
 
+// GetStatistics retrieves the current statistics from the eBPF program
+// Note: Statistics map will be available after eBPF regeneration
+func (t *ServiceTracer) GetStatistics() (map[string]uint64, error) {
+	stats := make(map[string]uint64)
+
+	// TODO: Implement statistics after eBPF regeneration
+	// For now, return empty statistics
+	stats["create_count"] = 0
+	stats["modify_count"] = 0
+	stats["destroy_count"] = 0
+	stats["error_count"] = 0
+	stats["gid_read_success"] = 0
+	stats["gid_read_failure"] = 0
+
+	return stats, nil
+}
+
 // Stop terminates tracing
 func (t *ServiceTracer) Stop() error {
-	// Send stop signal
+	// Signal stop to the event processor
 	close(t.stopCh)
 
-	// Detach kprobes
+	// Detach all kprobes
 	for _, kp := range t.kprobes {
-		kp.Close()
+		if err := kp.Close(); err != nil {
+			log.Printf("error closing kprobe: %v", err)
+		}
+	}
+	t.kprobes = nil
+
+	// Close ring buffer reader
+	if t.reader != nil {
+		if err := t.reader.Close(); err != nil {
+			log.Printf("error closing ringbuf reader: %v", err)
+		}
+		t.reader = nil
 	}
 
-	// Release eBPF resources
+	// Close eBPF objects
 	if err := t.objs.Close(); err != nil {
-		return fmt.Errorf("closing objects: %w", err)
+		return fmt.Errorf("closing eBPF objects: %w", err)
 	}
 
 	return nil

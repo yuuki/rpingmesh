@@ -237,6 +237,12 @@ func (u *UDQueue) parseIPv4GRH(grhBytes []byte) (string, string, error) {
 		return "", "", fmt.Errorf("GRH too small for IPv4 header at offset %d", ipv4HeaderOffsetInGRH)
 	}
 
+	// Check if we have enough bytes for the IPv4 header
+	if len(grhBytes) < ipv4HeaderOffsetInGRH+ipv4HeaderMinLength {
+		log.Error().Int("grhBytes_length", len(grhBytes)).Int("ipv4HeaderOffsetInGRH", ipv4HeaderOffsetInGRH).Int("ipv4HeaderMinLength", ipv4HeaderMinLength).Msg("GRH bytes are too few to contain a complete IPv4 header at the specified offset.")
+		return "", "", fmt.Errorf("not enough bytes for IPv4 header at offset %d", ipv4HeaderOffsetInGRH)
+	}
+
 	ipv4HeaderBytes := grhBytes[ipv4HeaderOffsetInGRH : ipv4HeaderOffsetInGRH+ipv4HeaderMinLength]
 	parsedIPv4Header, parseErr := ipv4.ParseHeader(ipv4HeaderBytes)
 	if parseErr != nil {

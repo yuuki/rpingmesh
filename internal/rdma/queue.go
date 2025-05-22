@@ -31,6 +31,8 @@ const (
 
 	// MRSize is the size of memory region for send/recv buffers
 	MRSize = 4096
+	// CQSize is the size of Completion Queue
+	CQSize = 256
 	// InitialRecvBuffers is the number of initial receive buffers to post
 	InitialRecvBuffers = 32
 

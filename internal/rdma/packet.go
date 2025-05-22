@@ -6,18 +6,16 @@ package rdma
 //
 // // Helper function to post receive WR without Go pointers
 // int post_recv(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey) {
-//     struct ibv_sge sge;
-//     struct ibv_recv_wr wr;
+//     struct ibv_sge sge = {
+//         .addr = addr,
+//         .length = length,
+//         .lkey = lkey,
+//     };
+//     struct ibv_recv_wr wr = {
+//         .sg_list = &sge,
+//         .num_sge = 1,
+//     };
 //     struct ibv_recv_wr *bad_wr = NULL;
-//
-//     memset(&sge, 0, sizeof(sge));
-//     sge.addr = addr;
-//     sge.length = length;
-//     sge.lkey = lkey;
-//
-//     memset(&wr, 0, sizeof(wr));
-//     wr.sg_list = &sge;
-//     wr.num_sge = 1;
 //
 //     return ibv_post_recv(qp, &wr, &bad_wr);
 // }
@@ -25,23 +23,21 @@ package rdma
 // // Helper function to post send WR without Go pointers
 // int post_send(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey,
 //              struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey) {
-//     struct ibv_sge sge;
-//     struct ibv_send_wr wr;
+//     struct ibv_sge sge = {
+//         .addr = addr,
+//         .length = length,
+//         .lkey = lkey,
+//     };
+//     struct ibv_send_wr wr = {
+//         .sg_list = &sge,
+//         .num_sge = 1,
+//         .opcode = IBV_WR_SEND,
+//         .send_flags = IBV_SEND_SIGNALED,
+//         .wr.ud.ah = ah,
+//         .wr.ud.remote_qpn = remote_qpn,
+//         .wr.ud.remote_qkey = remote_qkey,
+//     };
 //     struct ibv_send_wr *bad_wr = NULL;
-//
-//     memset(&sge, 0, sizeof(sge));
-//     sge.addr = addr;
-//     sge.length = length;
-//     sge.lkey = lkey;
-//
-//     memset(&wr, 0, sizeof(wr));
-//     wr.sg_list = &sge;
-//     wr.num_sge = 1;
-//     wr.opcode = IBV_WR_SEND;
-//     wr.send_flags = IBV_SEND_SIGNALED;
-//     wr.wr.ud.ah = ah;
-//     wr.wr.ud.remote_qpn = remote_qpn;
-//     wr.wr.ud.remote_qkey = remote_qkey;
 //
 //     return ibv_post_send(qp, &wr, &bad_wr);
 // }

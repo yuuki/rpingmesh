@@ -7,12 +7,6 @@ package rdma
 // static int get_errno(void) {
 //     return errno;
 // }
-//
-// // Helper function to copy bytes to a GID's raw field
-// void copy_to_gid_raw(union ibv_gid *gid, const void *src, size_t n) {
-//     memcpy(gid->raw, src, n);
-// }
-//
 import "C"
 import (
 	"fmt"
@@ -493,8 +487,8 @@ func (u *UDQueue) CreateAddressHandle(targetGID string, flowLabel uint32) (*C.st
 		return nil, fmt.Errorf("target GID '%s' is not a valid IPv6 address", targetGID)
 	}
 
-	// Copy IPv6 GID bytes to ahAttr.grh.dgid using our C helper function
-	C.copy_to_gid_raw(&ahAttr.grh.dgid, unsafe.Pointer(&ipv6[0]), 16)
+	// Copy IPv6 GID bytes to ahAttr.grh.dgid
+	C.memcpy(unsafe.Pointer(&ahAttr.grh.dgid), unsafe.Pointer(&ipv6[0]), 16)
 
 	ah := C.ibv_create_ah(u.RNIC.PD, &ahAttr)
 	if ah == nil {

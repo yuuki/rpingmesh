@@ -21,10 +21,8 @@ package rdma
 import "C"
 import (
 	"fmt"
-	"math/rand"
 	"net"
 	"os"
-	"time"
 	"unsafe"
 
 	"github.com/rs/zerolog/log"
@@ -56,9 +54,6 @@ type RDMAManager struct {
 
 // NewRDMAManager creates a new RDMA manager
 func NewRDMAManager() (*RDMAManager, error) {
-	// Seed the random number generator for PSN generation
-	rand.Seed(time.Now().UnixNano())
-
 	manager := &RDMAManager{
 		SenderUDQueues:    make(map[string]*UDQueue),
 		ResponderUDQueues: make(map[string]*UDQueue),

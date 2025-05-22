@@ -47,6 +47,7 @@ clean-compose:
 build-local:
 	@echo "Building controller and agent locally"
 	@go build -buildvcs=false -o ./bin/rpingmesh-controller ./cmd/controller
+	@go generate ./...
 	@go build -buildvcs=false -o ./bin/rpingmesh-agent ./cmd/agent
 
 # Debug build targets

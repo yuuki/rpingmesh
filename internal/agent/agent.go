@@ -428,7 +428,16 @@ func (a *Agent) updatePinglist() {
 		log.Error().Err(err).Msg("Failed to get ToR-mesh pinglist")
 		return
 	}
-	log.Debug().Int("target_count", len(torTargets)).Msg("Received ToR-mesh pinglist")
+	log.Debug().Int("target_count", len(torTargets)).Msg("Received ToR-mesh pinglist data")
+
+	// Log ToR-mesh targets grouped by AgentID at Trace level
+	torTargetsByAgent := make(map[string][]*controller_agent.RnicInfo)
+	for _, target := range torTargets {
+		if target.TargetRnic != nil {
+			torTargetsByAgent[target.TargetRnic.HostName] = append(torTargetsByAgent[target.TargetRnic.HostName], target.TargetRnic)
+		}
+	}
+	log.Debug().Interface("tor_targets_by_hostname", torTargetsByAgent).Msg("ToR-mesh pinglist targets grouped by hostname")
 
 	// Update probe timeout if controller specified it
 	if timeoutMs > 0 && timeoutMs != a.config.TimeoutMS {
@@ -457,15 +466,24 @@ func (a *Agent) updatePinglist() {
 		log.Error().Err(err).Msg("Failed to get Inter-ToR pinglist")
 		return
 	}
-	log.Debug().Int("target_count", len(interTorTargets)).Msg("Received Inter-ToR pinglist")
+	log.Debug().Int("target_count", len(interTorTargets)).Msg("Received Inter-ToR pinglist data")
+
+	// Log Inter-ToR targets grouped by AgentID at Trace level
+	interTorTargetsByAgent := make(map[string][]string)
+	for _, target := range interTorTargets {
+		if target.TargetRnic != nil {
+			interTorTargetsByAgent[target.TargetRnic.HostName] = append(interTorTargetsByAgent[target.TargetRnic.HostName], target.TargetRnic.Gid)
+		}
+	}
+	log.Debug().Interface("inter_tor_targets_by_hostname", interTorTargetsByAgent).Msg("Inter-ToR pinglist targets grouped by hostname")
 
 	// Combine the pinglists (in a real implementation, you might want to keep them separate)
-	log.Info().Int("torTargets", len(torTargets)).Int("interTorTargets", len(interTorTargets)).Msg("Updated pinglists")
+	log.Debug().Int("torTargets", len(torTargets)).Int("interTorTargets", len(interTorTargets)).Msg("Updated pinglists")
 }
 
 // Stop stops the agent
 func (a *Agent) Stop() {
-	log.Debug().Msg("Stopping agent")
+	log.Info().Msg("Stopping agent")
 	a.cancel()
 
 	// Stop components in reverse order

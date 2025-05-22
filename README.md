@@ -164,6 +164,7 @@ RPingMesh consists of several components:
 - **Agent**: User-space daemon that processes eBPF events and manages probing
 - **Controller**: Coordinates agents across the network (future component)
 - **Analyzer**: Processes gathered metrics for anomaly detection (future component)
+- **Documentation**: Provides user guides and technical details
 
 ## License
 

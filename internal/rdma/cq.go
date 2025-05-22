@@ -17,30 +17,34 @@ import (
 	"unsafe"
 
 	"github.com/rs/zerolog/log"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
-// WorkCompletion contains extracted work completion info
-// Note: This is a Go representation, distinct from GoWorkCompletion which is closer to C.struct_ibv_wc
-type WorkCompletion struct {
-	Status    uint32
-	SrcQP     uint32
-	SGID      string
-	DGID      string
-	IMM       uint32
-	VendorErr uint32
-	FlowLabel uint32
-}
+// WorkCompletion was previously defined here. It will be removed.
+// We will define ProcessedWorkCompletion below GoWorkCompletion.
 
-// GoWorkCompletion represents the Go version of C.struct_ibv_wc
+// GoWorkCompletion represents the Go version of C.struct_ibv_wc_ex
 type GoWorkCompletion struct {
 	WRID                  uint64
-	Status                int // Using int for C.enum_ibv_wc_status
-	Opcode                int // Using int for C.enum_ibv_wc_opcode
-	VendorErr             uint32
-	ByteLen               uint32
-	SrcQP                 uint32
-	WCFlags               uint32
+	Status                int    // Using int for C.enum_ibv_wc_status (ibv_wc_status)
+	Opcode                int    // Using int for C.enum_ibv_wc_opcode (ibv_wc_opcode)
+	VendorErr             uint32 // vendor_err
+	ByteLen               uint32 // byte_len (includes GRH length if GRH is present)
+	SrcQP                 uint32 // src_qp (remote QP number for received packets)
+	WCFlags               uint32 // wc_flags (e.g., C.IBV_WC_GRH) - crucial for interpretation
 	CompletionWallclockNS uint64 // Hardware wallclock timestamp in nanoseconds
+}
+
+// ProcessedWorkCompletion embeds GoWorkCompletion and adds GRH-parsed information.
+// This replaces the old WorkCompletion struct.
+type ProcessedWorkCompletion struct {
+	GoWorkCompletion // Embedded low-level work completion details
+
+	// Information parsed from GRH (if GRH was present in the received packet)
+	SGID      string // Source GID (string format)
+	DGID      string // Destination GID (string format)
+	FlowLabel uint32 // Flow Label from GRH
 }
 
 // CompletionType defines the type of work completion
@@ -75,10 +79,10 @@ func (u *UDQueue) processCQCompletions(cqEx *C.struct_ibv_cq_ex) {
 		}
 		if retNextPoll != 0 { // An error occurred
 			// errno might be set by ibv_next_poll on error.
-			errMsg := fmt.Sprintf("CQ Poller: ibv_next_poll failed for QPN 0x%x, Type: %s, Ret: %d, Errno: %d. Stopping poll for this batch.", u.QPN, getQueueTypeString(u.QueueType), retNextPoll, syscall.Errno(retNextPoll))
-			log.Error().Msg(errMsg)
+			pollerErr := fmt.Errorf("CQ Poller: ibv_next_poll failed for QPN 0x%x, Type: %s, Ret: %d, ErrnoCode: %d. Stopping poll for this batch", u.QPN, getQueueTypeString(u.QueueType), retNextPoll, syscall.Errno(retNextPoll))
+			log.Error().Err(pollerErr).Msg("ibv_next_poll error")
 			select {
-			case u.errChan <- fmt.Errorf(errMsg):
+			case u.errChan <- pollerErr:
 			default:
 				log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping ibv_next_poll error")
 			}
@@ -135,17 +139,19 @@ func (u *UDQueue) processSingleWC(cqEx *C.struct_ibv_cq_ex) {
 }
 
 func (u *UDQueue) handleWCError(gwc *GoWorkCompletion) {
-	errMsg := fmt.Sprintf("CQ Poller: WC error for QPN 0x%x, Type: %s, Status: %s (%d), Vendor Syndrome: 0x%x, Opcode: %d, HWTimestamp: %d ns",
-		u.QPN,
-		getQueueTypeString(u.QueueType),
-		C.GoString(C.ibv_wc_status_str(C.enum_ibv_wc_status(gwc.Status))),
-		gwc.Status,
-		gwc.VendorErr,
-		gwc.Opcode,
-		gwc.CompletionWallclockNS)
-	log.Error().Msg(errMsg)
+	// errMsg := fmt.Sprintf("CQ Poller: WC error for QPN 0x%x, Type: %s, Status: %s (%d), Vendor Syndrome: 0x%x, Opcode: %d, HWTimestamp: %d ns",
+	// 	u.QPN,
+	// 	getQueueTypeString(u.QueueType),
+	// 	C.GoString(C.ibv_wc_status_str(C.enum_ibv_wc_status(gwc.Status))),
+	// 	gwc.Status,
+	// 	gwc.VendorErr,
+	// 	gwc.Opcode,
+	// 	gwc.CompletionWallclockNS)
+	// log.Error().Msg(errMsg)
+	wcErr := fmt.Errorf("CQ Poller: WC error for QPN 0x%x, Type: %s, Status: %s (%d), Vendor Syndrome: 0x%x, Opcode: %d, HWTimestamp: %d ns", u.QPN, getQueueTypeString(u.QueueType), C.GoString(C.ibv_wc_status_str(C.enum_ibv_wc_status(gwc.Status))), gwc.Status, gwc.VendorErr, gwc.Opcode, gwc.CompletionWallclockNS)
+	log.Error().Err(wcErr).Msg("Work Completion Error")
 	select {
-	case u.errChan <- fmt.Errorf(errMsg):
+	case u.errChan <- wcErr:
 	default:
 		log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping WC error")
 	}
@@ -162,7 +168,6 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 		Msg("IBV_WC_RECV (HW Timestamp)")
 
 	var probePkt *ProbePacket
-	var grhInfo *GRHHeaderInfo
 
 	// The GRH is at the beginning of the u.RecvBuf (or the specific buffer for this WR_ID).
 	// Data starts after GRH.
@@ -202,30 +207,11 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 		payloadStartPtr = unsafe.Pointer(uintptr(grhStartPtr) + GRHSize)
 		probePkt = (*ProbePacket)(payloadStartPtr)
 
-		grhRaw := (*C.struct_ibv_grh)(grhStartPtr)
-		sgidBytes := make([]byte, 16)
-		// Use address of the union itself, as 'raw' is the first field.
-		C.memcpy(unsafe.Pointer(&sgidBytes[0]), unsafe.Pointer(&grhRaw.sgid), 16)
-		dgidBytes := make([]byte, 16)
-		// Use address of the union itself, as 'raw' is the first field.
-		C.memcpy(unsafe.Pointer(&dgidBytes[0]), unsafe.Pointer(&grhRaw.dgid), 16)
-
-		flowLabelRawN := grhRaw.version_tclass_flow
-		flowLabelRawH := C.ntohl(flowLabelRawN)
-		flowLabel := uint32(flowLabelRawH & 0x000FFFFF)
-
-		grhInfo = &GRHHeaderInfo{
-			SourceGID: formatGIDString(sgidBytes),
-			DestGID:   formatGIDString(dgidBytes),
-			FlowLabel: flowLabel,
-		}
 		log.Trace().
 			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 			Str("type", getQueueTypeString(u.QueueType)).
-			Str("sgid", grhInfo.SourceGID).
-			Str("dgid", grhInfo.DestGID).
-			Uint32("flow_label", grhInfo.FlowLabel).
-			Msg("GRH Info Extracted")
+			Msg("GRH present on received ACK")
+
 	} else {
 		// No GRH flag, ProbePacket is at the start of u.RecvBuf
 		probePkt = (*ProbePacket)(u.RecvBuf)
@@ -238,13 +224,72 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 			Uint64("seq", probePkt.SequenceNum).
 			Msg("ACK packet received on Sender Queue, calling ackHandler")
 
+		var sgid, dgid string
+		var flowLabel uint32
+		var payloadPtr unsafe.Pointer
+		var payloadLen uint32
+		var grhParseErr error
+
+		if (gwc.WCFlags & C.IBV_WC_GRH) == C.IBV_WC_GRH {
+			// Temporarily use the parsing logic from packet.go - this might need refactoring
+			// to avoid direct dependency or to have a shared GRH parsing utility.
+			// This is a simplified version for now, assuming u.RecvBuf is the one.
+			if uint32(gwc.ByteLen) >= GRHSize {
+				grhBytes := unsafe.Slice((*byte)(u.RecvBuf), GRHSize)
+				ipVersion := (grhBytes[0] >> 4) & 0x0F
+				if ipVersion == 6 {
+					sgid, dgid, flowLabel, grhParseErr = u.parseIPv6GRHFromBytes(grhBytes) // Assumes this helper exists or is added
+				} else if ipVersion == 4 {
+					sgid, dgid, grhParseErr = u.parseIPv4GRHFromBytes(grhBytes) // Assumes this helper exists or is added
+				}
+				if grhParseErr != nil {
+					log.Warn().Err(grhParseErr).Msg("GRH parsing failed in handleRecvCompletion for ACK")
+				}
+				payloadPtr = unsafe.Pointer(uintptr(u.RecvBuf) + uintptr(GRHSize))
+				payloadLen = uint32(gwc.ByteLen) - GRHSize
+			} else {
+				log.Warn().Msg("GRH flag set but ByteLen too small in handleRecvCompletion for ACK")
+				payloadPtr = u.RecvBuf
+				payloadLen = uint32(gwc.ByteLen)
+			}
+		} else {
+			payloadPtr = u.RecvBuf
+			payloadLen = uint32(gwc.ByteLen)
+		}
+
+		// Deserialize ProbePacket from payload if it's an ACK
+		if probePkt == nil && payloadPtr != nil { // probePkt might have been parsed earlier if logic changes
+			packetStructSize := uint32(unsafe.Sizeof(ProbePacket{}))
+			if payloadLen >= packetStructSize {
+				probePkt = (*ProbePacket)(payloadPtr) // Still points to RecvBuf, handler must copy if needed
+			} else {
+				log.Warn().Uint32("payloadLen", payloadLen).Uint32("expected", packetStructSize).Msg("Payload too small to be ProbePacket for ACK")
+				// Cannot proceed if we can't get the ACK type, etc.
+				u.PostRecv() // Attempt to repost buffer
+				return
+			}
+		}
+
+		if probePkt == nil || probePkt.IsAck != 1 { // Defensive check
+			log.Warn().Msg("Not a valid ACK packet for ackHandler, or failed to parse.")
+			// This path might indicate a logic error or unexpected packet. If it's not an ACK,
+			// it should go to recvCompChan. The `if u.QueueType == UDQueueTypeSender ...` handles this.
+			// For now, let the original logic send gwc to recvCompChan if not ACK for sender.
+			// This block mainly ensures probePkt is valid if we proceed to ackHandler.
+		}
+
+		processedWCForAck := &ProcessedWorkCompletion{
+			GoWorkCompletion: *gwc,
+			SGID:             sgid,
+			DGID:             dgid,
+			FlowLabel:        flowLabel,
+		}
+
 		ackInfo := &IncomingAckInfo{
-			Packet:      probePkt,
-			ReceivedAt:  time.Unix(0, int64(gwc.CompletionWallclockNS)), // use HW timestamp
-			GRHInfo:     grhInfo,
-			SourceQP:    gwc.SrcQP,
-			RawWC:       gwc, // Pass original wc (not wcCopy) for inspection. Handler should not store this pointer.
-			AckStatusOK: true,
+			Packet:      probePkt, // This is a pointer to RecvBuf, be careful.
+			ReceivedAt:  time.Unix(0, int64(gwc.CompletionWallclockNS)),
+			ProcessedWC: processedWCForAck,
+			AckStatusOK: gwc.Status == C.IBV_WC_SUCCESS, // Set AckStatusOK based on gwc.Status
 		}
 		u.ackHandler(ackInfo)
 	} else {
@@ -269,10 +314,12 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 	}
 
 	if errPost := u.PostRecv(); errPost != nil {
-		errMsg := fmt.Sprintf("CQ Poller: Failed to repost receive buffer for QPN 0x%x, Type: %s: %v", u.QPN, getQueueTypeString(u.QueueType), errPost)
-		log.Error().Msg(errMsg)
+		// errMsg := fmt.Sprintf("CQ Poller: Failed to repost receive buffer for QPN 0x%x, Type: %s: %v", u.QPN, getQueueTypeString(u.QueueType), errPost)
+		// log.Error().Msg(errMsg)
+		repostErr := fmt.Errorf("CQ Poller: Failed to repost receive buffer for QPN 0x%x, Type: %s: %w", u.QPN, getQueueTypeString(u.QueueType), errPost)
+		log.Error().Err(repostErr).Msg("Failed to repost receive buffer")
 		select {
-		case u.errChan <- fmt.Errorf(errMsg):
+		case u.errChan <- repostErr:
 		default:
 			log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping repost error")
 		}
@@ -323,10 +370,12 @@ func (u *UDQueue) StartCQPoller() {
 		}()
 
 		if u.CompChannel == nil {
-			errMsg := fmt.Sprintf("CQ Poller: Completion channel is nil for QPN 0x%x, Type: %s. Poller cannot start.", u.QPN, getQueueTypeString(u.QueueType))
-			log.Error().Msg(errMsg)
+			// errMsg := fmt.Sprintf("CQ Poller: Completion channel is nil for QPN 0x%x, Type: %s. Poller cannot start.", u.QPN, getQueueTypeString(u.QueueType))
+			// log.Error().Msg(errMsg)
+			nilChanErr := fmt.Errorf("CQ Poller: Completion channel is nil for QPN 0x%x, Type: %s. Poller cannot start", u.QPN, getQueueTypeString(u.QueueType))
+			log.Error().Err(nilChanErr).Msg("Completion channel is nil")
 			select {
-			case u.errChan <- fmt.Errorf(errMsg):
+			case u.errChan <- nilChanErr:
 			default:
 				log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping nil completion channel error")
 			}
@@ -335,10 +384,12 @@ func (u *UDQueue) StartCQPoller() {
 
 		baseCQ := C.ibv_cq_ex_to_cq(u.CQ)
 		if baseCQ == nil {
-			errMsg := fmt.Sprintf("CQ Poller: Failed to get base CQ from extended CQ for QPN 0x%x, Type: %s. Poller exiting.", u.QPN, getQueueTypeString(u.QueueType))
-			log.Error().Msg(errMsg)
+			// errMsg := fmt.Sprintf("CQ Poller: Failed to get base CQ from extended CQ for QPN 0x%x, Type: %s. Poller exiting.", u.QPN, getQueueTypeString(u.QueueType))
+			// log.Error().Msg(errMsg)
+			baseCqErr := fmt.Errorf("CQ Poller: Failed to get base CQ from extended CQ for QPN 0x%x, Type: %s. Poller exiting", u.QPN, getQueueTypeString(u.QueueType))
+			log.Error().Err(baseCqErr).Msg("Failed to get base CQ")
 			select {
-			case u.errChan <- fmt.Errorf(errMsg):
+			case u.errChan <- baseCqErr:
 			default:
 				log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping base CQ retrieval error")
 			}
@@ -347,10 +398,12 @@ func (u *UDQueue) StartCQPoller() {
 
 		// // Initial request for CQ notification
 		if C.ibv_req_notify_cq(baseCQ, 0) != 0 {
-			errMsg := fmt.Sprintf("CQ Poller: Failed to request initial CQ notification for QPN 0x%x, Type: %s: %s. Poller exiting.", u.QPN, getQueueTypeString(u.QueueType), syscall.Errno(C.get_errno()).Error())
-			log.Error().Msg(errMsg)
+			// errMsg := fmt.Sprintf("CQ Poller: Failed to request initial CQ notification for QPN 0x%x, Type: %s: %s. Poller exiting.", u.QPN, getQueueTypeString(u.QueueType), syscall.Errno(C.get_errno()).Error())
+			// log.Error().Msg(errMsg)
+			notifyErr := fmt.Errorf("CQ Poller: Failed to request initial CQ notification for QPN 0x%x, Type: %s: %w. Poller exiting", u.QPN, getQueueTypeString(u.QueueType), syscall.Errno(C.get_errno()))
+			log.Error().Err(notifyErr).Msg("Failed to request initial CQ notification")
 			select {
-			case u.errChan <- fmt.Errorf(errMsg):
+			case u.errChan <- notifyErr:
 			default:
 				log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping initial CQ notification error")
 			}
@@ -386,7 +439,8 @@ func (u *UDQueue) StartCQPoller() {
 						Str("errno", syscall.Errno(C.get_errno()).Error()).
 						Msg("ibv_get_cq_event failed")
 					select {
-					case u.errChan <- fmt.Errorf("ibv_get_cq_event failed: %s", syscall.Errno(C.get_errno()).Error()):
+					// case u.errChan <- fmt.Errorf("ibv_get_cq_event failed: %s", syscall.Errno(C.get_errno()).Error()):
+					case u.errChan <- fmt.Errorf("ibv_get_cq_event failed: %w", syscall.Errno(C.get_errno())):
 					default:
 						log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping ibv_get_cq_event error")
 					}
@@ -419,10 +473,12 @@ func (u *UDQueue) StartCQPoller() {
 			C.ibv_ack_cq_events(cqEv, 1) // Ack on the CQ that generated the event.
 
 			if C.ibv_req_notify_cq(baseCQ, 0) != 0 {
-				errMsg := fmt.Sprintf("CQ Poller: Failed to re-request CQ notification for QPN 0x%x, Type: %s: %s. Continuing, but may miss events.", u.QPN, getQueueTypeString(u.QueueType), syscall.Errno(C.get_errno()).Error())
-				log.Error().Msg(errMsg)
+				// errMsg := fmt.Sprintf("CQ Poller: Failed to re-request CQ notification for QPN 0x%x, Type: %s: %s. Continuing, but may miss events.", u.QPN, getQueueTypeString(u.QueueType), syscall.Errno(C.get_errno()).Error())
+				// log.Error().Msg(errMsg)
+				rereqErr := fmt.Errorf("CQ Poller: Failed to re-request CQ notification for QPN 0x%x, Type: %s: %w. Continuing, but may miss events", u.QPN, getQueueTypeString(u.QueueType), syscall.Errno(C.get_errno()))
+				log.Error().Err(rereqErr).Msg("Failed to re-request CQ notification")
 				select {
-				case u.errChan <- fmt.Errorf(errMsg):
+				case u.errChan <- rereqErr:
 				default:
 					log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping CQ re-request notification error")
 				}
@@ -440,10 +496,12 @@ func (u *UDQueue) StartCQPoller() {
 				// No need to call C.ibv_end_poll if C.ibv_start_poll didn't return 0
 			} else {
 				// An error other than ENOENT occurred with ibv_start_poll
-				errMsg := fmt.Sprintf("CQ Poller: ibv_start_poll failed for QPN 0x%x, Type: %s, Ret: %d, Errno: %d. Poller may miss events.", u.QPN, getQueueTypeString(u.QueueType), retStartPoll, syscall.Errno(retStartPoll))
-				log.Error().Msg(errMsg)
+				// errMsg := fmt.Sprintf("CQ Poller: ibv_start_poll failed for QPN 0x%x, Type: %s, Ret: %d, Errno: %d. Poller may miss events.", u.QPN, getQueueTypeString(u.QueueType), retStartPoll, syscall.Errno(retStartPoll))
+				// log.Error().Msg(errMsg)
+				startPollErr := fmt.Errorf("CQ Poller: ibv_start_poll failed for QPN 0x%x, Type: %s, Ret: %d, ErrnoCode: %d. Poller may miss events", u.QPN, getQueueTypeString(u.QueueType), retStartPoll, syscall.Errno(retStartPoll))
+				log.Error().Err(startPollErr).Msg("ibv_start_poll error")
 				select {
-				case u.errChan <- fmt.Errorf(errMsg):
+				case u.errChan <- startPollErr:
 				default:
 					log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping ibv_start_poll error")
 				}
@@ -469,4 +527,47 @@ func (u *UDQueue) StopCQPoller() {
 		time.Sleep(10 * time.Millisecond)
 		u.cqPollerMutex.Lock()
 	}
+}
+
+func (u *UDQueue) parseIPv6GRHFromBytes(grhBytes []byte) (sgid string, dgid string, flowLabel uint32, err error) {
+	// Simplified parsing logic, similar to packet.go, or call a shared utility.
+	// This is a placeholder for the actual implementation.
+	if len(grhBytes) < 40 {
+		return "", "", 0, fmt.Errorf("grhBytes too short for IPv6 GID extraction (len: %d)", len(grhBytes))
+	}
+	sgid = formatGIDString(grhBytes[8:24])
+	dgid = formatGIDString(grhBytes[24:40])
+	ipv6Header, parseErr := ipv6.ParseHeader(grhBytes)
+	if parseErr == nil && ipv6Header != nil {
+		flowLabel = uint32(ipv6Header.FlowLabel)
+	} else {
+		log.Warn().Err(parseErr).Msg("Failed to parse GRH as IPv6 header to get FlowLabel in UDQueue helper")
+	}
+	return sgid, dgid, flowLabel, nil
+}
+
+func (u *UDQueue) parseIPv4GRHFromBytes(grhBytes []byte) (sgid string, dgid string, err error) {
+	// Simplified parsing logic, similar to packet.go, or call a shared utility.
+	// This is a placeholder for the actual implementation.
+	const ipv4HeaderOffsetInGRH = 20
+	const ipv4HeaderMinLength = 20
+	if GRHSize < ipv4HeaderOffsetInGRH+ipv4HeaderMinLength {
+		return "", "", fmt.Errorf("GRH too small for IPv4 header at offset %d", ipv4HeaderOffsetInGRH)
+	}
+	ipv4HeaderBytes := grhBytes[ipv4HeaderOffsetInGRH : ipv4HeaderOffsetInGRH+ipv4HeaderMinLength]
+	parsedIPv4Header, parseErr := ipv4.ParseHeader(ipv4HeaderBytes)
+	if parseErr != nil {
+		return "", "", fmt.Errorf("failed to parse GRH region's IPv4 header part: %w", parseErr)
+	}
+	if parsedIPv4Header.Src == nil || parsedIPv4Header.Dst == nil {
+		return "", "", fmt.Errorf("parsed IPv4 header from GRH, but Src/Dst IP is nil")
+	}
+	srcIPv4 := parsedIPv4Header.Src.To4()
+	dstIPv4 := parsedIPv4Header.Dst.To4()
+	if srcIPv4 == nil || dstIPv4 == nil {
+		return "", "", fmt.Errorf("could not convert GRH region's IPv4 Src/Dst to 4-byte format")
+	}
+	srcMappedIPv6Bytes := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, srcIPv4[0], srcIPv4[1], srcIPv4[2], srcIPv4[3]}
+	dstMappedIPv6Bytes := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, dstIPv4[0], dstIPv4[1], dstIPv4[2], dstIPv4[3]}
+	return formatGIDString(srcMappedIPv6Bytes), formatGIDString(dstMappedIPv6Bytes), nil
 }

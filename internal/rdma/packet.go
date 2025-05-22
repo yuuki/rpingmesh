@@ -79,22 +79,15 @@ type ProbePacket struct {
 	Padding     [1]byte
 }
 
-// GRHHeaderInfo holds extracted information from the GRH.
-type GRHHeaderInfo struct {
-	SourceGID string
-	DestGID   string
-	FlowLabel uint32
-	// Add other relevant GRH fields if needed by the handler
-}
+// GRHHeaderInfo was defined here. It will be removed as its fields are integrated into ProcessedWorkCompletion.
 
 // IncomingAckInfo holds information about a received ACK packet to be passed to the handler.
+// It now directly includes ProcessedWorkCompletion for detailed info.
 type IncomingAckInfo struct {
-	Packet      *ProbePacket      // The deserialized ProbePacket
-	ReceivedAt  time.Time         // Timestamp when the ACK was processed by the CQ poller
-	GRHInfo     *GRHHeaderInfo    // Information from GRH, if present
-	SourceQP    uint32            // Source QP from the work completion (remote QPN)
-	RawWC       *GoWorkCompletion // Raw work completion for any other details. Use with caution.
-	AckStatusOK bool              // True if the RDMA work completion for this ACK was successful.
+	Packet      *ProbePacket             // The deserialized ProbePacket
+	ReceivedAt  time.Time                // Timestamp when the ACK was processed by the CQ poller
+	ProcessedWC *ProcessedWorkCompletion // Processed work completion including GRH details
+	AckStatusOK bool                     // True if the RDMA work completion for this ACK was successful (based on ProcessedWC.Status).
 }
 
 // AckHandlerFunc is a callback function type for processing incoming ACK packets.
@@ -185,25 +178,25 @@ func (u *UDQueue) SendProbePacket(
 	}
 }
 
-// parseGRHAndUpdateWorkCompletion parses the GRH if present, updates the WorkCompletion struct with GID/FlowLabel,
-// and returns the pointer to the actual payload and its length.
+// parseGRH parses the GRH if present and returns extracted GID/FlowLabel information.
 // It uses u.RecvBuf as the buffer containing the received data including potential GRH.
-func (u *UDQueue) parseGRHAndUpdateWorkCompletion(
-	goWC *GoWorkCompletion, workCompToUpdate *WorkCompletion) (payloadDataPtr unsafe.Pointer, actualPayloadLength uint32, err error) {
+// Returns: sgid, dgid, flowLabel, pointer to actual payload, actual payload length, error
+func (u *UDQueue) parseGRH(
+	goWC *GoWorkCompletion) (sgid string, dgid string, flowLabel uint32, payloadDataPtr unsafe.Pointer, actualPayloadLength uint32, err error) {
 	grhPresent := (goWC.WCFlags & C.IBV_WC_GRH) == C.IBV_WC_GRH
 
 	if !grhPresent { // GRH not present
 		log.Debug().Msg("IBV_WC_GRH is NOT set. Assuming payload starts at the beginning of the buffer.")
 		actualPayloadLength = uint32(goWC.ByteLen)
 		payloadDataPtr = u.RecvBuf
-		return payloadDataPtr, actualPayloadLength, nil
+		return "", "", 0, payloadDataPtr, actualPayloadLength, nil
 	}
 
 	log.Trace().Msg("IBV_WC_GRH is set. Parsing GRH.")
 
 	if uint32(goWC.ByteLen) < GRHSize { // GRHSize is 40
 		log.Error().Uint32("wc_byte_len", uint32(goWC.ByteLen)).Msg("IBV_WC_GRH is set, but wc.byte_len is less than GRHSize (40 bytes).")
-		return nil, 0, fmt.Errorf("IBV_WC_GRH set but wc.byte_len (%d) < GRHSize (%d)", goWC.ByteLen, GRHSize)
+		return "", "", 0, nil, 0, fmt.Errorf("IBV_WC_GRH set but wc.byte_len (%d) < GRHSize (%d)", goWC.ByteLen, GRHSize)
 	}
 
 	// GRH is at the beginning of u.RecvBuf
@@ -211,26 +204,29 @@ func (u *UDQueue) parseGRHAndUpdateWorkCompletion(
 	ipVersion := (grhBytes[0] >> 4) & 0x0F
 
 	if ipVersion == 4 {
-		err = u.parseIPv4GRHAndUpdateWorkCompletion(grhBytes, workCompToUpdate)
+		sgid, dgid, err = u.parseIPv4GRH(grhBytes)
+		// FlowLabel is not typically extracted from IPv4-mapped IPv6 GRH in this manner
+		// It might be part of the IPv6 header if one were constructed, but current parsing focuses on GIDs.
 	} else if ipVersion == 6 {
-		err = u.parseIPv6GRHAndUpdateWorkCompletion(grhBytes, workCompToUpdate)
+		sgid, dgid, flowLabel, err = u.parseIPv6GRH(grhBytes)
 	} else {
 		log.Error().Uint8("ip_version", ipVersion).Msg("GRH has an unknown or unsupported IP Version in its first byte.")
 		err = fmt.Errorf("GRH has unknown IP version: %d", ipVersion)
 	}
 
 	if err != nil {
-		return nil, 0, err
+		return "", "", 0, nil, 0, err
 	}
 
 	// Payload is after GRH
 	payloadDataPtr = unsafe.Pointer(uintptr(u.RecvBuf) + uintptr(GRHSize))
 	actualPayloadLength = uint32(goWC.ByteLen) - GRHSize
-	return payloadDataPtr, actualPayloadLength, nil
+	return sgid, dgid, flowLabel, payloadDataPtr, actualPayloadLength, nil
 }
 
-// parseIPv4GRHAndUpdateWorkCompletion handles parsing for IPv4-like GRH data.
-func (u *UDQueue) parseIPv4GRHAndUpdateWorkCompletion(grhBytes []byte, workCompToUpdate *WorkCompletion) error {
+// parseIPv4GRH handles parsing for IPv4-like GRH data.
+// Returns sgid, dgid, error
+func (u *UDQueue) parseIPv4GRH(grhBytes []byte) (string, string, error) {
 	log.Trace().Msg("GRH IP Version field is 4. Applying custom IPv4 header parsing logic (from GRH offset 20).")
 
 	const ipv4HeaderOffsetInGRH = 20 // Current code's assumption
@@ -238,19 +234,19 @@ func (u *UDQueue) parseIPv4GRHAndUpdateWorkCompletion(grhBytes []byte, workCompT
 
 	if GRHSize < ipv4HeaderOffsetInGRH+ipv4HeaderMinLength {
 		log.Error().Int("GRHSize", GRHSize).Int("ipv4HeaderOffsetInGRH", ipv4HeaderOffsetInGRH).Int("ipv4HeaderMinLength", ipv4HeaderMinLength).Msg("GRH is too small to contain an IPv4 header at the specified offset.")
-		return fmt.Errorf("GRH too small for IPv4 header at offset %d", ipv4HeaderOffsetInGRH)
+		return "", "", fmt.Errorf("GRH too small for IPv4 header at offset %d", ipv4HeaderOffsetInGRH)
 	}
 
 	ipv4HeaderBytes := grhBytes[ipv4HeaderOffsetInGRH : ipv4HeaderOffsetInGRH+ipv4HeaderMinLength]
 	parsedIPv4Header, parseErr := ipv4.ParseHeader(ipv4HeaderBytes)
 	if parseErr != nil {
 		log.Warn().Err(parseErr).Bytes("data", ipv4HeaderBytes).Msg("Failed to parse bytes from GRH offset 20 as IPv4 header.")
-		return fmt.Errorf("failed to parse GRH region's IPv4 header part (offset 20): %w", parseErr)
+		return "", "", fmt.Errorf("failed to parse GRH region's IPv4 header part (offset 20): %w", parseErr)
 	}
 
 	if parsedIPv4Header.Src == nil || parsedIPv4Header.Dst == nil {
 		log.Error().Msg("Parsed IPv4 header from GRH offset 20, but Src or Dst IP is nil.")
-		return fmt.Errorf("parsed IPv4 header from GRH (offset 20), but Src/Dst IP is nil")
+		return "", "", fmt.Errorf("parsed IPv4 header from GRH (offset 20), but Src/Dst IP is nil")
 	}
 	log.Trace().Str("parsed_ipv4_header", parsedIPv4Header.String()).Msg("Successfully parsed IPv4 Header from GRH offset 20")
 
@@ -259,40 +255,40 @@ func (u *UDQueue) parseIPv4GRHAndUpdateWorkCompletion(grhBytes []byte, workCompT
 
 	if srcIPv4 == nil || dstIPv4 == nil {
 		log.Error().Str("ipv4.Src", parsedIPv4Header.Src.String()).Str("ipv4.Dst", parsedIPv4Header.Dst.String()).Msg("Could not convert parsed Src/Dst IP (from GRH offset 20) to IPv4.")
-		return fmt.Errorf("could not convert GRH region's IPv4 Src/Dst (offset 20) to 4-byte format")
+		return "", "", fmt.Errorf("could not convert GRH region's IPv4 Src/Dst (offset 20) to 4-byte format")
 	}
 
 	srcMappedIPv6Bytes := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, srcIPv4[0], srcIPv4[1], srcIPv4[2], srcIPv4[3]}
 	dstMappedIPv6Bytes := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, dstIPv4[0], dstIPv4[1], dstIPv4[2], dstIPv4[3]}
-	workCompToUpdate.SGID = formatGIDString(srcMappedIPv6Bytes)
-	workCompToUpdate.DGID = formatGIDString(dstMappedIPv6Bytes)
-	return nil
+	return formatGIDString(srcMappedIPv6Bytes), formatGIDString(dstMappedIPv6Bytes), nil
 }
 
-// parseIPv6GRHAndUpdateWorkCompletion handles parsing for standard IPv6 GRH data.
-func (u *UDQueue) parseIPv6GRHAndUpdateWorkCompletion(grhBytes []byte, workCompToUpdate *WorkCompletion) error {
+// parseIPv6GRH handles parsing for standard IPv6 GRH data.
+// Returns sgid, dgid, flowlabel, error
+func (u *UDQueue) parseIPv6GRH(grhBytes []byte) (string, string, uint32, error) {
 	log.Trace().Msg("GRH IP Version field is 6. Parsing SGID/DGID from standard GRH fields.")
 	// Standard RoCEv2 GRH (IPv6 Format)
 	// Source GID: GRH bytes 8-23
 	// Destination GID: GRH bytes 24-39
 	if len(grhBytes) < 40 { // Defensive check, though already checked by caller
-		return fmt.Errorf("grhBytes too short for IPv6 GID extraction (len: %d)", len(grhBytes))
+		return "", "", 0, fmt.Errorf("grhBytes too short for IPv6 GID extraction (len: %d)", len(grhBytes))
 	}
 	sgidSlice := grhBytes[8:24]
 	dgidSlice := grhBytes[24:40]
 
-	workCompToUpdate.SGID = formatGIDString(sgidSlice)
-	workCompToUpdate.DGID = formatGIDString(dgidSlice)
+	sgidStr := formatGIDString(sgidSlice)
+	dgidStr := formatGIDString(dgidSlice)
+	var flowLabelVal uint32
 
 	ipv6Header, parseErr := ipv6.ParseHeader(grhBytes) // Parse the whole GRH as an IPv6 header
 	if parseErr == nil && ipv6Header != nil {
-		workCompToUpdate.FlowLabel = uint32(ipv6Header.FlowLabel)
-		log.Trace().Str("sgid", workCompToUpdate.SGID).Str("dgid", workCompToUpdate.DGID).Uint32("flow_label", workCompToUpdate.FlowLabel).Msg("Parsed IPv6 GRH")
+		flowLabelVal = uint32(ipv6Header.FlowLabel)
+		log.Trace().Str("sgid", sgidStr).Str("dgid", dgidStr).Uint32("flow_label", flowLabelVal).Msg("Parsed IPv6 GRH")
 	} else {
 		log.Warn().Err(parseErr).Msg("Failed to parse GRH as IPv6 header to get FlowLabel, but SGID/DGID extracted directly.")
-		// SGID/DGID are extracted, so this might not be a fatal error for them, but FlowLabel will be missing.
+		// SGID/DGID are extracted, so this might not be a fatal error for them, but FlowLabel will be missing (remains 0).
 	}
-	return nil
+	return sgidStr, dgidStr, flowLabelVal, nil
 }
 
 // deserializeProbePacket deserializes the given payload into a ProbePacket struct.
@@ -310,7 +306,7 @@ func (u *UDQueue) deserializeProbePacket(payloadDataPtr unsafe.Pointer, actualPa
 }
 
 // ReceivePacket waits for and processes a received packet using completion channel
-func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *WorkCompletion, error) {
+func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *ProcessedWorkCompletion, error) {
 	// Wait for completion notification from CQ poller
 	select {
 	case err := <-u.errChan:
@@ -321,30 +317,30 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 
 	case goWC := <-u.recvCompChan:
 		receiveTime := time.Unix(0, int64(goWC.CompletionWallclockNS)) // use HW timestamp
-		workComp := &WorkCompletion{
-			Status:    uint32(goWC.Status),
-			SrcQP:     uint32(goWC.SrcQP),
-			VendorErr: uint32(goWC.VendorErr),
-			// SGID, DGID, FlowLabel will be populated by parseGRHAndUpdateWorkCompletion
-		}
 
 		// Parse GRH (if present) and determine payload location and length
-		payloadDataPtr, actualPayloadLength, err := u.parseGRHAndUpdateWorkCompletion(goWC, workComp)
-		if err != nil {
+		sgid, dgid, flowLabel, payloadDataPtr, actualPayloadLength, grhParseErr := u.parseGRH(goWC)
+
+		processedWC := &ProcessedWorkCompletion{
+			GoWorkCompletion: *goWC, // Embed the original GoWorkCompletion
+			SGID:             sgid,
+			DGID:             dgid,
+			FlowLabel:        flowLabel,
+		}
+
+		if grhParseErr != nil {
 			// This error comes from GRH parsing issues (e.g., bad length, unknown IP version).
-			// The original code did not attempt to u.PostRecv() here.
-			log.Warn().Err(err).Msg("Failed to parse GRH or determine payload details")
-			return nil, receiveTime, workComp, err
+			log.Warn().Err(grhParseErr).Msg("Failed to parse GRH or determine payload details")
+			return nil, receiveTime, processedWC, grhParseErr // Return ProcessedWC even on GRH error, it contains the base goWC info
 		}
 
 		// Deserialize the payload into a ProbePacket
-		packet, err := u.deserializeProbePacket(payloadDataPtr, actualPayloadLength)
-		if err != nil {
+		packet, deserializeErr := u.deserializeProbePacket(payloadDataPtr, actualPayloadLength)
+		if deserializeErr != nil {
 			// This error is typically "actual received payload too small".
-			// The original code logs, then attempts u.PostRecv(), then returns.
 			grhPresentForLog := (goWC.WCFlags & C.IBV_WC_GRH) == C.IBV_WC_GRH
 			log.Warn().
-				Err(err). // err already contains "actual received payload too small..."
+				Err(deserializeErr). // err already contains "actual received payload too small..."
 				Uint32("actualPayloadLength", actualPayloadLength).
 				Uint32("wc_byte_len", uint32(goWC.ByteLen)).
 				Bool("grh_present", grhPresentForLog).
@@ -352,7 +348,7 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 			if errPost := u.PostRecv(); errPost != nil {
 				log.Warn().Err(errPost).Str("device", u.RNIC.DeviceName).Uint32("qpn", u.QPN).Msg("Failed to post replacement receive buffer after small/bad packet")
 			}
-			return nil, receiveTime, workComp, err // Return the deserialization error
+			return nil, receiveTime, processedWC, deserializeErr // Return ProcessedWC even on deserialize error
 		}
 
 		// Packet successfully deserialized (packet is already a copy)
@@ -363,13 +359,13 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 			Uint64("t1", packet.T1).
 			Uint64("t3", packet.T3).
 			Uint64("t4", packet.T4).
-			Str("workComp_SGID", workComp.SGID).
-			Str("workComp_DGID", workComp.DGID).
-			Uint32("workComp_FlowLabel", workComp.FlowLabel).
-			Uint32("srcQP", workComp.SrcQP).
+			Str("workComp_SGID", processedWC.SGID).
+			Str("workComp_DGID", processedWC.DGID).
+			Uint32("workComp_FlowLabel", processedWC.FlowLabel).
+			Uint32("srcQP", processedWC.SrcQP).
 			Msg("Received packet data (ProbePacket content)")
 
-		if packet.IsAck == 0 && (workComp.SGID == "" || workComp.SGID == "::") {
+		if packet.IsAck == 0 && (processedWC.SGID == "" || processedWC.SGID == "::") {
 			log.Warn().Msg("Received a probe, but SGID could not be determined (e.g. no GRH or GRH parsing issue). Sending ACK might fail if SGID is required for AH creation.")
 		}
 
@@ -380,7 +376,7 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 				Msg("Failed to post replacement receive buffer after processing packet")
 		}
 
-		return packet, receiveTime, workComp, nil
+		return packet, receiveTime, processedWC, nil
 	}
 }
 

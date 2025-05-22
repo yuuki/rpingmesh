@@ -27,15 +27,15 @@ func (m *testUDQueue) SendProbePacket(ctx context.Context, targetGID string, tar
 }
 
 // ReceivePacket implements the needed method for receiving packets
-func (m *testUDQueue) ReceivePacket(ctx context.Context) (*rdma.ProbePacket, time.Time, *rdma.WorkCompletion, error) {
+func (m *testUDQueue) ReceivePacket(ctx context.Context) (*rdma.ProbePacket, time.Time, *rdma.ProcessedWorkCompletion, error) {
 	args := m.Called(ctx)
 	var packet *rdma.ProbePacket
 	if args.Get(0) != nil {
 		packet = args.Get(0).(*rdma.ProbePacket)
 	}
-	var workComp *rdma.WorkCompletion
+	var workComp *rdma.ProcessedWorkCompletion
 	if args.Get(2) != nil {
-		workComp = args.Get(2).(*rdma.WorkCompletion)
+		workComp = args.Get(2).(*rdma.ProcessedWorkCompletion)
 	}
 	return packet, args.Get(1).(time.Time), workComp, args.Error(3)
 }

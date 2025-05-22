@@ -31,7 +31,7 @@ type PingSession struct {
 type ackEvent struct {
 	Packet     *rdma.ProbePacket
 	ReceivedAt time.Time
-	WorkComp   *rdma.WorkCompletion
+	WorkComp   *rdma.ProcessedWorkCompletion
 }
 
 // Prober is responsible for sending probes to targets and processing their responses
@@ -428,7 +428,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 		default:
 			// Create a context with timeout for ReceivePacket
 			ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
-			packet, receiveTime, workComp, err := udq.ReceivePacket(ctx)
+			packet, receiveTime, processedWC, err := udq.ReceivePacket(ctx)
 			cancel() // Important to call cancel to free resources associated with the context
 			if err != nil {
 				if !errors.Is(err, context.DeadlineExceeded) {
@@ -442,24 +442,33 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				continue
 			}
 
+			// Ensure processedWC is not nil before accessing its fields, especially if ReceivePacket can return nil for it on some errors
+			if processedWC == nil {
+				log.Error().
+					Str("device", udq.RNIC.DeviceName).
+					Uint32("qpn", udq.QPN).
+					Msg("[responder]: Received nil processedWorkCompletion from ReceivePacket, skipping packet")
+				atomic.AddUint64(&errorPackets, 1)
+				continue
+			}
+
 			// Count packets
 			atomic.AddUint64(&totalPackets, 1)
 
-			if packet.IsAck != 0 {
+			if packet.IsAck != 0 { // packet can be nil if deserialize failed but processedWC might still be returned
 				log.Warn().
 					Str("device", udq.RNIC.DeviceName).
 					Str("GID", udq.RNIC.GID).
 					Uint32("QPN", udq.QPN).
-					Uint32("flowLabel", workComp.FlowLabel).
-					Uint64("seqNum", packet.SequenceNum).
+					Uint32("flowLabel", processedWC.FlowLabel). // Use FlowLabel from ProcessedWorkCompletion
 					Msg("[responder]: Received ACK packet (this is invalid, ignoring)")
 				continue
 			}
 			atomic.AddUint64(&probePackets, 1)
 
 			// Get source information
-			sourceGID := workComp.SGID
-			sourceQPN := workComp.SrcQP
+			sourceGID := processedWC.SGID
+			sourceQPN := processedWC.SrcQP // SrcQP is from the embedded GoWorkCompletion
 
 			// Validate source
 			if sourceGID == "" || sourceGID == "::" || sourceQPN == 0 {
@@ -467,8 +476,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				log.Error().
 					Str("sourceGID", sourceGID).
 					Uint32("sourceQPN", sourceQPN).
-					Uint32("flowLabel", workComp.FlowLabel).
-					Uint64("seqNum", packet.SequenceNum).
+					Uint32("flowLabel", processedWC.FlowLabel).
 					Msg("[responder]: Invalid source GID or QPN in work completion, cannot send ACK")
 				continue
 			}
@@ -479,21 +487,19 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				Str("sendingGID", udq.RNIC.GID).
 				Str("targetGID", sourceGID).
 				Uint32("targetQPN", sourceQPN).
-				Uint32("flowLabel", workComp.FlowLabel).
-				Uint64("seqNum", packet.SequenceNum).
+				Uint32("flowLabel", processedWC.FlowLabel).
 				Msg("[responder]: Received probe packet, sending ACKs")
 
 			// Step 2: Send first ACK packet immediately (without processing delay info)
-			firstAckCompletionTime, err := udq.SendFirstAckPacket(sourceGID, sourceQPN, workComp.FlowLabel, packet, receiveTime)
+			firstAckCompletionTime, err := udq.SendFirstAckPacket(sourceGID, sourceQPN, processedWC.FlowLabel, packet, receiveTime)
 			if err != nil {
 				atomic.AddUint64(&errorPackets, 1)
 				log.Error().Err(err).
 					Str("sourceGID", sourceGID).
 					Uint32("sourceQPN", sourceQPN).
-					Str("targetGID", sourceGID).
-					Uint32("targetQPN", sourceQPN).
-					Uint32("flowLabel", workComp.FlowLabel).
-					Uint64("seqNum", packet.SequenceNum).
+					Str("targetGID", sourceGID).    // This should be sending_device for logging consistency? No, target is the original prober.
+					Uint32("targetQPN", sourceQPN). // Same as above.
+					Uint32("flowLabel", processedWC.FlowLabel).
 					Msg("[responder]: Failed to send first ACK packet")
 				continue
 			}
@@ -501,12 +507,11 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 			log.Trace().
 				Str("sourceGID", sourceGID).
 				Uint32("sourceQPN", sourceQPN).
-				Uint32("flowLabel", workComp.FlowLabel).
-				Uint64("seqNum", packet.SequenceNum).
+				Uint32("flowLabel", processedWC.FlowLabel).
 				Msg("[responder]: Sent first ACK packet")
 
 			// Step 3: Send second ACK packet with processing delay information
-			err = udq.SendSecondAckPacket(sourceGID, sourceQPN, workComp.FlowLabel, packet, receiveTime, firstAckCompletionTime)
+			err = udq.SendSecondAckPacket(sourceGID, sourceQPN, processedWC.FlowLabel, packet, receiveTime, firstAckCompletionTime)
 			if err != nil {
 				atomic.AddUint64(&errorPackets, 1)
 				log.Error().Err(err).
@@ -514,8 +519,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 					Uint32("sourceQPN", sourceQPN).
 					Str("targetGID", sourceGID).
 					Uint32("targetQPN", sourceQPN).
-					Uint32("flowLabel", workComp.FlowLabel).
-					Uint64("seqNum", packet.SequenceNum).
+					Uint32("flowLabel", processedWC.FlowLabel).
 					Msg("[responder]: Failed to send second ACK packet")
 				continue
 			}
@@ -523,8 +527,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 			log.Trace().
 				Str("sourceGID", sourceGID).
 				Uint32("sourceQPN", sourceQPN).
-				Uint32("flowLabel", workComp.FlowLabel).
-				Uint64("seqNum", packet.SequenceNum).
+				Uint32("flowLabel", processedWC.FlowLabel).
 				Msg("[responder]: Sent second ACK packet")
 		}
 	}
@@ -540,51 +543,41 @@ func (p *Prober) Close() error {
 // HandleIncomingRDMAPacket is the callback function for rdma.AckHandlerFunc.
 // It processes ACK packets received by the RDMA layer and dispatches them to the correct session.
 func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
-	if ackInfo == nil || ackInfo.Packet == nil {
-		log.Error().Msg("[prober_handler]: Received nil ackInfo or ackInfo.Packet")
+	if ackInfo == nil || ackInfo.Packet == nil || ackInfo.ProcessedWC == nil {
+		log.Error().Msg("[prober_handler]: Received nil ackInfo, ackInfo.Packet, or ackInfo.ProcessedWC")
 		return
 	}
 
 	// The user's latest change indicates FlowLabel from GRH is used as the session key.
-	// Ensure GRHInfo is present and FlowLabel is valid.
-	if ackInfo.GRHInfo == nil {
-		log.Warn().Uint64("seqNum_from_packet", ackInfo.Packet.SequenceNum).Msg("[prober_handler]: ACK packet missing GRHInfo, cannot determine FlowLabel for session lookup.")
-		return
-	}
-	sessionKey := ackInfo.GRHInfo.FlowLabel // Using FlowLabel as the key, per user's latest changes.
+	// ProcessedWC now contains FlowLabel directly.
+	sessionKey := ackInfo.ProcessedWC.FlowLabel // Using FlowLabel from ProcessedWorkCompletion
 
 	log.Trace().
 		Uint32("sessionKey_flowLabel", sessionKey).
 		Uint64("packet_seqNum", ackInfo.Packet.SequenceNum).
 		Uint8("packet_ackType", ackInfo.Packet.AckType).
-		Str("source_gid_from_grh", ackInfo.GRHInfo.SourceGID).
-		Uint32("source_qp_from_wc", ackInfo.SourceQP).
+		Str("source_gid_from_grh", ackInfo.ProcessedWC.SGID).   // From ProcessedWC
+		Uint32("source_qp_from_wc", ackInfo.ProcessedWC.SrcQP). // From ProcessedWC (embedded GoWorkCompletion)
+		Int("wc_status_from_pwc", ackInfo.ProcessedWC.Status).  // Status from embedded GoWorkCompletion
 		Msg("[prober_handler]: Processing incoming ACK packet via callback")
 
 	rawSession, exists := p.pendingSessions.Load(sessionKey)
 	if exists {
 		session, _ := rawSession.(*PingSession) // ignore ok because ok always becomes false
 		// Construct probe.ackEvent from rdma.IncomingAckInfo
-		// Note: ackInfo.Packet is a pointer into RDMA recv buffer. If Prober needs to hold onto it
-		// beyond the scope of this handler call, it *must* be deep-copied.
-		// For now, we assume PingSession channels consume it quickly or copy if needed.
 		probeEvent := &ackEvent{
 			Packet:     ackInfo.Packet, // This is a direct pointer, be cautious.
 			ReceivedAt: ackInfo.ReceivedAt,
-			WorkComp: &rdma.WorkCompletion{ // Populate with available info
-				// Status:    uint32(ackInfo.RawWC.status), // Avoid direct access to C struct fields
-				// Instead, rdma.IncomingAckInfo should provide a Go-friendly status, e.g., AckStatusOK bool
-				Status:    0, // Placeholder, to be replaced by a status from IncomingAckInfo if needed beyond simple success
-				SrcQP:     ackInfo.SourceQP,
-				SGID:      ackInfo.GRHInfo.SourceGID,
-				DGID:      ackInfo.GRHInfo.DestGID, // Assuming DestGID is populated in GRHInfo
-				FlowLabel: ackInfo.GRHInfo.FlowLabel,
-			},
+			WorkComp:   ackInfo.ProcessedWC, // Directly use the ProcessedWorkCompletion from ackInfo
 		}
 
-		// Check if the ACK itself was successful based on a field from IncomingAckInfo
-		if !ackInfo.AckStatusOK { // Now use the AckStatusOK field from rdma.IncomingAckInfo
-			log.Error().Uint32("sessionKey_flowLabel", sessionKey).Msg("[prober_handler]: Received ACK but RDMA completion status was not OK.")
+		// Check if the ACK itself was successful based on AckStatusOK field from IncomingAckInfo
+		// AckStatusOK should ideally be set based on ackInfo.ProcessedWC.Status == C.IBV_WC_SUCCESS
+		if !ackInfo.AckStatusOK { // This flag should be set correctly by the caller (e.g. CQ poller in rdma package)
+			log.Error().
+				Uint32("sessionKey_flowLabel", sessionKey).
+				Int("rdma_wc_status", ackInfo.ProcessedWC.Status). // Log the actual RDMA status
+				Msg("[prober_handler]: Received ACK but RDMA completion status was not OK (indicated by AckStatusOK flag).")
 			return
 		}
 

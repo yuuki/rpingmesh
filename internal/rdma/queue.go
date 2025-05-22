@@ -209,7 +209,10 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 	cqAttr.cq_context = nil
 	cqAttr.channel = compChannel
 	cqAttr.comp_vector = 0
-	cqAttr.wc_flags = C.IBV_WC_EX_WITH_BYTE_LEN | C.IBV_WC_EX_WITH_SRC_QP | C.IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK
+	// Ensure all parts of the bitwise OR are C.uint64_t
+	cqAttr.wc_flags = C.uint64_t(C.IBV_WC_EX_WITH_BYTE_LEN) |
+		C.uint64_t(C.IBV_WC_EX_WITH_SRC_QP) |
+		C.uint64_t(C.IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK)
 	// All other fields in cqAttr will be zero by default Go struct initialization if not set.
 
 	cqEx := C.ibv_create_cq_ex(rnic.Context, &cqAttr)

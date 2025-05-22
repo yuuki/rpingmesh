@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/pflag"
@@ -13,6 +14,7 @@ const DefaultProbeRatePerSecond = 10 // Default probes per second per target
 // AgentConfig holds configuration for the agent
 type AgentConfig struct {
 	AgentID                   string
+	HostName                  string
 	ControllerAddr            string
 	AnalyzerAddr              string
 	LogLevel                  string
@@ -77,13 +79,29 @@ func LoadAgentConfig(flagSet *pflag.FlagSet) (*AgentConfig, error) {
 	if configFile := v.GetString("config"); configFile != "" {
 		v.SetConfigFile(configFile)
 		if err := v.ReadInConfig(); err != nil {
-			return nil, fmt.Errorf("failed to read config file: %w", err)
+			// It's okay if the config file doesn't exist, if not specified.
+			// If specified and unreadable, then it's an error.
+			if !os.IsNotExist(err) || configFile != v.GetString("config") {
+				return nil, fmt.Errorf("failed to read config file: %w", err)
+			}
 		}
+	}
+
+	// Get the actual hostname of the machine
+	osHostName, err := os.Hostname()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get OS hostname: %w", err)
+	}
+
+	agentID := v.GetString("agent-id")
+	if agentID == "" {
+		agentID = osHostName // Use the OS hostname if agent-id is not specified
 	}
 
 	// Create config
 	config := &AgentConfig{
-		AgentID:                   v.GetString("agent-id"),
+		AgentID:                   agentID,
+		HostName:                  osHostName,
 		ControllerAddr:            v.GetString("controller-addr"),
 		AnalyzerAddr:              v.GetString("analyzer-addr"),
 		LogLevel:                  v.GetString("log-level"),

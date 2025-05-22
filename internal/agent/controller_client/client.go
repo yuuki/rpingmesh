@@ -85,6 +85,7 @@ func (c *ControllerClient) Close() error {
 // RegisterAgent registers the agent with the controller
 func (c *ControllerClient) RegisterAgent(
 	agentID string,
+	hostName string,
 	agentIP string,
 	rnics []*rdma.RNIC,
 ) error {
@@ -104,7 +105,7 @@ func (c *ControllerClient) RegisterAgent(
 			// because the other agents send probes to this agent via the responder queue
 			Qpn:        rnic.ResponderQueue.QPN,
 			IpAddress:  rnic.IPAddr,
-			HostName:   agentID,
+			HostName:   hostName,
 			DeviceName: rnic.DeviceName,
 			TorId:      "", // This would need to be set from config
 		})

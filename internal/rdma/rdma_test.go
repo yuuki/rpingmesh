@@ -1,7 +1,6 @@
 package rdma
 
 import (
-	"testing"
 	"time"
 )
 
@@ -54,19 +53,24 @@ func (m *MockRDMAManager) MockReceiveProbe(targetGID string) (*ProbePacket, time
 
 	// Get the first packet (FIFO)
 	packet := packets[0]
+
+	// Make a copy of the packet to return (to avoid modifying the original)
+	returnPacket := packet
+
+	// Remove the packet from the queue
 	m.packets[targetGID] = packets[1:]
 
-	// Set T3 timestamp (receive time)
+	// Set receive time
 	receiveTime := time.Now()
-	return &packet, receiveTime, nil
+	return &returnPacket, receiveTime, nil
 }
 
 // MockSendAck simulates sending an ACK packet
 func (m *MockRDMAManager) MockSendAck(sourceGID, targetGID string, targetQPN uint32, origPacket *ProbePacket, receiveTime time.Time, ackType uint8) (time.Time, error) {
-	// Create a new ACK packet
+	// Create a new ACK packet - preserve the sequence number from the original packet
 	now := time.Now()
 	packet := ProbePacket{
-		SequenceNum: origPacket.SequenceNum,
+		SequenceNum: origPacket.SequenceNum, // Important: Keep the same sequence number
 		T1:          origPacket.T1,
 		T3:          uint64(receiveTime.UnixNano()),
 		T4:          uint64(now.UnixNano()),
@@ -77,12 +81,4 @@ func (m *MockRDMAManager) MockSendAck(sourceGID, targetGID string, targetQPN uin
 	// Store the packet in the map
 	m.packets[targetGID] = append(m.packets[targetGID], packet)
 	return now, nil
-}
-
-// TestRDMAManager tests the RDMAManager functionality
-func TestRDMAManager(t *testing.T) {
-	t.Skip("Skipping TestRDMAManager due to OpenDevice signature changes and focus on WorkCompletion refactoring.")
-	// manager := NewRDMAManager()
-	// if manager == nil {
-	// ... existing code ...
 }

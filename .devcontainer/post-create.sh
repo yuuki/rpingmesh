@@ -28,7 +28,9 @@ set -gx GO111MODULE on
 EOF
 fi
 
-echo "Running go generate for eBPF bindings..."
+echo "Installing Claude Code..."
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+npm install -g @anthropic-ai/claude-code
 
 # Find the workspace directory
 WORKSPACE_DIR=${WORKSPACE_DIR:-$(pwd)}

@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -133,6 +134,10 @@ func NewServiceTracer() (*ServiceTracer, error) {
 	// Compile and load eBPF program
 	var objs rdmaTracingObjects
 	if err := loadRdmaTracingObjects(&objs, &opts); err != nil {
+		// Enhanced error handling for RDMA environment issues
+		if isRdmaRelatedError(err) {
+			return nil, fmt.Errorf("RDMA environment not available (missing drivers or kernel support): %w", err)
+		}
 		return nil, fmt.Errorf("loading objects: %w", err)
 	}
 
@@ -145,6 +150,29 @@ func NewServiceTracer() (*ServiceTracer, error) {
 		eventCh: eventCh,
 		stopCh:  stopCh,
 	}, nil
+}
+
+// isRdmaRelatedError checks if the error is related to RDMA functionality not being available
+func isRdmaRelatedError(err error) bool {
+	errStr := err.Error()
+	// Check for common RDMA-related error patterns
+	rdmaErrorPatterns := []string{
+		"bad CO-RE relocation",
+		"invalid func",
+		"ib_modify_qp",
+		"ib_destroy_qp",
+		"ib_create_qp",
+		"kprobe",
+		"symbol not found",
+		"function not found",
+	}
+
+	for _, pattern := range rdmaErrorPatterns {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // Start begins tracing

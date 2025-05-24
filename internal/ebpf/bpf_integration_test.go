@@ -35,9 +35,8 @@ func TestBPFProgramLoading(t *testing.T) {
 	defer tracer.Stop()
 
 	// Verify programs are loaded
-	assert.NotNil(t, tracer.objs.TraceCreateQp, "CreateQP program should be loaded")
 	assert.NotNil(t, tracer.objs.TraceModifyQp, "ModifyQP program should be loaded")
-	assert.NotNil(t, tracer.objs.TraceDestroyQp, "DestroyQP program should be loaded")
+	assert.NotNil(t, tracer.objs.TraceDestroyQpUser, "DestroyQP program should be loaded")
 
 	// Verify maps are created
 	assert.NotNil(t, tracer.objs.RdmaEvents, "Events ring buffer should be created")
@@ -94,7 +93,7 @@ func TestBPFProgramSpecValidation(t *testing.T) {
 	require.NoError(t, err, "Should be able to load program spec")
 
 	// Test that all expected programs exist in spec
-	expectedPrograms := []string{"trace_modify_qp", "trace_destroy_qp"}
+	expectedPrograms := []string{"trace_modify_qp", "trace_destroy_qp_user"}
 
 	for _, progName := range expectedPrograms {
 		t.Run(progName, func(t *testing.T) {

@@ -382,3 +382,5 @@ struct ib_port_data {
     struct net_device *netdev;
     struct ib_port *sysfs;
 };
+
+struct ib_udata;

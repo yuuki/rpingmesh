@@ -54,9 +54,8 @@ type rdmaTracingSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type rdmaTracingProgramSpecs struct {
-	TraceCreateQp  *ebpf.ProgramSpec `ebpf:"trace_create_qp"`
-	TraceDestroyQp *ebpf.ProgramSpec `ebpf:"trace_destroy_qp"`
-	TraceModifyQp  *ebpf.ProgramSpec `ebpf:"trace_modify_qp"`
+	TraceDestroyQpUser *ebpf.ProgramSpec `ebpf:"trace_destroy_qp_user"`
+	TraceModifyQp      *ebpf.ProgramSpec `ebpf:"trace_modify_qp"`
 }
 
 // rdmaTracingMapSpecs contains maps before they are loaded into the kernel.
@@ -64,6 +63,7 @@ type rdmaTracingProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type rdmaTracingMapSpecs struct {
 	RdmaEvents *ebpf.MapSpec `ebpf:"rdma_events"`
+	RdmaStats  *ebpf.MapSpec `ebpf:"rdma_stats"`
 }
 
 // rdmaTracingVariableSpecs contains global variables before they are loaded into the kernel.
@@ -93,11 +93,13 @@ func (o *rdmaTracingObjects) Close() error {
 // It can be passed to loadRdmaTracingObjects or ebpf.CollectionSpec.LoadAndAssign.
 type rdmaTracingMaps struct {
 	RdmaEvents *ebpf.Map `ebpf:"rdma_events"`
+	RdmaStats  *ebpf.Map `ebpf:"rdma_stats"`
 }
 
 func (m *rdmaTracingMaps) Close() error {
 	return _RdmaTracingClose(
 		m.RdmaEvents,
+		m.RdmaStats,
 	)
 }
 
@@ -111,15 +113,13 @@ type rdmaTracingVariables struct {
 //
 // It can be passed to loadRdmaTracingObjects or ebpf.CollectionSpec.LoadAndAssign.
 type rdmaTracingPrograms struct {
-	TraceCreateQp  *ebpf.Program `ebpf:"trace_create_qp"`
-	TraceDestroyQp *ebpf.Program `ebpf:"trace_destroy_qp"`
-	TraceModifyQp  *ebpf.Program `ebpf:"trace_modify_qp"`
+	TraceDestroyQpUser *ebpf.Program `ebpf:"trace_destroy_qp_user"`
+	TraceModifyQp      *ebpf.Program `ebpf:"trace_modify_qp"`
 }
 
 func (p *rdmaTracingPrograms) Close() error {
 	return _RdmaTracingClose(
-		p.TraceCreateQp,
-		p.TraceDestroyQp,
+		p.TraceDestroyQpUser,
 		p.TraceModifyQp,
 	)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/agent/controller_client"
@@ -107,6 +108,10 @@ func (sfm *ServiceFlowMonitor) eventLoop() {
 
 	eventChan := sfm.ebpfTracer.Events()
 
+	// Create ticker for periodic statistics logging
+	statsTicker := time.NewTicker(30 * time.Second)
+	defer statsTicker.Stop()
+
 	for {
 		select {
 		case <-sfm.ctx.Done():
@@ -118,6 +123,9 @@ func (sfm *ServiceFlowMonitor) eventLoop() {
 				return
 			}
 			sfm.handleEbpfEvent(event)
+		case <-statsTicker.C:
+			// Log eBPF statistics periodically to monitor GID read failures
+			sfm.logEbpfStatistics()
 		}
 	}
 }
@@ -146,8 +154,35 @@ func (sfm *ServiceFlowMonitor) fillMissingSrcGID(event *ebpf.RdmaConnTuple) stri
 }
 
 func (sfm *ServiceFlowMonitor) handleEbpfEvent(event ebpf.RdmaConnTuple) {
-	log.Trace().Msgf("ServiceFlowMonitor received eBPF event: Type %s, QPState: %d, SrcQPN: %d, DstQPN: %d, SrcGID: %s, DstGID: %s",
-		event.EventTypeString(), event.QPState, event.SrcQPN, event.DstQPN, event.SrcGIDString(), event.DstGIDString())
+	log.Trace().
+		Str("event_type", event.EventTypeString()).
+		Uint32("src_qpn", event.SrcQPN).
+		Uint32("dst_qpn", event.DstQPN).
+		Str("src_gid", event.SrcGIDString()).
+		Str("dst_gid", event.DstGIDString()).
+		Int32("qp_state", event.QPState).
+		Uint8("port_num", event.PortNum).
+		Uint64("timestamp", event.Timestamp).
+		Str("comm", event.CommString()).
+		Msg("ServiceFlowMonitor received eBPF event")
+
+		// Validate struct alignment and data integrity
+	if err := ebpf.ValidateStructAlignment(&event); err != nil {
+		log.Warn().
+			Err(err).
+			Uint32("src_qpn", event.SrcQPN).
+			Uint32("dst_qpn", event.DstQPN).
+			Str("src_gid", event.SrcGIDString()).
+			Str("dst_gid", event.DstGIDString()).
+			Msg("Invalid eBPF event data - possible struct alignment issue")
+
+		// Run detailed diagnostic on first alignment failure
+		ebpf.DiagnoseStructAlignment(&event)
+
+		// For now, skip processing events with invalid data to avoid creating bad service flows
+		log.Warn().Msg("Skipping event due to invalid data")
+		return
+	}
 
 	switch event.EventType {
 	case 2: // MODIFY_QP
@@ -170,8 +205,18 @@ func (sfm *ServiceFlowMonitor) handleEbpfEvent(event ebpf.RdmaConnTuple) {
 		}
 
 		dstGidStr := event.DstGIDString()
-		if dstGidStr == "00000000000000000000000000000000" || dstGidStr == "" || event.DstQPN == 0 {
-			log.Warn().Msgf("MODIFY_QP event (RTR) is missing valid DstGID (%s) or DstQPN (%d). Cannot establish service flow.", dstGidStr, event.DstQPN)
+		if event.DstQPN == 0 {
+			log.Warn().Msgf("MODIFY_QP event (RTR) has invalid DstQPN (%d). Cannot establish service flow.", event.DstQPN)
+			return
+		}
+
+		// Handle legitimate zero destination GID (common for local connections)
+		if dstGidStr == "00000000000000000000000000000000" || dstGidStr == "" {
+			log.Warn().
+				Uint32("dst_qpn", event.DstQPN).
+				Str("src_gid", srcGidStr).
+				Uint32("src_qpn", event.SrcQPN).
+				Msg("Destination GID is zero, skipping service flow")
 			return
 		}
 
@@ -290,5 +335,59 @@ func (sfm *ServiceFlowMonitor) notifyProberUpdate() {
 		// or Prober has its own loop that will pick up the changes.
 		// For now, UpdateServiceFlowTargets just updates the list.
 		// Prober will need its own goroutine to act on this list.
+	}
+}
+
+// logEbpfStatistics logs eBPF statistics to help debug GID read failures
+func (sfm *ServiceFlowMonitor) logEbpfStatistics() {
+	stats, err := sfm.ebpfTracer.GetStatistics()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get eBPF statistics")
+		return
+	}
+
+	// Check for concerning patterns
+	errorCount := stats["error_count"]
+	gidReadSuccess := stats["gid_read_success"]
+	gidReadFailure := stats["gid_read_failure"]
+	portDataFailure := stats["port_data_failure"]
+	gidTableFailure := stats["gid_table_failure"]
+	modifyCount := stats["modify_count"]
+
+	// Calculate success rate if we have any GID read attempts
+	totalGidReads := gidReadSuccess + gidReadFailure
+	var successRate float64
+	if totalGidReads > 0 {
+		successRate = float64(gidReadSuccess) / float64(totalGidReads) * 100
+	}
+
+	logLevel := log.Debug()
+	if errorCount > 0 || gidReadFailure > 0 || portDataFailure > 0 || gidTableFailure > 0 {
+		logLevel = log.Warn()
+	}
+
+	logLevel.
+		Uint64("modify_events", modifyCount).
+		Uint64("errors", errorCount).
+		Uint64("gid_read_success", gidReadSuccess).
+		Uint64("gid_read_failure", gidReadFailure).
+		Uint64("port_data_failure", portDataFailure).
+		Uint64("gid_table_failure", gidTableFailure).
+		Float64("gid_success_rate", successRate).
+		Int("active_flows", len(sfm.activeFlows)).
+		Msg("eBPF ServiceFlowMonitor statistics")
+
+	// Log specific warnings for troubleshooting
+	if gidReadFailure > 0 && gidReadSuccess == 0 {
+		log.Error().Msg("All GID reads are failing - check RDMA driver compatibility and kernel structure alignment")
+
+		// Provide detailed diagnosis on first failure detection
+		// Note: This is a simple check to avoid spamming logs. In production, you might want a more sophisticated approach.
+		if modifyCount <= 5 { // Only show detailed diagnosis for first few events
+			ebpf.DiagnoseGidReadFailures(stats)
+			ebpf.PrintBpfTraceLog()
+		}
+	} else if gidReadFailure > gidReadSuccess {
+		log.Warn().Msg("GID read failure rate is high - RDMA structure access may be unstable")
 	}
 }

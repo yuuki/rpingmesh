@@ -10,14 +10,19 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"log"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/rs/zerolog/log"
 )
 
 //go:embed bpf/*
@@ -32,29 +37,44 @@ const (
 
 // Statistics keys matching eBPF definitions
 const (
-	StatCreateCount    = 0
-	StatModifyCount    = 1
-	StatDestroyCount   = 2
-	StatErrorCount     = 3
-	StatGidReadSuccess = 4
-	StatGidReadFailure = 5
+	StatCreateCount     = 0
+	StatModifyCount     = 1
+	StatDestroyCount    = 2
+	StatErrorCount      = 3
+	StatGidReadSuccess  = 4
+	StatGidReadFailure  = 5
+	StatPortDataFailure = 6
+	StatGidTableFailure = 7
 )
 
 // RdmaConnTuple represents RDMA connection 5-tuple information
 // Struct layout optimized to match eBPF struct with proper alignment
+// Must maintain exact byte-for-byte compatibility with C struct
 type RdmaConnTuple struct {
-	Timestamp uint64   // Timestamp when the event occurred (nanoseconds)
-	SrcGID    [16]byte // Source Global Identifier (GID) - 16 bytes
-	DstGID    [16]byte // Destination Global Identifier (GID) - 16 bytes
-	SrcQPN    uint32   // Source Queue Pair Number
-	DstQPN    uint32   // Destination Queue Pair Number
-	PID       uint32   // Process ID
-	TID       uint32   // Thread ID
-	QPState   int32    // QP state (valid only for modify_qp)
-	EventType uint8    // Event type (1: create, 2: modify, 3: destroy)
-	PortNum   uint8    // Port number for debugging
-	Reserved  [2]uint8 // Explicit padding for alignment
-	Comm      [16]byte // Process name
+	Timestamp uint64   // Timestamp when the event occurred (nanoseconds) - offset 0, 8 bytes
+	SrcGID    [16]byte // Source Global Identifier (GID) - offset 8, 16 bytes
+	DstGID    [16]byte // Destination Global Identifier (GID) - offset 24, 16 bytes
+	SrcQPN    uint32   // Source Queue Pair Number - offset 40, 4 bytes
+	DstQPN    uint32   // Destination Queue Pair Number - offset 44, 4 bytes
+	PID       uint32   // Process ID - offset 48, 4 bytes
+	TID       uint32   // Thread ID - offset 52, 4 bytes
+	QPState   int32    // QP state (valid only for modify_qp) - offset 56, 4 bytes
+	EventType uint8    // Event type (1: create, 2: modify, 3: destroy) - offset 60, 1 byte
+	PortNum   uint8    // Port number for debugging - offset 61, 1 byte
+	Reserved  [2]uint8 // Explicit padding for alignment - offset 62, 2 bytes
+	Comm      [16]byte // Process name - offset 64, 16 bytes
+}
+
+// Verify struct size at compile time
+// Go doesn't have static_assert, but we can check at runtime
+const expectedStructSize = 80
+
+func init() {
+	// Verify struct size matches eBPF definition
+	actualSize := int(unsafe.Sizeof(RdmaConnTuple{}))
+	if actualSize != expectedStructSize {
+		panic(fmt.Sprintf("RdmaConnTuple size mismatch: expected %d bytes, got %d bytes", expectedStructSize, actualSize))
+	}
 }
 
 // EventTypeString returns the string representation of the event type
@@ -119,16 +139,97 @@ type ServiceTracer struct {
 
 // Note: rdmaTracingObjects is defined in the auto-generated file rdmatracing_x86_bpfel.go
 
+// checkPrivileges verifies if the current process has sufficient privileges
+func checkPrivileges() error {
+	// Check if running as root
+	if os.Getuid() == 0 {
+		return nil
+	}
+
+	// For non-root users, we can proceed but warn about potential issues
+	log.Warn().Msg("Not running as root. You may need CAP_BPF and CAP_SYS_ADMIN capabilities.")
+	return nil
+}
+
+// setMemlockLimit attempts to set MEMLOCK limit manually
+func setMemlockLimit() error {
+	// Try to set MEMLOCK to unlimited
+	var rlim syscall.Rlimit
+	rlim.Cur = ^uint64(0) // RLIM_INFINITY
+	rlim.Max = ^uint64(0) // RLIM_INFINITY
+
+	// RLIMIT_MEMLOCK constant value for Linux
+	const RLIMIT_MEMLOCK = 8
+
+	if err := syscall.Setrlimit(RLIMIT_MEMLOCK, &rlim); err != nil {
+		return fmt.Errorf("setrlimit(RLIMIT_MEMLOCK) failed: %w", err)
+	}
+
+	return nil
+}
+
+// isPermissionError checks if the error is related to permission issues
+func isPermissionError(err error) bool {
+	errStr := err.Error()
+	permissionErrorPatterns := []string{
+		"operation not permitted",
+		"permission denied",
+		"EPERM",
+		"EACCES",
+		"MEMLOCK",
+		"insufficient privileges",
+	}
+
+	for _, pattern := range permissionErrorPatterns {
+		if strings.Contains(strings.ToLower(errStr), strings.ToLower(pattern)) {
+			return true
+		}
+	}
+	return false
+}
+
 // NewServiceTracer creates a new ServiceTracer instance
 func NewServiceTracer() (*ServiceTracer, error) {
+	// Check if running with sufficient privileges
+	if err := checkPrivileges(); err != nil {
+		return nil, fmt.Errorf("insufficient privileges: %w", err)
+	}
+
 	// Remove kernel memory lock limit
 	if err := rlimit.RemoveMemlock(); err != nil {
-		return nil, fmt.Errorf("removing memlock rlimit: %w", err)
+		// Try to increase MEMLOCK limit manually if RemoveMemlock fails
+		if err := setMemlockLimit(); err != nil {
+			return nil, fmt.Errorf("failed to set memory lock limit: %w (original error: %v)", err, err)
+		}
+		log.Warn().Msg("rlimit.RemoveMemlock() failed, but manual MEMLOCK setting succeeded")
+	}
+
+	vmlinux, err := btf.LoadKernelSpec()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load kernel spec: %w", err)
+	}
+
+	moduleSpecs := make(map[string]*btf.Spec)
+	for _, file := range []string{"/var/lib/btf/ib_core", "/var/lib/btf/ib_uverbs"} {
+		f, err := os.Open(file)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open file: %w", err)
+		}
+		specs, err := btf.LoadSplitSpecFromReader(f, vmlinux)
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("failed to load split spec: %w", err)
+		}
+		f.Close()
+		moduleSpecs[filepath.Base(file)] = specs
 	}
 
 	// Options for compiling eBPF program
 	opts := ebpf.CollectionOptions{
-		Programs: ebpf.ProgramOptions{},
+		Programs: ebpf.ProgramOptions{
+			KernelTypes:       vmlinux,
+			KernelModuleTypes: moduleSpecs,
+		},
 	}
 
 	// Compile and load eBPF program
@@ -137,6 +238,9 @@ func NewServiceTracer() (*ServiceTracer, error) {
 		// Enhanced error handling for RDMA environment issues
 		if isRdmaRelatedError(err) {
 			return nil, fmt.Errorf("RDMA environment not available (missing drivers or kernel support): %w", err)
+		}
+		if isPermissionError(err) {
+			return nil, fmt.Errorf("insufficient permissions to load eBPF program (try running as root or with CAP_BPF/CAP_SYS_ADMIN capabilities): %w", err)
 		}
 		return nil, fmt.Errorf("loading objects: %w", err)
 	}
@@ -159,9 +263,8 @@ func isRdmaRelatedError(err error) bool {
 	rdmaErrorPatterns := []string{
 		"bad CO-RE relocation",
 		"invalid func",
-		"ib_modify_qp",
-		"ib_destroy_qp",
-		"ib_create_qp",
+		"ib_modify_qp_with_udata",
+		"ib_destroy_qp_user",
 		"kprobe",
 		"symbol not found",
 		"function not found",
@@ -179,27 +282,63 @@ func isRdmaRelatedError(err error) bool {
 func (t *ServiceTracer) Start() error {
 	var err error
 	var kprobes []link.Link
+	var hookAttempts int
+	var successfulHooks int
 
-	// Attach kprobes
-	kp, err := link.Kprobe("ib_modify_qp", t.objs.TraceModifyQp, nil)
-	if err != nil {
-		return fmt.Errorf("attaching kprobe to ib_modify_qp: %w", err)
-	}
-	kprobes = append(kprobes, kp)
+	// Check which functions are available for hooking
+	available := checkAvailableFunctions()
 
-	kp, err = link.Kprobe("ib_destroy_qp", t.objs.TraceDestroyQp, nil)
-	if err != nil {
-		return fmt.Errorf("attaching kprobe to ib_destroy_qp: %w", err)
-	}
-	kprobes = append(kprobes, kp)
+	log.Info().
+		Int("available_functions", len(available)).
+		Msg("Starting eBPF tracing with available RDMA functions")
 
-	kp, err = link.Kprobe("ib_create_qp", t.objs.TraceCreateQp, nil)
-	if err != nil {
-		return fmt.Errorf("attaching kprobe to ib_create_qp: %w", err)
+	// Attach to ib_modify_qp (this should always be available)
+	if available["ib_modify_qp_with_udata"] {
+		hookAttempts++
+		kp, err := link.Kprobe("ib_modify_qp_with_udata", t.objs.TraceModifyQp, nil)
+		if err != nil {
+			log.Error().Err(err).Msg("Critical: Failed to attach kprobe to ib_modify_qp_with_udata")
+			return fmt.Errorf("attaching kprobe to ib_modify_qp_with_udata: %w", err)
+		}
+		kprobes = append(kprobes, kp)
+		successfulHooks++
+		log.Info().Msg("Successfully attached to ib_modify_qp_with_udata")
+	} else {
+		log.Warn().Msg("ib_modify_qp_with_udata not available - RDMA monitoring may be limited")
 	}
-	kprobes = append(kprobes, kp)
+
+	// Try to attach to ib_destroy_qp_user
+	if available["ib_destroy_qp_user"] {
+		hookAttempts++
+		kp, err := link.Kprobe("ib_destroy_qp_user", t.objs.TraceDestroyQpUser, nil)
+		if err != nil {
+			log.Warn().Err(err).Str("function", "ib_destroy_qp_user").Msg("Failed to attach kprobe (continuing without destroy monitoring)")
+		} else {
+			kprobes = append(kprobes, kp)
+			successfulHooks++
+			log.Info().Msg("Successfully attached to ib_destroy_qp_user")
+		}
+	} else {
+		log.Debug().Msg("ib_destroy_qp_user not available in this kernel")
+	}
+
+	// Validate that we have at least some hooks
+	if len(kprobes) == 0 {
+		return fmt.Errorf("no RDMA functions could be hooked - RDMA monitoring not available")
+	}
+
+	// Warn if we couldn't hook to any functions despite them being available
+	if hookAttempts > 0 && successfulHooks == 0 {
+		return fmt.Errorf("all %d hook attempts failed despite functions being available - check permissions and kernel compatibility", hookAttempts)
+	}
 
 	t.kprobes = kprobes
+
+	log.Info().
+		Int("active_hooks", len(kprobes)).
+		Int("attempted_hooks", hookAttempts).
+		Int("successful_hooks", successfulHooks).
+		Msg("eBPF kprobe attachment completed")
 
 	// Create ring buffer reader
 	reader, err := ringbuf.NewReader(t.objs.RdmaEvents)
@@ -233,20 +372,20 @@ func (t *ServiceTracer) processEvents() {
 				// Normal termination
 				return
 			}
-			log.Printf("error reading from ringbuf: %v", err)
+			log.Error().Err(err).Msg("Error reading from ringbuf")
 			continue
 		}
 
 		// Convert binary data to RdmaConnTuple struct
 		var event RdmaConnTuple
 		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-			log.Printf("error parsing ringbuf event: %v", err)
+			log.Error().Err(err).Msg("Error parsing ringbuf event")
 			continue
 		}
 
 		// Validate event before sending
 		if !event.IsValidEvent() {
-			log.Printf("received invalid event type: %d", event.EventType)
+			log.Warn().Uint8("event_type", event.EventType).Msg("Received invalid event type")
 			continue
 		}
 
@@ -266,18 +405,45 @@ func (t *ServiceTracer) Events() <-chan RdmaConnTuple {
 }
 
 // GetStatistics retrieves the current statistics from the eBPF program
-// Note: Statistics map will be available after eBPF regeneration
 func (t *ServiceTracer) GetStatistics() (map[string]uint64, error) {
 	stats := make(map[string]uint64)
 
-	// TODO: Implement statistics after eBPF regeneration
-	// For now, return empty statistics
-	stats["create_count"] = 0
-	stats["modify_count"] = 0
-	stats["destroy_count"] = 0
-	stats["error_count"] = 0
-	stats["gid_read_success"] = 0
-	stats["gid_read_failure"] = 0
+	if t.objs.RdmaStats == nil {
+		return stats, fmt.Errorf("statistics map not available")
+	}
+
+	// Read all statistics from the eBPF map
+	statKeys := []uint32{
+		StatCreateCount,
+		StatModifyCount,
+		StatDestroyCount,
+		StatErrorCount,
+		StatGidReadSuccess,
+		StatGidReadFailure,
+		StatPortDataFailure,
+		StatGidTableFailure,
+	}
+
+	statNames := []string{
+		"create_count",
+		"modify_count",
+		"destroy_count",
+		"error_count",
+		"gid_read_success",
+		"gid_read_failure",
+		"port_data_failure",
+		"gid_table_failure",
+	}
+
+	for i, key := range statKeys {
+		var value uint64
+		if err := t.objs.RdmaStats.Lookup(key, &value); err != nil {
+			log.Warn().Err(err).Uint32("key", key).Str("stat", statNames[i]).Msg("Failed to read statistic from eBPF map")
+			stats[statNames[i]] = 0
+		} else {
+			stats[statNames[i]] = value
+		}
+	}
 
 	return stats, nil
 }
@@ -290,7 +456,7 @@ func (t *ServiceTracer) Stop() error {
 	// Detach all kprobes
 	for _, kp := range t.kprobes {
 		if err := kp.Close(); err != nil {
-			log.Printf("error closing kprobe: %v", err)
+			log.Error().Err(err).Msg("Error closing kprobe")
 		}
 	}
 	t.kprobes = nil
@@ -298,7 +464,7 @@ func (t *ServiceTracer) Stop() error {
 	// Close ring buffer reader
 	if t.reader != nil {
 		if err := t.reader.Close(); err != nil {
-			log.Printf("error closing ringbuf reader: %v", err)
+			log.Error().Err(err).Msg("Error closing ringbuf reader")
 		}
 		t.reader = nil
 	}
@@ -313,3 +479,223 @@ func (t *ServiceTracer) Stop() error {
 
 // Note: The actual loadRdmaTracingObjects is generated by bpf2go
 // and is defined in rdmatracing_x86_bpfel.go
+
+// DiagnoseEnvironment provides diagnostic information about the eBPF environment
+func DiagnoseEnvironment() {
+	log.Info().Msg("=== eBPF Environment Diagnostics ===")
+
+	// Check running user
+	if os.Getuid() == 0 {
+		log.Info().Msg("✓ Running as root (UID: 0)")
+	} else {
+		log.Warn().Int("uid", os.Getuid()).Msg("⚠ Not running as root")
+	}
+
+	// Check current MEMLOCK limit
+	var rlim syscall.Rlimit
+	const RLIMIT_MEMLOCK = 8
+	if err := syscall.Getrlimit(RLIMIT_MEMLOCK, &rlim); err != nil {
+		log.Error().Err(err).Msg("✗ Failed to get MEMLOCK limit")
+	} else {
+		if rlim.Cur == ^uint64(0) {
+			log.Info().Msg("✓ MEMLOCK limit: unlimited")
+		} else {
+			log.Warn().
+				Uint64("current", rlim.Cur).
+				Uint64("max", rlim.Max).
+				Msg("⚠ MEMLOCK limit (bytes)")
+		}
+	}
+
+	// Check if eBPF filesystem is mounted
+	if _, err := os.Stat("/sys/fs/bpf"); err != nil {
+		log.Warn().Err(err).Msg("⚠ BPF filesystem not found at /sys/fs/bpf")
+	} else {
+		log.Info().Msg("✓ BPF filesystem available")
+	}
+
+	// Check available RDMA functions
+	available := checkAvailableFunctions()
+	if len(available) > 0 {
+		log.Info().
+			Int("count", len(available)).
+			Msg("✓ RDMA functions available for monitoring")
+		for fn, avail := range available {
+			if avail {
+				log.Info().Str("function", fn).Msg("  ✓ Available")
+			} else {
+				log.Warn().Str("function", fn).Msg("  ✗ Not available")
+			}
+		}
+	} else {
+		log.Warn().Msg("⚠ No RDMA functions found - RDMA monitoring not available")
+	}
+
+	// Check kernel version (basic check)
+	if data, err := os.ReadFile("/proc/version"); err != nil {
+		log.Warn().Err(err).Msg("⚠ Failed to read kernel version")
+	} else {
+		log.Info().Str("version", strings.TrimSpace(string(data))).Msg("ℹ Kernel version")
+	}
+
+	log.Info().Msg("=== End Diagnostics ===")
+}
+
+// checkAvailableFunctions checks which RDMA functions are available for hooking
+func checkAvailableFunctions() map[string]bool {
+	available := make(map[string]bool)
+
+	// List of functions to check
+	functions := []string{
+		"ib_modify_qp_with_udata",
+		"ib_destroy_qp_user",
+	}
+
+	// Read /proc/kallsyms to check function availability
+	if data, err := os.ReadFile("/proc/kallsyms"); err == nil {
+		kallsyms := string(data)
+		for _, fn := range functions {
+			// Check if function appears in kallsyms (more robust check)
+			if strings.Contains(kallsyms, " "+fn+" ") || strings.Contains(kallsyms, " "+fn+"\t") {
+				available[fn] = true
+				log.Debug().Str("function", fn).Msg("RDMA function available for hooking")
+			} else {
+				log.Debug().Str("function", fn).Msg("RDMA function not found in kallsyms")
+			}
+		}
+	} else {
+		log.Warn().Err(err).Msg("Failed to read /proc/kallsyms, assuming all functions available")
+		// Fallback: assume all functions are available
+		for _, fn := range functions {
+			available[fn] = true
+		}
+	}
+
+	return available
+}
+
+// PrintBpfTraceLog reads and displays eBPF trace log (bpf_printk output)
+// This helps debug GID read failures and other eBPF issues
+func PrintBpfTraceLog() {
+	log.Info().Msg("=== eBPF Trace Log (for debugging GID read failures) ===")
+	log.Info().Msg("Run the following command to see eBPF debug output:")
+	log.Info().Msg("  sudo cat /sys/kernel/debug/tracing/trace_pipe | grep 'trace_modify_qp\\|read_dest_qp_info\\|read_source_gid_safe'")
+	log.Info().Msg("Or to see all eBPF trace output:")
+	log.Info().Msg("  sudo cat /sys/kernel/debug/tracing/trace_pipe")
+	log.Info().Msg("=== End eBPF Trace Log Instructions ===")
+}
+
+// ValidateStructAlignment checks if the received event data makes sense
+func ValidateStructAlignment(event *RdmaConnTuple) error {
+	// Check struct size
+	if unsafe.Sizeof(*event) != expectedStructSize {
+		return fmt.Errorf("struct size mismatch: expected %d, got %d", expectedStructSize, unsafe.Sizeof(*event))
+	}
+
+	// Validate QPN ranges (QPNs should be reasonable values)
+	const maxQPN = 0x1000000 // 24-bit max
+	if event.SrcQPN > maxQPN {
+		return fmt.Errorf("source QPN %d (0x%x) exceeds maximum expected value", event.SrcQPN, event.SrcQPN)
+	}
+	if event.DstQPN > maxQPN {
+		return fmt.Errorf("destination QPN %d (0x%x) exceeds maximum expected value", event.DstQPN, event.DstQPN)
+	}
+
+	// Validate event type
+	if event.EventType < RdmaEventCreate || event.EventType > RdmaEventDestroy {
+		return fmt.Errorf("invalid event type %d", event.EventType)
+	}
+
+	// Validate timestamp (should be recent)
+	now := uint64(time.Now().UnixNano())
+	if event.Timestamp > now || event.Timestamp < now-uint64(time.Hour) {
+		return fmt.Errorf("timestamp %d seems invalid (now: %d)", event.Timestamp, now)
+	}
+
+	return nil
+}
+
+// DiagnoseStructAlignment provides detailed analysis of struct alignment issues
+func DiagnoseStructAlignment(event *RdmaConnTuple) {
+	log.Info().Msg("=== Struct Alignment Diagnosis ===")
+	log.Info().
+		Int("expected_size", expectedStructSize).
+		Int("actual_size", int(unsafe.Sizeof(*event))).
+		Msg("Struct size comparison")
+
+	// Print field offsets for debugging
+	log.Info().Str("field_offsets", fmt.Sprintf(
+		"Timestamp: %d, SrcGID: %d, DstGID: %d, SrcQPN: %d, DstQPN: %d, PID: %d, TID: %d, QPState: %d, EventType: %d, PortNum: %d, Reserved: %d, Comm: %d",
+		unsafe.Offsetof(event.Timestamp),
+		unsafe.Offsetof(event.SrcGID),
+		unsafe.Offsetof(event.DstGID),
+		unsafe.Offsetof(event.SrcQPN),
+		unsafe.Offsetof(event.DstQPN),
+		unsafe.Offsetof(event.PID),
+		unsafe.Offsetof(event.TID),
+		unsafe.Offsetof(event.QPState),
+		unsafe.Offsetof(event.EventType),
+		unsafe.Offsetof(event.PortNum),
+		unsafe.Offsetof(event.Reserved),
+		unsafe.Offsetof(event.Comm),
+	)).Msg("Field offsets")
+
+	// Validate alignment
+	if err := ValidateStructAlignment(event); err != nil {
+		log.Error().Err(err).Msg("Struct alignment validation failed")
+	} else {
+		log.Info().Msg("Struct alignment validation passed")
+	}
+	log.Info().Msg("=== End Struct Alignment Diagnosis ===")
+}
+
+// DiagnoseGidReadFailures provides specific guidance for troubleshooting GID read failures
+func DiagnoseGidReadFailures(stats map[string]uint64) {
+	gidReadSuccess := stats["gid_read_success"]
+	gidReadFailure := stats["gid_read_failure"]
+	errorCount := stats["error_count"]
+	portDataFailure := stats["port_data_failure"]
+	gidTableFailure := stats["gid_table_failure"]
+
+	log.Info().Msg("=== GID Read Failure Diagnosis ===")
+	log.Info().
+		Uint64("gid_read_success", gidReadSuccess).
+		Uint64("gid_read_failure", gidReadFailure).
+		Uint64("port_data_failure", portDataFailure).
+		Uint64("gid_table_failure", gidTableFailure).
+		Uint64("total_errors", errorCount).
+		Msg("Current eBPF statistics")
+
+	if gidReadFailure > 0 || errorCount > 0 || portDataFailure > 0 || gidTableFailure > 0 {
+		log.Warn().Msg("Detected GID read failures. Possible causes:")
+
+		if portDataFailure > 0 {
+			log.Warn().Msg("- Port data access failures: RDMA device structure mismatch")
+		}
+		if gidTableFailure > 0 {
+			log.Warn().Msg("- GID table access failures: Kernel structure alignment issues")
+		}
+		if gidReadFailure > 0 {
+			log.Warn().Msg("- GID read failures: Memory access or pointer issues")
+		}
+
+		log.Warn().Msg("1. Kernel version incompatibility with RDMA structure definitions")
+		log.Warn().Msg("2. RDMA driver not loaded or incompatible")
+		log.Warn().Msg("3. BTF (BPF Type Format) information mismatch")
+		log.Warn().Msg("4. Insufficient privileges for kernel memory access")
+		log.Warn().Msg("5. RDMA device not properly initialized")
+
+		log.Info().Msg("Troubleshooting steps:")
+		log.Info().Msg("1. Check kernel version: uname -r")
+		log.Info().Msg("2. Check RDMA modules: lsmod | grep ib_")
+		log.Info().Msg("3. Check RDMA devices: ibv_devices")
+		log.Info().Msg("4. Check eBPF trace log (see instructions above)")
+		log.Info().Msg("5. Verify running with root privileges")
+		log.Info().Msg("6. Check dmesg for RDMA/InfiniBand errors")
+	} else if gidReadSuccess > 0 {
+		log.Info().Msg("GID reads are working correctly")
+	} else {
+		log.Warn().Msg("No GID read attempts detected - RDMA traffic may not be present")
+	}
+	log.Info().Msg("=== End GID Read Failure Diagnosis ===")
+}

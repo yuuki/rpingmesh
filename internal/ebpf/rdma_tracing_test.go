@@ -186,3 +186,62 @@ func BenchmarkRdmaConnTuple_IsValidEvent(b *testing.B) {
 		_ = tuple.IsValidEvent()
 	}
 }
+
+// Test GID read failure diagnosis functions
+func TestDiagnoseGidReadFailures(t *testing.T) {
+	// Test with various statistics scenarios
+	testCases := []struct {
+		name  string
+		stats map[string]uint64
+	}{
+		{
+			name: "all_failures",
+			stats: map[string]uint64{
+				"gid_read_success": 0,
+				"gid_read_failure": 10,
+				"error_count":      5,
+			},
+		},
+		{
+			name: "mixed_results",
+			stats: map[string]uint64{
+				"gid_read_success": 5,
+				"gid_read_failure": 3,
+				"error_count":      2,
+			},
+		},
+		{
+			name: "all_success",
+			stats: map[string]uint64{
+				"gid_read_success": 10,
+				"gid_read_failure": 0,
+				"error_count":      0,
+			},
+		},
+		{
+			name: "no_activity",
+			stats: map[string]uint64{
+				"gid_read_success": 0,
+				"gid_read_failure": 0,
+				"error_count":      0,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// This function primarily logs, so we're just testing it doesn't panic
+			assert.NotPanics(t, func() {
+				DiagnoseGidReadFailures(tc.stats)
+			})
+		})
+	}
+}
+
+// Test PrintBpfTraceLog function
+func TestPrintBpfTraceLog(t *testing.T) {
+	// This function primarily logs, so we're just testing it doesn't panic
+	assert.NotPanics(t, func() {
+		PrintBpfTraceLog()
+	})
+}

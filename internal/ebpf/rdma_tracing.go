@@ -11,7 +11,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -27,6 +26,9 @@ import (
 
 //go:embed bpf/*
 var bpfFS embed.FS
+
+//go:embed btf/*
+var btfFS embed.FS
 
 // Event type constants matching eBPF definitions
 const (
@@ -210,24 +212,27 @@ func NewServiceTracer() (*ServiceTracer, error) {
 	}
 
 	moduleSpecs := make(map[string]*btf.Spec)
-	for _, file := range []string{"/var/lib/btf/ib_core", "/var/lib/btf/ib_uverbs"} {
-		f, err := os.Open(file)
+	for _, file := range []string{"ib_core.full.btf", "ib_uverbs.full.btf"} {
+		// Read embedded BTF file
+		data, err := btfFS.ReadFile("btf/" + file)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open file: %w", err)
+			return nil, fmt.Errorf("failed to read embedded BTF file %s: %w", file, err)
 		}
-		specs, err := btf.LoadSplitSpecFromReader(f, vmlinux)
+
+		// Create reader from embedded data
+		reader := bytes.NewReader(data)
+		specs, err := btf.LoadSplitSpecFromReader(reader, vmlinux)
 		if err != nil {
-			f.Close()
-			return nil, fmt.Errorf("failed to load split spec: %w", err)
+			return nil, fmt.Errorf("failed to load split spec from embedded file %s: %w", file, err)
 		}
-		f.Close()
-		moduleSpecs[filepath.Base(file)] = specs
+		// Use base name without extension for the key, but preserve the original logic
+		baseName := strings.TrimSuffix(strings.TrimSuffix(file, ".btf"), ".full")
+		moduleSpecs[baseName] = specs
 	}
 
 	// Options for compiling eBPF program
 	opts := ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{
-			KernelTypes:       vmlinux,
 			KernelModuleTypes: moduleSpecs,
 		},
 	}

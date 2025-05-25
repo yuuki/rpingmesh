@@ -335,16 +335,11 @@ static __always_inline int read_dest_qp_info_core(struct ib_qp_attr *attr,
 
 // CO-RE compatible function to hook ib_modify_qp
 SEC("kprobe/ib_modify_qp_with_udata")
-int trace_modify_qp(struct pt_regs *ctx) {
+int trace_modify_qp(struct ib_qp *qp, struct ib_qp_attr *attr, int attr_mask) {
     struct rdma_conn_tuple *event;
     struct ib_device *dev;
     __u8 port_num_for_gid = INVALID_PORT_NUM;
     __s32 qp_state_val = INVALID_QP_STATE;
-
-    // Get arguments from PT_REGS
-    struct ib_qp *qp = (struct ib_qp *)PT_REGS_PARM1(ctx);
-    struct ib_qp_attr *attr = (struct ib_qp_attr *)PT_REGS_PARM2(ctx);
-    int attr_mask = (int)PT_REGS_PARM3(ctx);
 
     if (!qp || !attr) {
         increment_stat(STAT_ERROR_COUNT);
@@ -441,17 +436,10 @@ int trace_modify_qp(struct pt_regs *ctx) {
 
 // CO-RE compatible function to hook ib_destroy_qp_user
 SEC("kprobe/ib_destroy_qp_user")
-int trace_destroy_qp_user(struct pt_regs *ctx) {
+int trace_destroy_qp_user(struct ib_qp *qp, struct ib_udata *udata) {
     struct rdma_conn_tuple *event;
     struct ib_device *dev;
     __u8 port_num_from_qp = INVALID_PORT_NUM;
-
-    // Get first argument (struct ib_qp *qp) from PT_REGS
-    struct ib_qp *qp = (struct ib_qp *)PT_REGS_PARM1(ctx);
-    if (!qp) {
-        increment_stat(STAT_ERROR_COUNT);
-        return 0;
-    }
 
     // Reserve space in the ring buffer
     event = bpf_ringbuf_reserve(&rdma_events, sizeof(*event), 0);

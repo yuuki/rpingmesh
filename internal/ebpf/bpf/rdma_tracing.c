@@ -1,4 +1,9 @@
 // go:build ignore
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+/*
+ * R-Pingmesh eBPF Program
+ * Copyright (c) 2025 Yuuki Tsubouchi
+ */
 
 // Support for CO-RE (Compile Once - Run Everywhere)
 #include "minimal_vmlinux.h"

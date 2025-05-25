@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+/*
+ * R-Pingmesh eBPF Program
+ * Copyright (c) 2025 Yuuki Tsubouchi
+ */
 #pragma once
 
 #include "minimal_vmlinux.h"

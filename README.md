@@ -170,3 +170,5 @@ RPingMesh consists of several components:
 ## License
 
 This software is licensed under the [MIT License](LICENSE).
+
+Note that the eBPF code located at `internal/ebpf/bpf/rdma_tracing.c` is dual-licensed under the MIT License and GPLv2.

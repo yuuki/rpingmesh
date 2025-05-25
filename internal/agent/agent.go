@@ -12,8 +12,10 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/agent/controller_client"
+	"github.com/yuuki/rpingmesh/internal/agent/serviceflowmonitor"
 	"github.com/yuuki/rpingmesh/internal/agent/telemetry"
 	"github.com/yuuki/rpingmesh/internal/config"
+	"github.com/yuuki/rpingmesh/internal/ebpf"
 	"github.com/yuuki/rpingmesh/internal/monitor"
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/internal/state"
@@ -55,17 +57,19 @@ const (
 
 // Agent represents the RPingMesh agent
 type Agent struct {
-	ctx              context.Context
-	cancel           context.CancelFunc
-	config           *config.AgentConfig
-	agentState       *state.AgentState
-	controllerClient *controller_client.ControllerClient
-	prober           *probe.Prober
-	clusterMonitor   *monitor.ClusterMonitor
-	tracer           *tracer.Tracer
-	uploader         *upload.Uploader
-	metrics          *telemetry.Metrics
-	wg               sync.WaitGroup
+	ctx                context.Context
+	cancel             context.CancelFunc
+	config             *config.AgentConfig
+	agentState         *state.AgentState
+	controllerClient   *controller_client.ControllerClient
+	prober             *probe.Prober
+	clusterMonitor     *monitor.ClusterMonitor
+	tracer             *tracer.Tracer
+	uploader           *upload.Uploader
+	metrics            *telemetry.Metrics
+	serviceTracer      *ebpf.ServiceTracer
+	serviceFlowMonitor *serviceflowmonitor.ServiceFlowMonitor
+	wg                 sync.WaitGroup
 }
 
 // New creates a new agent instance
@@ -79,7 +83,7 @@ func New(cfg *config.AgentConfig) (*Agent, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create agent state
-	agentState := state.NewAgentState(cfg.AgentID, "", cfg.GIDIndex)
+	agentState := state.NewAgentState(cfg.AgentID, cfg.HostName, "", cfg.GIDIndex)
 
 	// Initialize controller client
 	controllerClient := controller_client.NewControllerClient(cfg.ControllerAddr)
@@ -101,7 +105,25 @@ func New(cfg *config.AgentConfig) (*Agent, error) {
 		log.Info().Msg("Tracer is disabled via configuration")
 	}
 
-	log.Debug().Str("agent_id", cfg.AgentID).Str("controller_addr", cfg.ControllerAddr).Msg("Agent instance created")
+	// Initialize eBPF ServiceTracer if eBPF is generally enabled
+	if cfg.EBPFEnabled {
+		st, err := ebpf.NewServiceTracer()
+		if err != nil {
+			// If eBPF is required but fails, we might want to error out,
+			// especially if ServiceFlowMonitor is also enabled.
+			log.Error().Err(err).Msg("Failed to initialize eBPF ServiceTracer")
+			// Depending on strictness, could return an error here:
+			// return nil, fmt.Errorf("failed to initialize eBPF ServiceTracer: %w", err)
+			// For now, log and continue, ServiceFlowMonitor init will then also likely fail or be skipped.
+		} else {
+			agent.serviceTracer = st
+			log.Info().Msg("eBPF ServiceTracer initialized.")
+		}
+	} else {
+		log.Info().Msg("eBPF is disabled. ServiceFlowMonitor will not be available.")
+	}
+
+	log.Debug().Str("agent_id", cfg.AgentID).Str("controller_addr", cfg.ControllerAddr).Msg("Agent instance partially created, prober and SFM to be initialized in Start")
 	return agent, nil
 }
 
@@ -146,6 +168,30 @@ func (a *Agent) Start() error {
 	}
 	log.Debug().Msg("Prober started")
 
+	// Initialize and start ServiceFlowMonitor if enabled
+	if a.config.ServiceFlowMonitorEnabled {
+		if !a.config.EBPFEnabled || a.serviceTracer == nil {
+			log.Warn().Msg("ServiceFlowMonitor is enabled in config, but eBPF is disabled or eBPF ServiceTracer failed to initialize. ServiceFlowMonitor will NOT start.")
+		} else {
+			sfm, err := serviceflowmonitor.NewServiceFlowMonitor(a.ctx, a.serviceTracer, a.controllerClient, a.prober, a.agentState)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to create ServiceFlowMonitor")
+				// Potentially return error, or continue without it
+			} else {
+				a.serviceFlowMonitor = sfm
+				if err := a.serviceTracer.Start(); err != nil { // Start the eBPF tracer itself
+					log.Error().Err(err).Msg("Failed to start eBPF ServiceTracer for ServiceFlowMonitor")
+					// SFM might not work correctly, decide if this is fatal
+				} else {
+					a.serviceFlowMonitor.Start() // Start the monitor component that uses the tracer
+					log.Info().Msg("ServiceFlowMonitor started.")
+				}
+			}
+		}
+	} else {
+		log.Info().Msg("ServiceFlowMonitor is disabled via configuration.")
+	}
+
 	// Connect to controller
 	if err := a.controllerClient.Connect(); err != nil {
 		return fmt.Errorf("failed to connect to controller: %w", err)
@@ -155,6 +201,7 @@ func (a *Agent) Start() error {
 	// Register with controller
 	if err := a.controllerClient.RegisterAgent(
 		a.agentState.GetAgentID(),
+		a.agentState.GetHostName(),
 		a.agentState.GetAgentIP(),
 		a.agentState.GetDetectedRNICs(),
 	); err != nil {
@@ -502,6 +549,18 @@ func (a *Agent) Stop() {
 		log.Debug().Msg("Closing tracer")
 		if err := a.tracer.Close(); err != nil {
 			log.Error().Err(err).Msg("Failed to close tracer")
+		}
+	}
+
+	if a.serviceFlowMonitor != nil {
+		log.Debug().Msg("Stopping ServiceFlowMonitor")
+		a.serviceFlowMonitor.Stop()
+	}
+
+	if a.serviceTracer != nil { // Should be stopped after ServiceFlowMonitor uses it
+		log.Debug().Msg("Stopping eBPF ServiceTracer")
+		if err := a.serviceTracer.Stop(); err != nil {
+			log.Error().Err(err).Msg("Failed to stop eBPF ServiceTracer")
 		}
 	}
 

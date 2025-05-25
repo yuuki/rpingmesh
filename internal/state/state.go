@@ -17,6 +17,7 @@ const (
 // AgentState holds the current state of the agent
 type AgentState struct {
 	agentID         string
+	hostName        string
 	agentIP         string
 	localTorID      string
 	rdmaManager     *rdma.RDMAManager
@@ -30,9 +31,10 @@ type AgentState struct {
 }
 
 // NewAgentState creates a new agent state
-func NewAgentState(agentID, localTorID string, gidIndex int) *AgentState {
+func NewAgentState(agentID, hostName, localTorID string, gidIndex int) *AgentState {
 	return &AgentState{
 		agentID:         agentID,
+		hostName:        hostName,
 		localTorID:      DefaultLocalTorID,
 		senderQueues:    make(map[string]*rdma.UDQueue),
 		responderQueues: make(map[string]*rdma.UDQueue),
@@ -172,6 +174,13 @@ func (a *AgentState) GetAgentID() string {
 	a.mutex.RLock()
 	defer a.mutex.RUnlock()
 	return a.agentID
+}
+
+// GetHostName returns the OS hostname
+func (a *AgentState) GetHostName() string {
+	a.mutex.RLock()
+	defer a.mutex.RUnlock()
+	return a.hostName
 }
 
 // GetAgentIP returns the agent IP

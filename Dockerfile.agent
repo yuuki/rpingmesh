@@ -61,5 +61,6 @@ WORKDIR /app
 # Copy binary and config
 COPY --from=builder /app/bin/agent ./agent
 COPY --from=builder /app/agent.yaml ./agent.yaml
+COPY --from=builder /app/internal/ebpf/rdmatracing_x86_bpfel.o ./internal/ebpf/rdmatracing_x86_bpfel.o
 
 ENTRYPOINT ["./agent"]

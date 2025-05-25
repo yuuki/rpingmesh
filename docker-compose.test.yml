@@ -49,7 +49,6 @@ services:
     volumes:
       - go_mod_cache:/go/pkg/mod
       - go_build_cache:/root/.cache/go-build
-      - .:/app
     working_dir: /app
     environment:
       - CGO_ENABLED=1

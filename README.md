@@ -4,6 +4,11 @@
 
 R-Pingmesh is a monitoring tool for RDMA networks that uses eBPF to trace RDMA connections and perform network measurements. It is designed to be lightweight and efficient, and to be used in production environments.
 
+R-Pingmesh is an implementation based on the following research paper:
+
+Kefei Liu, Zhuo Jiang, Jiao Zhang, Shixian Guo, Xuan Zhang, Yangyang Bai, Yongbin Dong, Feng Luo, Zhang Zhang, Lei Wang, Xiang Shi, Haohan Xu, Yang Bai, Dongyang Song, Haoran Wei, Bo Li, Yongchen Pan, Tian Pan, Tao Huang, "R-Pingmesh: A Service-Aware RoCE Network Monitoring and Diagnostic System", the 38th annual conference of the ACM Special Interest Group on Data Communication (SIGCOMM), 2024.
+
+
 ## Requirements
 
 For building the application:

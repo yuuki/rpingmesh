@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+/*
+ * R-Pingmesh eBPF Program
+ * Copyright (c) 2025 Yuuki Tsubouchi
+ */
+
 // Minimal vmlinux.h for eBPF compilation
 // This is used when BTF information is not available from the kernel
 

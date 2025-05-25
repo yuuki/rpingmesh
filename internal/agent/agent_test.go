@@ -13,24 +13,10 @@ import (
 func TestNew(t *testing.T) {
 	// Create a test configuration
 	cfg := &config.AgentConfig{
-		AgentID:                   "test-agent",
-		HostName:                  "test-host",
-		ControllerAddr:            "localhost:50051",
-		AnalyzerAddr:              "localhost:50052",
-		LogLevel:                  "info",
-		ProbeIntervalMS:           1000,
-		TimeoutMS:                 500,
-		DataUploadIntervalMS:      10000,
-		TracerouteIntervalMS:      300000,
-		TracerouteOnTimeout:       true,
-		EBPFEnabled:               false,
-		ServiceFlowMonitorEnabled: false,
-		TracerEnabled:             false,
-		MetricsEnabled:            false,
-		AnalyzerEnabled:           false,
-		GIDIndex:                  0,
-		PinglistUpdateIntervalSec: 300,
-		ProbeRatePerSecond:        10,
+		AgentID:        "test-agent",
+		ControllerAddr: "localhost:50051",
+		AnalyzerAddr:   "localhost:50052",
+		LogLevel:       "info",
 	}
 
 	// Try to create a new agent
@@ -72,24 +58,13 @@ func TestAgentBasicOperation(t *testing.T) {
 
 	// Create a test configuration
 	cfg := &config.AgentConfig{
-		AgentID:                   "test-agent",
-		HostName:                  "test-host",
-		ControllerAddr:            "localhost:50051",
-		AnalyzerAddr:              "localhost:50052",
-		LogLevel:                  "info",
-		ProbeIntervalMS:           1000,
-		TimeoutMS:                 500,
-		DataUploadIntervalMS:      10000,
-		TracerouteIntervalMS:      300000,
-		TracerouteOnTimeout:       true,
-		EBPFEnabled:               false,
-		ServiceFlowMonitorEnabled: false,
-		TracerEnabled:             false,
-		MetricsEnabled:            false,
-		AnalyzerEnabled:           false,
-		GIDIndex:                  0,
-		PinglistUpdateIntervalSec: 300,
-		ProbeRatePerSecond:        10,
+		AgentID:              "test-agent",
+		ControllerAddr:       "localhost:50051",
+		AnalyzerAddr:         "localhost:50052",
+		LogLevel:             "info",
+		ProbeIntervalMS:      1000,
+		TimeoutMS:            500,
+		DataUploadIntervalMS: 10000,
 	}
 
 	// Create an agent
@@ -165,24 +140,16 @@ ebpf_enabled: false
 
 	// Create config manually with the expected values
 	cfg := &config.AgentConfig{
-		AgentID:                   "config-test-agent",
-		HostName:                  "test-host",
-		ControllerAddr:            "localhost:12345",
-		AnalyzerAddr:              "localhost:12346",
-		LogLevel:                  "debug",
-		ProbeIntervalMS:           2000,
-		TimeoutMS:                 1000,
-		DataUploadIntervalMS:      5000,
-		TracerouteIntervalMS:      300000,
-		TracerouteOnTimeout:       true,
-		EBPFEnabled:               false,
-		ServiceFlowMonitorEnabled: false,
-		TracerEnabled:             false,
-		MetricsEnabled:            false,
-		AnalyzerEnabled:           false,
-		GIDIndex:                  0,
-		PinglistUpdateIntervalSec: 300,
-		ProbeRatePerSecond:        10,
+		AgentID:              "config-test-agent",
+		ControllerAddr:       "localhost:12345",
+		AnalyzerAddr:         "localhost:12346",
+		LogLevel:             "debug",
+		ProbeIntervalMS:      2000,
+		TimeoutMS:            1000,
+		DataUploadIntervalMS: 5000,
+		TracerouteIntervalMS: 300000,
+		TracerouteOnTimeout:  true,
+		EBPFEnabled:          false,
 	}
 
 	// Verify configuration values

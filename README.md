@@ -1,6 +1,8 @@
-# rpingmesh
+# R-Pingmesh
+[![Go Tests](https://github.com/yuuki/rpingmesh/actions/workflows/go-test.yml/badge.svg)](https://github.com/yuuki/rpingmesh/actions/workflows/go-test.yml)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/yuuki/rpingmesh)
 
-RPingMesh is a monitoring tool for RDMA networks that uses eBPF to trace RDMA connections and perform network measurements.
+R-Pingmesh is a monitoring tool for RDMA networks that uses eBPF to trace RDMA connections and perform network measurements. It is designed to be lightweight and efficient, and to be used in production environments.
 
 ## Requirements
 

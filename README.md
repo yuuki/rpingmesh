@@ -167,4 +167,4 @@ RPingMesh consists of several components:
 
 ## License
 
-See [LICENSE](LICENSE) file for details.
+This software is licensed under the [MIT License](LICENSE).

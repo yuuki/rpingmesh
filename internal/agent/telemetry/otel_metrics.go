@@ -172,9 +172,9 @@ func NewMetrics(ctx context.Context, agentID, collectorAddr string) (*Metrics, e
 
 // RecordRTT records a RTT measurement
 func (m *Metrics) RecordRTT(ctx context.Context, rttNs int64, attributes ...metric.RecordOption) {
-	// Convert nanoseconds to milliseconds
-	rttMs := float64(rttNs) / 1_000_000.0
-	m.rttHistogram.Record(ctx, rttMs, attributes...)
+	// Convert nanoseconds to microseconds
+	rttUs := float64(rttNs) / 1_000.0
+	m.rttHistogram.Record(ctx, rttUs, attributes...)
 }
 
 // RecordTimeout records a probe timeout
@@ -184,16 +184,16 @@ func (m *Metrics) RecordTimeout(ctx context.Context, attributes ...metric.AddOpt
 
 // RecordProberDelay records a prober processing delay
 func (m *Metrics) RecordProberDelay(ctx context.Context, delayNs int64, attributes ...metric.RecordOption) {
-	// Convert nanoseconds to milliseconds
-	delayMs := float64(delayNs) / 1_000_000.0
-	m.proberDelayHistogram.Record(ctx, delayMs, attributes...)
+	// Convert nanoseconds to microseconds
+	delayUs := float64(delayNs) / 1_000.0
+	m.proberDelayHistogram.Record(ctx, delayUs, attributes...)
 }
 
 // RecordResponderDelay records a responder processing delay
 func (m *Metrics) RecordResponderDelay(ctx context.Context, delayNs int64, attributes ...metric.RecordOption) {
-	// Convert nanoseconds to milliseconds
-	delayMs := float64(delayNs) / 1_000_000.0
-	m.responderDelayHistogram.Record(ctx, delayMs, attributes...)
+	// Convert nanoseconds to microseconds
+	delayUs := float64(delayNs) / 1_000.0
+	m.responderDelayHistogram.Record(ctx, delayUs, attributes...)
 }
 
 // Shutdown stops the metrics provider

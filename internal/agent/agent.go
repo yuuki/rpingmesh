@@ -355,22 +355,20 @@ func (a *Agent) resultHandler() {
 				// Get device names and agent IDs from RNIC identifiers
 				var srcDeviceName, dstDeviceName, dstAgentID string
 
-				// Get source device name from primary RNIC
-				if primaryRnic := a.agentState.GetPrimaryRNIC(); primaryRnic != nil {
-					srcDeviceName = primaryRnic.DeviceName
+				// Get source device name from probe result's source RNIC
+				if result.SourceRnic != nil {
+					srcDeviceName = result.SourceRnic.DeviceName
 				}
 
 				// Get destination device name and agent ID from destination RNIC
 				if result.DestinationRnic != nil {
 					dstAgentID = result.DestinationRnic.HostName
-					// For destination device name, we need to look it up from the controller
-					// For now, we'll use the hostname as a fallback
-					dstDeviceName = result.DestinationRnic.HostName
+					dstDeviceName = result.DestinationRnic.DeviceName
 				}
 
 				// Create common attributes
 				commonAttrs := attribute.NewSet(
-					attribute.String("agent_id", a.agentState.GetAgentID()),
+					attribute.String("src_agent_id", a.agentState.GetAgentID()),
 					attribute.String("src_gid", result.FiveTuple.SrcGid),
 					attribute.String("dst_gid", result.FiveTuple.DstGid),
 					attribute.String("probe_type", result.ProbeType),

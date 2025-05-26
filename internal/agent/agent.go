@@ -354,6 +354,7 @@ func (a *Agent) resultHandler() {
 			if a.metrics != nil {
 				// Create common attributes
 				commonAttrs := attribute.NewSet(
+					attribute.String("agent_id", a.agentState.GetAgentID()),
 					attribute.String("src_gid", result.FiveTuple.SrcGid),
 					attribute.String("dst_gid", result.FiveTuple.DstGid),
 					attribute.String("probe_type", result.ProbeType),

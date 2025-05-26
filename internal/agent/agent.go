@@ -352,12 +352,31 @@ func (a *Agent) resultHandler() {
 
 			// Record metrics if enabled
 			if a.metrics != nil {
+				// Get device names and agent IDs from RNIC identifiers
+				var srcDeviceName, dstDeviceName, dstAgentID string
+
+				// Get source device name from primary RNIC
+				if primaryRnic := a.agentState.GetPrimaryRNIC(); primaryRnic != nil {
+					srcDeviceName = primaryRnic.DeviceName
+				}
+
+				// Get destination device name and agent ID from destination RNIC
+				if result.DestinationRnic != nil {
+					dstAgentID = result.DestinationRnic.HostName
+					// For destination device name, we need to look it up from the controller
+					// For now, we'll use the hostname as a fallback
+					dstDeviceName = result.DestinationRnic.HostName
+				}
+
 				// Create common attributes
 				commonAttrs := attribute.NewSet(
 					attribute.String("agent_id", a.agentState.GetAgentID()),
 					attribute.String("src_gid", result.FiveTuple.SrcGid),
 					attribute.String("dst_gid", result.FiveTuple.DstGid),
 					attribute.String("probe_type", result.ProbeType),
+					attribute.String("src_device_name", srcDeviceName),
+					attribute.String("dst_device_name", dstDeviceName),
+					attribute.String("dst_agent_id", dstAgentID),
 				)
 
 				// Record metrics based on probe status

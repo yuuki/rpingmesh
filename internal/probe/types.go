@@ -29,6 +29,7 @@ type PingTarget struct {
 	IPAddress        string
 	HostName         string
 	TorID            string
+	DeviceName       string
 	SourcePort       uint32
 	FlowLabel        uint32
 	Priority         uint32

@@ -267,16 +267,18 @@ func (p *Prober) ProbeTarget(
 		// Populate and send error result via probeResults
 		result := &agent_analyzer.ProbeResult{
 			SourceRnic: &agent_analyzer.RnicIdentifier{
-				Gid:       actualSrcGid,
-				IpAddress: sourceRnic.IPAddr,
-				HostName:  p.agentState.GetHostName(),
+				Gid:        actualSrcGid,
+				IpAddress:  sourceRnic.IPAddr,
+				HostName:   p.agentState.GetHostName(),
+				DeviceName: sourceRnic.DeviceName,
 			},
 			DestinationRnic: &agent_analyzer.RnicIdentifier{
-				Gid:       target.GID,
-				Qpn:       target.QPN,
-				IpAddress: target.IPAddress,
-				HostName:  target.HostName,
-				TorId:     target.TorID,
+				Gid:        target.GID,
+				Qpn:        target.QPN,
+				IpAddress:  target.IPAddress,
+				HostName:   target.HostName,
+				TorId:      target.TorID,
+				DeviceName: target.DeviceName,
 			},
 			FiveTuple: &agent_analyzer.ProbeFiveTuple{
 				SrcGid:    actualSrcGid,
@@ -326,16 +328,18 @@ func (p *Prober) ProbeTarget(
 			// Populate and send error result via probeResults
 			result := &agent_analyzer.ProbeResult{
 				SourceRnic: &agent_analyzer.RnicIdentifier{
-					Gid:       actualSrcGid,
-					IpAddress: p.getRnicByGid(actualSrcGid).IPAddr,
-					HostName:  p.agentState.GetHostName(),
+					Gid:        actualSrcGid,
+					IpAddress:  p.getRnicByGid(actualSrcGid).IPAddr,
+					HostName:   p.agentState.GetHostName(),
+					DeviceName: p.getRnicByGid(actualSrcGid).DeviceName,
 				},
 				DestinationRnic: &agent_analyzer.RnicIdentifier{
-					Gid:       target.GID,
-					Qpn:       target.QPN,
-					IpAddress: target.IPAddress,
-					HostName:  target.HostName,
-					TorId:     target.TorID,
+					Gid:        target.GID,
+					Qpn:        target.QPN,
+					IpAddress:  target.IPAddress,
+					HostName:   target.HostName,
+					TorId:      target.TorID,
+					DeviceName: target.DeviceName,
 				},
 				FiveTuple: &agent_analyzer.ProbeFiveTuple{
 					SrcGid:    actualSrcGid,
@@ -367,17 +371,19 @@ func (p *Prober) ProbeTarget(
 
 	result := &agent_analyzer.ProbeResult{
 		SourceRnic: &agent_analyzer.RnicIdentifier{
-			Gid:       actualSrcGid,
-			Qpn:       actualSrcQpn,
-			IpAddress: sourceRnicInfo.IPAddr,
-			HostName:  p.agentState.GetHostName(),
+			Gid:        actualSrcGid,
+			Qpn:        actualSrcQpn,
+			IpAddress:  sourceRnicInfo.IPAddr,
+			HostName:   p.agentState.GetHostName(),
+			DeviceName: sourceRnicInfo.DeviceName,
 		},
 		DestinationRnic: &agent_analyzer.RnicIdentifier{
-			Gid:       target.GID,
-			Qpn:       target.QPN,
-			IpAddress: target.IPAddress,
-			HostName:  target.HostName,
-			TorId:     target.TorID,
+			Gid:        target.GID,
+			Qpn:        target.QPN,
+			IpAddress:  target.IPAddress,
+			HostName:   target.HostName,
+			TorId:      target.TorID,
+			DeviceName: target.DeviceName,
 		},
 		FiveTuple: &agent_analyzer.ProbeFiveTuple{
 			SrcGid:    actualSrcGid,

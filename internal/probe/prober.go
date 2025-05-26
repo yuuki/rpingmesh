@@ -28,6 +28,7 @@ import (
 
 // PingSession holds the state for a single probe transaction.
 type PingSession struct {
+	FlowLabel     uint32 // Flow label used as session key
 	SequenceNum   uint64
 	SourceRnicGid string
 	TargetGid     string
@@ -54,7 +55,7 @@ type Prober struct {
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
 	timeout       time.Duration
-	sessions      map[uint64]*PingSession // Key: Sequence Number
+	sessions      map[uint32]*PingSession // Key: Flow Label
 	sessionsMutex sync.RWMutex
 	nextSeqNum    uint64
 	metricMutex   sync.Mutex // To protect metrics if any are directly managed here
@@ -78,7 +79,7 @@ func NewProber(manager *rdma.RDMAManager, agentState *state.AgentState, timeoutM
 		probeResults:       make(chan *agent_analyzer.ProbeResult, probeResultChanBufferSize),
 		stopCh:             make(chan struct{}),
 		timeout:            time.Duration(timeoutMs) * time.Millisecond,
-		sessions:           make(map[uint64]*PingSession),
+		sessions:           make(map[uint32]*PingSession),
 		nextSeqNum:         0,
 		serviceFlowTargets: make([]*PingTarget, 0), // Changed from monitor.PingTarget
 	}
@@ -142,7 +143,7 @@ func (p *Prober) Close() error {
 			close(session.Ack2Chan)
 		}
 	}
-	p.sessions = make(map[uint64]*PingSession) // Clear sessions map
+	p.sessions = make(map[uint32]*PingSession) // Clear sessions map
 	p.sessionsMutex.Unlock()
 
 	close(p.probeResults)
@@ -240,7 +241,9 @@ func (p *Prober) ProbeTarget(
 	}
 
 	seqNum := atomic.AddUint64(&p.nextSeqNum, 1)
+	flowLabel := target.FlowLabel // Use target's flow label as session key
 	session := &PingSession{
+		FlowLabel:     flowLabel,
 		SequenceNum:   seqNum,
 		SourceRnicGid: sourceRnic.GID,
 		TargetGid:     target.GID,
@@ -250,7 +253,7 @@ func (p *Prober) ProbeTarget(
 		CreationTime:  time.Now(),
 	}
 	p.addSession(session)
-	defer p.removeSession(seqNum)
+	defer p.removeSession(flowLabel)
 
 	var actualSrcGid, actualDstGid string
 	var actualSrcQpn, actualDstQpn, actualFlowLabel uint32
@@ -739,14 +742,12 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 		return
 	}
 
-	// sessionKey is now sequence number, which should be in Packet.SequenceNum
-	// The FlowLabel from GRH was previously used, but that can collide.
-	// The PingSession map key is uint64 (seqNum).
-	// We need to get the session using SequenceNum from the packet.
-	sessionKey := ackInfo.Packet.SequenceNum // Use SequenceNum from packet as the session key
+	// sessionKey is flow label from the GRH (Global Routing Header)
+	// This is the original implementation approach using flow label as session key
+	sessionKey := ackInfo.ProcessedWC.FlowLabel // Use FlowLabel from ProcessedWC as the session key
 
 	log.Trace().
-		Uint64("sessionKey_seqNum", sessionKey). // Changed from flowLabel to seqNum
+		Uint32("sessionKey_flowLabel", sessionKey). // Changed back to flowLabel
 		Uint64("packet_seqNum", ackInfo.Packet.SequenceNum).
 		Uint8("packet_ackType", ackInfo.Packet.AckType).
 		Str("source_gid_from_grh", ackInfo.ProcessedWC.SGID).   // From ProcessedWC
@@ -767,7 +768,7 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 		// AckStatusOK should ideally be set based on ackInfo.ProcessedWC.Status == C.IBV_WC_SUCCESS
 		if !ackInfo.AckStatusOK { // This flag should be set correctly by the caller (e.g. CQ poller in rdma package)
 			log.Error().
-				Uint64("sessionKey_seqNum", sessionKey).           // Changed
+				Uint32("sessionKey_flowLabel", sessionKey).        // Changed back to flowLabel
 				Int("rdma_wc_status", ackInfo.ProcessedWC.Status). // Log the actual RDMA status
 				Msg("[prober_handler]: Received ACK but RDMA completion status was not OK (indicated by AckStatusOK flag).")
 			return
@@ -783,13 +784,13 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 			targetChan = session.Ack2Chan
 			chanName = "Ack2Chan"
 		} else {
-			log.Warn().Uint64("sessionKey_seqNum", sessionKey).Uint8("ackType", ackInfo.Packet.AckType).Msg("[prober_handler]: Received ACK with unknown type") // Changed
+			log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Uint8("ackType", ackInfo.Packet.AckType).Msg("[prober_handler]: Received ACK with unknown type") // Changed back to flowLabel
 			return
 		}
 
 		if targetChan == nil {
 			log.Warn().
-				Uint64("sessionKey_seqNum", sessionKey). // Changed
+				Uint32("sessionKey_flowLabel", sessionKey). // Changed back to flowLabel
 				Str("chan", chanName).
 				Msg("[prober_handler]: Session channel is nil. Session likely ended or cleaned up.")
 			return
@@ -798,14 +799,14 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 		// Non-blocking send to the session channel
 		select {
 		case targetChan <- probeEvent:
-			log.Trace().Uint64("sessionKey_seqNum", sessionKey).Str("chan", chanName). // Changed
+			log.Trace().Uint32("sessionKey_flowLabel", sessionKey).Str("chan", chanName). // Changed back to flowLabel
 													Msg("[prober_handler]: Successfully sent ACK event to session channel")
 		default:
-			log.Warn().Uint64("sessionKey_seqNum", sessionKey).Str("chan", chanName). // Changed
+			log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Str("chan", chanName). // Changed back to flowLabel
 													Msg("[prober_handler]: Session channel blocked or closed (likely late ACK or session ended).")
 		}
 	} else {
-		log.Warn().Uint64("sessionKey_seqNum", sessionKey).Uint64("packet_seqNum", ackInfo.Packet.SequenceNum).Msg("[prober_handler]: Received ACK for non-existent or already cleaned-up session") // Changed
+		log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Uint64("packet_seqNum", ackInfo.Packet.SequenceNum).Msg("[prober_handler]: Received ACK for non-existent or already cleaned-up session") // Changed back to flowLabel
 	}
 }
 
@@ -824,14 +825,14 @@ func (p *Prober) getRnicByGid(gid string) *rdma.RNIC {
 func (p *Prober) addSession(session *PingSession) {
 	p.sessionsMutex.Lock()
 	defer p.sessionsMutex.Unlock()
-	p.sessions[session.SequenceNum] = session
+	p.sessions[session.FlowLabel] = session
 }
 
 // removeSession removes a session from the map.
-func (p *Prober) removeSession(seqNum uint64) {
+func (p *Prober) removeSession(flowLabel uint32) {
 	p.sessionsMutex.Lock()
 	defer p.sessionsMutex.Unlock()
-	session, ok := p.sessions[seqNum]
+	session, ok := p.sessions[flowLabel]
 	if ok {
 		if session.Ack1Chan != nil {
 			close(session.Ack1Chan)
@@ -839,15 +840,15 @@ func (p *Prober) removeSession(seqNum uint64) {
 		if session.Ack2Chan != nil {
 			close(session.Ack2Chan)
 		}
-		delete(p.sessions, seqNum)
+		delete(p.sessions, flowLabel)
 	}
 }
 
-// getSession retrieves a session by sequence number.
-func (p *Prober) getSession(seqNum uint64) *PingSession {
+// getSession retrieves a session by flow label.
+func (p *Prober) getSession(flowLabel uint32) *PingSession {
 	p.sessionsMutex.RLock()
 	defer p.sessionsMutex.RUnlock()
-	session, exists := p.sessions[seqNum]
+	session, exists := p.sessions[flowLabel]
 	if !exists {
 		return nil
 	}

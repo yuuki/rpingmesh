@@ -38,6 +38,10 @@ type PingSession struct {
 	Ack2Chan chan *ackEvent // Receives the second ACK (type 2)
 
 	CreationTime time.Time
+
+	// Use sync.Once for elegant channel closing and chan struct{} for status check
+	closeOnce sync.Once
+	closed    chan struct{} // Closed when session is terminated
 }
 
 // ackEvent is a wrapper for ACK data received.
@@ -136,12 +140,15 @@ func (p *Prober) Close() error {
 	p.sessionsMutex.Lock()
 	// Close any active session channels
 	for _, session := range p.sessions {
-		if session.Ack1Chan != nil {
-			close(session.Ack1Chan)
-		}
-		if session.Ack2Chan != nil {
-			close(session.Ack2Chan)
-		}
+		session.closeOnce.Do(func() {
+			close(session.closed)
+			if session.Ack1Chan != nil {
+				close(session.Ack1Chan)
+			}
+			if session.Ack2Chan != nil {
+				close(session.Ack2Chan)
+			}
+		})
 	}
 	p.sessions = make(map[uint32]*PingSession) // Clear sessions map
 	p.sessionsMutex.Unlock()
@@ -251,6 +258,7 @@ func (p *Prober) ProbeTarget(
 		Ack1Chan:      make(chan *ackEvent, 1),
 		Ack2Chan:      make(chan *ackEvent, 1),
 		CreationTime:  time.Now(),
+		closed:        make(chan struct{}), // Initialize closed channel
 	}
 	p.addSession(session)
 	defer p.removeSession(flowLabel)
@@ -767,13 +775,33 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 		}
 
 		// Non-blocking send to the session channel
+		// Use select to safely check if session is closed and send to channel
 		select {
+		case <-session.closed:
+			// Session is closed, cannot send
+			log.Warn().
+				Uint32("sessionKey_flowLabel", sessionKey).
+				Str("chan", chanName).
+				Msg("[prober_handler]: Session is closed, cannot send ACK event.")
 		case targetChan <- probeEvent:
-			log.Trace().Uint32("sessionKey_flowLabel", sessionKey).Str("chan", chanName). // Changed back to flowLabel
-													Msg("[prober_handler]: Successfully sent ACK event to session channel")
+			// Successfully sent
+			log.Trace().Uint32("sessionKey_flowLabel", sessionKey).Str("chan", chanName).
+				Msg("[prober_handler]: Successfully sent ACK event to session channel")
 		default:
-			log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Str("chan", chanName). // Changed back to flowLabel
-													Msg("[prober_handler]: Session channel blocked or closed (likely late ACK or session ended).")
+			// Channel is blocked or nil
+			log.Warn().
+				Uint32("sessionKey_flowLabel", sessionKey).
+				Str("chan", chanName).
+				Bool("closed", func() bool {
+					select {
+					case <-session.closed:
+						return true
+					default:
+						return false
+					}
+				}()).
+				Bool("chanNil", targetChan == nil).
+				Msg("[prober_handler]: Session channel blocked or closed (likely late ACK or session ended).")
 		}
 	} else {
 		log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Uint64("packet_seqNum", ackInfo.Packet.SequenceNum).Msg("[prober_handler]: Received ACK for non-existent or already cleaned-up session") // Changed back to flowLabel
@@ -804,12 +832,16 @@ func (p *Prober) removeSession(flowLabel uint32) {
 	defer p.sessionsMutex.Unlock()
 	session, ok := p.sessions[flowLabel]
 	if ok {
-		if session.Ack1Chan != nil {
-			close(session.Ack1Chan)
-		}
-		if session.Ack2Chan != nil {
-			close(session.Ack2Chan)
-		}
+		// Safely close the session channels using sync.Once
+		session.closeOnce.Do(func() {
+			close(session.closed)
+			if session.Ack1Chan != nil {
+				close(session.Ack1Chan)
+			}
+			if session.Ack2Chan != nil {
+				close(session.Ack2Chan)
+			}
+		})
 		delete(p.sessions, flowLabel)
 	}
 }

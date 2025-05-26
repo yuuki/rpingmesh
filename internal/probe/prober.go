@@ -75,7 +75,7 @@ func NewProber(manager *rdma.RDMAManager, agentState *state.AgentState, timeoutM
 	return &Prober{
 		rdmaManager:        manager,
 		agentState:         agentState,
-		probeResults:       make(chan *agent_analyzer.ProbeResult, 1000), // Buffer size
+		probeResults:       make(chan *agent_analyzer.ProbeResult, probeResultChanBufferSize),
 		stopCh:             make(chan struct{}),
 		timeout:            time.Duration(timeoutMs) * time.Millisecond,
 		sessions:           make(map[uint64]*PingSession),
@@ -98,13 +98,31 @@ func (p *Prober) UpdateServiceFlowTargets(targets []*PingTarget) { // Changed fr
 
 // Start initializes the prober and starts its background processing.
 func (p *Prober) Start() error {
-	// p.wg.Add(1) // If HandleIncomingRDMAPacket is a persistent goroutine started here.
-	// Assuming it's called externally or managed by RDMA layer for now.
+	// Start responder loops for all detected RNICs
+	detectedRnics := p.agentState.GetDetectedRNICs()
+	for _, rnic := range detectedRnics {
+		if rnic == nil {
+			continue
+		}
 
-	p.wg.Add(1) // For the service probing loop
+		// Get responder UD queue for this RNIC
+		responderQueue := p.agentState.GetResponderUDQueue(rnic.GID)
+		if responderQueue == nil {
+			log.Warn().Str("rnic_gid", rnic.GID).Msg("No responder UD queue available for RNIC")
+			continue
+		}
+
+		// Start responder loop for this queue
+		p.wg.Add(1)
+		go p.responderLoop(responderQueue)
+		log.Debug().Str("rnic_gid", rnic.GID).Uint32("qpn", responderQueue.QPN).Msg("Started responder loop for RNIC")
+	}
+
+	// Start service probing loop
+	p.wg.Add(1)
 	go p.runServiceProbingLoop()
 
-	log.Info().Msg("Prober started, including service probing loop.")
+	log.Info().Msg("Prober started with responder loops and service probing loop.")
 	return nil
 }
 
@@ -210,7 +228,7 @@ func (p *Prober) runServiceProbingLoop() {
 func (p *Prober) ProbeTarget(
 	ctx context.Context,
 	sourceRnic *rdma.RNIC, // Local RNIC used for sending the probe
-	target *PingTarget, // Target details, including potential ServiceFlowTuple. Changed from monitor.PingTarget
+	target *PingTarget, // Target details, including potential ServiceFlowTuple
 ) {
 	if sourceRnic == nil {
 		log.Error().Msg("ProbeTarget called with nil sourceRnic")
@@ -222,14 +240,13 @@ func (p *Prober) ProbeTarget(
 	}
 
 	seqNum := atomic.AddUint64(&p.nextSeqNum, 1)
-	// target.GID is the GID of the ultimate destination for the probe
-	session := &PingSession{ // Changed to direct struct initialization
+	session := &PingSession{
 		SequenceNum:   seqNum,
 		SourceRnicGid: sourceRnic.GID,
 		TargetGid:     target.GID,
 		ProbeType:     target.ProbeType,
-		Ack1Chan:      make(chan *ackEvent, 1), // Buffer of 1 is usually sufficient
-		Ack2Chan:      make(chan *ackEvent, 1), // Buffer of 1
+		Ack1Chan:      make(chan *ackEvent, 1),
+		Ack2Chan:      make(chan *ackEvent, 1),
 		CreationTime:  time.Now(),
 	}
 	p.addSession(session)
@@ -244,14 +261,37 @@ func (p *Prober) ProbeTarget(
 	srcUdQueue := p.agentState.GetSenderUDQueue(actualSrcGid)
 	if srcUdQueue == nil {
 		log.Error().Str("srcGID", actualSrcGid).Msg("No sender UDQueue available for source RNIC")
-		// TODO: Populate and send error result via probeResults
+		// Populate and send error result via probeResults
+		result := &agent_analyzer.ProbeResult{
+			SourceRnic: &agent_analyzer.RnicIdentifier{
+				Gid:       actualSrcGid,
+				IpAddress: sourceRnic.IPAddr,
+				HostName:  p.agentState.GetHostName(),
+			},
+			DestinationRnic: &agent_analyzer.RnicIdentifier{
+				Gid:       target.GID,
+				Qpn:       target.QPN,
+				IpAddress: target.IPAddress,
+				HostName:  target.HostName,
+				TorId:     target.TorID,
+			},
+			FiveTuple: &agent_analyzer.ProbeFiveTuple{
+				SrcGid:    actualSrcGid,
+				DstGid:    target.GID,
+				DstQpn:    target.QPN,
+				FlowLabel: target.FlowLabel,
+			},
+			ProbeType: target.ProbeType,
+			Status:    agent_analyzer.ProbeResult_ERROR,
+		}
+		p.probeResults <- result
 		return
 	}
 	actualSrcQpn = srcUdQueue.QPN
 	actualDstGid = target.GID
 	actualDstQpn = target.QPN
 	actualFlowLabel = target.FlowLabel
-	srcPortForPacket = target.SourcePort // For RoCE UDP source port
+	srcPortForPacket = target.SourcePort
 
 	// If it's a service tracing probe, override with ServiceFlowTuple specifics
 	if target.ProbeType == ProbeTypeServiceTracing && target.ServiceFlowTuple != nil {
@@ -280,6 +320,31 @@ func (p *Prober) ProbeTarget(
 		tmpSrcUdQueue := p.agentState.GetSenderUDQueue(actualSrcGid) // Still gets generic queue
 		if tmpSrcUdQueue == nil {
 			log.Error().Str("srcGID", actualSrcGid).Msg("No sender UDQueue for service flow's source GID")
+			// Populate and send error result via probeResults
+			result := &agent_analyzer.ProbeResult{
+				SourceRnic: &agent_analyzer.RnicIdentifier{
+					Gid:       actualSrcGid,
+					IpAddress: p.getRnicByGid(actualSrcGid).IPAddr,
+					HostName:  p.agentState.GetHostName(),
+				},
+				DestinationRnic: &agent_analyzer.RnicIdentifier{
+					Gid:       target.GID,
+					Qpn:       target.QPN,
+					IpAddress: target.IPAddress,
+					HostName:  target.HostName,
+					TorId:     target.TorID,
+				},
+				FiveTuple: &agent_analyzer.ProbeFiveTuple{
+					SrcGid:    actualSrcGid,
+					SrcQpn:    flow.SrcQPN,
+					DstGid:    actualDstGid,
+					DstQpn:    actualDstQpn,
+					FlowLabel: actualFlowLabel,
+				},
+				ProbeType: target.ProbeType,
+				Status:    agent_analyzer.ProbeResult_ERROR,
+			}
+			p.probeResults <- result
 			return
 		}
 		// WARNING: Overriding actualSrcQpn to the generic UD QPN due to current limitations.
@@ -289,11 +354,19 @@ func (p *Prober) ProbeTarget(
 		srcUdQueue = tmpSrcUdQueue // Use this UD queue for sending.
 	}
 
+	// Get RNIC info for result construction with proper error handling
+	sourceRnicInfo := p.getRnicByGid(actualSrcGid)
+	if sourceRnicInfo == nil {
+		log.Error().Str("actualSrcGid", actualSrcGid).Msg("Could not find source RNIC info for result construction")
+		// Use basic info from sourceRnic parameter
+		sourceRnicInfo = sourceRnic
+	}
+
 	result := &agent_analyzer.ProbeResult{
 		SourceRnic: &agent_analyzer.RnicIdentifier{
 			Gid:       actualSrcGid,
 			Qpn:       actualSrcQpn,
-			IpAddress: p.getRnicByGid(actualSrcGid).IPAddr,
+			IpAddress: sourceRnicInfo.IPAddr,
 			HostName:  p.agentState.GetHostName(),
 		},
 		DestinationRnic: &agent_analyzer.RnicIdentifier{
@@ -320,14 +393,19 @@ func (p *Prober) ProbeTarget(
 		Str("actualDstGID", actualDstGid).Uint32("actualDstQPN", actualDstQpn).
 		Uint32("actualFlowLabel", actualFlowLabel).
 		Uint64("seqNum", seqNum).
-		Msg("Prober: Starting probe to target")
+		Msg("[prober]: Starting probe to target")
 
 	sendCtx, sendCancel := context.WithTimeout(ctx, p.timeout)
 	defer sendCancel()
 
 	t1, t2, err := srcUdQueue.SendProbePacket(sendCtx, actualDstGid, actualDstQpn, seqNum, srcPortForPacket, actualFlowLabel)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to send probe packet")
+		log.Error().Err(err).
+			Str("actualSrcGID", actualSrcGid).Uint32("actualSrcQPN", actualSrcQpn).
+			Str("actualDstGID", actualDstGid).Uint32("actualDstQPN", actualDstQpn).
+			Uint32("actualFlowLabel", actualFlowLabel).
+			Uint64("seqNum", seqNum).
+			Msg("Failed to send probe packet")
 		result.Status = agent_analyzer.ProbeResult_ERROR
 		p.probeResults <- result
 		return
@@ -335,35 +413,61 @@ func (p *Prober) ProbeTarget(
 	result.T1 = timestamppb.New(t1)
 	result.T2 = timestamppb.New(t2)
 
+	log.Trace().
+		Str("actualSrcGID", actualSrcGid).Uint32("actualSrcQPN", actualSrcQpn).
+		Str("actualDstGID", actualDstGid).Uint32("actualDstQPN", actualDstQpn).
+		Uint32("actualFlowLabel", actualFlowLabel).
+		Uint64("seqNum", seqNum).
+		Time("t1", t1).Time("t2", t2).
+		Msg("[prober]: Probe packet sent successfully, waiting for ACKs")
+
 	// Wait for ACK in session
 	select {
 	case ack1Event, ok := <-session.Ack1Chan: // Listen on Ack1Chan
 		if !ok {
-			log.Warn().Uint64("seqNum", seqNum).Msg("Session Ack1Chan channel closed prematurely")
+			log.Warn().Uint64("seqNum", seqNum).
+				Str("actualDstGID", actualDstGid).
+				Msg("[prober]: Session Ack1Chan channel closed prematurely")
 			result.Status = agent_analyzer.ProbeResult_ERROR
 			p.probeResults <- result
 			return
 		}
 
+		log.Trace().Uint64("seqNum", seqNum).
+			Str("actualDstGID", actualDstGid).
+			Msg("[prober]: Received first ACK, waiting for second ACK")
+
 		// Now wait for the second ACK
 		select {
 		case ack2Event, ok := <-session.Ack2Chan: // Listen on Ack2Chan
 			if !ok {
-				log.Warn().Uint64("seqNum", seqNum).Msg("Session Ack2Chan channel closed prematurely")
+				log.Warn().Uint64("seqNum", seqNum).
+					Str("actualDstGID", actualDstGid).
+					Msg("[prober]: Session Ack2Chan channel closed prematurely")
 				result.Status = agent_analyzer.ProbeResult_ERROR
 				p.probeResults <- result
 				return
 			}
 			// Both ACKs received
 			result.Status = agent_analyzer.ProbeResult_OK
+			log.Trace().Uint64("seqNum", seqNum).
+				Str("actualDstGID", actualDstGid).
+				Msg("[prober]: Received both ACKs, processing timestamps and delays")
+
 			// T1 and T2 are set before sending.
 			// T3 and T4 are from the first ACK (responder's perspective on original probe)
 			// ack1Event.Packet should contain T3 and T4 as set by the responder.
 			if ack1Event.Packet != nil {
 				result.T3 = timestamppb.New(time.Unix(0, int64(ack1Event.Packet.T3)))
 				result.T4 = timestamppb.New(time.Unix(0, int64(ack1Event.Packet.T4)))
+				log.Trace().Uint64("seqNum", seqNum).
+					Time("t3", time.Unix(0, int64(ack1Event.Packet.T3))).
+					Time("t4", time.Unix(0, int64(ack1Event.Packet.T4))).
+					Msg("[prober]: Set T3 and T4 from first ACK packet")
 			} else {
-				log.Warn().Uint64("seqNum", seqNum).Msg("ack1Event.Packet is nil, cannot set T3/T4")
+				log.Warn().Uint64("seqNum", seqNum).
+					Str("actualDstGID", actualDstGid).
+					Msg("[prober]: ack1Event.Packet is nil, cannot set T3/T4")
 				// Potentially set status to error or handle missing T3/T4 in calculations
 			}
 
@@ -372,6 +476,11 @@ func (p *Prober) ProbeTarget(
 			result.T5 = timestamppb.New(ack2Event.ReceivedAt) // When second ACK was physically received
 			result.T6 = timestamppb.New(ack2Event.ReceivedAt) // Placeholder: prober poll complete for second ACK.
 			// Need to clarify how T6 is precisely measured in the context of two ACKs.
+
+			log.Trace().Uint64("seqNum", seqNum).
+				Time("t5", ack2Event.ReceivedAt).
+				Time("t6", ack2Event.ReceivedAt).
+				Msg("[prober]: Set T5 and T6 from second ACK reception")
 
 			// Calculate delays (ensure Packet fields are correct)
 			// These calculations need to be revisited based on the two-ACK model.
@@ -409,7 +518,20 @@ func (p *Prober) ProbeTarget(
 					responderDelay := t4Time.Sub(t3Time).Nanoseconds()
 					result.ResponderDelay = responderDelay
 					result.NetworkRtt = (t5Time.Sub(t2Time).Nanoseconds()) - responderDelay
+
+					log.Trace().Uint64("seqNum", seqNum).
+						Int64("responderDelay_ns", responderDelay).
+						Int64("networkRtt_ns", result.NetworkRtt).
+						Msg("[prober]: Calculated responder delay and network RTT")
+				} else {
+					log.Warn().Uint64("seqNum", seqNum).
+						Bool("t2_valid", result.T2 != nil).
+						Bool("t3_valid", result.T3 != nil).
+						Bool("t4_valid", result.T4 != nil).
+						Bool("t5_valid", result.T5 != nil).
+						Msg("[prober]: Cannot calculate responder delay and network RTT due to missing timestamps")
 				}
+
 				if result.T1 != nil && result.T6 != nil && result.T2 != nil && result.T5 != nil {
 					// Prober delay: (T6-T1) - (T5-T2)
 					// (T6-T1) is total time at prober for the transaction.
@@ -425,22 +547,53 @@ func (p *Prober) ProbeTarget(
 					t5Time := result.T5.AsTime()
 					if result.T6.IsValid() && result.T1.IsValid() && result.T5.IsValid() && result.T2.IsValid() {
 						result.ProberDelay = (t6Time.Sub(t1Time).Nanoseconds()) - (t5Time.Sub(t2Time).Nanoseconds())
+						log.Trace().Uint64("seqNum", seqNum).
+							Int64("proberDelay_ns", result.ProberDelay).
+							Msg("[prober]: Calculated prober delay")
+					} else {
+						log.Warn().Uint64("seqNum", seqNum).
+							Bool("t1_valid", result.T1 != nil && result.T1.IsValid()).
+							Bool("t6_valid", result.T6 != nil && result.T6.IsValid()).
+							Bool("t2_valid", result.T2 != nil && result.T2.IsValid()).
+							Bool("t5_valid", result.T5 != nil && result.T5.IsValid()).
+							Msg("[prober]: Cannot calculate prober delay due to invalid timestamps")
 					}
 				}
 			} else {
-				log.Warn().Uint64("seqNum", seqNum).Msg("ack2Event.Packet is nil, cannot calculate delays accurately.")
+				log.Warn().Uint64("seqNum", seqNum).
+					Str("actualDstGID", actualDstGid).
+					Msg("[prober]: ack2Event.Packet is nil, cannot calculate delays accurately.")
 			}
 
+			log.Debug().Uint64("seqNum", seqNum).
+				Str("actualDstGID", actualDstGid).
+				Int64("networkRtt_ns", result.NetworkRtt).
+				Int64("responderDelay_ns", result.ResponderDelay).
+				Int64("proberDelay_ns", result.ProberDelay).
+				Msg("[prober]: Probe completed successfully with both ACKs")
+
 		case <-ctx.Done(): // Timeout waiting for the second ACK
-			log.Warn().Uint64("seqNum", seqNum).Str("targetGID", actualDstGid).Msg("Probe timed out waiting for second ACK")
+			log.Warn().Uint64("seqNum", seqNum).
+				Str("targetGID", actualDstGid).
+				Str("probeType", target.ProbeType).
+				Msg("[prober]: Probe timed out waiting for second ACK")
 			result.Status = agent_analyzer.ProbeResult_TIMEOUT
 			// If first ACK was received, we might have partial data, but status is still TIMEOUT overall.
 		}
 
 	case <-ctx.Done(): // Timeout waiting for the first ACK
-		log.Warn().Uint64("seqNum", seqNum).Str("targetGID", actualDstGid).Msg("Probe timed out waiting for first ACK")
+		log.Warn().Uint64("seqNum", seqNum).
+			Str("targetGID", actualDstGid).
+			Str("probeType", target.ProbeType).
+			Msg("[prober]: Probe timed out waiting for first ACK")
 		result.Status = agent_analyzer.ProbeResult_TIMEOUT
 	}
+
+	log.Trace().Uint64("seqNum", seqNum).
+		Str("actualDstGID", actualDstGid).
+		Str("status", result.Status.String()).
+		Msg("Sending probe result to results channel")
+
 	p.probeResults <- result
 }
 

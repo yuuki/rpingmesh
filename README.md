@@ -26,6 +26,7 @@ R-Pingmesh solves these challenges with **active probing**, **precise measuremen
 - **Sub-microsecond precision** with CQE timestamps
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'primaryTextColor':'#333333', 'fontSize':'14px'}}}%%
 sequenceDiagram
     participant P as Prober
     participant PN as Prober RNIC
@@ -68,6 +69,7 @@ sequenceDiagram
 - **5-tuple aware** measurements for ECMP environments
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'primaryTextColor':'#333333', 'fontSize':'14px'}}}%%
 flowchart TD
     subgraph "Service Discovery Process"
         A[Application creates RDMA connection] --> B[eBPF hooks modify_qp syscall]
@@ -98,121 +100,79 @@ flowchart TD
 R-Pingmesh consists of three core components.
 
 ```mermaid
-graph TB
-    subgraph "RoCE Host 1"
-        A1[Agent]
-        A1_RDMA[RDMA Manager]
-        A1_EBPF[eBPF Service Tracer]
-        A1_PROBE[Active Probing Engine]
-        A1_PATH[Path Tracer]
-        A1_CLIENT[Controller Client]
-        A1_UPLOAD[Upload Client]
+%%{init: {'theme':'base', 'themeVariables': {'primaryTextColor':'#333333', 'lineColor':'#666666', 'fontSize':'16px'}}}%%
+flowchart TD
+    %% Agent Layer
+    A1["🖥️ Agent (Host 1)<br/>────────────────<br/>RDMA Manager<br/>eBPF Service Tracer<br/>Active Probing Engine<br/>Path Tracer<br/>Controller Client<br/>Upload Client"]
 
-        A1 --> A1_RDMA
-        A1 --> A1_EBPF
-        A1 --> A1_PROBE
-        A1 --> A1_PATH
-        A1 --> A1_CLIENT
-        A1 --> A1_UPLOAD
+    A1_HW["⚙️ Hardware Layer<br/>────────────────<br/>RDMA Hardware<br/>UD Queue Pairs<br/>CQE Timestamps"]
 
-        subgraph "Hardware Layer"
-            HW1[RDMA Hardware<br/>UD Queue Pairs<br/>CQE Timestamps]
-        end
+    A1_KERNEL["🔧 Kernel Layer<br/>────────────────<br/>eBPF Programs<br/>modify_qp/destroy_qp<br/>Ring Buffer Events"]
 
-        subgraph "Kernel Layer"
-            EBPF1[eBPF Programs<br/>modify_qp / destroy_qp<br/>Ring Buffer Events]
-        end
+    AN["🖥️ Agent (Host N)<br/>────────────────<br/>Core Modules<br/>RDMA Hardware<br/>eBPF Programs"]
 
-        A1_RDMA -.-> HW1
-        A1_EBPF -.-> EBPF1
-    end
+    %% Network Infrastructure
+    NET["🌐 RoCE Network<br/>────────────────<br/>RoCE Fabric<br/>ToR Switches<br/>Spine Switches<br/>Active Probing Paths"]
 
-    subgraph "RoCE Host N"
-        AN[Agent N]
-        HWN[RDMA Hardware]
-        EBPFN[eBPF Programs]
+    %% Controller
+    C["🎛️ Controller<br/>────────────────<br/>RNIC Registry<br/>Pinglist Generator<br/>gRPC Server<br/>Configuration Manager"]
 
-        AN -.-> HWN
-        AN -.-> EBPFN
-    end
+    C_DB["💾 Controller Storage<br/>────────────────<br/>RNIC Database<br/>GID → RNIC Info<br/>ToR ID → RNIC List"]
 
-    subgraph "Control Plane"
-        C[Controller]
-        C_REG[RNIC Registry]
-        C_PING[Pinglist Generator]
-        C_GRPC[gRPC Server]
-        C_CONFIG[Configuration Manager]
-        C_DB[(RNIC Database<br/>GID → RNIC Info<br/>ToR ID → RNIC List)]
+    %% Analyzer
+    AZ["📊 Analyzer<br/>────────────────<br/>Data Ingestion API<br/>Anomaly Detection<br/>Root Cause Analysis<br/>SLA Tracker"]
 
-        C --> C_REG
-        C --> C_PING
-        C --> C_GRPC
-        C --> C_CONFIG
-        C --> C_DB
-    end
+    %% Monitoring Capabilities
+    MONITORING["🔍 Monitoring Modes<br/>────────────────<br/>• Cluster Monitoring<br/>  (ToR-mesh, Inter-ToR)<br/>• Service Tracing<br/>  (eBPF Flow Discovery)<br/>• Path Tracing<br/>  (Network Topology)<br/>• Anomaly Detection<br/>  (RNIC vs Network)"]
 
-    subgraph "Analytics Plane"
-        AZ[Analyzer]
-        AZ_API[Data Ingestion API]
-        AZ_ANOMALY[Anomaly Detection]
-        AZ_RCA[Root Cause Analysis]
-        AZ_SLA[SLA Tracker]
-        AZ_ALERT[Alert Manager]
-        AZ_TSDB[(Time Series DB<br/>RTT Metrics<br/>Path Information<br/>Anomaly Events)]
-        AZ_DASH[Monitoring Dashboard<br/>Real-time Visualization<br/>Alert Notifications]
+    %% OpenTelemetry Integration
+    OTLP["📡 OpenTelemetry (OTLP)<br/>────────────────<br/>RTT Metrics Export"]
 
-        AZ --> AZ_API
-        AZ --> AZ_ANOMALY
-        AZ --> AZ_RCA
-        AZ --> AZ_SLA
-        AZ --> AZ_ALERT
-        AZ --> AZ_TSDB
-        AZ --> AZ_DASH
-    end
+    %% Vertical Flow
+    A1 --> A1_HW
+    A1 --> A1_KERNEL
+    A1_HW --> NET
+    A1_KERNEL --> NET
+    AN --> NET
 
-    subgraph "RoCE Network"
-        NET[RoCE Fabric<br/>ToR Switches<br/>Spine Switches]
-    end
+    NET --> C
+    C --> C_DB
 
-    %% Communication flows
-    A1_CLIENT <-->|gRPC<br/>Registration<br/>Pinglists| C_GRPC
-    AN <-->|gRPC| C_GRPC
+    C --> AZ
 
-    A1_UPLOAD -->|gRPC Upload<br/>Probe Results<br/>Path Traces| AZ_API
-    AN -->|gRPC Upload| AZ_API
+    AZ --> MONITORING
+    A1 -.-> MONITORING
+    AN -.-> MONITORING
 
-    %% Network probing
-    A1_PROBE <-.->|Active Probing<br/>RTT Measurement| NET
-    AN <-.->|Active Probing| NET
+    %% OpenTelemetry Integration
+    A1 -->|"OTLP Export<br/>RTT Metrics"| OTLP
+    AN -->|"OTLP Export"| OTLP
+    OTLP --> MONITORING
 
-    %% Monitoring modes
-    subgraph "Monitoring Modes"
-        direction LR
-        CM[Cluster Monitoring<br/>ToR-mesh Probing<br/>Inter-ToR Probing]
-        ST[Service Tracing<br/>eBPF Flow Discovery<br/>Dynamic Probing]
-        PT[Path Tracing<br/>Network Topology<br/>Traceroute]
-        AD[Anomaly Detection<br/>RNIC vs Network<br/>Impact Assessment]
-    end
-
-    A1 -.-> CM
-    A1 -.-> ST
-    A1 -.-> PT
-    AZ -.-> AD
+    %% Communication Labels
+    A1 -.->|"Active Probing<br/>RTT Measurement"| NET
+    AN -.->|"Active Probing"| NET
+    A1 <-.->|"gRPC Registration<br/>Pinglists"| C
+    AN <-.->|"gRPC"| C
+    A1 -->|"gRPC Upload<br/>Probe Results"| AZ
+    AN -->|"Data Upload"| AZ
 
     %% Styling
-    classDef agentClass fill:#4CAF50,stroke:#2E7D32,stroke-width:2px,color:#fff
-    classDef controllerClass fill:#2196F3,stroke:#1565C0,stroke-width:2px,color:#fff
-    classDef analyzerClass fill:#FF9800,stroke:#E65100,stroke-width:2px,color:#fff
-    classDef hardwareClass fill:#9E9E9E,stroke:#424242,stroke-width:2px,color:#fff
-    classDef networkClass fill:#E3F2FD,stroke:#1976D2,stroke-width:2px,color:#1976D2
-    classDef monitoringClass fill:#F3E5F5,stroke:#7B1FA2,stroke-width:2px,color:#7B1FA2
+    classDef agentClass fill:#4CAF50,stroke:#2E7D32,stroke-width:3px,color:#fff,font-weight:bold
+    classDef controllerClass fill:#2196F3,stroke:#1565C0,stroke-width:3px,color:#fff,font-weight:bold
+    classDef analyzerClass fill:#FF9800,stroke:#E65100,stroke-width:3px,color:#fff,font-weight:bold
+    classDef networkClass fill:#E3F2FD,stroke:#1976D2,stroke-width:3px,color:#1976D2,font-weight:bold
+    classDef storageClass fill:#9E9E9E,stroke:#424242,stroke-width:3px,color:#fff,font-weight:bold
+        classDef monitoringClass fill:#F3E5F5,stroke:#7B1FA2,stroke-width:3px,color:#7B1FA2,font-weight:bold
+    classDef otlpClass fill:#E8F5E8,stroke:#4CAF50,stroke-width:3px,color:#2E7D32,font-weight:bold
 
-    class A1,AN,A1_RDMA,A1_EBPF,A1_PROBE,A1_PATH,A1_CLIENT,A1_UPLOAD agentClass
-    class C,C_REG,C_PING,C_GRPC,C_CONFIG controllerClass
-    class AZ,AZ_API,AZ_ANOMALY,AZ_RCA,AZ_SLA,AZ_ALERT analyzerClass
-    class HW1,HWN,EBPF1,EBPFN,C_DB,AZ_TSDB,AZ_DASH hardwareClass
+    class A1,AN agentClass
+    class C controllerClass
+    class AZ analyzerClass
     class NET networkClass
-    class CM,ST,PT,AD monitoringClass
+    class A1_HW,A1_KERNEL,C_DB storageClass
+    class MONITORING monitoringClass
+    class OTLP otlpClass
 ```
 
 ### Agent

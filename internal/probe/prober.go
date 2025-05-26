@@ -479,7 +479,9 @@ func (p *Prober) ProbeTarget(
 			// T5 is when the prober received the *second* ACK.
 			// T6 is when the prober finished processing the *second* ACK (poll complete).
 			result.T5 = timestamppb.New(ack2Event.ReceivedAt) // When second ACK was physically received
-			result.T6 = timestamppb.New(ack2Event.ReceivedAt) // Placeholder: prober poll complete for second ACK.
+
+			t6 := time.Now() // T6 is prober's post-processing time
+			result.T6 = timestamppb.New(t6)
 
 			// Calculate delays (ensure Packet fields are correct)
 			// These calculations need to be revisited based on the two-ACK model.

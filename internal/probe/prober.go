@@ -53,16 +53,15 @@ type ackEvent struct {
 
 // Prober is responsible for sending probe packets and collecting results.
 type Prober struct {
-	rdmaManager   *rdma.RDMAManager
-	agentState    *state.AgentState
-	probeResults  chan *agent_analyzer.ProbeResult
-	stopCh        chan struct{}
-	wg            sync.WaitGroup
-	timeout       time.Duration
-	sessions      map[uint32]*PingSession // Key: Flow Label
-	sessionsMutex sync.RWMutex
-	nextSeqNum    uint64
-	metricMutex   sync.Mutex // To protect metrics if any are directly managed here
+	rdmaManager  *rdma.RDMAManager
+	agentState   *state.AgentState
+	probeResults chan *agent_analyzer.ProbeResult
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
+	timeout      time.Duration
+	sessions     sync.Map // Key: uint32 (Flow Label), Value: *PingSession
+	nextSeqNum   uint64
+	metricMutex  sync.Mutex // To protect metrics if any are directly managed here
 
 	// For Service Flow Tracing
 	// Using PingTarget from the same package now
@@ -83,7 +82,7 @@ func NewProber(manager *rdma.RDMAManager, agentState *state.AgentState, timeoutM
 		probeResults:       make(chan *agent_analyzer.ProbeResult, probeResultChanBufferSize),
 		stopCh:             make(chan struct{}),
 		timeout:            time.Duration(timeoutMs) * time.Millisecond,
-		sessions:           make(map[uint32]*PingSession),
+		sessions:           sync.Map{},
 		nextSeqNum:         0,
 		serviceFlowTargets: make([]*PingTarget, 0), // Changed from monitor.PingTarget
 	}
@@ -137,9 +136,9 @@ func (p *Prober) Close() error {
 	close(p.stopCh) // Signal all internal goroutines to stop
 	p.wg.Wait()     // Wait for all goroutines (like runServiceProbingLoop) to finish
 
-	p.sessionsMutex.Lock()
 	// Close any active session channels
-	for _, session := range p.sessions {
+	p.sessions.Range(func(key, value interface{}) bool {
+		session := value.(*PingSession)
 		session.closeOnce.Do(func() {
 			close(session.closed)
 			if session.Ack1Chan != nil {
@@ -149,9 +148,9 @@ func (p *Prober) Close() error {
 				close(session.Ack2Chan)
 			}
 		})
-	}
-	p.sessions = make(map[uint32]*PingSession) // Clear sessions map
-	p.sessionsMutex.Unlock()
+		p.sessions.Delete(key) // Remove session from sync.Map
+		return true            // Continue iteration
+	})
 
 	close(p.probeResults)
 	log.Info().Msg("Prober closed.")
@@ -821,17 +820,13 @@ func (p *Prober) getRnicByGid(gid string) *rdma.RNIC {
 
 // addSession adds a session to the map.
 func (p *Prober) addSession(session *PingSession) {
-	p.sessionsMutex.Lock()
-	defer p.sessionsMutex.Unlock()
-	p.sessions[session.FlowLabel] = session
+	p.sessions.Store(session.FlowLabel, session)
 }
 
 // removeSession removes a session from the map.
 func (p *Prober) removeSession(flowLabel uint32) {
-	p.sessionsMutex.Lock()
-	defer p.sessionsMutex.Unlock()
-	session, ok := p.sessions[flowLabel]
-	if ok {
+	if value, ok := p.sessions.LoadAndDelete(flowLabel); ok {
+		session := value.(*PingSession)
 		// Safely close the session channels using sync.Once
 		session.closeOnce.Do(func() {
 			close(session.closed)
@@ -842,17 +837,13 @@ func (p *Prober) removeSession(flowLabel uint32) {
 				close(session.Ack2Chan)
 			}
 		})
-		delete(p.sessions, flowLabel)
 	}
 }
 
 // getSession retrieves a session by flow label.
 func (p *Prober) getSession(flowLabel uint32) *PingSession {
-	p.sessionsMutex.RLock()
-	defer p.sessionsMutex.RUnlock()
-	session, exists := p.sessions[flowLabel]
-	if !exists {
-		return nil
+	if value, ok := p.sessions.Load(flowLabel); ok {
+		return value.(*PingSession)
 	}
-	return session
+	return nil
 }

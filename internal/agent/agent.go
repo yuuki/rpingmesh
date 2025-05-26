@@ -347,7 +347,7 @@ func (a *Agent) resultHandler() {
 				Str("src_gid", result.FiveTuple.SrcGid).
 				Str("dst_gid", result.FiveTuple.DstGid).
 				Int32("status", int32(result.Status)).
-				Float64("rtt_ms", float64(result.NetworkRtt)/1000000.0).
+				Int64("rtt_us", result.NetworkRtt/1000).
 				Msg("Received probe result")
 
 			// Record metrics if enabled

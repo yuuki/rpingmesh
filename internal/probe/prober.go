@@ -446,6 +446,20 @@ func (p *Prober) ProbeTarget(
 			Str("actualDstGID", actualDstGid).
 			Msg("[prober]: Received first ACK, waiting for second ACK")
 
+		// T1 and T2 are set before sending.
+		// T3 are from the first ACK (responder's perspective on original probe)
+		// ack1Event.Packet should contain T3 as set by the responder.
+		t3 := time.Unix(0, int64(ack1Event.Packet.T3))
+		result.T3 = timestamppb.New(t3)
+
+		// T5 is when the prober received the *first* ACK.
+		// T6 is when the prober finished processing the *first* ACK (poll complete).
+		t5 := ack1Event.ReceivedAt // When first ACK was physically received
+		result.T5 = timestamppb.New(t5)
+
+		t6 := time.Now() // T6 is when the prober finished processing the *first* ACK (CQE poll complete).
+		result.T6 = timestamppb.New(t6)
+
 		// Now wait for the second ACK
 		select {
 		case ack2Event, ok := <-session.Ack2Chan: // Listen on Ack2Chan
@@ -463,12 +477,11 @@ func (p *Prober) ProbeTarget(
 				Str("actualDstGID", actualDstGid).
 				Msg("[prober]: Received both ACKs, processing timestamps and delays")
 
-			// T1 and T2 are set before sending.
-			// T3 and T4 are from the first ACK (responder's perspective on original probe)
-			// ack1Event.Packet should contain T3 and T4 as set by the responder.
+			// T4 is when the prober received the *second* ACK.
+			var t4 time.Time
 			if ack1Event.Packet != nil {
-				result.T3 = timestamppb.New(time.Unix(0, int64(ack1Event.Packet.T3)))
-				result.T4 = timestamppb.New(time.Unix(0, int64(ack1Event.Packet.T4)))
+				t4 = time.Unix(0, int64(ack1Event.Packet.T4))
+				result.T4 = timestamppb.New(t4)
 			} else {
 				log.Warn().Uint64("seqNum", seqNum).
 					Str("actualDstGID", actualDstGid).
@@ -476,36 +489,13 @@ func (p *Prober) ProbeTarget(
 				// Potentially set status to error or handle missing T3/T4 in calculations
 			}
 
-			// T5 is when the prober received the *second* ACK.
-			// T6 is when the prober finished processing the *second* ACK (poll complete).
-			result.T5 = timestamppb.New(ack2Event.ReceivedAt) // When second ACK was physically received
-
-			t6 := time.Now() // T6 is prober's post-processing time
-			result.T6 = timestamppb.New(t6)
-
 			// Calculate delays (ensure Packet fields are correct)
-			// These calculations need to be revisited based on the two-ACK model.
-			// For now, using fields from ack2Event.Packet for responder delay and ack1Event.Packet potentially for others.
-			// This part is highly dependent on what timestamps are carried in each ACK.
-
-			// For now, let's assume ack2Event.Packet contains the final calculated delays from responder
-			// This is a simplification. The actual calculation is more complex with two ACKs.
 			if ack2Event.Packet != nil {
-				// Let's assume for now that T3, T4 are from the first ACK's payload
-				// and the RDMA layer calculates/passes these.
-				// The current ackEvent.Packet might not have direct NetworkRttNS etc.
-				// These are calculated based on T1-T6.
-
-				// Re-calculate based on T1-T6
 				if result.T2 != nil && result.T3 != nil && result.T4 != nil && result.T5 != nil {
-					t2Time := result.T2.AsTime()
-					t3Time := result.T3.AsTime()
-					t4Time := result.T4.AsTime()
-					t5Time := result.T5.AsTime()
-
-					responderDelay := t4Time.Sub(t3Time).Nanoseconds()
-					result.ResponderDelay = responderDelay
-					result.NetworkRtt = (t5Time.Sub(t2Time).Nanoseconds()) - responderDelay
+					responderDelay := t4.Sub(t3)
+					result.ResponderDelay = responderDelay.Nanoseconds()
+					result.NetworkRtt = (t5.Sub(t2) - responderDelay).Nanoseconds()
+					result.ProberDelay = (t6.Sub(t1) - (t5.Sub(t2))).Nanoseconds()
 				} else {
 					log.Warn().Uint64("seqNum", seqNum).
 						Bool("t2_valid", result.T2 != nil).
@@ -513,34 +503,6 @@ func (p *Prober) ProbeTarget(
 						Bool("t4_valid", result.T4 != nil).
 						Bool("t5_valid", result.T5 != nil).
 						Msg("[prober]: Cannot calculate responder delay and network RTT due to missing timestamps")
-				}
-
-				if result.T1 != nil && result.T6 != nil && result.T2 != nil && result.T5 != nil {
-					// Prober delay: (T6-T1) - (T5-T2)
-					// (T6-T1) is total time at prober for the transaction.
-					// (T5-T2) is network RTT + responder processing for the *probe* packet's lifecycle.
-					// This definition of ProberDelay = (T6-T1) - (T5-T2) needs to be re-checked with the paper's definition.
-					// (T6-T1) - ((T5-T2) - (T4-T3)) - (T4-T3)
-					// If T6 is poll complete of second ACK, T1 is post send of probe.
-					// If T5 is receive of second ACK, T2 is CQE of probe send.
-					// The current ProbeResult proto has: ProberDelay = (T6-T1)-(T5-T2)
-					t1Time := result.T1.AsTime()
-					t6Time := result.T6.AsTime()
-					t2Time := result.T2.AsTime()
-					t5Time := result.T5.AsTime()
-					if result.T6.IsValid() && result.T1.IsValid() && result.T5.IsValid() && result.T2.IsValid() {
-						result.ProberDelay = (t6Time.Sub(t1Time).Nanoseconds()) - (t5Time.Sub(t2Time).Nanoseconds())
-						log.Trace().Uint64("seqNum", seqNum).
-							Int64("proberDelay_ns", result.ProberDelay).
-							Msg("[prober]: Calculated prober delay")
-					} else {
-						log.Warn().Uint64("seqNum", seqNum).
-							Bool("t1_valid", result.T1 != nil && result.T1.IsValid()).
-							Bool("t6_valid", result.T6 != nil && result.T6.IsValid()).
-							Bool("t2_valid", result.T2 != nil && result.T2.IsValid()).
-							Bool("t5_valid", result.T5 != nil && result.T5.IsValid()).
-							Msg("[prober]: Cannot calculate prober delay due to invalid timestamps")
-					}
 				}
 			} else {
 				log.Warn().Uint64("seqNum", seqNum).
@@ -553,12 +515,12 @@ func (p *Prober) ProbeTarget(
 				Int64("networkRtt_ns", result.NetworkRtt).
 				Int64("responderDelay_ns", result.ResponderDelay).
 				Int64("proberDelay_ns", result.ProberDelay).
-				Int64("t1_ns", result.T1.AsTime().UnixNano()).
-				Int64("t2_ns", result.T2.AsTime().UnixNano()).
-				Int64("t3_ns", result.T3.AsTime().UnixNano()).
-				Int64("t4_ns", result.T4.AsTime().UnixNano()).
-				Int64("t5_ns", result.T5.AsTime().UnixNano()).
-				Int64("t6_ns", result.T6.AsTime().UnixNano()).
+				Int64("t1_ns", int64(t1.UnixNano())).
+				Int64("t2_ns", int64(t2.UnixNano())).
+				Int64("t3_ns", int64(t3.UnixNano())).
+				Int64("t4_ns", int64(t4.UnixNano())).
+				Int64("t5_ns", int64(t5.UnixNano())).
+				Int64("t6_ns", int64(t6.UnixNano())).
 				Msg("[prober]: Probe completed successfully with both ACKs")
 
 		case <-ctx.Done(): // Timeout waiting for the second ACK

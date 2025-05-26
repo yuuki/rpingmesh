@@ -347,7 +347,7 @@ func (a *Agent) resultHandler() {
 				Str("src_gid", result.FiveTuple.SrcGid).
 				Str("dst_gid", result.FiveTuple.DstGid).
 				Int32("status", int32(result.Status)).
-				Int64("rtt_us", result.NetworkRtt/1000).
+				Float64("rtt_us", float64(result.NetworkRtt)/1000000.0).
 				Msg("Received probe result")
 
 			// Record metrics if enabled
@@ -480,77 +480,112 @@ func (a *Agent) runPinglistUpdater() {
 	}
 }
 
-// updatePinglist gets a fresh pinglist from the controller
+// updatePinglist gets a fresh pinglist from the controller for all local RNICs
 func (a *Agent) updatePinglist() {
 	log.Debug().Msg("Updating pinglist from controller")
 
-	primaryRnic := a.agentState.GetPrimaryRNIC()
-	if primaryRnic == nil {
-		log.Error().Msg("No primary RNIC available")
+	// Get all detected RNICs instead of just the primary one
+	localRnics := a.agentState.GetDetectedRNICs()
+	if len(localRnics) == 0 {
+		log.Error().Msg("No local RNICs available")
 		return
 	}
-	log.Debug().Str("primary_rnic_gid", primaryRnic.GID).Msg("Retrieved primary RNIC for pinglist request")
+	log.Debug().Int("local_rnic_count", len(localRnics)).Msg("Retrieved local RNICs for pinglist requests")
 
-	// Get ToR-mesh pinglist
-	torTargets, intervalMs, timeoutMs, err := a.controllerClient.GetPinglist(
-		primaryRnic,
-		controller_agent.PinglistRequest_TOR_MESH,
-	)
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to get ToR-mesh pinglist")
-		return
+	// Collect all targets from all RNICs to avoid duplicates and ensure proper flow label distribution
+	allTorTargets := make([]*controller_agent.PingTarget, 0)
+	allInterTorTargets := make([]*controller_agent.PingTarget, 0)
+
+	var lastIntervalMs, lastTimeoutMs uint32
+
+	// Get pinglist for each local RNIC to ensure unique flow labels
+	for _, localRnic := range localRnics {
+		if localRnic == nil || localRnic.GID == "" {
+			log.Warn().Msg("Skipping invalid local RNIC")
+			continue
+		}
+
+		log.Debug().Str("local_rnic_gid", localRnic.GID).Msg("Getting pinglist for local RNIC")
+
+		// Get ToR-mesh pinglist for this RNIC
+		torTargets, intervalMs, timeoutMs, err := a.controllerClient.GetPinglist(
+			localRnic,
+			controller_agent.PinglistRequest_TOR_MESH,
+		)
+		if err != nil {
+			log.Error().Err(err).Str("rnic_gid", localRnic.GID).Msg("Failed to get ToR-mesh pinglist for RNIC")
+			continue
+		}
+		log.Debug().Str("rnic_gid", localRnic.GID).Int("target_count", len(torTargets)).Msg("Received ToR-mesh pinglist data for RNIC")
+
+		// Add targets to the combined list
+		allTorTargets = append(allTorTargets, torTargets...)
+
+		// Get Inter-ToR pinglist for this RNIC
+		interTorTargets, _, _, err := a.controllerClient.GetPinglist(
+			localRnic,
+			controller_agent.PinglistRequest_INTER_TOR,
+		)
+		if err != nil {
+			log.Error().Err(err).Str("rnic_gid", localRnic.GID).Msg("Failed to get Inter-ToR pinglist for RNIC")
+			continue
+		}
+		log.Debug().Str("rnic_gid", localRnic.GID).Int("target_count", len(interTorTargets)).Msg("Received Inter-ToR pinglist data for RNIC")
+
+		// Add targets to the combined list
+		allInterTorTargets = append(allInterTorTargets, interTorTargets...)
+
+		// Store the last valid interval and timeout values
+		if intervalMs > 0 {
+			lastIntervalMs = intervalMs
+		}
+		if timeoutMs > 0 {
+			lastTimeoutMs = timeoutMs
+		}
 	}
-	log.Debug().Int("target_count", len(torTargets)).Msg("Received ToR-mesh pinglist data")
 
-	// Log ToR-mesh targets grouped by AgentID at Trace level
+	// Log combined ToR-mesh targets grouped by AgentID
 	torTargetsByAgent := make(map[string][]*controller_agent.RnicInfo)
-	for _, target := range torTargets {
+	for _, target := range allTorTargets {
 		if target.TargetRnic != nil {
 			torTargetsByAgent[target.TargetRnic.HostName] = append(torTargetsByAgent[target.TargetRnic.HostName], target.TargetRnic)
 		}
 	}
-	log.Debug().Interface("tor_targets_by_hostname", torTargetsByAgent).Msg("ToR-mesh pinglist targets grouped by hostname")
+	log.Debug().Interface("tor_targets_by_hostname", torTargetsByAgent).Msg("Combined ToR-mesh pinglist targets grouped by hostname")
 
-	// Update probe timeout if controller specified it
-	if timeoutMs > 0 && timeoutMs != a.config.TimeoutMS {
-		log.Debug().Uint32("old_timeout_ms", a.config.TimeoutMS).Uint32("new_timeout_ms", timeoutMs).Msg("Updating probe timeout")
-		a.config.TimeoutMS = timeoutMs
-		log.Info().Uint32("timeout_ms", timeoutMs).Msg("Updated probe timeout from controller")
-	}
-
-	// Update probe interval if controller specified it
-	if intervalMs > 0 && intervalMs != a.config.ProbeIntervalMS {
-		log.Debug().Uint32("old_interval_ms", a.config.ProbeIntervalMS).Uint32("new_interval_ms", intervalMs).Msg("Updating probe interval")
-		a.config.ProbeIntervalMS = intervalMs
-		log.Info().Uint32("interval_ms", intervalMs).Msg("Updated probe interval from controller")
-	}
-
-	// Update cluster monitor's pinglist
-	a.clusterMonitor.UpdatePinglist(torTargets)
-	log.Debug().Msg("Updated cluster monitor pinglist")
-
-	// Also get Inter-ToR pinglist
-	interTorTargets, _, _, err := a.controllerClient.GetPinglist(
-		primaryRnic,
-		controller_agent.PinglistRequest_INTER_TOR,
-	)
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to get Inter-ToR pinglist")
-		return
-	}
-	log.Debug().Int("target_count", len(interTorTargets)).Msg("Received Inter-ToR pinglist data")
-
-	// Log Inter-ToR targets grouped by AgentID at Trace level
+	// Log combined Inter-ToR targets grouped by AgentID
 	interTorTargetsByAgent := make(map[string][]string)
-	for _, target := range interTorTargets {
+	for _, target := range allInterTorTargets {
 		if target.TargetRnic != nil {
 			interTorTargetsByAgent[target.TargetRnic.HostName] = append(interTorTargetsByAgent[target.TargetRnic.HostName], target.TargetRnic.Gid)
 		}
 	}
-	log.Debug().Interface("inter_tor_targets_by_hostname", interTorTargetsByAgent).Msg("Inter-ToR pinglist targets grouped by hostname")
+	log.Debug().Interface("inter_tor_targets_by_hostname", interTorTargetsByAgent).Msg("Combined Inter-ToR pinglist targets grouped by hostname")
 
-	// Combine the pinglists (in a real implementation, you might want to keep them separate)
-	log.Debug().Int("torTargets", len(torTargets)).Int("interTorTargets", len(interTorTargets)).Msg("Updated pinglists")
+	// Update probe timeout if controller specified it
+	if lastTimeoutMs > 0 && lastTimeoutMs != a.config.TimeoutMS {
+		log.Debug().Uint32("old_timeout_ms", a.config.TimeoutMS).Uint32("new_timeout_ms", lastTimeoutMs).Msg("Updating probe timeout")
+		a.config.TimeoutMS = lastTimeoutMs
+		log.Info().Uint32("timeout_ms", lastTimeoutMs).Msg("Updated probe timeout from controller")
+	}
+
+	// Update probe interval if controller specified it
+	if lastIntervalMs > 0 && lastIntervalMs != a.config.ProbeIntervalMS {
+		log.Debug().Uint32("old_interval_ms", a.config.ProbeIntervalMS).Uint32("new_interval_ms", lastIntervalMs).Msg("Updating probe interval")
+		a.config.ProbeIntervalMS = lastIntervalMs
+		log.Info().Uint32("interval_ms", lastIntervalMs).Msg("Updated probe interval from controller")
+	}
+
+	// Update cluster monitor's pinglist with combined targets
+	a.clusterMonitor.UpdatePinglist(allTorTargets)
+	log.Debug().Msg("Updated cluster monitor pinglist with combined targets")
+
+	// Log summary
+	log.Info().
+		Int("total_tor_targets", len(allTorTargets)).
+		Int("total_inter_tor_targets", len(allInterTorTargets)).
+		Int("local_rnics", len(localRnics)).
+		Msg("Updated pinglists for all local RNICs")
 }
 
 // Stop stops the agent

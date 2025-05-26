@@ -52,16 +52,17 @@ func (p *mockPingLister) generateTorMeshPinglist(
 	}
 
 	targets := make([]*controller_agent.PingTarget, 0, len(rnics))
-	for _, rnic := range rnics {
+	for i, rnic := range rnics {
 		if rnic.Gid == requesterRnic.Gid {
 			continue
 		}
 
 		targets = append(targets, &controller_agent.PingTarget{
 			TargetRnic: rnic,
-			SourcePort: p.generateRandomPort(),
-			FlowLabel:  p.generateRandomFlowLabel(),
-			Priority:   p.generateRandomPriority(),
+			SourceRnic: requesterRnic, // Explicit source RNIC information
+			SourcePort: p.generateRequesterSpecificPort(requesterRnic.Gid, rnic.Gid),
+			FlowLabel:  p.generateRequesterSpecificFlowLabel(requesterRnic.Gid, rnic.Gid, i),
+			Priority:   p.generateRequesterSpecificPriority(requesterRnic.Gid, rnic.Gid),
 		})
 	}
 
@@ -79,12 +80,13 @@ func (p *mockPingLister) generateInterTorPinglist(
 	}
 
 	targets := make([]*controller_agent.PingTarget, 0, len(rnics))
-	for _, rnic := range rnics {
+	for i, rnic := range rnics {
 		targets = append(targets, &controller_agent.PingTarget{
 			TargetRnic: rnic,
-			SourcePort: p.generateRandomPort(),
-			FlowLabel:  p.generateRandomFlowLabel(),
-			Priority:   p.generateRandomPriority(),
+			SourceRnic: requesterRnic, // Explicit source RNIC information
+			SourcePort: p.generateRequesterSpecificPort(requesterRnic.Gid, rnic.Gid),
+			FlowLabel:  p.generateRequesterSpecificFlowLabel(requesterRnic.Gid, rnic.Gid, i),
+			Priority:   p.generateRequesterSpecificPriority(requesterRnic.Gid, rnic.Gid),
 		})
 	}
 
@@ -102,6 +104,32 @@ func (p *mockPingLister) generateRandomFlowLabel() uint32 {
 
 func (p *mockPingLister) generateRandomPriority() uint32 {
 	return uint32(p.rand.Intn(8))
+}
+
+// Implement requester-specific functions - same logic as the real one
+func (p *mockPingLister) generateRequesterSpecificPort(requesterGID, targetGID string) uint32 {
+	hash := p.hashGIDPair(requesterGID, targetGID)
+	return uint32((hash % 16384) + 49152)
+}
+
+func (p *mockPingLister) generateRequesterSpecificFlowLabel(requesterGID, targetGID string, index int) uint32 {
+	hash := p.hashGIDPair(requesterGID, targetGID)
+	hash = hash + uint32(index)*1000
+	return hash % 1048576
+}
+
+func (p *mockPingLister) generateRequesterSpecificPriority(requesterGID, targetGID string) uint32 {
+	hash := p.hashGIDPair(requesterGID, targetGID)
+	return hash % 8
+}
+
+func (p *mockPingLister) hashGIDPair(gid1, gid2 string) uint32 {
+	combined := gid1 + ":" + gid2
+	hash := uint32(0)
+	for _, char := range combined {
+		hash = hash*31 + uint32(char)
+	}
+	return hash
 }
 
 // newMockPingLister creates a mock PingLister for testing
@@ -351,6 +379,93 @@ func TestUnknownPinglistType(t *testing.T) {
 	// Verify
 	require.NoError(t, err)
 	require.Len(t, targets, 1, "Should default to TOR_MESH and return 1 target")
+
+	// Verify that mock was called as expected
+	mockReg.AssertExpectations(t)
+}
+
+func TestFlowLabelUniqueness(t *testing.T) {
+	// Create mock registry
+	mockReg := &MockRegistry{}
+
+	// Create RNIC data for testing - multiple requester RNICs
+	requesterRnic1 := &controller_agent.RnicInfo{
+		Gid:       "fe80:0000:0000:0000:0002:c903:0033:1001",
+		Qpn:       1001,
+		IpAddress: "192.168.1.1",
+		HostName:  "host-1",
+		TorId:     "tor-A",
+	}
+
+	requesterRnic2 := &controller_agent.RnicInfo{
+		Gid:       "fe80:0000:0000:0000:0002:c903:0033:1002",
+		Qpn:       1002,
+		IpAddress: "192.168.1.2",
+		HostName:  "host-2",
+		TorId:     "tor-A",
+	}
+
+	sameToRRnics := []*controller_agent.RnicInfo{
+		requesterRnic1,
+		requesterRnic2,
+		{
+			Gid:       "fe80:0000:0000:0000:0002:c903:0033:1003",
+			Qpn:       1003,
+			IpAddress: "192.168.1.3",
+			HostName:  "host-3",
+			TorId:     "tor-A",
+		},
+	}
+
+	// Mock setup: return list of RNICs belonging to the same ToR
+	mockReg.On("GetRNICsByToR", mock.Anything, "tor-A").Return(sameToRRnics, nil)
+
+	// Create mock version of PingLister
+	pingLister := newMockPingLister(mockReg)
+
+	// Run test for first requester
+	ctx := context.Background()
+	targets1, err := pingLister.GeneratePinglist(ctx, requesterRnic1, controller_agent.PinglistRequest_TOR_MESH)
+	require.NoError(t, err)
+
+	// Run test for second requester
+	targets2, err := pingLister.GeneratePinglist(ctx, requesterRnic2, controller_agent.PinglistRequest_TOR_MESH)
+	require.NoError(t, err)
+
+	// Collect flow labels from both requests
+	flowLabels1 := make(map[uint32]bool)
+	flowLabels2 := make(map[uint32]bool)
+
+	for _, target := range targets1 {
+		flowLabels1[target.FlowLabel] = true
+	}
+
+	for _, target := range targets2 {
+		flowLabels2[target.FlowLabel] = true
+	}
+
+	// Verify that flow labels are different between different requesters
+	// At least some flow labels should be different
+	hasUniqueFlowLabels := false
+	for flowLabel := range flowLabels1 {
+		if !flowLabels2[flowLabel] {
+			hasUniqueFlowLabels = true
+			break
+		}
+	}
+
+	assert.True(t, hasUniqueFlowLabels, "Flow labels should be unique between different requester RNICs")
+
+	// Verify that each requester gets consistent flow labels for the same target
+	targets1Again, err := pingLister.GeneratePinglist(ctx, requesterRnic1, controller_agent.PinglistRequest_TOR_MESH)
+	require.NoError(t, err)
+
+	// Flow labels should be the same for the same requester-target pair
+	require.Len(t, targets1Again, len(targets1))
+	for i, target := range targets1 {
+		assert.Equal(t, target.FlowLabel, targets1Again[i].FlowLabel,
+			"Flow labels should be consistent for the same requester-target pair")
+	}
 
 	// Verify that mock was called as expected
 	mockReg.AssertExpectations(t)

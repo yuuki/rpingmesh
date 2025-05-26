@@ -24,12 +24,23 @@ type ServiceFlowTuple struct {
 
 // PingTarget represents a target for probing
 type PingTarget struct {
-	GID              string
-	QPN              uint32
-	IPAddress        string
-	HostName         string
-	TorID            string
-	DeviceName       string
+	// Destination RNIC information
+	GID        string
+	QPN        uint32
+	IPAddress  string
+	HostName   string
+	TorID      string
+	DeviceName string
+
+	// Source RNIC information (which local RNIC should send the probe)
+	SourceRnicGID    string
+	SourceRnicQPN    uint32
+	SourceRnicIP     string
+	SourceHostName   string
+	SourceTorID      string
+	SourceDeviceName string
+
+	// 5-tuple details
 	SourcePort       uint32
 	FlowLabel        uint32
 	Priority         uint32

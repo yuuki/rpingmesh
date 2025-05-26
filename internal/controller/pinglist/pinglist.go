@@ -61,18 +61,19 @@ func (p *PingLister) generateTorMeshPinglist(
 
 	// Convert to ping targets
 	targets := make([]*controller_agent.PingTarget, 0, len(rnics))
-	for _, rnic := range rnics {
+	for i, rnic := range rnics {
 		// Skip the requester RNIC
 		if rnic.Gid == requesterRnic.Gid {
 			continue
 		}
 
-		// Create target with randomized 5-tuple details
+		// Create target with source-destination mapping and requester-specific 5-tuple details
 		targets = append(targets, &controller_agent.PingTarget{
 			TargetRnic: rnic,
-			SourcePort: p.generateRandomPort(),
-			FlowLabel:  p.generateRandomFlowLabel(),
-			Priority:   p.generateRandomPriority(),
+			SourceRnic: requesterRnic, // Explicit source RNIC information
+			SourcePort: p.generateRequesterSpecificPort(requesterRnic.Gid, rnic.Gid),
+			FlowLabel:  p.generateRequesterSpecificFlowLabel(requesterRnic.Gid, rnic.Gid, i),
+			Priority:   p.generateRequesterSpecificPriority(requesterRnic.Gid, rnic.Gid),
 		})
 	}
 
@@ -98,13 +99,14 @@ func (p *PingLister) generateInterTorPinglist(
 
 	// Convert to ping targets
 	targets := make([]*controller_agent.PingTarget, 0, len(rnics))
-	for _, rnic := range rnics {
-		// Create target with randomized 5-tuple details
+	for i, rnic := range rnics {
+		// Create target with source-destination mapping and requester-specific 5-tuple details
 		targets = append(targets, &controller_agent.PingTarget{
 			TargetRnic: rnic,
-			SourcePort: p.generateRandomPort(),
-			FlowLabel:  p.generateRandomFlowLabel(),
-			Priority:   p.generateRandomPriority(),
+			SourceRnic: requesterRnic, // Explicit source RNIC information
+			SourcePort: p.generateRequesterSpecificPort(requesterRnic.Gid, rnic.Gid),
+			FlowLabel:  p.generateRequesterSpecificFlowLabel(requesterRnic.Gid, rnic.Gid, i),
+			Priority:   p.generateRequesterSpecificPriority(requesterRnic.Gid, rnic.Gid),
 		})
 	}
 
@@ -133,4 +135,41 @@ func (p *PingLister) generateRandomFlowLabel() uint32 {
 func (p *PingLister) generateRandomPriority() uint32 {
 	// Priority is typically 0-7 for IPv6 traffic class
 	return uint32(p.rand.Intn(8))
+}
+
+// generateRequesterSpecificPort generates a port number specific to the requester-target pair
+func (p *PingLister) generateRequesterSpecificPort(requesterGID, targetGID string) uint32 {
+	// Create a deterministic but unique port based on requester and target GIDs
+	hash := p.hashGIDPair(requesterGID, targetGID)
+	// Use ephemeral port range (49152-65535)
+	return uint32((hash % 16384) + 49152)
+}
+
+// generateRequesterSpecificFlowLabel generates a flow label specific to the requester-target pair
+func (p *PingLister) generateRequesterSpecificFlowLabel(requesterGID, targetGID string, index int) uint32 {
+	// Create a deterministic but unique flow label based on requester GID, target GID, and index
+	hash := p.hashGIDPair(requesterGID, targetGID)
+	// Add index to ensure uniqueness within the same requester-target relationship
+	hash = hash + uint32(index)*1000
+	// Flow label is 20 bits (0-1048575)
+	return hash % 1048576
+}
+
+// generateRequesterSpecificPriority generates a priority specific to the requester-target pair
+func (p *PingLister) generateRequesterSpecificPriority(requesterGID, targetGID string) uint32 {
+	// Create a deterministic but unique priority based on requester and target GIDs
+	hash := p.hashGIDPair(requesterGID, targetGID)
+	// Priority is typically 0-7 for IPv6 traffic class
+	return hash % 8
+}
+
+// hashGIDPair creates a hash from two GID strings for deterministic but unique values
+func (p *PingLister) hashGIDPair(gid1, gid2 string) uint32 {
+	// Simple hash function combining two GID strings
+	combined := gid1 + ":" + gid2
+	hash := uint32(0)
+	for _, char := range combined {
+		hash = hash*31 + uint32(char)
+	}
+	return hash
 }

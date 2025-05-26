@@ -40,10 +40,11 @@ message PinglistRequest {
 // Target for ping operations
 message PingTarget {
   RnicInfo target_rnic = 1;
+  RnicInfo source_rnic = 2; // Source RNIC information for explicit source-destination mapping
   // 5-tuple details
-  uint32 source_port = 2;
-  uint32 flow_label = 3;
-  uint32 priority = 4;
+  uint32 source_port = 3;
+  uint32 flow_label = 4;
+  uint32 priority = 5;
 }
 
 // Pinglist response

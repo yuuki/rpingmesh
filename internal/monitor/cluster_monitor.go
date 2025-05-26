@@ -90,7 +90,7 @@ func (c *ClusterMonitor) Stop() {
 	log.Info().Msg("Cluster monitor stopped")
 }
 
-// UpdatePinglist updates the list of targets to ping
+// UpdatePinglist updates the list of targets to ping using source-destination mapping from controller
 func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget) {
 	// Stop existing probe workers
 	for _, stopCh := range c.targetChans {
@@ -98,20 +98,42 @@ func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget)
 	}
 	c.targetChans = make(map[string]chan struct{})
 
-	// Update pinglist
-	c.pinglist = make([]probe.PingTarget, 0, len(pinglist)) // Changed to probe.PingTarget
+	// Convert controller targets to probe targets using explicit source-destination mapping
+	c.pinglist = make([]probe.PingTarget, 0, len(pinglist))
+
 	for _, target := range pinglist {
-		c.pinglist = append(c.pinglist, probe.PingTarget{ // Changed to probe.PingTarget
+		// Skip targets without proper source or destination information
+		if target.TargetRnic == nil || target.SourceRnic == nil {
+			log.Warn().Msg("Skipping target with missing source or destination RNIC information")
+			continue
+		}
+
+		// Create probe target with explicit source-destination mapping from controller
+		probeTarget := probe.PingTarget{
+			// Destination RNIC information
 			GID:        target.TargetRnic.Gid,
 			QPN:        target.TargetRnic.Qpn,
 			IPAddress:  target.TargetRnic.IpAddress,
 			HostName:   target.TargetRnic.HostName,
 			TorID:      target.TargetRnic.TorId,
+			DeviceName: target.TargetRnic.DeviceName,
+
+			// Source RNIC information (from controller's explicit mapping)
+			SourceRnicGID:    target.SourceRnic.Gid,
+			SourceRnicQPN:    target.SourceRnic.Qpn,
+			SourceRnicIP:     target.SourceRnic.IpAddress,
+			SourceHostName:   target.SourceRnic.HostName,
+			SourceTorID:      target.SourceRnic.TorId,
+			SourceDeviceName: target.SourceRnic.DeviceName,
+
+			// 5-tuple details from controller
 			SourcePort: target.SourcePort,
 			FlowLabel:  target.FlowLabel,
 			Priority:   target.Priority,
-			// ProbeType will be set in probeTargetWithRateLimit or based on context
-		})
+			// ProbeType will be set in probeTargetWithRateLimit based on TOR relationship
+		}
+
+		c.pinglist = append(c.pinglist, probeTarget)
 	}
 
 	// If the monitor is running, start new probe workers
@@ -119,44 +141,80 @@ func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget)
 		c.runAllProbeWorkers()
 	}
 
-	log.Info().Int("targets", len(c.pinglist)).Msg("Updated cluster monitoring pinglist")
+	log.Info().
+		Int("controller_targets", len(pinglist)).
+		Int("probe_targets", len(c.pinglist)).
+		Msg("Updated cluster monitoring pinglist using controller's source-destination mapping")
 }
 
 // runAllProbeWorkers starts goroutines for each target in the pinglist
 func (c *ClusterMonitor) runAllProbeWorkers() {
-	// Get local RNICs
+	// Get local RNICs for validation
 	localRnics := c.agentState.GetDetectedRNICs()
 	if len(localRnics) == 0 {
 		log.Error().Msg("No local RNICs available for probing")
 		return
 	}
 
-	// For each target in the pinglist, create a goroutine
-	for _, target := range c.pinglist {
-		for _, localRnic := range localRnics {
-			// Skip if the RNIC is nil or doesn't have a valid GID
-			if localRnic == nil || localRnic.GID == "" {
-				continue
-			}
-
-			// Skip probing ourselves (initial check)
-			if target.GID == localRnic.GID {
-				log.Debug().Str("target.GID", target.GID).Str("localRnic.GID", localRnic.GID).Msg("Skipping probe to self (initial check)")
-				continue
-			}
-
-			// Create a unique key for this source-target pair
-			key := localRnic.GID + "_" + target.GID
-
-			// Create a stop channel for this target
-			stopCh := make(chan struct{})
-			c.targetChans[key] = stopCh
-
-			// Start a goroutine for this target
-			c.wg.Add(1)
-			go c.probeTargetWithRateLimit(localRnic, target, stopCh)
+	// Create a map of local RNICs by GID for quick lookup
+	localRnicsByGID := make(map[string]*rdma.RNIC)
+	for _, rnic := range localRnics {
+		if rnic != nil && rnic.GID != "" {
+			localRnicsByGID[rnic.GID] = rnic
 		}
 	}
+
+	// For each target in the pinglist, create a goroutine using the specified source RNIC
+	for _, target := range c.pinglist {
+		// Find the source RNIC specified in the target
+		sourceRnic, exists := localRnicsByGID[target.SourceRnicGID]
+		if !exists || sourceRnic == nil {
+			log.Warn().
+				Str("target_source_gid", target.SourceRnicGID).
+				Str("target_dest_gid", target.GID).
+				Msg("Source RNIC specified in target not found in local RNICs, skipping")
+			continue
+		}
+
+		// Skip probing ourselves (should not happen with proper pinglist generation)
+		if target.GID == target.SourceRnicGID {
+			log.Debug().
+				Str("target_gid", target.GID).
+				Str("source_gid", target.SourceRnicGID).
+				Msg("Skipping self-probe target")
+			continue
+		}
+
+		// Create a unique key for this source-target pair
+		key := target.SourceRnicGID + "_" + target.GID
+
+		// Check if this probe worker is already running
+		if _, exists := c.targetChans[key]; exists {
+			log.Debug().
+				Str("key", key).
+				Msg("Probe worker already running for this source-target pair")
+			continue
+		}
+
+		// Create a stop channel for this target
+		stopCh := make(chan struct{})
+		c.targetChans[key] = stopCh
+
+		// Start a goroutine for this specific source-target pair
+		c.wg.Add(1)
+		go c.probeTargetWithRateLimit(sourceRnic, target, stopCh)
+
+		log.Debug().
+			Str("source_gid", target.SourceRnicGID).
+			Str("target_gid", target.GID).
+			Uint32("flow_label", target.FlowLabel).
+			Msg("Started probe worker for source-target pair")
+	}
+
+	log.Info().
+		Int("total_targets", len(c.pinglist)).
+		Int("active_workers", len(c.targetChans)).
+		Msg("Started probe workers with explicit source-destination mapping")
 }
 
 // probeTargetWithRateLimit continuously probes a target with rate limiting

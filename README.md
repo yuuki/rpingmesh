@@ -3,6 +3,8 @@
 [![Go Tests](https://github.com/yuuki/rpingmesh/actions/workflows/go-test.yml/badge.svg)](https://github.com/yuuki/rpingmesh/actions/workflows/go-test.yml)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/yuuki/rpingmesh)
 
+R-Pingmesh is still *under heavy development*. Please do not use it in production.
+
 > **The service-aware RoCE network monitoring and diagnostic system based on end-to-end active probing.**
 
 R-Pingmesh is a production-ready monitoring system designed for RDMA over Converged Ethernet (RoCE) networks. Built on cutting-edge research from SIGCOMM 2024, it delivers unprecedented visibility into RoCE network performance, enabling rapid detection and precise localization of network problems that can severely impact distributed services.

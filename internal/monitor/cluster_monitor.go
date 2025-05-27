@@ -100,11 +100,22 @@ func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget)
 
 	// Convert controller targets to probe targets using explicit source-destination mapping
 	c.pinglist = make([]probe.PingTarget, 0, len(pinglist))
+	localHostName := c.agentState.GetHostName()
 
 	for _, target := range pinglist {
 		// Skip targets without proper source or destination information
 		if target.TargetRnic == nil || target.SourceRnic == nil {
 			log.Warn().Msg("Skipping target with missing source or destination RNIC information")
+			continue
+		}
+
+		// Skip targets on the same host to avoid RDMA CM address resolution issues
+		if target.TargetRnic.HostName == localHostName {
+			log.Debug().
+				Str("target_hostname", target.TargetRnic.HostName).
+				Str("local_hostname", localHostName).
+				Str("target_gid", target.TargetRnic.Gid).
+				Msg("Skipping target on same host during pinglist update")
 			continue
 		}
 
@@ -174,6 +185,18 @@ func (c *ClusterMonitor) runAllProbeWorkers() {
 				Str("target_gid", target.GID).
 				Str("source_gid", target.SourceRnicGID).
 				Msg("Skipping self-probe target")
+			continue
+		}
+
+		// Skip probing targets on the same host to avoid RDMA CM address resolution issues
+		localHostName := c.agentState.GetHostName()
+		if target.HostName == localHostName {
+			log.Debug().
+				Str("target_hostname", target.HostName).
+				Str("local_hostname", localHostName).
+				Str("target_gid", target.GID).
+				Str("source_gid", target.SourceRnicGID).
+				Msg("Skipping probe to target on same host to avoid RDMA CM address resolution issues")
 			continue
 		}
 
@@ -258,6 +281,18 @@ func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target p
 			Str("actualTargetGID", actualTargetGID).
 			Str("localRnic.GID", localRnic.GID).
 			Msg("Skipping probe to self (after GID resolution)")
+		return
+	}
+
+	// Final check to skip probing targets on the same host
+	localHostName := c.agentState.GetHostName()
+	if target.HostName == localHostName {
+		log.Debug().
+			Str("target_hostname", target.HostName).
+			Str("local_hostname", localHostName).
+			Str("actualTargetGID", actualTargetGID).
+			Str("localRnic.GID", localRnic.GID).
+			Msg("Skipping probe to target on same host (final check)")
 		return
 	}
 

@@ -25,6 +25,7 @@ type AgentState struct {
 	detectedRNICs   []*rdma.RNIC
 	senderQueues    map[string]*rdma.UDQueue // Map of GID to Sender UDQueue
 	responderQueues map[string]*rdma.UDQueue // Map of GID to Responder UDQueue
+	rnicByGID       map[string]*rdma.RNIC    // Map of GID to RNIC for quick lookup
 	gidIndex        int                      // Changed: preferredGIDIndex to gidIndex
 	mutex           sync.RWMutex
 	ackHandler      rdma.AckHandlerFunc // Store the ACK handler directly
@@ -134,6 +135,9 @@ func (a *AgentState) InitializeUDQueues() error {
 		return fmt.Errorf("RDMA manager not initialized")
 	}
 
+	// Initialize rnicByGID map
+	a.rnicByGID = make(map[string]*rdma.RNIC)
+
 	// Create separate UD queues for each RNIC - one for sending probes, one for receiving probes
 	for _, rnic := range a.detectedRNICs {
 		err := a.rdmaManager.CreateSenderAndResponderQueues(rnic, a.ackHandler)
@@ -143,6 +147,11 @@ func (a *AgentState) InitializeUDQueues() error {
 		}
 		a.senderQueues[rnic.GID] = rnic.SenderQueue
 		a.responderQueues[rnic.GID] = rnic.ResponderQueue
+
+		// Build rnicByGID map for quick lookup
+		if rnic.GID != "" {
+			a.rnicByGID[rnic.GID] = rnic
+		}
 	}
 
 	log.Info().
@@ -261,6 +270,7 @@ func (a *AgentState) Close() {
 	a.detectedRNICs = nil
 	a.senderQueues = nil
 	a.responderQueues = nil
+	a.rnicByGID = nil
 }
 
 // getLocalIP returns the non-loopback IP address of the host
@@ -279,4 +289,11 @@ func getLocalIP() (net.IP, error) {
 	}
 
 	return nil, nil
+}
+
+// GetRnicByGID returns the RNIC for the given GID
+func (a *AgentState) GetRnicByGID(gid string) *rdma.RNIC {
+	a.mutex.RLock()
+	defer a.mutex.RUnlock()
+	return a.rnicByGID[gid]
 }

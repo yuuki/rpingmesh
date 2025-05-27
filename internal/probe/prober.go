@@ -809,13 +809,7 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 
 // Helper function to get RNIC by GID from agent state
 func (p *Prober) getRnicByGid(gid string) *rdma.RNIC {
-	rnics := p.agentState.GetDetectedRNICs()
-	for _, rnic := range rnics {
-		if rnic.GID == gid {
-			return rnic
-		}
-	}
-	return nil
+	return p.agentState.GetRnicByGID(gid)
 }
 
 // addSession adds a session to the map.

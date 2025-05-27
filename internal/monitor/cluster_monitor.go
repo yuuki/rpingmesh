@@ -156,19 +156,11 @@ func (c *ClusterMonitor) runAllProbeWorkers() {
 		return
 	}
 
-	// Create a map of local RNICs by GID for quick lookup
-	localRnicsByGID := make(map[string]*rdma.RNIC)
-	for _, rnic := range localRnics {
-		if rnic != nil && rnic.GID != "" {
-			localRnicsByGID[rnic.GID] = rnic
-		}
-	}
-
 	// For each target in the pinglist, create a goroutine using the specified source RNIC
 	for _, target := range c.pinglist {
-		// Find the source RNIC specified in the target
-		sourceRnic, exists := localRnicsByGID[target.SourceRnicGID]
-		if !exists || sourceRnic == nil {
+		// Find the source RNIC specified in the target using the shared method
+		sourceRnic := c.agentState.GetRnicByGID(target.SourceRnicGID)
+		if sourceRnic == nil {
 			log.Warn().
 				Str("target_source_gid", target.SourceRnicGID).
 				Str("target_dest_gid", target.GID).

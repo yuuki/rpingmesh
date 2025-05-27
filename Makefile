@@ -56,14 +56,14 @@ build-debug-controller:
 	@export CGO_ENABLED=1
 	@export CGO_CFLAGS="-g -O0"
 	@export CGO_LDFLAGS="-g"
-	@go build -o ./bin/rpingmesh-controller.debug -gcflags "all=-N -l" -ldflags "-compressdwarf=false" ./cmd/controller
+	@go build -o -race ./bin/rpingmesh-controller.debug -gcflags "all=-N -l" -ldflags "-compressdwarf=false" ./cmd/controller
 
 build-debug-agent:
 	@echo "Building agent for debug locally"
 	@export CGO_ENABLED=1
 	@export CGO_CFLAGS="-g -O0"
 	@export CGO_LDFLAGS="-g"
-	@go build -o ./bin/rpingmesh-agent.debug -gcflags "all=-N -l" -ldflags "-compressdwarf=false" ./cmd/agent
+	@go build -race -o ./bin/rpingmesh-agent.debug -gcflags "all=-N -l" -ldflags "-compressdwarf=false" ./cmd/agent
 
 build-debug: build-debug-controller build-debug-agent
 

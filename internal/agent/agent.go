@@ -265,6 +265,7 @@ func (a *Agent) Start() error {
 			// Get a pinglist from the controller to use as traceroute targets
 			targets, _, _, err := a.controllerClient.GetPinglist(
 				primaryRnic,
+				a.agentState.GetHostName(),
 				controller_agent.PinglistRequest_TOR_MESH,
 			)
 
@@ -510,6 +511,7 @@ func (a *Agent) updatePinglist() {
 		// Get ToR-mesh pinglist for this RNIC
 		torTargets, intervalMs, _, err := a.controllerClient.GetPinglist(
 			localRnic,
+			a.agentState.GetHostName(),
 			controller_agent.PinglistRequest_TOR_MESH,
 		)
 		if err != nil {
@@ -524,6 +526,7 @@ func (a *Agent) updatePinglist() {
 		// Get Inter-ToR pinglist for this RNIC
 		interTorTargets, _, _, err := a.controllerClient.GetPinglist(
 			localRnic,
+			a.agentState.GetHostName(),
 			controller_agent.PinglistRequest_INTER_TOR,
 		)
 		if err != nil {

@@ -141,6 +141,7 @@ func (c *ControllerClient) RegisterAgent(
 // GetPinglist gets the pinglist from the controller
 func (c *ControllerClient) GetPinglist(
 	requesterRnic *rdma.RNIC,
+	hostName string,
 	pinglistType controller_agent.PinglistRequest_PinglistType,
 ) ([]*controller_agent.PingTarget, uint32, uint32, error) {
 	if c.client == nil {
@@ -159,11 +160,12 @@ func (c *ControllerClient) GetPinglist(
 	// Create request
 	req := &controller_agent.PinglistRequest{
 		RequesterRnic: &controller_agent.RnicInfo{
-			Gid:       requesterRnic.GID,
-			Qpn:       qpn,
-			IpAddress: requesterRnic.IPAddr,
-			HostName:  requesterRnic.DeviceName,
-			TorId:     "", // This would need to be set from config
+			Gid:        requesterRnic.GID,
+			Qpn:        qpn,
+			IpAddress:  requesterRnic.IPAddr,
+			HostName:   hostName,
+			DeviceName: requesterRnic.DeviceName,
+			TorId:      "", // This would need to be set from config
 		},
 		Type: pinglistType,
 	}

@@ -85,6 +85,7 @@ func (m *mockControllerClient) Close() error {
 
 func (m *mockControllerClient) GetPinglist(
 	requesterRnic *rdma.RNIC,
+	hostName string,
 	pinglistType controller_agent.PinglistRequest_PinglistType,
 ) ([]*controller_agent.PingTarget, uint32, uint32, error) {
 	return []*controller_agent.PingTarget{}, 1000, 500, nil

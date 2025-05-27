@@ -166,11 +166,13 @@ func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget)
 	// Convert controller targets to probe targets using explicit source-destination mapping
 	probeTargets := make([]probe.PingTarget, 0, len(pinglist))
 	localHostName := c.agentState.GetHostName()
+	skippedCount := 0
 
 	for _, target := range pinglist {
 		// Skip targets without proper source or destination information
 		if target.TargetRnic == nil || target.SourceRnic == nil {
 			log.Warn().Msg("Skipping target with missing source or destination RNIC information")
+			skippedCount++
 			continue
 		}
 
@@ -181,6 +183,31 @@ func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget)
 				Str("local_hostname", localHostName).
 				Str("target_gid", target.TargetRnic.Gid).
 				Msg("Skipping target on same host during pinglist update")
+			skippedCount++
+			continue
+		}
+
+		// TEMPORARY FIX: Skip targets that would fail due to link-local GID constraints
+		// Link-local GIDs (fe80::) can only communicate within the same physical port/L2 segment
+
+		// Get the actual source device name from local RNIC information
+		sourceDeviceName := target.SourceRnic.DeviceName
+		if sourceDeviceName == "" {
+			// If source device name is not provided by controller, look it up locally
+			sourceRnic := c.agentState.GetRnicByGID(target.SourceRnic.Gid)
+			if sourceRnic != nil {
+				sourceDeviceName = sourceRnic.DeviceName
+			}
+		}
+
+		if c.shouldSkipLinkLocalTarget(target.SourceRnic.Gid, target.TargetRnic.Gid, sourceDeviceName, target.TargetRnic.DeviceName) {
+			log.Debug().
+				Str("source_gid", target.SourceRnic.Gid).
+				Str("target_gid", target.TargetRnic.Gid).
+				Str("source_device", sourceDeviceName).
+				Str("target_device", target.TargetRnic.DeviceName).
+				Msg("Skipping target due to link-local GID cross-port communication constraint")
+			skippedCount++
 			continue
 		}
 
@@ -217,7 +244,46 @@ func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget)
 	log.Info().
 		Int("controller_targets", len(pinglist)).
 		Int("probe_targets", len(probeTargets)).
+		Int("skipped_targets", skippedCount).
 		Msg("Updated cluster monitoring pinglist for sequential processing")
+}
+
+// shouldSkipLinkLocalTarget determines if a target should be skipped due to link-local GID constraints
+// Link-local GIDs (fe80::) can only communicate within the same physical port/L2 segment
+func (c *ClusterMonitor) shouldSkipLinkLocalTarget(sourceGID, targetGID, sourceDevice, targetDevice string) bool {
+	// Check if both GIDs are link-local (fe80::)
+	sourceIsLinkLocal := c.isLinkLocalGID(sourceGID)
+	targetIsLinkLocal := c.isLinkLocalGID(targetGID)
+
+	// If neither is link-local, no constraint applies
+	if !sourceIsLinkLocal && !targetIsLinkLocal {
+		return false
+	}
+
+	// If both are link-local, check if they are on different devices
+	// Different devices typically mean different physical ports/L2 segments
+	if sourceIsLinkLocal && targetIsLinkLocal {
+		// For cross-device communication with link-local GIDs, we need to be more careful
+		// In the current setup, different devices (mlx5_0 vs mlx5_1) are on different networks
+		// So cross-device link-local communication will likely fail
+		if sourceDevice != targetDevice {
+			return true // Skip cross-device link-local communication
+		}
+	}
+
+	// If only one is link-local, it might still work depending on routing
+	// For now, allow mixed link-local/global communication
+	return false
+}
+
+// isLinkLocalGID checks if a GID is a link-local IPv6 address (fe80::)
+func (c *ClusterMonitor) isLinkLocalGID(gid string) bool {
+	if len(gid) < 4 {
+		return false
+	}
+	// Check if GID starts with "fe80:" (case-insensitive)
+	prefix := gid[:5]
+	return prefix == "fe80:" || prefix == "FE80:"
 }
 
 // runSequentialProbeWorker runs the main sequential probe loop

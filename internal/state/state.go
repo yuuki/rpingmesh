@@ -145,7 +145,7 @@ func (a *AgentState) InitializeUDQueues() error {
 			log.Error().Err(err).Str("device", rnic.DeviceName).Msg("Failed to create sender and responder UD queues")
 			continue // Or collect errors and return them
 		}
-		a.senderQueues[rnic.GID] = rnic.SenderQueue
+		a.senderQueues[rnic.GID] = rnic.ProberQueue
 		a.responderQueues[rnic.GID] = rnic.ResponderQueue
 
 		// Build rnicByGID map for quick lookup

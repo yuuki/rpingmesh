@@ -143,7 +143,7 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 	mapKey := rnic.GID
 	if queueType == UDQueueTypeSender {
 		mapKey = mapKey + "_sender"
-		rnic.SenderQueue = udQueue
+		rnic.ProberQueue = udQueue
 		m.SenderUDQueues[rnic.GID] = udQueue
 	} else {
 		mapKey = mapKey + "_responder"
@@ -436,7 +436,7 @@ func (m *RDMAManager) CreateSenderAndResponderQueues(rnic *RNIC, senderAckHandle
 	}
 	log.Info().Str("device", rnic.DeviceName).Uint32("qpn", responderQueue.QPN).Msg("Created responder queue")
 
-	rnic.SenderQueue = senderQueue
+	rnic.ProberQueue = senderQueue
 	rnic.ResponderQueue = responderQueue
 
 	return nil

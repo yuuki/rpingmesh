@@ -149,8 +149,8 @@ func (c *ControllerClient) GetPinglist(
 
 	// UDキューの分離実装に対応: SenderQueueを使用
 	var qpn uint32
-	if requesterRnic.SenderQueue != nil {
-		qpn = requesterRnic.SenderQueue.QPN
+	if requesterRnic.ProberQueue != nil {
+		qpn = requesterRnic.ProberQueue.QPN
 	} else if requesterRnic.UDQueues != nil && len(requesterRnic.UDQueues) > 0 {
 		// 後方互換性のためのフォールバック
 		// 古い方式のマップからも確認する

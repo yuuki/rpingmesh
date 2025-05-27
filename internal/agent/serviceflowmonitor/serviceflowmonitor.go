@@ -145,7 +145,7 @@ func (sfm *ServiceFlowMonitor) fillMissingSrcGID(event *ebpf.RdmaConnTuple) stri
 				return rnic.GID
 			}
 		}
-		if rnic.SenderQueue != nil && rnic.SenderQueue.QPN == event.SrcQPN {
+		if rnic.ProberQueue != nil && rnic.ProberQueue.QPN == event.SrcQPN {
 			return rnic.GID
 		}
 	}

@@ -39,8 +39,8 @@ type RNIC struct {
 	IsOpen         bool
 	ActiveGIDIndex uint8               // Added to store the active GID index
 	ActivePortNum  uint8               // Added to store the active port number
-	SenderQueue    *UDQueue            // Queue for sending probes and receiving ACKs
-	ResponderQueue *UDQueue            // Queue for receiving probes and sending ACKs
+	ProberQueue    *UDQueue            // Queue for probing and receiving ACKs
+	ResponderQueue *UDQueue            // Queue for responding to probes and sending ACKs
 	UDQueues       map[string]*UDQueue // Map of keys to UDQueue for backward compatibility
 }
 

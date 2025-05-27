@@ -221,7 +221,9 @@ func (c *ClusterMonitor) runAllProbeWorkers() {
 
 		log.Debug().
 			Str("source_gid", target.SourceRnicGID).
+			Str("source_device_name", target.SourceDeviceName).
 			Str("target_gid", target.GID).
+			Str("target_device_name", target.DeviceName).
 			Uint32("flow_label", target.FlowLabel).
 			Msg("Started probe worker for source-target pair")
 	}
@@ -254,6 +256,7 @@ func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target p
 		QPN:              target.QPN,
 		IPAddress:        target.IPAddress,
 		HostName:         target.HostName,
+		DeviceName:       target.DeviceName,
 		TorID:            target.TorID,
 		SourcePort:       target.SourcePort,
 		FlowLabel:        target.FlowLabel,

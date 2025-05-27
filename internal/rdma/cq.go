@@ -126,14 +126,18 @@ func (u *UDQueue) processSingleWC(cqEx *C.struct_ibv_cq_ex) {
 
 	switch gwc.Opcode {
 	case C.IBV_WC_RECV:
-		u.handleRecvCompletion(gwc)
-		if errPost := u.PostRecv(); errPost != nil {
-			repostErr := fmt.Errorf("CQ Poller: Failed to repost receive buffer for QPN 0x%x, Type: %s: %w", u.QPN, getQueueTypeString(u.QueueType), errPost)
-			log.Error().Err(repostErr).Msg("Failed to repost receive buffer")
-			select {
-			case u.errChan <- repostErr:
-			default:
-				log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping repost error")
+		// handleRecvCompletion returns true if it handled an ACK and already called PostRecv()
+		ackHandled := u.handleRecvCompletion(gwc)
+		if !ackHandled {
+			// Only call PostRecv() if ACK was not handled (to avoid double posting)
+			if errPost := u.PostRecv(); errPost != nil {
+				repostErr := fmt.Errorf("CQ Poller: Failed to repost receive buffer for QPN 0x%x, Type: %s: %w", u.QPN, getQueueTypeString(u.QueueType), errPost)
+				log.Error().Err(repostErr).Msg("Failed to repost receive buffer")
+				select {
+				case u.errChan <- repostErr:
+				default:
+					log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping repost error")
+				}
 			}
 		}
 	case C.IBV_WC_SEND:
@@ -166,7 +170,7 @@ func (u *UDQueue) handleWCError(gwc *GoWorkCompletion) {
 	}
 }
 
-func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx from args
+func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns true if ACK was handled and PostRecv() was called
 	log.Trace().
 		Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 		Str("type", getQueueTypeString(u.QueueType)).
@@ -207,7 +211,7 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 		if errPost := u.PostRecv(); errPost != nil { // Attempt to repost buffer even on error
 			log.Error().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msgf("Failed to repost recv buffer after small packet error: %v", errPost)
 		}
-		return
+		return false
 	}
 
 	var payloadStartPtr unsafe.Pointer
@@ -274,8 +278,13 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 			} else {
 				log.Warn().Uint32("payloadLen", payloadLen).Uint32("expected", packetStructSize).Msg("Payload too small to be ProbePacket for ACK")
 				// Cannot proceed if we can't get the ACK type, etc.
-				u.PostRecv() // Attempt to repost buffer
-				return
+				if errPost := u.PostRecv(); errPost != nil {
+					log.Error().Err(errPost).
+						Str("device", u.RNIC.DeviceName).
+						Uint32("qpn", u.QPN).
+						Msg("Failed to repost recv buffer after small ACK packet error")
+				}
+				return false
 			}
 		}
 
@@ -285,7 +294,17 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 			// it should go to recvCompChan. The `if u.QueueType == UDQueueTypeSender ...` handles this.
 			// For now, let the original logic send gwc to recvCompChan if not ACK for sender.
 			// This block mainly ensures probePkt is valid if we proceed to ackHandler.
+			if errPost := u.PostRecv(); errPost != nil {
+				log.Error().Err(errPost).
+					Str("device", u.RNIC.DeviceName).
+					Uint32("qpn", u.QPN).
+					Msg("Failed to repost recv buffer after invalid ACK packet")
+			}
+			return false
 		}
+
+		// Create a deep copy of the ProbePacket to avoid data corruption when RecvBuf is reused
+		ppCopy := *probePkt
 
 		processedWCForAck := &ProcessedWorkCompletion{
 			GoWorkCompletion: *gwc,
@@ -295,12 +314,21 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 		}
 
 		ackInfo := &IncomingAckInfo{
-			Packet:      probePkt, // This is a pointer to RecvBuf, be careful.
+			Packet:      &ppCopy, // Use the safe copy instead of pointer to RecvBuf
 			ReceivedAt:  time.Unix(0, int64(gwc.CompletionWallclockNS)),
 			ProcessedWC: processedWCForAck,
 			AckStatusOK: gwc.Status == C.IBV_WC_SUCCESS, // Set AckStatusOK based on gwc.Status
 		}
 		u.ackHandler(ackInfo)
+
+		// Immediately repost receive buffer after ACK processing to prevent RQ exhaustion
+		if errPost := u.PostRecv(); errPost != nil {
+			log.Error().Err(errPost).
+				Str("device", u.RNIC.DeviceName).
+				Uint32("qpn", u.QPN).
+				Msg("Failed to repost recv buffer after ACK processing")
+		}
+		return true // ACK processing is complete
 	} else {
 		log.Trace().
 			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
@@ -321,6 +349,7 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 				Msg("Receive completion channel full, dropping WC_RECV event. gwc will be freed.")
 		}
 	}
+	return false // Non-ACK packet, PostRecv() should be called by caller
 }
 
 func (u *UDQueue) handleSendCompletion(gwc *GoWorkCompletion) {

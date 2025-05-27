@@ -199,7 +199,7 @@ func (r *RnicRegistry) GetSampleRNICsFromOtherToRs(
 	// This is a simplified implementation - in a real system, you might want
 	// a more sophisticated sampling strategy
 	querySQL := `
-	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id
+	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 	FROM rnics
 	WHERE tor_id != ?
 	AND last_updated > datetime('now', '-5 minutes')
@@ -223,21 +223,22 @@ func (r *RnicRegistry) GetSampleRNICsFromOtherToRs(
 
 	// Iterate through result rows
 	for result.Next() {
-		var gid, ip, hostname, torID string
+		var gid, ip, hostname, torID, deviceName string
 		var qpn int64
 
 		// Scan row values
-		if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID); err != nil {
+		if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID, &deviceName); err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
 		// Add to result list
 		rnics = append(rnics, &controller_agent.RnicInfo{
-			Gid:       gid,
-			Qpn:       uint32(qpn),
-			IpAddress: ip,
-			HostName:  hostname,
-			TorId:     torID,
+			Gid:        gid,
+			Qpn:        uint32(qpn),
+			IpAddress:  ip,
+			HostName:   hostname,
+			TorId:      torID,
+			DeviceName: deviceName,
 		})
 	}
 

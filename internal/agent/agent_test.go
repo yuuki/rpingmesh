@@ -63,7 +63,6 @@ func TestAgentBasicOperation(t *testing.T) {
 		AnalyzerAddr:         "localhost:50052",
 		LogLevel:             "info",
 		ProbeIntervalMS:      1000,
-		TimeoutMS:            500,
 		DataUploadIntervalMS: 10000,
 	}
 
@@ -113,7 +112,6 @@ controller_addr: "localhost:12345"
 analyzer_addr: "localhost:12346"
 log_level: "debug"
 probe_interval_ms: 2000
-timeout_ms: 1000
 data_upload_interval_ms: 5000
 traceroute_interval_ms: 300000
 traceroute_on_timeout: true
@@ -132,7 +130,6 @@ ebpf_enabled: false
 	os.Setenv("RPINGMESH_ANALYZER_ADDR", "localhost:12346")
 	os.Setenv("RPINGMESH_LOG_LEVEL", "debug")
 	os.Setenv("RPINGMESH_PROBE_INTERVAL_MS", "2000")
-	os.Setenv("RPINGMESH_TIMEOUT_MS", "1000")
 	os.Setenv("RPINGMESH_DATA_UPLOAD_INTERVAL_MS", "5000")
 	os.Setenv("RPINGMESH_TRACEROUTE_INTERVAL_MS", "300000")
 	os.Setenv("RPINGMESH_TRACEROUTE_ON_TIMEOUT", "true")
@@ -145,7 +142,6 @@ ebpf_enabled: false
 		AnalyzerAddr:         "localhost:12346",
 		LogLevel:             "debug",
 		ProbeIntervalMS:      2000,
-		TimeoutMS:            1000,
 		DataUploadIntervalMS: 5000,
 		TracerouteIntervalMS: 300000,
 		TracerouteOnTimeout:  true,
@@ -163,10 +159,6 @@ ebpf_enabled: false
 
 	if cfg.ProbeIntervalMS != 2000 {
 		t.Errorf("Expected probe interval 2000, got %d", cfg.ProbeIntervalMS)
-	}
-
-	if cfg.TimeoutMS != 1000 {
-		t.Errorf("Expected timeout 1000, got %d", cfg.TimeoutMS)
 	}
 
 	if cfg.EBPFEnabled != false {

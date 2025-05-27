@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,7 +29,8 @@ import (
 
 // PingSession holds the state for a single probe transaction.
 type PingSession struct {
-	FlowLabel     uint32 // Flow label used as session key
+	SessionKey    string // Changed: Use composite key instead of just FlowLabel
+	FlowLabel     uint32 // Keep for reference
 	SequenceNum   uint64
 	SourceRnicGid string
 	TargetGid     string
@@ -58,9 +60,22 @@ type Prober struct {
 	probeResults chan *agent_analyzer.ProbeResult
 	stopCh       chan struct{}
 	wg           sync.WaitGroup
-	sessions     sync.Map // Key: uint32 (Flow Label), Value: *PingSession
+	sessions     sync.Map // Key: string (composite session key), Value: *PingSession
+	seqNumIndex  sync.Map // Key: uint64 (sequence number), Value: string (session key) - for faster lookup
 	nextSeqNum   uint64
 	metricMutex  sync.Mutex // To protect metrics if any are directly managed here
+
+	// Diagnostic statistics (using atomic operations for thread-safe access)
+	stats struct {
+		SessionsCreated       uint64 // Use atomic.AddUint64 and atomic.LoadUint64
+		SessionsFoundByFlow   uint64 // Use atomic.AddUint64 and atomic.LoadUint64
+		SessionsFoundBySeqNum uint64 // Use atomic.AddUint64 and atomic.LoadUint64
+		SessionsNotFound      uint64 // Use atomic.AddUint64 and atomic.LoadUint64
+		AckTimeouts           uint64 // Use atomic.AddUint64 and atomic.LoadUint64
+		SuccessfulProbes      uint64 // Use atomic.AddUint64 and atomic.LoadUint64
+		FailedProbes          uint64 // Use atomic.AddUint64 and atomic.LoadUint64
+		SessionCleanups       uint64 // Use atomic.AddUint64 and atomic.LoadUint64
+	}
 
 	// For Service Flow Tracing
 	// Using PingTarget from the same package now
@@ -71,6 +86,8 @@ type Prober struct {
 const (
 	probeResultChanBufferSize = 1000
 	responderStatsInterval    = 30 * time.Second
+	sessionCleanupInterval    = 60 * time.Second // New: Session cleanup interval
+	sessionTimeout            = 5 * time.Minute  // New: Session timeout duration
 )
 
 // NewProber creates a new Prober.
@@ -124,7 +141,15 @@ func (p *Prober) Start() error {
 	p.wg.Add(1)
 	go p.runServiceProbingLoop()
 
-	log.Info().Msg("Prober started with responder loops and service probing loop.")
+	// Start session cleanup loop
+	p.wg.Add(1)
+	go p.runSessionCleanupLoop()
+
+	// Start statistics logging loop
+	p.wg.Add(1)
+	go p.runStatsLoggingLoop()
+
+	log.Info().Msg("Prober started with responder loops, service probing loop, session cleanup loop, and statistics logging loop.")
 	return nil
 }
 
@@ -148,6 +173,12 @@ func (p *Prober) Close() error {
 		})
 		p.sessions.Delete(key) // Remove session from sync.Map
 		return true            // Continue iteration
+	})
+
+	// Clear sequence number index
+	p.seqNumIndex.Range(func(key, value interface{}) bool {
+		p.seqNumIndex.Delete(key)
+		return true
 	})
 
 	close(p.probeResults)
@@ -229,6 +260,11 @@ func (p *Prober) runServiceProbingLoop() {
 	}
 }
 
+// generateSessionKey creates a unique session key for probe tracking
+func (p *Prober) generateSessionKey(sourceGid, targetGid string, seqNum uint64) string {
+	return fmt.Sprintf("%s->%s:%d", sourceGid, targetGid, seqNum)
+}
+
 // ProbeTarget sends a single probe to a target RNIC.
 func (p *Prober) ProbeTarget(
 	ctx context.Context,
@@ -246,7 +282,12 @@ func (p *Prober) ProbeTarget(
 
 	seqNum := atomic.AddUint64(&p.nextSeqNum, 1)
 	flowLabel := target.FlowLabel // Use target's flow label as session key
+
+	// Generate composite session key for better tracking
+	sessionKey := p.generateSessionKey(sourceRnic.GID, target.GID, seqNum)
+
 	session := &PingSession{
+		SessionKey:    sessionKey,
 		FlowLabel:     flowLabel,
 		SequenceNum:   seqNum,
 		SourceRnicGid: sourceRnic.GID,
@@ -258,7 +299,7 @@ func (p *Prober) ProbeTarget(
 		closed:        make(chan struct{}), // Initialize closed channel
 	}
 	p.addSession(session)
-	defer p.removeSession(flowLabel)
+	defer p.removeSession(sessionKey)
 
 	var actualSrcGid, actualDstGid string
 	var actualSrcQpn, actualDstQpn, actualFlowLabel uint32
@@ -418,6 +459,10 @@ func (p *Prober) ProbeTarget(
 			Uint64("seqNum", seqNum).
 			Msg("Failed to send probe packet")
 		result.Status = agent_analyzer.ProbeResult_ERROR
+
+		// Update statistics for failed probe using atomic operation
+		atomic.AddUint64(&p.stats.FailedProbes, 1)
+
 		p.probeResults <- result
 		return
 	}
@@ -455,6 +500,9 @@ func (p *Prober) ProbeTarget(
 					Msg("[prober]: Probe timed out waiting for remaining ACK")
 			}
 			result.Status = agent_analyzer.ProbeResult_TIMEOUT
+			// Update statistics using atomic operation
+			atomic.AddUint64(&p.stats.AckTimeouts, 1)
+
 			p.probeResults <- result
 			return
 
@@ -464,6 +512,10 @@ func (p *Prober) ProbeTarget(
 					Str("actualDstGID", actualDstGid).
 					Msg("[prober]: Session Ack1Chan channel closed prematurely")
 				result.Status = agent_analyzer.ProbeResult_ERROR
+
+				// Update statistics for failed probe using atomic operation
+				atomic.AddUint64(&p.stats.FailedProbes, 1)
+
 				p.probeResults <- result
 				return
 			}
@@ -489,6 +541,10 @@ func (p *Prober) ProbeTarget(
 					Str("actualDstGID", actualDstGid).
 					Msg("[prober]: Session Ack2Chan channel closed prematurely")
 				result.Status = agent_analyzer.ProbeResult_ERROR
+
+				// Update statistics for failed probe using atomic operation
+				atomic.AddUint64(&p.stats.FailedProbes, 1)
+
 				p.probeResults <- result
 				return
 			}
@@ -514,6 +570,9 @@ func (p *Prober) ProbeTarget(
 	result.Status = agent_analyzer.ProbeResult_OK
 	t6 = time.Now() // T6 is when both ACKs have been processed
 	result.T6 = timestamppb.New(t6)
+
+	// Update statistics for successful probe using atomic operation
+	atomic.AddUint64(&p.stats.SuccessfulProbes, 1)
 
 	log.Trace().Uint64("seqNum", seqNum).
 		Str("actualDstGID", actualDstGid).
@@ -616,6 +675,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 		probePackets   uint64
 		invalidPackets uint64
 		errorPackets   uint64
+		timeoutCount   uint64
 	)
 
 	// Log stats periodically
@@ -630,6 +690,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				Uint64("probePackets", probePackets).
 				Uint64("invalidPackets", invalidPackets).
 				Uint64("errorPackets", errorPackets).
+				Uint64("timeoutCount", timeoutCount).
 				Msg("Stopping responder loop")
 			return
 
@@ -640,6 +701,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				Uint64("probePackets", probePackets).
 				Uint64("invalidPackets", invalidPackets).
 				Uint64("errorPackets", errorPackets).
+				Uint64("timeoutCount", timeoutCount).
 				Msg("Responder loop stats")
 
 		default:
@@ -654,6 +716,16 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 						Str("gid", udq.RNIC.GID).
 						Msg("[responder]: Error receiving packet")
 					atomic.AddUint64(&errorPackets, 1)
+				} else {
+					atomic.AddUint64(&timeoutCount, 1)
+					// Log timeout every 1000 occurrences to avoid spam
+					if timeoutCount%1000 == 0 {
+						log.Trace().
+							Str("device", udq.RNIC.DeviceName).
+							Uint32("qpn", udq.QPN).
+							Uint64("timeout_count", timeoutCount).
+							Msg("[responder]: Receive timeout (normal)")
+					}
 				}
 				continue
 			}
@@ -671,12 +743,34 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 			// Count packets
 			atomic.AddUint64(&totalPackets, 1)
 
+			log.Trace().
+				Str("device", udq.RNIC.DeviceName).
+				Uint32("qpn", udq.QPN).
+				Str("gid", udq.RNIC.GID).
+				Uint64("seqNum", func() uint64 {
+					if packet != nil {
+						return packet.SequenceNum
+					}
+					return 0
+				}()).
+				Uint8("isAck", func() uint8 {
+					if packet != nil {
+						return packet.IsAck
+					}
+					return 255 // Invalid value to indicate packet is nil
+				}()).
+				Str("sourceGID", processedWC.SGID).
+				Uint32("sourceQPN", processedWC.SrcQP).
+				Uint32("flowLabel", processedWC.FlowLabel).
+				Msg("[responder]: Received packet on responder queue")
+
 			if packet.IsAck != 0 { // packet can be nil if deserialize failed but processedWC might still be returned
 				log.Warn().
 					Str("device", udq.RNIC.DeviceName).
 					Str("GID", udq.RNIC.GID).
 					Uint32("QPN", udq.QPN).
 					Uint32("flowLabel", processedWC.FlowLabel). // Use FlowLabel from ProcessedWorkCompletion
+					Uint64("seqNum", packet.SequenceNum).
 					Msg("[responder]: Received ACK packet (this is invalid, ignoring)")
 				continue
 			}
@@ -693,17 +787,23 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 					Str("sourceGID", sourceGID).
 					Uint32("sourceQPN", sourceQPN).
 					Uint32("flowLabel", processedWC.FlowLabel).
+					Uint64("seqNum", packet.SequenceNum).
+					Str("device", udq.RNIC.DeviceName).
+					Uint32("qpn", udq.QPN).
 					Msg("[responder]: Invalid source GID or QPN in work completion, cannot send ACK")
 				continue
 			}
 
-			log.Trace().
+			log.Debug().
 				Str("sending_device", udq.RNIC.DeviceName).
 				Uint32("sendingQPN", udq.QPN).
 				Str("sendingGID", udq.RNIC.GID).
 				Str("targetGID", sourceGID).
 				Uint32("targetQPN", sourceQPN).
 				Uint32("flowLabel", processedWC.FlowLabel).
+				Uint64("seqNum", packet.SequenceNum).
+				Uint64("packet_t1", packet.T1).
+				Time("receiveTime", receiveTime).
 				Msg("[responder]: Received probe packet, sending ACKs")
 
 			// Step 2: Send first ACK packet immediately (without processing delay info)
@@ -716,6 +816,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 					Str("targetGID", sourceGID).    // This should be sending_device for logging consistency? No, target is the original prober.
 					Uint32("targetQPN", sourceQPN). // Same as above.
 					Uint32("flowLabel", processedWC.FlowLabel).
+					Uint64("seqNum", packet.SequenceNum).
 					Msg("[responder]: Failed to send first ACK packet")
 				continue
 			}
@@ -724,6 +825,8 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				Str("sourceGID", sourceGID).
 				Uint32("sourceQPN", sourceQPN).
 				Uint32("flowLabel", processedWC.FlowLabel).
+				Uint64("seqNum", packet.SequenceNum).
+				Time("firstAckCompletionTime", firstAckCompletionTime).
 				Msg("[responder]: Sent first ACK packet")
 
 			// Step 3: Send second ACK packet with processing delay information
@@ -736,6 +839,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 					Str("targetGID", sourceGID).
 					Uint32("targetQPN", sourceQPN).
 					Uint32("flowLabel", processedWC.FlowLabel).
+					Uint64("seqNum", packet.SequenceNum).
 					Msg("[responder]: Failed to send second ACK packet")
 				continue
 			}
@@ -744,6 +848,7 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				Str("sourceGID", sourceGID).
 				Uint32("sourceQPN", sourceQPN).
 				Uint32("flowLabel", processedWC.FlowLabel).
+				Uint64("seqNum", packet.SequenceNum).
 				Msg("[responder]: Sent second ACK packet")
 		}
 	}
@@ -757,20 +862,55 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 		return
 	}
 
-	// sessionKey is flow label from the GRH (Global Routing Header)
-	// This is the original implementation approach using flow label as session key
-	sessionKey := ackInfo.ProcessedWC.FlowLabel // Use FlowLabel from ProcessedWC as the session key
+	// Try to find session using multiple strategies
+	var session *PingSession
+	var sessionKey string
+
+	// Strategy 1: Use flow label (original approach)
+	flowLabelKey := ackInfo.ProcessedWC.FlowLabel
+	session = p.getSessionByFlowLabel(flowLabelKey)
+	if session != nil {
+		sessionKey = session.SessionKey
+		// Update statistics using atomic operation
+		atomic.AddUint64(&p.stats.SessionsFoundByFlow, 1)
+
+		log.Trace().
+			Uint32("found_by_flowLabel", flowLabelKey).
+			Str("sessionKey", sessionKey).
+			Msg("[prober_handler]: Found session by flow label")
+	} else {
+		// Strategy 2: Search by sequence number and source/dest GIDs
+		sourceGid := ackInfo.ProcessedWC.SGID
+		// We need to find the session by searching through all active sessions
+		// This is less efficient but more reliable
+		session = p.findSessionByPacketInfo(ackInfo.Packet.SequenceNum, sourceGid)
+		if session != nil {
+			sessionKey = session.SessionKey
+			// Update statistics using atomic operation
+			atomic.AddUint64(&p.stats.SessionsFoundBySeqNum, 1)
+
+			log.Trace().
+				Uint64("found_by_seqNum", ackInfo.Packet.SequenceNum).
+				Str("sourceGid", sourceGid).
+				Str("sessionKey", sessionKey).
+				Msg("[prober_handler]: Found session by sequence number and GID")
+		} else {
+			// Update statistics for not found using atomic operation
+			atomic.AddUint64(&p.stats.SessionsNotFound, 1)
+		}
+	}
 
 	log.Trace().
-		Uint32("sessionKey_flowLabel", sessionKey). // Changed back to flowLabel
+		Uint32("flowLabel", flowLabelKey).
 		Uint64("packet_seqNum", ackInfo.Packet.SequenceNum).
 		Uint8("packet_ackType", ackInfo.Packet.AckType).
-		Str("source_gid_from_grh", ackInfo.ProcessedWC.SGID).   // From ProcessedWC
-		Uint32("source_qp_from_wc", ackInfo.ProcessedWC.SrcQP). // From ProcessedWC (embedded GoWorkCompletion)
-		Int("wc_status_from_pwc", ackInfo.ProcessedWC.Status).  // Status from embedded GoWorkCompletion
+		Str("source_gid_from_grh", ackInfo.ProcessedWC.SGID).
+		Uint32("source_qp_from_wc", ackInfo.ProcessedWC.SrcQP).
+		Int("wc_status_from_pwc", ackInfo.ProcessedWC.Status).
+		Str("sessionKey", sessionKey).
+		Bool("session_found", session != nil).
 		Msg("[prober_handler]: Processing incoming ACK packet via callback")
 
-	session := p.getSession(sessionKey) // Use getSession helper
 	if session != nil {
 		// Construct probe.ackEvent from rdma.IncomingAckInfo
 		probeEvent := &ackEvent{
@@ -783,7 +923,7 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 		// AckStatusOK should ideally be set based on ackInfo.ProcessedWC.Status == C.IBV_WC_SUCCESS
 		if !ackInfo.AckStatusOK { // This flag should be set correctly by the caller (e.g. CQ poller in rdma package)
 			log.Error().
-				Uint32("sessionKey_flowLabel", sessionKey).        // Changed back to flowLabel
+				Str("sessionKey", sessionKey).
 				Int("rdma_wc_status", ackInfo.ProcessedWC.Status). // Log the actual RDMA status
 				Msg("[prober_handler]: Received ACK but RDMA completion status was not OK (indicated by AckStatusOK flag).")
 			return
@@ -799,13 +939,13 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 			targetChan = session.Ack2Chan
 			chanName = "Ack2Chan"
 		} else {
-			log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Uint8("ackType", ackInfo.Packet.AckType).Msg("[prober_handler]: Received ACK with unknown type") // Changed back to flowLabel
+			log.Warn().Str("sessionKey", sessionKey).Uint8("ackType", ackInfo.Packet.AckType).Msg("[prober_handler]: Received ACK with unknown type")
 			return
 		}
 
 		if targetChan == nil {
 			log.Warn().
-				Uint32("sessionKey_flowLabel", sessionKey). // Changed back to flowLabel
+				Str("sessionKey", sessionKey).
 				Str("chan", chanName).
 				Msg("[prober_handler]: Session channel is nil. Session likely ended or cleaned up.")
 			return
@@ -817,17 +957,17 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 		case <-session.closed:
 			// Session is closed, cannot send
 			log.Warn().
-				Uint32("sessionKey_flowLabel", sessionKey).
+				Str("sessionKey", sessionKey).
 				Str("chan", chanName).
 				Msg("[prober_handler]: Session is closed, cannot send ACK event.")
 		case targetChan <- probeEvent:
 			// Successfully sent
-			log.Trace().Uint32("sessionKey_flowLabel", sessionKey).Str("chan", chanName).
+			log.Trace().Str("sessionKey", sessionKey).Str("chan", chanName).
 				Msg("[prober_handler]: Successfully sent ACK event to session channel")
 		default:
 			// Channel is blocked or nil
 			log.Warn().
-				Uint32("sessionKey_flowLabel", sessionKey).
+				Str("sessionKey", sessionKey).
 				Str("chan", chanName).
 				Bool("closed", func() bool {
 					select {
@@ -841,7 +981,11 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 				Msg("[prober_handler]: Session channel blocked or closed (likely late ACK or session ended).")
 		}
 	} else {
-		log.Warn().Uint32("sessionKey_flowLabel", sessionKey).Uint64("packet_seqNum", ackInfo.Packet.SequenceNum).Msg("[prober_handler]: Received ACK for non-existent or already cleaned-up session") // Changed back to flowLabel
+		log.Warn().
+			Uint32("flowLabel", flowLabelKey).
+			Uint64("packet_seqNum", ackInfo.Packet.SequenceNum).
+			Str("source_gid", ackInfo.ProcessedWC.SGID).
+			Msg("[prober_handler]: Received ACK for non-existent or already cleaned-up session")
 	}
 }
 
@@ -852,13 +996,19 @@ func (p *Prober) getRnicByGid(gid string) *rdma.RNIC {
 
 // addSession adds a session to the map.
 func (p *Prober) addSession(session *PingSession) {
-	p.sessions.Store(session.FlowLabel, session)
+	p.sessions.Store(session.SessionKey, session)
+	p.seqNumIndex.Store(session.SequenceNum, session.SessionKey)
+
+	// Update statistics using atomic operation
+	atomic.AddUint64(&p.stats.SessionsCreated, 1)
 }
 
 // removeSession removes a session from the map.
-func (p *Prober) removeSession(flowLabel uint32) {
-	if value, ok := p.sessions.LoadAndDelete(flowLabel); ok {
+func (p *Prober) removeSession(sessionKey string) {
+	if value, ok := p.sessions.LoadAndDelete(sessionKey); ok {
 		session := value.(*PingSession)
+		// Remove from sequence number index
+		p.seqNumIndex.Delete(session.SequenceNum)
 		// Safely close the session channels using sync.Once
 		session.closeOnce.Do(func() {
 			close(session.closed)
@@ -872,10 +1022,193 @@ func (p *Prober) removeSession(flowLabel uint32) {
 	}
 }
 
-// getSession retrieves a session by flow label.
-func (p *Prober) getSession(flowLabel uint32) *PingSession {
-	if value, ok := p.sessions.Load(flowLabel); ok {
+// getSession retrieves a session by session key.
+func (p *Prober) getSession(sessionKey string) *PingSession {
+	if value, ok := p.sessions.Load(sessionKey); ok {
 		return value.(*PingSession)
 	}
 	return nil
+}
+
+// getSessionByFlowLabel retrieves a session by flow label (fallback method).
+func (p *Prober) getSessionByFlowLabel(flowLabel uint32) *PingSession {
+	var foundSession *PingSession
+	p.sessions.Range(func(key, value interface{}) bool {
+		session := value.(*PingSession)
+		if session.FlowLabel == flowLabel {
+			foundSession = session
+			return false // Stop iteration
+		}
+		return true // Continue iteration
+	})
+	return foundSession
+}
+
+// findSessionByPacketInfo finds a session by sequence number and source GID.
+func (p *Prober) findSessionByPacketInfo(seqNum uint64, sourceGid string) *PingSession {
+	// First, try to find by sequence number index (O(1) lookup)
+	if sessionKeyValue, ok := p.seqNumIndex.Load(seqNum); ok {
+		sessionKey := sessionKeyValue.(string)
+		if session := p.getSession(sessionKey); session != nil {
+			// Verify the source GID matches (additional validation)
+			if session.TargetGid == sourceGid {
+				log.Trace().
+					Uint64("seqNum", seqNum).
+					Str("sourceGid", sourceGid).
+					Str("sessionKey", sessionKey).
+					Msg("Found session using sequence number index")
+				return session
+			} else {
+				log.Warn().
+					Uint64("seqNum", seqNum).
+					Str("expected_sourceGid", sourceGid).
+					Str("session_targetGid", session.TargetGid).
+					Str("sessionKey", sessionKey).
+					Msg("Sequence number found but GID mismatch - possible sequence number collision")
+			}
+		}
+	}
+
+	// Fallback to linear search if index lookup fails
+	log.Trace().
+		Uint64("seqNum", seqNum).
+		Str("sourceGid", sourceGid).
+		Msg("Falling back to linear search for session")
+
+	var foundSession *PingSession
+	p.sessions.Range(func(key, value interface{}) bool {
+		session := value.(*PingSession)
+		if session.SequenceNum == seqNum && session.TargetGid == sourceGid {
+			foundSession = session
+			return false // Stop iteration
+		}
+		return true // Continue iteration
+	})
+
+	if foundSession != nil {
+		log.Trace().
+			Uint64("seqNum", seqNum).
+			Str("sourceGid", sourceGid).
+			Str("sessionKey", foundSession.SessionKey).
+			Msg("Found session using linear search")
+	}
+
+	return foundSession
+}
+
+// runSessionCleanupLoop periodically cleans up expired sessions to prevent memory leaks.
+func (p *Prober) runSessionCleanupLoop() {
+	defer p.wg.Done()
+
+	ticker := time.NewTicker(sessionCleanupInterval)
+	defer ticker.Stop()
+
+	log.Info().
+		Dur("cleanup_interval", sessionCleanupInterval).
+		Dur("session_timeout", sessionTimeout).
+		Msg("Starting session cleanup loop")
+
+	for {
+		select {
+		case <-p.stopCh:
+			log.Info().Msg("Session cleanup loop stopping")
+			return
+		case <-ticker.C:
+			p.cleanupExpiredSessions()
+		}
+	}
+}
+
+// cleanupExpiredSessions removes sessions that have exceeded the timeout duration.
+func (p *Prober) cleanupExpiredSessions() {
+	now := time.Now()
+	var expiredKeys []string
+	var totalSessions int
+
+	// Collect expired session keys
+	p.sessions.Range(func(key, value interface{}) bool {
+		totalSessions++
+		session := value.(*PingSession)
+		if now.Sub(session.CreationTime) > sessionTimeout {
+			expiredKeys = append(expiredKeys, key.(string))
+		}
+		return true // Continue iteration
+	})
+
+	// Remove expired sessions
+	for _, sessionKey := range expiredKeys {
+		p.removeSession(sessionKey)
+		log.Debug().
+			Str("sessionKey", sessionKey).
+			Msg("Cleaned up expired session")
+	}
+
+	if len(expiredKeys) > 0 {
+		// Update statistics using atomic operation
+		atomic.AddUint64(&p.stats.SessionCleanups, uint64(len(expiredKeys)))
+
+		log.Info().
+			Int("expired_sessions", len(expiredKeys)).
+			Int("total_sessions", totalSessions).
+			Int("remaining_sessions", totalSessions-len(expiredKeys)).
+			Msg("Session cleanup completed")
+	}
+}
+
+// runStatsLoggingLoop periodically logs diagnostic statistics.
+func (p *Prober) runStatsLoggingLoop() {
+	defer p.wg.Done()
+
+	ticker := time.NewTicker(1 * time.Minute) // Log stats every 5 minutes
+	defer ticker.Stop()
+
+	log.Info().Msg("Starting statistics logging loop")
+
+	for {
+		select {
+		case <-p.stopCh:
+			log.Info().Msg("Statistics logging loop stopping")
+			return
+		case <-ticker.C:
+			p.logDiagnosticStats()
+		}
+	}
+}
+
+// logDiagnosticStats logs current diagnostic statistics.
+func (p *Prober) logDiagnosticStats() {
+	// Count active sessions
+	var activeSessions int
+	p.sessions.Range(func(key, value interface{}) bool {
+		activeSessions++
+		return true
+	})
+
+	// Use atomic loads for statistics
+	log.Info().
+		Uint64("sessions_created", atomic.LoadUint64(&p.stats.SessionsCreated)).
+		Uint64("sessions_found_by_flow", atomic.LoadUint64(&p.stats.SessionsFoundByFlow)).
+		Uint64("sessions_found_by_seq_num", atomic.LoadUint64(&p.stats.SessionsFoundBySeqNum)).
+		Uint64("sessions_not_found", atomic.LoadUint64(&p.stats.SessionsNotFound)).
+		Uint64("ack_timeouts", atomic.LoadUint64(&p.stats.AckTimeouts)).
+		Uint64("successful_probes", atomic.LoadUint64(&p.stats.SuccessfulProbes)).
+		Uint64("failed_probes", atomic.LoadUint64(&p.stats.FailedProbes)).
+		Uint64("session_cleanups", atomic.LoadUint64(&p.stats.SessionCleanups)).
+		Int("active_sessions", activeSessions).
+		Msg("Prober diagnostic statistics")
+}
+
+// GetDiagnosticStats returns current diagnostic statistics.
+func (p *Prober) GetDiagnosticStats() map[string]uint64 {
+	// Use atomic loads for statistics
+	return map[string]uint64{
+		"sessions_created":          atomic.LoadUint64(&p.stats.SessionsCreated),
+		"sessions_found_by_flow":    atomic.LoadUint64(&p.stats.SessionsFoundByFlow),
+		"sessions_found_by_seq_num": atomic.LoadUint64(&p.stats.SessionsFoundBySeqNum),
+		"sessions_not_found":        atomic.LoadUint64(&p.stats.SessionsNotFound),
+		"ack_timeouts":              atomic.LoadUint64(&p.stats.AckTimeouts),
+		"successful_probes":         atomic.LoadUint64(&p.stats.SuccessfulProbes),
+		"failed_probes":             atomic.LoadUint64(&p.stats.FailedProbes),
+		"session_cleanups":          atomic.LoadUint64(&p.stats.SessionCleanups),
+	}
 }

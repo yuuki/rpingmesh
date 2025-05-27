@@ -125,13 +125,28 @@ func (u *UDQueue) SendProbePacket(
 		Uint32("source_port", sourcePort).
 		Uint32("flow_label", flowLabel).
 		Uint64("sequence_num", sequenceNum).
+		Str("local_device", u.RNIC.DeviceName).
+		Str("local_gid", u.RNIC.GID).
+		Uint32("local_qpn", u.QPN).
 		Msg("sendProbe: Details of target for SendProbePacket")
 
 	ah, err := u.CreateAddressHandle(targetGID, flowLabel)
 	if err != nil {
+		log.Error().Err(err).
+			Str("target_dest_rnic_gid", targetGID).
+			Uint32("flow_label", flowLabel).
+			Str("local_device", u.RNIC.DeviceName).
+			Str("local_gid", u.RNIC.GID).
+			Msg("Failed to create Address Handle for probe packet")
 		return time.Time{}, time.Time{}, err
 	}
 	defer C.ibv_destroy_ah(ah)
+
+	log.Trace().
+		Str("target_dest_rnic_gid", targetGID).
+		Uint32("flow_label", flowLabel).
+		Uint64("sequence_num", sequenceNum).
+		Msg("Address Handle created successfully")
 
 	// Prepare the packet
 	packet := (*ProbePacket)(u.SendBuf)
@@ -140,6 +155,15 @@ func (u *UDQueue) SendProbePacket(
 	t1 := time.Now()
 	packet.T1 = uint64(t1.UnixNano())
 	packet.IsAck = 0 // Not an ACK
+
+	log.Trace().
+		Str("target_dest_rnic_gid", targetGID).
+		Uint32("target_dest_rnic_qpn", targetQPN).
+		Uint32("flow_label", flowLabel).
+		Uint64("sequence_num", sequenceNum).
+		Uint64("packet_t1", packet.T1).
+		Uint8("packet_isack", packet.IsAck).
+		Msg("Probe packet prepared, posting send")
 
 	if ret := C.post_send(
 		u.QP,
@@ -150,6 +174,16 @@ func (u *UDQueue) SendProbePacket(
 		C.uint32_t(targetQPN),
 		C.uint32_t(DefaultQKey),
 	); ret != 0 {
+		log.Error().
+			Int("post_send_ret", int(ret)).
+			Str("target_dest_rnic_gid", targetGID).
+			Uint32("target_dest_rnic_qpn", targetQPN).
+			Uint32("flow_label", flowLabel).
+			Uint64("sequence_num", sequenceNum).
+			Str("local_device", u.RNIC.DeviceName).
+			Str("local_gid", u.RNIC.GID).
+			Uint32("local_qpn", u.QPN).
+			Msg("post_send failed for probe packet")
 		return time.Time{}, time.Time{}, fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
 
@@ -166,14 +200,39 @@ func (u *UDQueue) SendProbePacket(
 	case wc := <-u.sendCompChan:
 		// Received send completion event
 		if wc.Status != C.IBV_WC_SUCCESS {
+			log.Error().
+				Int("wc_status", wc.Status).
+				Str("target_dest_rnic_gid", targetGID).
+				Uint32("target_dest_rnic_qpn", targetQPN).
+				Uint32("flow_label", flowLabel).
+				Uint64("sequence_num", sequenceNum).
+				Msg("Send completion failed for probe packet")
 			return time.Time{}, time.Time{}, fmt.Errorf("send completion failed: %d", wc.Status)
 		}
 		t2 := time.Unix(0, int64(wc.CompletionWallclockNS))
+		log.Trace().
+			Str("target_dest_rnic_gid", targetGID).
+			Uint32("flow_label", flowLabel).
+			Uint64("sequence_num", sequenceNum).
+			Uint64("hw_timestamp_ns", wc.CompletionWallclockNS).
+			Time("t2", t2).
+			Msg("Send completion successful for probe packet")
 		return t1, t2, nil
 	case err := <-u.errChan:
 		// Error occurred
+		log.Error().Err(err).
+			Str("target_dest_rnic_gid", targetGID).
+			Uint32("flow_label", flowLabel).
+			Uint64("sequence_num", sequenceNum).
+			Msg("Error during probe packet send")
 		return time.Time{}, time.Time{}, fmt.Errorf("error during send: %w", err)
 	case <-ctx.Done(): // Context cancelled or timed out
+		log.Warn().
+			Str("target_dest_rnic_gid", targetGID).
+			Uint32("flow_label", flowLabel).
+			Uint64("sequence_num", sequenceNum).
+			Err(ctx.Err()).
+			Msg("Send probe packet timed out")
 		return time.Time{}, time.Time{}, fmt.Errorf("send probe to (%s, %d, %d) timed out: %w", targetGID, targetQPN, sequenceNum, ctx.Err())
 	}
 }

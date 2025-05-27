@@ -4,14 +4,15 @@ package rdma
 // #include <stdlib.h>
 // #include <infiniband/verbs.h>
 //
-// // Helper function to post receive WR without Go pointers
-// int post_recv(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey) {
+// // Helper function to post receive WR without Go pointers with WRID support
+// int post_recv_with_wrid(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey, uint64_t wr_id) {
 //     struct ibv_sge sge = {
 //         .addr = addr,
 //         .length = length,
 //         .lkey = lkey,
 //     };
 //     struct ibv_recv_wr wr = {
+//         .wr_id = wr_id,
 //         .sg_list = &sge,
 //         .num_sge = 1,
 //     };
@@ -20,15 +21,16 @@ package rdma
 //     return ibv_post_recv(qp, &wr, &bad_wr);
 // }
 //
-// // Helper function to post send WR without Go pointers
-// int post_send(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey,
-//              struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey) {
+// // Helper function to post send WR without Go pointers with WRID support
+// int post_send_with_wrid(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey,
+//              struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey, uint64_t wr_id) {
 //     struct ibv_sge sge = {
 //         .addr = addr,
 //         .length = length,
 //         .lkey = lkey,
 //     };
 //     struct ibv_send_wr wr = {
+//         .wr_id = wr_id,
 //         .sg_list = &sge,
 //         .num_sge = 1,
 //         .opcode = IBV_WR_SEND,
@@ -40,6 +42,16 @@ package rdma
 //     struct ibv_send_wr *bad_wr = NULL;
 //
 //     return ibv_post_send(qp, &wr, &bad_wr);
+// }
+//
+// // Legacy helper functions for backward compatibility
+// int post_recv(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey) {
+//     return post_recv_with_wrid(qp, addr, length, lkey, 0);
+// }
+//
+// int post_send(struct ibv_qp *qp, uint64_t addr, uint32_t length, uint32_t lkey,
+//              struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey) {
+//     return post_send_with_wrid(qp, addr, length, lkey, ah, remote_qpn, remote_qkey, 0);
 // }
 //
 import "C"
@@ -94,20 +106,49 @@ type IncomingAckInfo struct {
 // It's called by the CQ poller when an ACK is received on a sender queue.
 type AckHandlerFunc func(ackInfo *IncomingAckInfo)
 
-// PostRecv posts a receive work request
-func (u *UDQueue) PostRecv() error {
-	// Use the C helper function that manages work request memory on C side
-	// This avoids the "cgo argument has Go pointers to unpinned Go pointers" error
-	ret := C.post_recv(
+// PostRecvSlot posts a receive work request to a specific slot
+func (u *UDQueue) PostRecvSlot(slot int) error {
+	if slot < 0 || slot >= u.NumRecvSlots {
+		return fmt.Errorf("invalid slot index %d, must be between 0 and %d", slot, u.NumRecvSlots-1)
+	}
+
+	slotAddr := u.RecvSlots[slot]
+	wrid := uint64(slot) // Use slot index as WRID
+
+	// Use the C helper function with WRID support
+	ret := C.post_recv_with_wrid(
 		u.QP,
-		C.uint64_t(uintptr(u.RecvBuf)),
+		C.uint64_t(slotAddr),
 		C.uint32_t(MRSize+GRHSize),
 		u.RecvMR.lkey,
+		C.uint64_t(wrid),
 	)
 	if ret != 0 {
-		return fmt.Errorf("ibv_post_recv failed: %d", ret)
+		return fmt.Errorf("ibv_post_recv failed for slot %d: %d", slot, ret)
 	}
 	return nil
+}
+
+// PostRecv posts a receive work request using the next available slot
+func (u *UDQueue) PostRecv() error {
+	u.RecvSlotMutex.Lock()
+	defer u.RecvSlotMutex.Unlock()
+
+	slot := u.NextRecvSlot % u.NumRecvSlots
+	u.NextRecvSlot++
+
+	return u.PostRecvSlot(slot)
+}
+
+// GetNextSendSlot returns the next available send slot and its address
+func (u *UDQueue) GetNextSendSlot() (int, unsafe.Pointer) {
+	u.SendSlotMutex.Lock()
+	defer u.SendSlotMutex.Unlock()
+
+	slot := u.NextSendSlot % u.NumSendSlots
+	u.NextSendSlot++
+
+	return slot, unsafe.Pointer(u.SendSlots[slot])
 }
 
 // SendProbePacket sends a probe packet to the target
@@ -148,9 +189,13 @@ func (u *UDQueue) SendProbePacket(
 		Uint64("sequence_num", sequenceNum).
 		Msg("Address Handle created successfully")
 
+	// Get next available send slot
+	sendSlot, sendBuf := u.GetNextSendSlot()
+	sendWRID := uint64(sendSlot + u.NumRecvSlots) // Offset send WRIDs to avoid collision with recv WRIDs
+
 	// Prepare the packet
-	packet := (*ProbePacket)(u.SendBuf)
-	C.memset(u.SendBuf, 0, C.size_t(unsafe.Sizeof(ProbePacket{})))
+	packet := (*ProbePacket)(sendBuf)
+	C.memset(sendBuf, 0, C.size_t(unsafe.Sizeof(ProbePacket{})))
 	packet.SequenceNum = sequenceNum
 	t1 := time.Now()
 	packet.T1 = uint64(t1.UnixNano())
@@ -163,16 +208,19 @@ func (u *UDQueue) SendProbePacket(
 		Uint64("sequence_num", sequenceNum).
 		Uint64("packet_t1", packet.T1).
 		Uint8("packet_isack", packet.IsAck).
+		Int("send_slot", sendSlot).
+		Uint64("send_wrid", sendWRID).
 		Msg("Probe packet prepared, posting send")
 
-	if ret := C.post_send(
+	if ret := C.post_send_with_wrid(
 		u.QP,
-		C.uint64_t(uintptr(u.SendBuf)),
+		C.uint64_t(uintptr(sendBuf)),
 		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
 		u.SendMR.lkey,
 		ah,
 		C.uint32_t(targetQPN),
 		C.uint32_t(DefaultQKey),
+		C.uint64_t(sendWRID),
 	); ret != 0 {
 		log.Error().
 			Int("post_send_ret", int(ret)).
@@ -183,6 +231,7 @@ func (u *UDQueue) SendProbePacket(
 			Str("local_device", u.RNIC.DeviceName).
 			Str("local_gid", u.RNIC.GID).
 			Uint32("local_qpn", u.QPN).
+			Int("send_slot", sendSlot).
 			Msg("post_send failed for probe packet")
 		return time.Time{}, time.Time{}, fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
@@ -193,6 +242,7 @@ func (u *UDQueue) SendProbePacket(
 		Uint32("source_port", sourcePort).
 		Uint32("flow_label", flowLabel).
 		Uint64("sequence_num", sequenceNum).
+		Int("send_slot", sendSlot).
 		Msg("post_send successful")
 
 	// Wait for completion notification from CQ poller
@@ -206,6 +256,7 @@ func (u *UDQueue) SendProbePacket(
 				Uint32("target_dest_rnic_qpn", targetQPN).
 				Uint32("flow_label", flowLabel).
 				Uint64("sequence_num", sequenceNum).
+				Int("send_slot", sendSlot).
 				Msg("Send completion failed for probe packet")
 			return time.Time{}, time.Time{}, fmt.Errorf("send completion failed: %d", wc.Status)
 		}
@@ -216,6 +267,7 @@ func (u *UDQueue) SendProbePacket(
 			Uint64("sequence_num", sequenceNum).
 			Uint64("hw_timestamp_ns", wc.CompletionWallclockNS).
 			Time("t2", t2).
+			Int("send_slot", sendSlot).
 			Msg("Send completion successful for probe packet")
 		return t1, t2, nil
 	case err := <-u.errChan:
@@ -224,6 +276,7 @@ func (u *UDQueue) SendProbePacket(
 			Str("target_dest_rnic_gid", targetGID).
 			Uint32("flow_label", flowLabel).
 			Uint64("sequence_num", sequenceNum).
+			Int("send_slot", sendSlot).
 			Msg("Error during probe packet send")
 		return time.Time{}, time.Time{}, fmt.Errorf("error during send: %w", err)
 	case <-ctx.Done(): // Context cancelled or timed out
@@ -231,6 +284,7 @@ func (u *UDQueue) SendProbePacket(
 			Str("target_dest_rnic_gid", targetGID).
 			Uint32("flow_label", flowLabel).
 			Uint64("sequence_num", sequenceNum).
+			Int("send_slot", sendSlot).
 			Err(ctx.Err()).
 			Msg("Send probe packet timed out")
 		return time.Time{}, time.Time{}, fmt.Errorf("send probe to (%s, %d, %d) timed out: %w", targetGID, targetQPN, sequenceNum, ctx.Err())
@@ -238,16 +292,16 @@ func (u *UDQueue) SendProbePacket(
 }
 
 // parseGRH parses the GRH if present and returns extracted GID/FlowLabel information.
-// It uses u.RecvBuf as the buffer containing the received data including potential GRH.
+// It uses the provided buffer as the buffer containing the received data including potential GRH.
 // Returns: sgid, dgid, flowLabel, pointer to actual payload, actual payload length, error
 func (u *UDQueue) parseGRH(
-	goWC *GoWorkCompletion) (sgid string, dgid string, flowLabel uint32, payloadDataPtr unsafe.Pointer, actualPayloadLength uint32, err error) {
+	goWC *GoWorkCompletion, recvBuffer unsafe.Pointer) (sgid string, dgid string, flowLabel uint32, payloadDataPtr unsafe.Pointer, actualPayloadLength uint32, err error) {
 	grhPresent := (goWC.WCFlags & C.IBV_WC_GRH) == C.IBV_WC_GRH
 
 	if !grhPresent { // GRH not present
 		log.Debug().Msg("IBV_WC_GRH is NOT set. Assuming payload starts at the beginning of the buffer.")
 		actualPayloadLength = uint32(goWC.ByteLen)
-		payloadDataPtr = u.RecvBuf
+		payloadDataPtr = recvBuffer
 		return "", "", 0, payloadDataPtr, actualPayloadLength, nil
 	}
 
@@ -258,8 +312,8 @@ func (u *UDQueue) parseGRH(
 		return "", "", 0, nil, 0, fmt.Errorf("IBV_WC_GRH set but wc.byte_len (%d) < GRHSize (%d)", goWC.ByteLen, GRHSize)
 	}
 
-	// GRH is at the beginning of u.RecvBuf
-	grhBytes := unsafe.Slice((*byte)(u.RecvBuf), GRHSize)
+	// GRH is at the beginning of the provided buffer
+	grhBytes := unsafe.Slice((*byte)(recvBuffer), GRHSize)
 	ipVersion := (grhBytes[0] >> 4) & 0x0F
 
 	if ipVersion == 4 {
@@ -278,7 +332,7 @@ func (u *UDQueue) parseGRH(
 	}
 
 	// Payload is after GRH
-	payloadDataPtr = unsafe.Pointer(uintptr(u.RecvBuf) + uintptr(GRHSize))
+	payloadDataPtr = unsafe.Pointer(uintptr(recvBuffer) + uintptr(GRHSize))
 	actualPayloadLength = uint32(goWC.ByteLen) - GRHSize
 	return sgid, dgid, flowLabel, payloadDataPtr, actualPayloadLength, nil
 }
@@ -383,8 +437,19 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 	case goWC := <-u.recvCompChan:
 		receiveTime := time.Unix(0, int64(goWC.CompletionWallclockNS)) // use HW timestamp
 
+		// Extract slot index from WRID to get the correct buffer
+		slot := int(goWC.WRID)
+		var recvBuffer unsafe.Pointer
+		if slot >= 0 && slot < u.NumRecvSlots {
+			recvBuffer = unsafe.Pointer(u.RecvSlots[slot])
+		} else {
+			// Fallback to the base RecvBuf if slot is invalid
+			log.Warn().Int("slot", slot).Int("num_recv_slots", u.NumRecvSlots).Msg("Invalid slot from WRID, using base RecvBuf")
+			recvBuffer = u.RecvBuf
+		}
+
 		// Parse GRH (if present) and determine payload location and length
-		sgid, dgid, flowLabel, payloadDataPtr, actualPayloadLength, grhParseErr := u.parseGRH(goWC)
+		sgid, dgid, flowLabel, payloadDataPtr, actualPayloadLength, grhParseErr := u.parseGRH(goWC, recvBuffer)
 
 		processedWC := &ProcessedWorkCompletion{
 			GoWorkCompletion: *goWC, // Embed the original GoWorkCompletion
@@ -409,9 +474,16 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 				Uint32("actualPayloadLength", actualPayloadLength).
 				Uint32("wc_byte_len", uint32(goWC.ByteLen)).
 				Bool("grh_present", grhPresentForLog).
+				Int("slot", slot).
 				Msg("Failed to deserialize probe packet. Ignoring packet.")
-			if errPost := u.PostRecv(); errPost != nil {
-				log.Warn().Err(errPost).Str("device", u.RNIC.DeviceName).Uint32("qpn", u.QPN).Msg("Failed to post replacement receive buffer after small/bad packet")
+			if slot >= 0 && slot < u.NumRecvSlots {
+				if errPost := u.PostRecvSlot(slot); errPost != nil {
+					log.Warn().Err(errPost).Str("device", u.RNIC.DeviceName).Uint32("qpn", u.QPN).Int("slot", slot).Msg("Failed to post replacement receive buffer after small/bad packet")
+				}
+			} else {
+				if errPost := u.PostRecv(); errPost != nil {
+					log.Warn().Err(errPost).Str("device", u.RNIC.DeviceName).Uint32("qpn", u.QPN).Msg("Failed to post replacement receive buffer after small/bad packet")
+				}
 			}
 			return nil, receiveTime, processedWC, deserializeErr // Return ProcessedWC even on deserialize error
 		}
@@ -428,17 +500,28 @@ func (u *UDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Time, *
 			Str("workComp_DGID", processedWC.DGID).
 			Uint32("workComp_FlowLabel", processedWC.FlowLabel).
 			Uint32("srcQP", processedWC.SrcQP).
+			Int("slot", slot).
 			Msg("Received packet data (ProbePacket content)")
 
 		if packet.IsAck == 0 && (processedWC.SGID == "" || processedWC.SGID == "::") {
 			log.Warn().Msg("Received a probe, but SGID could not be determined (e.g. no GRH or GRH parsing issue). Sending ACK might fail if SGID is required for AH creation.")
 		}
 
-		if errPost := u.PostRecv(); errPost != nil {
-			log.Warn().Err(errPost).
-				Str("device", u.RNIC.DeviceName).
-				Uint32("qpn", u.QPN).
-				Msg("Failed to post replacement receive buffer after processing packet")
+		if slot >= 0 && slot < u.NumRecvSlots {
+			if errPost := u.PostRecvSlot(slot); errPost != nil {
+				log.Warn().Err(errPost).
+					Str("device", u.RNIC.DeviceName).
+					Uint32("qpn", u.QPN).
+					Int("slot", slot).
+					Msg("Failed to post replacement receive buffer after processing packet")
+			}
+		} else {
+			if errPost := u.PostRecv(); errPost != nil {
+				log.Warn().Err(errPost).
+					Str("device", u.RNIC.DeviceName).
+					Uint32("qpn", u.QPN).
+					Msg("Failed to post replacement receive buffer after processing packet")
+			}
 		}
 
 		return packet, receiveTime, processedWC, nil
@@ -463,12 +546,16 @@ func (u *UDQueue) SendFirstAckPacket(
 	}
 	defer C.ibv_destroy_ah(ah)
 
+	// Get next available send slot
+	sendSlot, sendBuf := u.GetNextSendSlot()
+	sendWRID := uint64(sendSlot + u.NumRecvSlots) // Offset send WRIDs to avoid collision with recv WRIDs
+
 	// Clear the send buffer completely to avoid junk data
 	clearSize := unsafe.Sizeof(ProbePacket{})
-	C.memset(u.SendBuf, 0, C.size_t(clearSize))
+	C.memset(sendBuf, 0, C.size_t(clearSize))
 
 	// Prepare the first ACK packet
-	packet := (*ProbePacket)(u.SendBuf)
+	packet := (*ProbePacket)(sendBuf)
 	packet.SequenceNum = originalPacket.SequenceNum
 	packet.T1 = originalPacket.T1
 	packet.T3 = uint64(receiveTime.UnixNano()) // Record T3 timestamp
@@ -477,15 +564,16 @@ func (u *UDQueue) SendFirstAckPacket(
 	packet.AckType = 1 // First ACK
 	packet.Flags = 0
 
-	// Use the C helper function to post a send WR from C-allocated memory
-	if ret := C.post_send(
+	// Use the C helper function to post a send WR from C-allocated memory with WRID
+	if ret := C.post_send_with_wrid(
 		u.QP,
-		C.uint64_t(uintptr(u.SendBuf)),
+		C.uint64_t(uintptr(sendBuf)),
 		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
 		u.SendMR.lkey,
 		ah,
 		C.uint32_t(targetQPN),
 		C.uint32_t(qkey),
+		C.uint64_t(sendWRID),
 	); ret != 0 {
 		return time.Time{}, fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
@@ -525,16 +613,20 @@ func (u *UDQueue) SendSecondAckPacket(
 	}
 	defer C.ibv_destroy_ah(ah)
 
+	// Get next available send slot
+	sendSlot, sendBuf := u.GetNextSendSlot()
+	sendWRID := uint64(sendSlot + u.NumRecvSlots) // Offset send WRIDs to avoid collision with recv WRIDs
+
 	// Clear the send buffer completely to avoid junk data
 	clearSize := unsafe.Sizeof(ProbePacket{})
-	C.memset(u.SendBuf, 0, C.size_t(clearSize))
+	C.memset(sendBuf, 0, C.size_t(clearSize))
 
 	// Calculate processing delay (T4-T3)
 	t3 := receiveTime.UnixNano()
 	t4 := sendCompletionTime.UnixNano()
 
 	// Prepare the second ACK packet with processing delay information
-	packet := (*ProbePacket)(u.SendBuf)
+	packet := (*ProbePacket)(sendBuf)
 	packet.SequenceNum = originalPacket.SequenceNum
 	packet.T1 = originalPacket.T1
 	packet.T3 = uint64(t3)
@@ -543,15 +635,16 @@ func (u *UDQueue) SendSecondAckPacket(
 	packet.AckType = 2 // Second ACK with processing delay
 	packet.Flags = 0
 
-	// Use the C helper function to post a send WR from C-allocated memory
-	if ret := C.post_send(
+	// Use the C helper function to post a send WR from C-allocated memory with WRID
+	if ret := C.post_send_with_wrid(
 		u.QP,
-		C.uint64_t(uintptr(u.SendBuf)),
+		C.uint64_t(uintptr(sendBuf)),
 		C.uint32_t(unsafe.Sizeof(ProbePacket{})),
 		u.SendMR.lkey,
 		ah,
 		C.uint32_t(targetQPN),
 		C.uint32_t(qkey),
+		C.uint64_t(sendWRID),
 	); ret != 0 {
 		return fmt.Errorf("ibv_post_send failed: %d", ret)
 	}

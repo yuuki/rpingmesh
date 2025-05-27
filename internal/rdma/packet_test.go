@@ -867,7 +867,7 @@ func TestParseGRH(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			sgid, dgid, _, payloadPtr, payloadLen, err := udQueue.parseGRH(tc.goWC)
+			sgid, dgid, _, payloadPtr, payloadLen, err := udQueue.parseGRH(tc.goWC, udQueue.RecvBuf)
 
 			if tc.expectError {
 				if err == nil {
@@ -969,7 +969,7 @@ func (m *MockUDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Tim
 		receiveTime := time.Unix(0, int64(goWC.CompletionWallclockNS)) // use HW timestamp
 
 		// Parse GRH (if present) and determine payload location and length
-		sgid, dgid, flowLabel, payloadDataPtr, actualPayloadLength, grhParseErr := m.parseGRH(goWC)
+		sgid, dgid, flowLabel, payloadDataPtr, actualPayloadLength, grhParseErr := m.parseGRH(goWC, m.RecvBuf)
 
 		processedWC := &ProcessedWorkCompletion{
 			GoWorkCompletion: *goWC, // Embed the original GoWorkCompletion
@@ -996,8 +996,8 @@ func (m *MockUDQueue) ReceivePacket(ctx context.Context) (*ProbePacket, time.Tim
 }
 
 // parseGRH is a mock implementation for testing
-func (m *MockUDQueue) parseGRH(goWC *GoWorkCompletion) (sgid string, dgid string, flowLabel uint32, payloadDataPtr unsafe.Pointer, actualPayloadLength uint32, err error) {
-	return m.UDQueue.parseGRH(goWC)
+func (m *MockUDQueue) parseGRH(goWC *GoWorkCompletion, recvBuffer unsafe.Pointer) (sgid string, dgid string, flowLabel uint32, payloadDataPtr unsafe.Pointer, actualPayloadLength uint32, err error) {
+	return m.UDQueue.parseGRH(goWC, recvBuffer)
 }
 
 // deserializeProbePacket is a mock implementation for testing

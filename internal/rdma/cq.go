@@ -126,17 +126,32 @@ func (u *UDQueue) processSingleWC(cqEx *C.struct_ibv_cq_ex) {
 
 	switch gwc.Opcode {
 	case C.IBV_WC_RECV:
-		// handleRecvCompletion returns true if it handled an ACK and already called PostRecv()
+		// handleRecvCompletion returns true if it handled an ACK and already called PostRecvSlot()
 		ackHandled := u.handleRecvCompletion(gwc)
 		if !ackHandled {
-			// Only call PostRecv() if ACK was not handled (to avoid double posting)
-			if errPost := u.PostRecv(); errPost != nil {
-				repostErr := fmt.Errorf("CQ Poller: Failed to repost receive buffer for QPN 0x%x, Type: %s: %w", u.QPN, getQueueTypeString(u.QueueType), errPost)
-				log.Error().Err(repostErr).Msg("Failed to repost receive buffer")
-				select {
-				case u.errChan <- repostErr:
-				default:
-					log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping repost error")
+			// Only call PostRecvSlot() if ACK was not handled (to avoid double posting)
+			// Extract slot from WRID for reposting
+			slot := int(gwc.WRID)
+			if slot >= 0 && slot < u.NumRecvSlots {
+				if errPost := u.PostRecvSlot(slot); errPost != nil {
+					repostErr := fmt.Errorf("CQ Poller: Failed to repost receive buffer to slot %d for QPN 0x%x, Type: %s: %w", slot, u.QPN, getQueueTypeString(u.QueueType), errPost)
+					log.Error().Err(repostErr).Msg("Failed to repost receive buffer")
+					select {
+					case u.errChan <- repostErr:
+					default:
+						log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping repost error")
+					}
+				}
+			} else {
+				// Fallback to PostRecv() if slot is invalid
+				if errPost := u.PostRecv(); errPost != nil {
+					repostErr := fmt.Errorf("CQ Poller: Failed to repost receive buffer (fallback) for QPN 0x%x, Type: %s: %w", u.QPN, getQueueTypeString(u.QueueType), errPost)
+					log.Error().Err(repostErr).Msg("Failed to repost receive buffer (fallback)")
+					select {
+					case u.errChan <- repostErr:
+					default:
+						log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping repost error")
+					}
 				}
 			}
 		}
@@ -178,11 +193,32 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns 
 		Uint32("src_qp", gwc.SrcQP).
 		Uint32("wc_flags", gwc.WCFlags).
 		Uint64("hw_ts_ns", gwc.CompletionWallclockNS).
+		Uint64("wr_id", gwc.WRID).
 		Msg("IBV_WC_RECV (HW Timestamp)")
+
+	// Extract slot index from WRID
+	slot := int(gwc.WRID)
+	if slot < 0 || slot >= u.NumRecvSlots {
+		log.Error().
+			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
+			Str("type", getQueueTypeString(u.QueueType)).
+			Int("slot", slot).
+			Int("num_recv_slots", u.NumRecvSlots).
+			Msg("Invalid slot index from WRID")
+		// Attempt to repost using PostRecv() which will use next available slot
+		if errPost := u.PostRecv(); errPost != nil {
+			log.Error().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msgf("Failed to repost recv buffer after invalid slot error: %v", errPost)
+		}
+		return false
+	}
+
+	// Get the buffer address for this slot
+	slotAddr := u.RecvSlots[slot]
+	recvBufForSlot := unsafe.Pointer(slotAddr)
 
 	var probePkt *ProbePacket
 
-	// The GRH is at the beginning of the u.RecvBuf (or the specific buffer for this WR_ID).
+	// The GRH is at the beginning of the slot buffer.
 	// Data starts after GRH.
 	probePacketStructSize := unsafe.Sizeof(ProbePacket{})
 	expectedMinLengthWithGRH := GRHSize + int(probePacketStructSize)
@@ -195,6 +231,7 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns 
 		log.Warn().
 			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 			Str("type", getQueueTypeString(u.QueueType)).
+			Int("slot", slot).
 			Msg("IBV_WC_RECV without IBV_WC_GRH flag. Assuming ProbePacket is at buffer start.")
 	} else {
 		currentExpectedMinLength = expectedMinLengthWithGRH
@@ -207,27 +244,29 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns 
 			Uint32("received_bytes", gwc.ByteLen).
 			Int("expected_min_bytes", currentExpectedMinLength). // Changed to Int
 			Bool("grh_flag_present", (gwc.WCFlags&C.IBV_WC_GRH) != 0).
+			Int("slot", slot).
 			Msg("Received packet too small")
-		if errPost := u.PostRecv(); errPost != nil { // Attempt to repost buffer even on error
-			log.Error().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msgf("Failed to repost recv buffer after small packet error: %v", errPost)
+		if errPost := u.PostRecvSlot(slot); errPost != nil { // Repost to the same slot
+			log.Error().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Int("slot", slot).Msgf("Failed to repost recv buffer after small packet error: %v", errPost)
 		}
 		return false
 	}
 
 	var payloadStartPtr unsafe.Pointer
 	if (gwc.WCFlags & C.IBV_WC_GRH) != 0 {
-		grhStartPtr := u.RecvBuf // Assuming RecvBuf points to the start of the received data including GRH for WR_ID.
+		grhStartPtr := recvBufForSlot // Use slot-specific buffer
 		payloadStartPtr = unsafe.Pointer(uintptr(grhStartPtr) + GRHSize)
 		probePkt = (*ProbePacket)(payloadStartPtr)
 
 		log.Trace().
 			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 			Str("type", getQueueTypeString(u.QueueType)).
+			Int("slot", slot).
 			Msg("GRH present on received ACK")
 
 	} else {
-		// No GRH flag, ProbePacket is at the start of u.RecvBuf
-		probePkt = (*ProbePacket)(u.RecvBuf)
+		// No GRH flag, ProbePacket is at the start of the slot buffer
+		probePkt = (*ProbePacket)(recvBufForSlot)
 	}
 
 	if u.QueueType == UDQueueTypeSender && u.ackHandler != nil && probePkt.IsAck == 1 {
@@ -235,6 +274,7 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns 
 			Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 			Str("type", getQueueTypeString(u.QueueType)).
 			Uint64("seq", probePkt.SequenceNum).
+			Int("slot", slot).
 			Msg("ACK packet received on Sender Queue, calling ackHandler")
 
 		var sgid, dgid string
@@ -244,11 +284,9 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns 
 		var grhParseErr error
 
 		if (gwc.WCFlags & C.IBV_WC_GRH) == C.IBV_WC_GRH {
-			// Temporarily use the parsing logic from packet.go - this might need refactoring
-			// to avoid direct dependency or to have a shared GRH parsing utility.
-			// This is a simplified version for now, assuming u.RecvBuf is the one.
+			// Parse GRH from slot-specific buffer
 			if uint32(gwc.ByteLen) >= GRHSize {
-				grhBytes := unsafe.Slice((*byte)(u.RecvBuf), GRHSize)
+				grhBytes := unsafe.Slice((*byte)(recvBufForSlot), GRHSize)
 				ipVersion := (grhBytes[0] >> 4) & 0x0F
 				if ipVersion == 6 {
 					sgid, dgid, flowLabel, grhParseErr = u.parseIPv6GRHFromBytes(grhBytes) // Assumes this helper exists or is added
@@ -256,17 +294,17 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns 
 					sgid, dgid, grhParseErr = u.parseIPv4GRHFromBytes(grhBytes) // Assumes this helper exists or is added
 				}
 				if grhParseErr != nil {
-					log.Warn().Err(grhParseErr).Msg("GRH parsing failed in handleRecvCompletion for ACK")
+					log.Warn().Err(grhParseErr).Int("slot", slot).Msg("GRH parsing failed in handleRecvCompletion for ACK")
 				}
-				payloadPtr = unsafe.Pointer(uintptr(u.RecvBuf) + uintptr(GRHSize))
+				payloadPtr = unsafe.Pointer(uintptr(recvBufForSlot) + uintptr(GRHSize))
 				payloadLen = uint32(gwc.ByteLen) - GRHSize
 			} else {
-				log.Warn().Msg("GRH flag set but ByteLen too small in handleRecvCompletion for ACK")
-				payloadPtr = u.RecvBuf
+				log.Warn().Int("slot", slot).Msg("GRH flag set but ByteLen too small in handleRecvCompletion for ACK")
+				payloadPtr = recvBufForSlot
 				payloadLen = uint32(gwc.ByteLen)
 			}
 		} else {
-			payloadPtr = u.RecvBuf
+			payloadPtr = recvBufForSlot
 			payloadLen = uint32(gwc.ByteLen)
 		}
 
@@ -274,14 +312,15 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns 
 		if probePkt == nil && payloadPtr != nil { // probePkt might have been parsed earlier if logic changes
 			packetStructSize := uint32(unsafe.Sizeof(ProbePacket{}))
 			if payloadLen >= packetStructSize {
-				probePkt = (*ProbePacket)(payloadPtr) // Still points to RecvBuf, handler must copy if needed
+				probePkt = (*ProbePacket)(payloadPtr) // Still points to slot buffer, handler must copy if needed
 			} else {
-				log.Warn().Uint32("payloadLen", payloadLen).Uint32("expected", packetStructSize).Msg("Payload too small to be ProbePacket for ACK")
+				log.Warn().Uint32("payloadLen", payloadLen).Uint32("expected", packetStructSize).Int("slot", slot).Msg("Payload too small to be ProbePacket for ACK")
 				// Cannot proceed if we can't get the ACK type, etc.
-				if errPost := u.PostRecv(); errPost != nil {
+				if errPost := u.PostRecvSlot(slot); errPost != nil { // Repost to the same slot
 					log.Error().Err(errPost).
 						Str("device", u.RNIC.DeviceName).
 						Uint32("qpn", u.QPN).
+						Int("slot", slot).
 						Msg("Failed to repost recv buffer after small ACK packet error")
 				}
 				return false
@@ -289,21 +328,22 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns 
 		}
 
 		if probePkt == nil || probePkt.IsAck != 1 { // Defensive check
-			log.Warn().Msg("Not a valid ACK packet for ackHandler, or failed to parse.")
+			log.Warn().Int("slot", slot).Msg("Not a valid ACK packet for ackHandler, or failed to parse.")
 			// This path might indicate a logic error or unexpected packet. If it's not an ACK,
 			// it should go to recvCompChan. The `if u.QueueType == UDQueueTypeSender ...` handles this.
 			// For now, let the original logic send gwc to recvCompChan if not ACK for sender.
 			// This block mainly ensures probePkt is valid if we proceed to ackHandler.
-			if errPost := u.PostRecv(); errPost != nil {
+			if errPost := u.PostRecvSlot(slot); errPost != nil { // Repost to the same slot
 				log.Error().Err(errPost).
 					Str("device", u.RNIC.DeviceName).
 					Uint32("qpn", u.QPN).
+					Int("slot", slot).
 					Msg("Failed to repost recv buffer after invalid ACK packet")
 			}
 			return false
 		}
 
-		// Create a deep copy of the ProbePacket to avoid data corruption when RecvBuf is reused
+		// Create a deep copy of the ProbePacket to avoid data corruption when slot buffer is reused
 		ppCopy := *probePkt
 
 		processedWCForAck := &ProcessedWorkCompletion{
@@ -314,18 +354,19 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns 
 		}
 
 		ackInfo := &IncomingAckInfo{
-			Packet:      &ppCopy, // Use the safe copy instead of pointer to RecvBuf
+			Packet:      &ppCopy, // Use the safe copy instead of pointer to slot buffer
 			ReceivedAt:  time.Unix(0, int64(gwc.CompletionWallclockNS)),
 			ProcessedWC: processedWCForAck,
 			AckStatusOK: gwc.Status == C.IBV_WC_SUCCESS, // Set AckStatusOK based on gwc.Status
 		}
 		u.ackHandler(ackInfo)
 
-		// Immediately repost receive buffer after ACK processing to prevent RQ exhaustion
-		if errPost := u.PostRecv(); errPost != nil {
+		// Immediately repost receive buffer to the same slot after ACK processing to prevent RQ exhaustion
+		if errPost := u.PostRecvSlot(slot); errPost != nil {
 			log.Error().Err(errPost).
 				Str("device", u.RNIC.DeviceName).
 				Uint32("qpn", u.QPN).
+				Int("slot", slot).
 				Msg("Failed to repost recv buffer after ACK processing")
 		}
 		return true // ACK processing is complete
@@ -339,6 +380,7 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns 
 				}
 				return 0
 			}()).
+			Int("slot", slot).
 			Msg("Non-ACK packet or no handler/responder queue, sending to recvCompChan")
 		select {
 		case u.recvCompChan <- gwc:
@@ -346,6 +388,7 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns 
 			log.Warn().
 				Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 				Str("type", getQueueTypeString(u.QueueType)).
+				Int("slot", slot).
 				Msg("Receive completion channel full, dropping WC_RECV event. gwc will be freed.")
 		}
 	}

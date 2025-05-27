@@ -57,6 +57,18 @@ type UDQueue struct {
 	QPN         uint32
 	QueueType   UDQueueType // Type of queue (sender or responder)
 
+	// Slot-based buffer management for receive operations
+	RecvSlots     []uintptr  // Array of receive buffer slot addresses
+	NextRecvSlot  int        // Next slot index to use for posting receive buffers
+	RecvSlotMutex sync.Mutex // Mutex to protect slot allocation
+	NumRecvSlots  int        // Total number of receive slots
+
+	// Slot-based buffer management for send operations
+	SendSlots     []uintptr  // Array of send buffer slot addresses
+	NextSendSlot  int        // Next slot index to use for posting send buffers
+	SendSlotMutex sync.Mutex // Mutex to protect slot allocation
+	NumSendSlots  int        // Total number of send slots
+
 	// Channels for CQ completion event notifications
 	sendCompChan chan *GoWorkCompletion // Channel for send completion events
 	recvCompChan chan *GoWorkCompletion // Channel for receive completion events (non-ACKs or if no handler)
@@ -126,6 +138,27 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 		ackHandler:   ackHandler,
 	}
 
+	// Initialize slot arrays for buffer management
+	slotSize := uintptr(MRSize + GRHSize)
+	numSendSlots := InitialRecvBuffers // Use same number for send slots
+	numRecvSlots := InitialRecvBuffers
+
+	// Initialize receive slots
+	udQueue.NumRecvSlots = numRecvSlots
+	udQueue.RecvSlots = make([]uintptr, numRecvSlots)
+	for i := 0; i < numRecvSlots; i++ {
+		udQueue.RecvSlots[i] = uintptr(recvBuf) + uintptr(i)*slotSize
+	}
+	udQueue.NextRecvSlot = 0
+
+	// Initialize send slots
+	udQueue.NumSendSlots = numSendSlots
+	udQueue.SendSlots = make([]uintptr, numSendSlots)
+	for i := 0; i < numSendSlots; i++ {
+		udQueue.SendSlots[i] = uintptr(sendBuf) + uintptr(i)*slotSize
+	}
+	udQueue.NextSendSlot = 0
+
 	// Set ackHandler only for Sender queues
 	if queueType == UDQueueTypeSender {
 		udQueue.ackHandler = ackHandler
@@ -146,27 +179,30 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 	// Start CQ polling goroutine
 	udQueue.StartCQPoller()
 
-	// Post initial receive buffers
+	// Post initial receive buffers using slot-based approach
 	numInitialRecvBuffers := InitialRecvBuffers // Using the constant
 	log.Info().
 		Str("device", rnic.DeviceName).
 		Uint32("qpn", udQueue.QPN).
 		Str("queueType", getQueueTypeString(queueType)).
 		Int("num_initial_recv_buffers_to_post", numInitialRecvBuffers).
-		Msg("Attempting to post initial receive buffers")
+		Int("num_recv_slots", udQueue.NumRecvSlots).
+		Int("num_send_slots", udQueue.NumSendSlots).
+		Msg("Attempting to post initial receive buffers using slot-based approach")
 
 	for i := 0; i < numInitialRecvBuffers; i++ {
-		if err := udQueue.PostRecv(); err != nil {
+		if err := udQueue.PostRecvSlot(i); err != nil {
 			log.Error().Err(err).
 				Str("device", rnic.DeviceName).
 				Uint32("qpn", udQueue.QPN).
 				Str("queueType", getQueueTypeString(queueType)).
 				Int("posted_count", i).
 				Int("total_to_post", numInitialRecvBuffers).
-				Msg("Failed to post an initial receive buffer")
+				Int("slot_index", i).
+				Msg("Failed to post an initial receive buffer to slot")
 			// Cleanup and return error
 			udQueue.Destroy() // Important to clean up partially created queue
-			return nil, fmt.Errorf("failed to post initial receive buffer %d/%d for device %s qpn %d: %w", i+1, numInitialRecvBuffers, rnic.DeviceName, udQueue.QPN, err)
+			return nil, fmt.Errorf("failed to post initial receive buffer %d/%d to slot %d for device %s qpn %d: %w", i+1, numInitialRecvBuffers, i, rnic.DeviceName, udQueue.QPN, err)
 		}
 	}
 
@@ -368,35 +404,43 @@ func (m *RDMAManager) modifyQPToRTS(rnic *RNIC, qp *C.struct_ibv_qp, psn uint32)
 
 // allocateMemoryResources allocates memory buffers and registers memory regions
 func (m *RDMAManager) allocateMemoryResources(rnic *RNIC, qp *C.struct_ibv_qp, cq *C.struct_ibv_cq_ex, compChannel *C.struct_ibv_comp_channel) (unsafe.Pointer, unsafe.Pointer, *C.struct_ibv_mr, *C.struct_ibv_mr, error) {
-	// Allocate send buffers
-	bufferSize := C.size_t(MRSize + GRHSize)
-	sendBuf := C.aligned_alloc(C.size_t(os.Getpagesize()), bufferSize)
-	if sendBuf == nil {
-		return nil, nil, nil, nil, fmt.Errorf("failed to allocate send buffer")
-	}
-	C.memset(sendBuf, 0, bufferSize)
+	// Calculate buffer sizes for slot-based allocation
+	slotSize := C.size_t(MRSize + GRHSize)
+	numSendSlots := InitialRecvBuffers // Use same number for send slots
+	numRecvSlots := InitialRecvBuffers
 
-	recvBuf := C.aligned_alloc(C.size_t(os.Getpagesize()), bufferSize)
+	sendBufferTotalSize := C.size_t(numSendSlots) * slotSize
+	recvBufferTotalSize := C.size_t(numRecvSlots) * slotSize
+
+	// Allocate send buffers (multiple slots)
+	sendBuf := C.aligned_alloc(C.size_t(os.Getpagesize()), sendBufferTotalSize)
+	if sendBuf == nil {
+		return nil, nil, nil, nil, fmt.Errorf("failed to allocate send buffer for %d slots", numSendSlots)
+	}
+	C.memset(sendBuf, 0, sendBufferTotalSize)
+
+	// Allocate receive buffers (multiple slots)
+	recvBuf := C.aligned_alloc(C.size_t(os.Getpagesize()), recvBufferTotalSize)
 	if recvBuf == nil {
 		C.free(sendBuf)
-		return nil, nil, nil, nil, fmt.Errorf("failed to allocate receive buffer")
+		return nil, nil, nil, nil, fmt.Errorf("failed to allocate receive buffer for %d slots", numRecvSlots)
 	}
-	C.memset(recvBuf, 0, bufferSize)
+	C.memset(recvBuf, 0, recvBufferTotalSize)
 
 	// Register memory regions with all necessary access flags
-	sendMR := C.ibv_reg_mr(rnic.PD, sendBuf, bufferSize, C.IBV_ACCESS_LOCAL_WRITE)
+	sendMR := C.ibv_reg_mr(rnic.PD, sendBuf, sendBufferTotalSize, C.IBV_ACCESS_LOCAL_WRITE)
 	if sendMR == nil {
 		C.free(recvBuf)
 		C.free(sendBuf)
-		return nil, nil, nil, nil, fmt.Errorf("failed to register send buffer MR")
+		return nil, nil, nil, nil, fmt.Errorf("failed to register send buffer MR for %d slots", numSendSlots)
 	}
 
-	recvMR := C.ibv_reg_mr(rnic.PD, recvBuf, bufferSize, C.IBV_ACCESS_LOCAL_WRITE)
+	recvMR := C.ibv_reg_mr(rnic.PD, recvBuf, recvBufferTotalSize, C.IBV_ACCESS_LOCAL_WRITE)
 	if recvMR == nil {
 		C.ibv_dereg_mr(sendMR)
 		C.free(recvBuf)
 		C.free(sendBuf)
-		return nil, nil, nil, nil, fmt.Errorf("failed to register receive buffer MR")
+		return nil, nil, nil, nil, fmt.Errorf("failed to register receive buffer MR for %d slots", numRecvSlots)
 	}
 
 	return sendBuf, recvBuf, sendMR, recvMR, nil

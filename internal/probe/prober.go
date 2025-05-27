@@ -434,6 +434,7 @@ func (p *Prober) ProbeTarget(
 
 	// Wait for both ACKs in any order
 	var ack1Event *ackEvent
+	var ack2Event *ackEvent
 	var ack1Received, ack2Received bool
 	var t5, t6 time.Time // T5: first ACK received time, T6: processing complete time
 
@@ -478,6 +479,7 @@ func (p *Prober) ProbeTarget(
 
 				log.Trace().Uint64("seqNum", seqNum).
 					Str("actualDstGID", actualDstGid).
+					Uint8("ackType", ackEvent.Packet.AckType).
 					Msg("[prober]: Received ACK type 1")
 			}
 
@@ -491,6 +493,7 @@ func (p *Prober) ProbeTarget(
 				return
 			}
 			if !ack2Received {
+				ack2Event = ackEvent
 				ack2Received = true
 
 				// If this is the first ACK to arrive (regardless of type), record T5
@@ -501,6 +504,7 @@ func (p *Prober) ProbeTarget(
 
 				log.Trace().Uint64("seqNum", seqNum).
 					Str("actualDstGID", actualDstGid).
+					Uint8("ackType", ackEvent.Packet.AckType).
 					Msg("[prober]: Received ACK type 2")
 			}
 		}
@@ -517,15 +521,41 @@ func (p *Prober) ProbeTarget(
 
 	// Extract T3 and T4 from the appropriate ACK packets
 	var t3, t4 time.Time
-	if ack1Event != nil && ack1Event.Packet != nil {
-		t3 = time.Unix(0, int64(ack1Event.Packet.T3))
+
+	// Find the first ACK (AckType == 1) for T3
+	var firstAckEvent *ackEvent
+	if ack1Event != nil && ack1Event.Packet != nil && ack1Event.Packet.AckType == 1 {
+		firstAckEvent = ack1Event
+	} else if ack2Event != nil && ack2Event.Packet != nil && ack2Event.Packet.AckType == 1 {
+		firstAckEvent = ack2Event
+	}
+
+	// Find the second ACK (AckType == 2) for T4
+	var secondAckEvent *ackEvent
+	if ack1Event != nil && ack1Event.Packet != nil && ack1Event.Packet.AckType == 2 {
+		secondAckEvent = ack1Event
+	} else if ack2Event != nil && ack2Event.Packet != nil && ack2Event.Packet.AckType == 2 {
+		secondAckEvent = ack2Event
+	}
+
+	// Extract T3 from the first ACK
+	if firstAckEvent != nil {
+		t3 = time.Unix(0, int64(firstAckEvent.Packet.T3))
 		result.T3 = timestamppb.New(t3)
-		t4 = time.Unix(0, int64(ack1Event.Packet.T4))
+	} else {
+		log.Warn().Uint64("seqNum", seqNum).
+			Str("actualDstGID", actualDstGid).
+			Msg("[prober]: First ACK (AckType=1) not found, cannot extract T3")
+	}
+
+	// Extract T4 from the second ACK
+	if secondAckEvent != nil {
+		t4 = time.Unix(0, int64(secondAckEvent.Packet.T4))
 		result.T4 = timestamppb.New(t4)
 	} else {
 		log.Warn().Uint64("seqNum", seqNum).
 			Str("actualDstGID", actualDstGid).
-			Msg("[prober]: ack1Event or ack1Event.Packet is nil, cannot extract T3/T4")
+			Msg("[prober]: Second ACK (AckType=2) not found, cannot extract T4")
 	}
 
 	// Calculate delays if all timestamps are available

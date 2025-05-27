@@ -147,14 +147,12 @@ func (c *ControllerClient) GetPinglist(
 		return nil, 0, 0, fmt.Errorf("not connected to controller")
 	}
 
-	// UDキューの分離実装に対応: SenderQueueを使用
 	var qpn uint32
-	if requesterRnic.ProberQueue != nil {
-		qpn = requesterRnic.ProberQueue.QPN
+	// Use the **responder** queue because the other agents send probes to this agent via the responder queue
+	if requesterRnic.ResponderQueue != nil {
+		qpn = requesterRnic.ResponderQueue.QPN
 	}
-
-	// QPNが取得できなかった場合はエラーを返す
-	if qpn == 0 {
+	if qpn == 0 { // Return error if no valid QPN is found
 		return nil, 0, 0, fmt.Errorf("no valid QPN found for RNIC with GID %s", requesterRnic.GID)
 	}
 

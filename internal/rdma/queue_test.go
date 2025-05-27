@@ -17,7 +17,6 @@ func TestUDQueueOperationsWithMock(t *testing.T) {
 		IsOpen:         true,
 		ActivePortNum:  1,
 		ActiveGIDIndex: 0,
-		UDQueues:       make(map[string]*UDQueue),
 	}
 
 	// Create a UDQueue with minimal initialized fields for testing

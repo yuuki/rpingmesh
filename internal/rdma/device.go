@@ -37,11 +37,10 @@ type RNIC struct {
 	IPAddr         string
 	PD             *C.struct_ibv_pd
 	IsOpen         bool
-	ActiveGIDIndex uint8               // Added to store the active GID index
-	ActivePortNum  uint8               // Added to store the active port number
-	ProberQueue    *UDQueue            // Queue for probing and receiving ACKs
-	ResponderQueue *UDQueue            // Queue for responding to probes and sending ACKs
-	UDQueues       map[string]*UDQueue // Map of keys to UDQueue for backward compatibility
+	ActiveGIDIndex uint8    // Added to store the active GID index
+	ActivePortNum  uint8    // Added to store the active port number
+	ProberQueue    *UDQueue // Queue for probing and receiving ACKs
+	ResponderQueue *UDQueue // Queue for responding to probes and sending ACKs
 }
 
 // RDMAManager manages RDMA devices and operations
@@ -49,7 +48,6 @@ type RDMAManager struct {
 	Devices           []*RNIC
 	SenderUDQueues    map[string]*UDQueue // Map of GID to sender UDQueue
 	ResponderUDQueues map[string]*UDQueue // Map of GID to responder UDQueue
-	UDQueues          map[string]*UDQueue // Map of unique keys to UDQueue for backward compatibility
 }
 
 // NewRDMAManager creates a new RDMA manager
@@ -57,7 +55,6 @@ func NewRDMAManager() (*RDMAManager, error) {
 	manager := &RDMAManager{
 		SenderUDQueues:    make(map[string]*UDQueue),
 		ResponderUDQueues: make(map[string]*UDQueue),
-		UDQueues:          make(map[string]*UDQueue),
 	}
 
 	// Get list of RDMA devices

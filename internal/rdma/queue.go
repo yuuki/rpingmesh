@@ -80,11 +80,6 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 		return nil, fmt.Errorf("RNIC device %s is not open. CreateUDQueue requires an already opened RNIC.", rnic.DeviceName)
 	}
 
-	// Lazy initialization of RNIC's UDQueues map
-	if rnic.UDQueues == nil {
-		rnic.UDQueues = make(map[string]*UDQueue)
-	}
-
 	// Step 1: Create QP resources
 	qp, cq, compChannel, psn, err := m.createQueuePair(rnic)
 	if err != nil {
@@ -140,19 +135,13 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 	}
 
 	// Store the UDQueue in the maps based on its type
-	mapKey := rnic.GID
 	if queueType == UDQueueTypeSender {
-		mapKey = mapKey + "_sender"
 		rnic.ProberQueue = udQueue
 		m.SenderUDQueues[rnic.GID] = udQueue
 	} else {
-		mapKey = mapKey + "_responder"
 		rnic.ResponderQueue = udQueue
 		m.ResponderUDQueues[rnic.GID] = udQueue
 	}
-
-	m.UDQueues[mapKey] = udQueue
-	rnic.UDQueues[mapKey] = udQueue
 
 	// Start CQ polling goroutine
 	udQueue.StartCQPoller()
@@ -564,14 +553,19 @@ func (u *UDQueue) Destroy() {
 
 // Close now delegates queue destruction to each UDQueue and then closes devices.
 func (m *RDMAManager) Close() {
-	for gid, udQueue := range m.UDQueues {
-		log.Debug().Str("gid", gid).Msg("Destroying UD queue pair")
+	// Destroy sender queues
+	for gid, udQueue := range m.SenderUDQueues {
+		log.Debug().Str("gid", gid).Msg("Destroying sender UD queue pair")
 		udQueue.Destroy()
-		// Do not delete from m.UDQueues here as it will be iterated by other goroutines.
-		// Instead, mark it as destroyed or let the GC handle it after all references are gone.
 	}
+
+	// Destroy responder queues
+	for gid, udQueue := range m.ResponderUDQueues {
+		log.Debug().Str("gid", gid).Msg("Destroying responder UD queue pair")
+		udQueue.Destroy()
+	}
+
 	// Clear the maps after destroying all queues
-	m.UDQueues = make(map[string]*UDQueue)
 	m.SenderUDQueues = make(map[string]*UDQueue)
 	m.ResponderUDQueues = make(map[string]*UDQueue)
 

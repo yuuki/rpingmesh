@@ -151,15 +151,6 @@ func (c *ControllerClient) GetPinglist(
 	var qpn uint32
 	if requesterRnic.ProberQueue != nil {
 		qpn = requesterRnic.ProberQueue.QPN
-	} else if requesterRnic.UDQueues != nil && len(requesterRnic.UDQueues) > 0 {
-		// 後方互換性のためのフォールバック
-		// 古い方式のマップからも確認する
-		for _, udq := range requesterRnic.UDQueues {
-			if udq != nil {
-				qpn = udq.QPN
-				break
-			}
-		}
 	}
 
 	// QPNが取得できなかった場合はエラーを返す

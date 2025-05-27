@@ -133,19 +133,12 @@ func (sfm *ServiceFlowMonitor) eventLoop() {
 // fillMissingSrcGID uses the agent's known RNICs to find a GID matching the event's SrcQPN.
 func (sfm *ServiceFlowMonitor) fillMissingSrcGID(event *ebpf.RdmaConnTuple) string {
 	for _, rnic := range sfm.agentState.GetDetectedRNICs() {
-		if rnic.UDQueues != nil {
-			// Check sender queue
-			senderKey := rnic.GID + "_sender"
-			if q, ok := rnic.UDQueues[senderKey]; ok && q.QPN == event.SrcQPN {
-				return rnic.GID
-			}
-			// Check responder queue
-			responderKey := rnic.GID + "_responder"
-			if q, ok := rnic.UDQueues[responderKey]; ok && q.QPN == event.SrcQPN {
-				return rnic.GID
-			}
-		}
+		// Check prober queue (sender)
 		if rnic.ProberQueue != nil && rnic.ProberQueue.QPN == event.SrcQPN {
+			return rnic.GID
+		}
+		// Check responder queue
+		if rnic.ResponderQueue != nil && rnic.ResponderQueue.QPN == event.SrcQPN {
 			return rnic.GID
 		}
 	}

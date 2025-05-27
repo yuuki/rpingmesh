@@ -149,7 +149,7 @@ func (a *Agent) Start() error {
 	}
 
 	// Create prober - Prober itself does not start its loops yet.
-	a.prober = probe.NewProber(a.agentState.GetRDMAManager(), a.agentState, a.config.TimeoutMS)
+	a.prober = probe.NewProber(a.agentState.GetRDMAManager(), a.agentState)
 	log.Debug().Msg("Prober instance created")
 
 	// Set the ACK handler in AgentState now that prober is created.
@@ -496,7 +496,7 @@ func (a *Agent) updatePinglist() {
 	allTorTargets := make([]*controller_agent.PingTarget, 0)
 	allInterTorTargets := make([]*controller_agent.PingTarget, 0)
 
-	var lastIntervalMs, lastTimeoutMs uint32
+	var lastIntervalMs uint32
 
 	// Get pinglist for each local RNIC to ensure unique flow labels
 	for _, localRnic := range localRnics {
@@ -508,7 +508,7 @@ func (a *Agent) updatePinglist() {
 		log.Debug().Str("local_rnic_gid", localRnic.GID).Msg("Getting pinglist for local RNIC")
 
 		// Get ToR-mesh pinglist for this RNIC
-		torTargets, intervalMs, timeoutMs, err := a.controllerClient.GetPinglist(
+		torTargets, intervalMs, _, err := a.controllerClient.GetPinglist(
 			localRnic,
 			controller_agent.PinglistRequest_TOR_MESH,
 		)
@@ -539,9 +539,6 @@ func (a *Agent) updatePinglist() {
 		if intervalMs > 0 {
 			lastIntervalMs = intervalMs
 		}
-		if timeoutMs > 0 {
-			lastTimeoutMs = timeoutMs
-		}
 	}
 
 	// Log combined ToR-mesh targets grouped by AgentID
@@ -561,13 +558,6 @@ func (a *Agent) updatePinglist() {
 		}
 	}
 	log.Debug().Interface("inter_tor_targets_by_hostname", interTorTargetsByAgent).Msg("Combined Inter-ToR pinglist targets grouped by hostname")
-
-	// Update probe timeout if controller specified it
-	if lastTimeoutMs > 0 && lastTimeoutMs != a.config.TimeoutMS {
-		log.Debug().Uint32("old_timeout_ms", a.config.TimeoutMS).Uint32("new_timeout_ms", lastTimeoutMs).Msg("Updating probe timeout")
-		a.config.TimeoutMS = lastTimeoutMs
-		log.Info().Uint32("timeout_ms", lastTimeoutMs).Msg("Updated probe timeout from controller")
-	}
 
 	// Update probe interval if controller specified it
 	if lastIntervalMs > 0 && lastIntervalMs != a.config.ProbeIntervalMS {

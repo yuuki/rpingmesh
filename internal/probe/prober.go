@@ -58,7 +58,6 @@ type Prober struct {
 	probeResults chan *agent_analyzer.ProbeResult
 	stopCh       chan struct{}
 	wg           sync.WaitGroup
-	timeout      time.Duration
 	sessions     sync.Map // Key: uint32 (Flow Label), Value: *PingSession
 	nextSeqNum   uint64
 	metricMutex  sync.Mutex // To protect metrics if any are directly managed here
@@ -75,13 +74,12 @@ const (
 )
 
 // NewProber creates a new Prober.
-func NewProber(manager *rdma.RDMAManager, agentState *state.AgentState, timeoutMs uint32) *Prober {
+func NewProber(manager *rdma.RDMAManager, agentState *state.AgentState) *Prober {
 	return &Prober{
 		rdmaManager:        manager,
 		agentState:         agentState,
 		probeResults:       make(chan *agent_analyzer.ProbeResult, probeResultChanBufferSize),
 		stopCh:             make(chan struct{}),
-		timeout:            time.Duration(timeoutMs) * time.Millisecond,
 		sessions:           sync.Map{},
 		nextSeqNum:         0,
 		serviceFlowTargets: make([]*PingTarget, 0), // Changed from monitor.PingTarget
@@ -210,7 +208,7 @@ func (p *Prober) runServiceProbingLoop() {
 					target.ProbeType = ProbeTypeServiceTracing
 				}
 
-				probeCtx, cancelProbe := context.WithTimeout(context.Background(), p.timeout)
+				probeCtx, cancelProbe := context.WithTimeout(context.Background(), 500*time.Millisecond) // TODO: make this configurable
 
 				// Launch as goroutine to prevent one slow probe from blocking the entire loop.
 				// The ProbeTarget method itself is blocking.
@@ -411,10 +409,7 @@ func (p *Prober) ProbeTarget(
 		Uint64("seqNum", seqNum).
 		Msg("[prober]: Starting probe to target")
 
-	sendCtx, sendCancel := context.WithTimeout(ctx, p.timeout)
-	defer sendCancel()
-
-	t1, t2, err := srcUdQueue.SendProbePacket(sendCtx, actualDstGid, actualDstQpn, seqNum, srcPortForPacket, actualFlowLabel)
+	t1, t2, err := srcUdQueue.SendProbePacket(ctx, actualDstGid, actualDstQpn, seqNum, srcPortForPacket, actualFlowLabel)
 	if err != nil {
 		log.Error().Err(err).
 			Str("actualSrcGID", actualSrcGid).Uint32("actualSrcQPN", actualSrcQpn).
@@ -444,6 +439,24 @@ func (p *Prober) ProbeTarget(
 
 	for !ack1Received || !ack2Received {
 		select {
+		case <-ctx.Done():
+			if !ack1Received && !ack2Received {
+				log.Warn().Uint64("seqNum", seqNum).
+					Str("targetGID", actualDstGid).
+					Str("probeType", target.ProbeType).
+					Msg("[prober]: Probe timed out waiting for ACKs")
+			} else {
+				log.Warn().Uint64("seqNum", seqNum).
+					Str("targetGID", actualDstGid).
+					Str("probeType", target.ProbeType).
+					Bool("ack1Received", ack1Received).
+					Bool("ack2Received", ack2Received).
+					Msg("[prober]: Probe timed out waiting for remaining ACK")
+			}
+			result.Status = agent_analyzer.ProbeResult_TIMEOUT
+			p.probeResults <- result
+			return
+
 		case ackEvent, ok := <-session.Ack1Chan:
 			if !ok {
 				log.Warn().Uint64("seqNum", seqNum).
@@ -490,24 +503,6 @@ func (p *Prober) ProbeTarget(
 					Str("actualDstGID", actualDstGid).
 					Msg("[prober]: Received ACK type 2")
 			}
-
-		case <-ctx.Done():
-			if !ack1Received && !ack2Received {
-				log.Warn().Uint64("seqNum", seqNum).
-					Str("targetGID", actualDstGid).
-					Str("probeType", target.ProbeType).
-					Msg("[prober]: Probe timed out waiting for ACKs")
-			} else {
-				log.Warn().Uint64("seqNum", seqNum).
-					Str("targetGID", actualDstGid).
-					Str("probeType", target.ProbeType).
-					Bool("ack1Received", ack1Received).
-					Bool("ack2Received", ack2Received).
-					Msg("[prober]: Probe timed out waiting for remaining ACK")
-			}
-			result.Status = agent_analyzer.ProbeResult_TIMEOUT
-			p.probeResults <- result
-			return
 		}
 	}
 
@@ -618,10 +613,9 @@ func (p *Prober) responderLoop(udq *rdma.UDQueue) {
 				Msg("Responder loop stats")
 
 		default:
-			// Create a context with timeout for ReceivePacket
-			ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			packet, receiveTime, processedWC, err := udq.ReceivePacket(ctx)
-			cancel() // Important to call cancel to free resources associated with the context
+			cancel()
 			if err != nil {
 				if !errors.Is(err, context.DeadlineExceeded) {
 					log.Error().Err(err).

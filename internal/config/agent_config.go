@@ -19,7 +19,6 @@ type AgentConfig struct {
 	AnalyzerAddr              string
 	LogLevel                  string
 	ProbeIntervalMS           uint32
-	TimeoutMS                 uint32
 	DataUploadIntervalMS      uint32
 	TracerouteIntervalMS      uint32
 	TracerouteOnTimeout       bool
@@ -46,7 +45,6 @@ func SetupAgentFlags(flagSet *pflag.FlagSet) {
 	flagSet.String("analyzer-addr", "localhost:50052", "Analyzer address")
 	flagSet.String("log-level", "info", "Log level (debug, info, warn, error)")
 	flagSet.Uint32("probe-interval-ms", 500, "Probe interval in milliseconds")
-	flagSet.Uint32("timeout-ms", 500, "Timeout in milliseconds")
 	flagSet.Uint32("data-upload-interval-ms", 10000, "Data upload interval in milliseconds")
 	flagSet.Uint32("traceroute-interval-ms", 300000, "Traceroute interval in milliseconds")
 	flagSet.Bool("traceroute-on-timeout", true, "Run traceroute on probe timeout")
@@ -108,7 +106,6 @@ func LoadAgentConfig(flagSet *pflag.FlagSet) (*AgentConfig, error) {
 		AnalyzerAddr:              v.GetString("analyzer-addr"),
 		LogLevel:                  v.GetString("log-level"),
 		ProbeIntervalMS:           v.GetUint32("probe-interval-ms"),
-		TimeoutMS:                 v.GetUint32("timeout-ms"),
 		DataUploadIntervalMS:      v.GetUint32("data-upload-interval-ms"),
 		TracerouteIntervalMS:      v.GetUint32("traceroute-interval-ms"),
 		TracerouteOnTimeout:       v.GetBool("traceroute-on-timeout"),
@@ -141,7 +138,7 @@ func WriteDefaultConfig(path string) error {
 	v.Set("controller-addr", "localhost:50051")
 	v.Set("analyzer-addr", "localhost:50052")
 	v.Set("log-level", "info")
-	v.Set("probe-interval-ms", 1000)
+	v.Set("probe-interval-ms", 500)
 	v.Set("timeout-ms", 500)
 	v.Set("data-upload-interval-ms", 10000)
 	v.Set("traceroute-interval-ms", 300000)

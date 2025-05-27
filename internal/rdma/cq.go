@@ -127,6 +127,15 @@ func (u *UDQueue) processSingleWC(cqEx *C.struct_ibv_cq_ex) {
 	switch gwc.Opcode {
 	case C.IBV_WC_RECV:
 		u.handleRecvCompletion(gwc)
+		if errPost := u.PostRecv(); errPost != nil {
+			repostErr := fmt.Errorf("CQ Poller: Failed to repost receive buffer for QPN 0x%x, Type: %s: %w", u.QPN, getQueueTypeString(u.QueueType), errPost)
+			log.Error().Err(repostErr).Msg("Failed to repost receive buffer")
+			select {
+			case u.errChan <- repostErr:
+			default:
+				log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping repost error")
+			}
+		}
 	case C.IBV_WC_SEND:
 		u.handleSendCompletion(gwc)
 	default:
@@ -310,18 +319,6 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) { // Removed cqEx 
 				Str("qpn", fmt.Sprintf("0x%x", u.QPN)).
 				Str("type", getQueueTypeString(u.QueueType)).
 				Msg("Receive completion channel full, dropping WC_RECV event. gwc will be freed.")
-		}
-	}
-
-	if errPost := u.PostRecv(); errPost != nil {
-		// errMsg := fmt.Sprintf("CQ Poller: Failed to repost receive buffer for QPN 0x%x, Type: %s: %v", u.QPN, getQueueTypeString(u.QueueType), errPost)
-		// log.Error().Msg(errMsg)
-		repostErr := fmt.Errorf("CQ Poller: Failed to repost receive buffer for QPN 0x%x, Type: %s: %w", u.QPN, getQueueTypeString(u.QueueType), errPost)
-		log.Error().Err(repostErr).Msg("Failed to repost receive buffer")
-		select {
-		case u.errChan <- repostErr:
-		default:
-			log.Warn().Str("qpn", fmt.Sprintf("0x%x", u.QPN)).Msg("Error channel full, dropping repost error")
 		}
 	}
 }

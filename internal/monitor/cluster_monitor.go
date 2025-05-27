@@ -8,11 +8,99 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/probe"
-	"github.com/yuuki/rpingmesh/internal/rdma"
 	"github.com/yuuki/rpingmesh/internal/state"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
-	"go.uber.org/ratelimit"
 )
+
+// ProbeScheduler manages sequential probe execution with per-target rate limiting
+type ProbeScheduler struct {
+	targets            []probe.PingTarget
+	targetLastProbe    map[string]time.Time // Key: target GID, Value: last probe time
+	probeRatePerSecond int
+	currentIndex       int
+	mutex              sync.RWMutex
+}
+
+// NewProbeScheduler creates a new ProbeScheduler
+func NewProbeScheduler() *ProbeScheduler {
+	return &ProbeScheduler{
+		targets:         make([]probe.PingTarget, 0),
+		targetLastProbe: make(map[string]time.Time),
+		currentIndex:    0,
+	}
+}
+
+// UpdateTargets updates the target list and recreates rate limiters
+func (ps *ProbeScheduler) UpdateTargets(targets []probe.PingTarget, probeRatePerSecond int) {
+	ps.mutex.Lock()
+	defer ps.mutex.Unlock()
+
+	ps.targets = make([]probe.PingTarget, len(targets))
+	copy(ps.targets, targets)
+	ps.currentIndex = 0
+	ps.probeRatePerSecond = probeRatePerSecond
+
+	// Clear existing last probe times
+	ps.targetLastProbe = make(map[string]time.Time)
+
+	log.Info().
+		Int("targets", len(targets)).
+		Int("rate_per_second", probeRatePerSecond).
+		Msg("ProbeScheduler targets updated")
+}
+
+// GetNextTarget returns the next target to probe, applying rate limiting
+// Returns nil if no target is ready to be probed
+func (ps *ProbeScheduler) GetNextTarget() *probe.PingTarget {
+	ps.mutex.Lock()
+	defer ps.mutex.Unlock()
+
+	if len(ps.targets) == 0 {
+		return nil
+	}
+
+	// If rate limiting is disabled (rate <= 0) or very high rate (>= 100),
+	// return targets in round-robin fashion without rate limiting
+	if ps.probeRatePerSecond <= 0 || ps.probeRatePerSecond >= 100 {
+		target := &ps.targets[ps.currentIndex]
+		ps.currentIndex = (ps.currentIndex + 1) % len(ps.targets)
+		return target
+	}
+
+	// Calculate minimum interval between probes for the same target
+	minInterval := time.Second / time.Duration(ps.probeRatePerSecond)
+
+	// Try to find a target that's ready to be probed (not rate limited)
+	startIndex := ps.currentIndex
+	for {
+		target := &ps.targets[ps.currentIndex]
+
+		// Move to next target for next call
+		ps.currentIndex = (ps.currentIndex + 1) % len(ps.targets)
+
+		// Check if enough time has passed since the last probe to this target
+		lastProbe, exists := ps.targetLastProbe[target.GID]
+		now := time.Now()
+
+		if !exists || now.Sub(lastProbe) >= minInterval {
+			// Update last probe time for this target
+			ps.targetLastProbe[target.GID] = now
+			return target
+		}
+
+		// If we've checked all targets and none are ready, return nil
+		if ps.currentIndex == startIndex {
+			return nil
+		}
+	}
+}
+
+// GetTargetCount returns the number of targets
+func (ps *ProbeScheduler) GetTargetCount() int {
+	ps.mutex.RLock()
+	defer ps.mutex.RUnlock()
+	return len(ps.targets)
+}
 
 // ClusterMonitor monitors all RDMA devices in the cluster
 type ClusterMonitor struct {
@@ -20,13 +108,10 @@ type ClusterMonitor struct {
 	prober             *probe.Prober
 	intervalMs         uint32
 	probeRatePerSecond int
-	pinglist           []probe.PingTarget // Changed to probe.PingTarget
+	scheduler          *ProbeScheduler
 	stopCh             chan struct{}
 	wg                 sync.WaitGroup
 	running            bool
-
-	// For rate limiting and controlling goroutines
-	targetChans map[string]chan struct{}
 }
 
 // NewClusterMonitor creates a new ClusterMonitor
@@ -41,10 +126,9 @@ func NewClusterMonitor(
 		prober:             prober,
 		intervalMs:         intervalMs,
 		probeRatePerSecond: probeRatePerSecond,
-		pinglist:           make([]probe.PingTarget, 0), // Changed to probe.PingTarget
+		scheduler:          NewProbeScheduler(),
 		stopCh:             make(chan struct{}),
 		running:            false,
-		targetChans:        make(map[string]chan struct{}),
 	}
 }
 
@@ -57,24 +141,11 @@ func (c *ClusterMonitor) Start() error {
 	c.running = true
 	c.stopCh = make(chan struct{})
 
-	// Start the monitor goroutine
+	// Start the sequential probe worker
 	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		// Start probe workers for each target
-		c.runAllProbeWorkers()
+	go c.runSequentialProbeWorker()
 
-		// Wait for stop signal
-		<-c.stopCh
-
-		// Stop all target goroutines
-		for _, stopCh := range c.targetChans {
-			close(stopCh)
-		}
-		c.targetChans = make(map[string]chan struct{})
-	}()
-
-	log.Info().Msg("Cluster monitor started")
+	log.Info().Msg("Cluster monitor started with sequential probe worker")
 	return nil
 }
 
@@ -92,14 +163,8 @@ func (c *ClusterMonitor) Stop() {
 
 // UpdatePinglist updates the list of targets to ping using source-destination mapping from controller
 func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget) {
-	// Stop existing probe workers
-	for _, stopCh := range c.targetChans {
-		close(stopCh)
-	}
-	c.targetChans = make(map[string]chan struct{})
-
 	// Convert controller targets to probe targets using explicit source-destination mapping
-	c.pinglist = make([]probe.PingTarget, 0, len(pinglist))
+	probeTargets := make([]probe.PingTarget, 0, len(pinglist))
 	localHostName := c.agentState.GetHostName()
 
 	for _, target := range pinglist {
@@ -141,118 +206,98 @@ func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget)
 			SourcePort: target.SourcePort,
 			FlowLabel:  target.FlowLabel,
 			Priority:   target.Priority,
-			// ProbeType will be set in probeTargetWithRateLimit based on TOR relationship
 		}
 
-		c.pinglist = append(c.pinglist, probeTarget)
+		probeTargets = append(probeTargets, probeTarget)
 	}
 
-	// If the monitor is running, start new probe workers
-	if c.running {
-		c.runAllProbeWorkers()
-	}
+	// Update the scheduler with new targets
+	c.scheduler.UpdateTargets(probeTargets, c.probeRatePerSecond)
 
 	log.Info().
 		Int("controller_targets", len(pinglist)).
-		Int("probe_targets", len(c.pinglist)).
-		Msg("Updated cluster monitoring pinglist using controller's source-destination mapping")
+		Int("probe_targets", len(probeTargets)).
+		Msg("Updated cluster monitoring pinglist for sequential processing")
 }
 
-// runAllProbeWorkers starts goroutines for each target in the pinglist
-func (c *ClusterMonitor) runAllProbeWorkers() {
-	// Get local RNICs for validation
-	localRnics := c.agentState.GetDetectedRNICs()
-	if len(localRnics) == 0 {
-		log.Error().Msg("No local RNICs available for probing")
+// runSequentialProbeWorker runs the main sequential probe loop
+func (c *ClusterMonitor) runSequentialProbeWorker() {
+	defer c.wg.Done()
+
+	// Calculate minimum interval between probe attempts
+	minInterval := time.Duration(c.intervalMs) * time.Millisecond
+	if minInterval <= 0 {
+		minInterval = 10 * time.Millisecond // Default minimum interval
+	}
+
+	ticker := time.NewTicker(minInterval)
+	defer ticker.Stop()
+
+	log.Info().
+		Dur("min_interval", minInterval).
+		Int("rate_per_second", c.probeRatePerSecond).
+		Msg("Sequential probe worker started")
+
+	for {
+		select {
+		case <-c.stopCh:
+			log.Info().Msg("Sequential probe worker stopping")
+			return
+		case <-ticker.C:
+			c.processNextProbe()
+		}
+	}
+}
+
+// processNextProbe processes the next available probe target
+func (c *ClusterMonitor) processNextProbe() {
+	// Get the next target that's ready to be probed
+	target := c.scheduler.GetNextTarget()
+	if target == nil {
+		// No targets ready to be probed (either empty list or all rate limited)
 		return
 	}
 
-	// For each target in the pinglist, create a goroutine using the specified source RNIC
-	for _, target := range c.pinglist {
-		// Find the source RNIC specified in the target using the shared method
-		sourceRnic := c.agentState.GetRnicByGID(target.SourceRnicGID)
-		if sourceRnic == nil {
-			log.Warn().
-				Str("target_source_gid", target.SourceRnicGID).
-				Str("target_dest_gid", target.GID).
-				Msg("Source RNIC specified in target not found in local RNICs, skipping")
-			continue
-		}
-
-		// Skip probing ourselves (should not happen with proper pinglist generation)
-		if target.GID == target.SourceRnicGID {
-			log.Debug().
-				Str("target_gid", target.GID).
-				Str("source_gid", target.SourceRnicGID).
-				Msg("Skipping self-probe target")
-			continue
-		}
-
-		// Skip probing targets on the same host to avoid RDMA CM address resolution issues
-		localHostName := c.agentState.GetHostName()
-		if target.HostName == localHostName {
-			log.Debug().
-				Str("target_hostname", target.HostName).
-				Str("local_hostname", localHostName).
-				Str("target_gid", target.GID).
-				Str("source_gid", target.SourceRnicGID).
-				Msg("Skipping probe to target on same host to avoid RDMA CM address resolution issues")
-			continue
-		}
-
-		// Create a unique key for this source-target pair
-		key := target.SourceRnicGID + "_" + target.GID
-
-		// Check if this probe worker is already running
-		if _, exists := c.targetChans[key]; exists {
-			log.Debug().
-				Str("key", key).
-				Msg("Probe worker already running for this source-target pair")
-			continue
-		}
-
-		// Create a stop channel for this target
-		stopCh := make(chan struct{})
-		c.targetChans[key] = stopCh
-
-		// Start a goroutine for this specific source-target pair
-		c.wg.Add(1)
-		go c.probeTargetWithRateLimit(sourceRnic, target, stopCh)
-
-		log.Debug().
-			Str("source_gid", target.SourceRnicGID).
-			Str("source_device_name", target.SourceDeviceName).
-			Str("target_gid", target.GID).
-			Str("target_device_name", target.DeviceName).
-			Uint32("flow_label", target.FlowLabel).
-			Msg("Started probe worker for source-target pair")
+	// Find the source RNIC specified in the target
+	sourceRnic := c.agentState.GetRnicByGID(target.SourceRnicGID)
+	if sourceRnic == nil {
+		log.Warn().
+			Str("target_source_gid", target.SourceRnicGID).
+			Str("target_dest_gid", target.GID).
+			Msg("Source RNIC specified in target not found in local RNICs, skipping")
+		return
 	}
 
-	log.Info().
-		Int("total_targets", len(c.pinglist)).
-		Int("active_workers", len(c.targetChans)).
-		Msg("Started probe workers with explicit source-destination mapping")
-}
+	// Skip probing ourselves (should not happen with proper pinglist generation)
+	if target.GID == target.SourceRnicGID {
+		log.Debug().
+			Str("target_gid", target.GID).
+			Str("source_gid", target.SourceRnicGID).
+			Msg("Skipping self-probe target")
+		return
+	}
 
-// probeTargetWithRateLimit continuously probes a target with rate limiting
-func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target probe.PingTarget, stopCh chan struct{}) { // Changed to probe.PingTarget
-	defer c.wg.Done()
+	// Skip probing targets on the same host to avoid RDMA CM address resolution issues
+	localHostName := c.agentState.GetHostName()
+	if target.HostName == localHostName {
+		log.Debug().
+			Str("target_hostname", target.HostName).
+			Str("local_hostname", localHostName).
+			Str("target_gid", target.GID).
+			Str("source_gid", target.SourceRnicGID).
+			Msg("Skipping probe to target on same host to avoid RDMA CM address resolution issues")
+		return
+	}
 
 	// Determine probe type based on TOR relationship
-	probeType := probe.ProbeTypeInterTor              // Changed to probe.ProbeTypeInterTor
-	if target.TorID == c.agentState.GetLocalTorID() { // agentState.GetLocalTorID() needs to be checked for existence
-		probeType = probe.ProbeTypeTorMesh // Changed to probe.ProbeTypeTorMesh
+	probeType := probe.ProbeTypeInterTor
+	if target.TorID == c.agentState.GetLocalTorID() {
+		probeType = probe.ProbeTypeTorMesh
 	}
 
-	// Create a mutable copy of the target to set the ProbeType for this specific probe instance.
-	// This is important if the original `target` from `c.pinglist` should remain unchanged
-	// or if multiple goroutines might operate on slightly different versions of it.
-	// However, given the current structure where `target` is a copy from the `c.pinglist` loop,
-	// modifying it directly here for `ProbeType` is acceptable if `c.pinglist` elements are not meant
-	// to store this dynamic probe type.
-	// For clarity and safety, let's create a PingTarget specifically for the prober call.
+	// Create probe details with the determined probe type
 	probeDetails := probe.PingTarget{
-		GID:              target.GID, // This might need to be actualTargetGID later
+		GID:              c.resolveTargetGID(*target),
 		QPN:              target.QPN,
 		IPAddress:        target.IPAddress,
 		HostName:         target.HostName,
@@ -261,94 +306,40 @@ func (c *ClusterMonitor) probeTargetWithRateLimit(localRnic *rdma.RNIC, target p
 		SourcePort:       target.SourcePort,
 		FlowLabel:        target.FlowLabel,
 		Priority:         target.Priority,
-		ServiceFlowTuple: target.ServiceFlowTuple, // Pass along if present
-		ProbeType:        probeType,               // Set the determined probe type
+		ServiceFlowTuple: target.ServiceFlowTuple,
+		ProbeType:        probeType,
 	}
-
-	// Create target RNIC info for the result (used for logging/reporting, not directly for probing logic with ProbeTarget)
-	// agent_analyzer.RnicIdentifier remains the same
-	/* targetRnicInfo := &agent_analyzer.RnicIdentifier{
-		Gid:       target.GID,
-		Qpn:       target.QPN,
-		IpAddress: target.IPAddress,
-		HostName:  target.HostName,
-		TorId:     target.TorID,
-	} */
-
-	// Resolve the actual GID to use for the target
-	actualTargetGID := c.resolveTargetGID(target) // Pass probe.PingTarget
-
-	// Final check to skip probing ourselves after GID resolution
-	if actualTargetGID == localRnic.GID {
-		log.Debug().
-			Str("actualTargetGID", actualTargetGID).
-			Str("localRnic.GID", localRnic.GID).
-			Msg("Skipping probe to self (after GID resolution)")
-		return
-	}
-
-	// Final check to skip probing targets on the same host
-	localHostName := c.agentState.GetHostName()
-	if target.HostName == localHostName {
-		log.Debug().
-			Str("target_hostname", target.HostName).
-			Str("local_hostname", localHostName).
-			Str("actualTargetGID", actualTargetGID).
-			Str("localRnic.GID", localRnic.GID).
-			Msg("Skipping probe to target on same host (final check)")
-		return
-	}
-
-	// Update probeDetails with the resolved GID if it's different and relevant for ProbeTarget
-	// The prober.ProbeTarget function signature expects a *probe.PingTarget.
-	// Let's ensure the GID in probeDetails is the one to be probed.
-	probeDetails.GID = actualTargetGID
 
 	// Verify that a sender UDQueue is available for this RNIC
-	senderUDQueue := c.agentState.GetSenderUDQueue(localRnic.GID) // agentState.GetSenderUDQueue needs to be checked
+	senderUDQueue := c.agentState.GetSenderUDQueue(sourceRnic.GID)
 	if senderUDQueue == nil {
 		log.Error().
-			Str("localRnic.GID", localRnic.GID).
-			Str("localRnic.DeviceName", localRnic.DeviceName).
+			Str("localRnic.GID", sourceRnic.GID).
+			Str("localRnic.DeviceName", sourceRnic.DeviceName).
 			Msg("No sender UDQueue available for this RNIC, cannot probe target")
-		// TODO: Consider how to report this failure, e.g., via a ProbeResult with an error status.
-		// For now, just returning as the original code did.
 		return
 	}
 
-	// Create rate limiter for this target using configured rate
-	limiter := ratelimit.New(c.probeRatePerSecond, ratelimit.WithoutSlack)
+	// Send probe with a timeout context
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.intervalMs)*time.Millisecond)
+	defer cancel()
 
-	// Main probing loop with rate limiting
-	for {
-		select {
-		case <-stopCh:
-			return
-		default:
-			// Take a token from the rate limiter (this blocks until the rate limit allows)
-			limiter.Take()
+	// Execute the probe
+	c.prober.ProbeTarget(ctx, sourceRnic, &probeDetails)
 
-			// Send probe with a timeout context
-			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.intervalMs)*time.Millisecond)
-			// Ensure cancel is called to free resources, even if ProbeTarget panics or returns early.
-			// However, ProbeTarget itself might handle the context cancellation if it's long-running.
-			// The prober.ProbeTarget call needs to be updated to accept *probe.PingTarget
-			c.prober.ProbeTarget(
-				ctx,
-				localRnic,
-				&probeDetails, // Pass the address of probeDetails, which is *probe.PingTarget
-			)
-			cancel() // Call cancel after the probe is done or times out.
-		}
-	}
+	log.Trace().
+		Str("source_gid", target.SourceRnicGID).
+		Str("target_gid", probeDetails.GID).
+		Str("probe_type", probeType).
+		Msg("Executed probe in sequential worker")
 }
 
 // resolveTargetGID resolves the GID to use for the target.
 // Currently, it just returns target.GID, but could involve more complex logic.
-func (c *ClusterMonitor) resolveTargetGID(target probe.PingTarget) string { // Changed to probe.PingTarget
+func (c *ClusterMonitor) resolveTargetGID(target probe.PingTarget) string {
 	// Placeholder for more complex GID resolution if needed (e.g., based on IP, hostname)
 	// For now, assume target.GID is the correct one to use for probing.
-	if target.IPAddress != probe.EmptyIPString && net.ParseIP(target.IPAddress) == nil { // Changed to probe.EmptyIPString
+	if target.IPAddress != probe.EmptyIPString && net.ParseIP(target.IPAddress) == nil {
 		log.Warn().Str("ip", target.IPAddress).Str("gid", target.GID).Msg("Target has an invalid IP address, using GID for probing.")
 	}
 	// Potentially, if GID is empty but IP is present, query controller for GID by IP.

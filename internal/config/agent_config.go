@@ -138,8 +138,8 @@ func WriteDefaultConfig(path string) error {
 	v.Set("controller-addr", "localhost:50051")
 	v.Set("analyzer-addr", "localhost:50052")
 	v.Set("log-level", "info")
-	v.Set("probe-interval-ms", 500)
-	v.Set("timeout-ms", 500)
+	v.Set("probe-interval-ms", 10)
+	v.Set("probe-rate-per-second", DefaultProbeRatePerSecond)
 	v.Set("data-upload-interval-ms", 10000)
 	v.Set("traceroute-interval-ms", 300000)
 	v.Set("traceroute-on-timeout", true)
@@ -152,7 +152,6 @@ func WriteDefaultConfig(path string) error {
 	v.Set("allowed-device-names", []string{})
 	v.Set("gid-index", 0)
 	v.Set("pinglist-update-interval-sec", 300)
-	v.Set("probe-rate-per-second", DefaultProbeRatePerSecond)
 
 	// Write the config file
 	if err := v.WriteConfig(); err != nil {

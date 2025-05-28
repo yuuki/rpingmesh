@@ -1,4 +1,4 @@
-.PHONY: build agent-up debugfs-volume generate-config generate-bpf test-controller test-agent test clean-compose build-local build-debug
+.PHONY: build agent-up debugfs-volume generate-config generate-proto generate-bpf generate test-controller test-agent test clean-compose build-local build-debug
 
 # Default configuration
 VERSION := 0.1.0
@@ -44,21 +44,20 @@ clean-compose:
 	@docker compose down -v
 	@docker compose rm -f
 
-build-local:
+build-local: generate
 	@echo "Building controller and agent locally"
 	@go build -buildvcs=false -race -o ./bin/rpingmesh-controller ./cmd/controller
-	@go generate ./...
 	@go build -buildvcs=false -race -o ./bin/rpingmesh-agent ./cmd/agent
 
 # Debug build targets
-build-debug-controller:
+build-debug-controller: generate-proto
 	@echo "Building controller for debug locally"
 	@export CGO_ENABLED=1
 	@export CGO_CFLAGS="-g -O0"
 	@export CGO_LDFLAGS="-g"
 	@go build -o -race ./bin/rpingmesh-controller.debug -gcflags "all=-N -l" -ldflags "-compressdwarf=false" ./cmd/controller
 
-build-debug-agent:
+build-debug-agent: generate
 	@echo "Building agent for debug locally"
 	@export CGO_ENABLED=1
 	@export CGO_CFLAGS="-g -O0"
@@ -66,6 +65,15 @@ build-debug-agent:
 	@go build -race -o ./bin/rpingmesh-agent.debug -gcflags "all=-N -l" -ldflags "-compressdwarf=false" ./cmd/agent
 
 build-debug: build-debug-controller build-debug-agent
+
+# Generate protobuf code
+generate-proto:
+	@echo "Generating protobuf Go bindings"
+	@go generate ./proto/controller_agent
+	@go generate ./proto/agent_analyzer
+
+# Generate all code (protobuf + eBPF)
+generate: generate-proto generate-bpf
 
 # Generate bpf2go code locally (requires local dependencies)
 ARCH_SUFFIX := $(shell if [ -d /usr/include/$$(uname -m)-linux-gnu ]; then echo "$$(uname -m)-linux-gnu"; fi)
@@ -83,14 +91,7 @@ endif
 
 generate-bpf:
 	@echo "Generating eBPF Go bindings"
-	@mkdir -p pkg/ebpf/bpf/include
-	@if [ ! -f pkg/ebpf/bpf/include/vmlinux.h ]; then \
-		cp scripts/minimal_vmlinux.h pkg/ebpf/bpf/include/vmlinux.h; \
-	fi
-	@echo "Using include paths for bpf2go: $(INCLUDE_PATHS)"
-	@cd pkg/ebpf && GOPACKAGE=ebpf bpf2go -cc clang \
-		-go-package github.com/yuuki/rpingmesh/pkg/ebpf \
-		rdmaTracing ../ebpf/bpf/rdma_tracing.c -- $(INCLUDE_PATHS)
+	@go generate ./internal/ebpf
 
 # Test controller
 test-controller:
@@ -121,7 +122,9 @@ help:
 	@echo "  agent-up         - Run the agent container with Docker Compose"
 	@echo "  debugfs-volume   - Create debugfs volume for Docker Desktop"
 	@echo "  generate-config  - Generate default configuration file with Docker Compose"
+	@echo "  generate-proto   - Generate protobuf Go bindings"
 	@echo "  generate-bpf     - Generate eBPF Go bindings locally"
+	@echo "  generate         - Generate all code (protobuf + eBPF)"
 	@echo "  test-controller  - Run controller tests with Docker Compose"
 	@echo "  test-agent       - Run agent tests with Docker Compose"
 	@echo "  test             - Run all tests with Docker Compose"

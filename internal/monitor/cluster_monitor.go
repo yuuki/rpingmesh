@@ -10,47 +10,60 @@ import (
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/internal/state"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
+	"go.uber.org/ratelimit"
 )
 
-// ProbeScheduler manages sequential probe execution with per-target rate limiting
+// ProbeScheduler manages sequential probe execution with per-target rate limiting using ratelimit
 type ProbeScheduler struct {
-	targets            []probe.PingTarget
-	targetLastProbe    map[string]time.Time // Key: target GID, Value: last probe time
-	probeRatePerSecond int
-	currentIndex       int
-	mutex              sync.RWMutex
+	targets               []probe.PingTarget
+	targetLimiters        map[string]ratelimit.Limiter // Key: target GID, Value: rate limiter
+	currentIndex          int
+	mutex                 sync.RWMutex
+	targetProbeRatePerSec int
 }
 
 // NewProbeScheduler creates a new ProbeScheduler
 func NewProbeScheduler() *ProbeScheduler {
 	return &ProbeScheduler{
-		targets:         make([]probe.PingTarget, 0),
-		targetLastProbe: make(map[string]time.Time),
-		currentIndex:    0,
+		targets:               make([]probe.PingTarget, 0),
+		targetLimiters:        make(map[string]ratelimit.Limiter),
+		currentIndex:          0,
+		targetProbeRatePerSec: 10,
 	}
 }
 
 // UpdateTargets updates the target list and recreates rate limiters
-func (ps *ProbeScheduler) UpdateTargets(targets []probe.PingTarget, probeRatePerSecond int) {
+func (ps *ProbeScheduler) UpdateTargets(targets []probe.PingTarget, targetProbeRatePerSecond int) {
 	ps.mutex.Lock()
 	defer ps.mutex.Unlock()
 
 	ps.targets = make([]probe.PingTarget, len(targets))
 	copy(ps.targets, targets)
 	ps.currentIndex = 0
-	ps.probeRatePerSecond = probeRatePerSecond
+	ps.targetProbeRatePerSec = targetProbeRatePerSecond
 
-	// Clear existing last probe times
-	ps.targetLastProbe = make(map[string]time.Time)
+	// Create new rate limiters for each unique target GID
+	ps.targetLimiters = make(map[string]ratelimit.Limiter)
 
-	log.Info().
+	for _, target := range targets {
+		if _, exists := ps.targetLimiters[target.GID]; !exists {
+			if targetProbeRatePerSecond <= 0 {
+				ps.targetLimiters[target.GID] = ratelimit.NewUnlimited()
+			} else {
+				ps.targetLimiters[target.GID] = ratelimit.New(targetProbeRatePerSecond, ratelimit.WithoutSlack)
+			}
+		}
+	}
+
+	log.Debug().
 		Int("targets", len(targets)).
-		Int("rate_per_second", probeRatePerSecond).
-		Msg("ProbeScheduler targets updated")
+		Int("unique_target_gids", len(ps.targetLimiters)).
+		Int("target_rate_per_second", targetProbeRatePerSecond).
+		Msg("ProbeScheduler targets updated with per-target rate limiting using ratelimit")
 }
 
-// GetNextTarget returns the next target to probe, applying rate limiting
-// Returns nil if no target is ready to be probed
+// GetNextTarget returns the next target to probe, applying per-target rate limiting
+// This method blocks until a target is available according to the rate limiter
 func (ps *ProbeScheduler) GetNextTarget() *probe.PingTarget {
 	ps.mutex.Lock()
 	defer ps.mutex.Unlock()
@@ -59,40 +72,21 @@ func (ps *ProbeScheduler) GetNextTarget() *probe.PingTarget {
 		return nil
 	}
 
-	// If rate limiting is disabled (rate <= 0) or very high rate (>= 100),
-	// return targets in round-robin fashion without rate limiting
-	if ps.probeRatePerSecond <= 0 || ps.probeRatePerSecond >= 100 {
-		target := &ps.targets[ps.currentIndex]
-		ps.currentIndex = (ps.currentIndex + 1) % len(ps.targets)
-		return target
+	// Get the next target in round-robin fashion
+	target := &ps.targets[ps.currentIndex]
+	ps.currentIndex = (ps.currentIndex + 1) % len(ps.targets)
+
+	// Get the rate limiter for this target
+	limiter, exists := ps.targetLimiters[target.GID]
+	if !exists {
+		// This shouldn't happen if UpdateTargets was called properly
+		log.Warn().Str("target_gid", target.GID).Msg("No rate limiter found for target GID")
+		return target // Return anyway to avoid infinite loop
 	}
 
-	// Calculate minimum interval between probes for the same target
-	minInterval := time.Second / time.Duration(ps.probeRatePerSecond)
-
-	// Try to find a target that's ready to be probed (not rate limited)
-	startIndex := ps.currentIndex
-	for {
-		target := &ps.targets[ps.currentIndex]
-
-		// Move to next target for next call
-		ps.currentIndex = (ps.currentIndex + 1) % len(ps.targets)
-
-		// Check if enough time has passed since the last probe to this target
-		lastProbe, exists := ps.targetLastProbe[target.GID]
-		now := time.Now()
-
-		if !exists || now.Sub(lastProbe) >= minInterval {
-			// Update last probe time for this target
-			ps.targetLastProbe[target.GID] = now
-			return target
-		}
-
-		// If we've checked all targets and none are ready, return nil
-		if ps.currentIndex == startIndex {
-			return nil
-		}
-	}
+	// Take from the rate limiter (this will block until allowed)
+	limiter.Take()
+	return target
 }
 
 // GetTargetCount returns the number of targets
@@ -102,16 +96,23 @@ func (ps *ProbeScheduler) GetTargetCount() int {
 	return len(ps.targets)
 }
 
+// GetRateInfo returns current rate limiting information
+func (ps *ProbeScheduler) GetRateInfo() (targetRate int, uniqueTargets int) {
+	ps.mutex.RLock()
+	defer ps.mutex.RUnlock()
+	return ps.targetProbeRatePerSec, len(ps.targetLimiters)
+}
+
 // ClusterMonitor monitors all RDMA devices in the cluster
 type ClusterMonitor struct {
-	agentState         *state.AgentState
-	prober             *probe.Prober
-	intervalMs         uint32
-	probeRatePerSecond int
-	scheduler          *ProbeScheduler
-	stopCh             chan struct{}
-	wg                 sync.WaitGroup
-	running            bool
+	agentState            *state.AgentState
+	prober                *probe.Prober
+	intervalMs            uint32
+	targetProbeRatePerSec int
+	scheduler             *ProbeScheduler
+	stopCh                chan struct{}
+	wg                    sync.WaitGroup
+	running               bool
 }
 
 // NewClusterMonitor creates a new ClusterMonitor
@@ -119,16 +120,16 @@ func NewClusterMonitor(
 	agentState *state.AgentState,
 	prober *probe.Prober,
 	intervalMs uint32,
-	probeRatePerSecond int,
+	targetProbeRatePerSec int,
 ) *ClusterMonitor {
 	return &ClusterMonitor{
-		agentState:         agentState,
-		prober:             prober,
-		intervalMs:         intervalMs,
-		probeRatePerSecond: probeRatePerSecond,
-		scheduler:          NewProbeScheduler(),
-		stopCh:             make(chan struct{}),
-		running:            false,
+		agentState:            agentState,
+		prober:                prober,
+		intervalMs:            intervalMs,
+		targetProbeRatePerSec: targetProbeRatePerSec,
+		scheduler:             NewProbeScheduler(),
+		stopCh:                make(chan struct{}),
+		running:               false,
 	}
 }
 
@@ -239,7 +240,7 @@ func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget)
 	}
 
 	// Update the scheduler with new targets
-	c.scheduler.UpdateTargets(probeTargets, c.probeRatePerSecond)
+	c.scheduler.UpdateTargets(probeTargets, c.targetProbeRatePerSec)
 
 	log.Info().
 		Int("controller_targets", len(pinglist)).
@@ -290,26 +291,16 @@ func (c *ClusterMonitor) isLinkLocalGID(gid string) bool {
 func (c *ClusterMonitor) runSequentialProbeWorker() {
 	defer c.wg.Done()
 
-	// Calculate minimum interval between probe attempts
-	minInterval := time.Duration(c.intervalMs) * time.Millisecond
-	if minInterval <= 0 {
-		minInterval = 10 * time.Millisecond // Default minimum interval
-	}
-
-	ticker := time.NewTicker(minInterval)
-	defer ticker.Stop()
-
 	log.Info().
-		Dur("min_interval", minInterval).
-		Int("rate_per_second", c.probeRatePerSecond).
-		Msg("Sequential probe worker started")
+		Int("target_rate_per_second", c.targetProbeRatePerSec).
+		Msg("Sequential probe worker started with per-target rate limiting")
 
 	for {
 		select {
 		case <-c.stopCh:
 			log.Info().Msg("Sequential probe worker stopping")
 			return
-		case <-ticker.C:
+		default:
 			c.processNextProbe()
 		}
 	}
@@ -317,10 +308,10 @@ func (c *ClusterMonitor) runSequentialProbeWorker() {
 
 // processNextProbe processes the next available probe target
 func (c *ClusterMonitor) processNextProbe() {
-	// Get the next target that's ready to be probed
+	// Get the next target - this will block until a target is available according to rate limiting
 	target := c.scheduler.GetNextTarget()
 	if target == nil {
-		// No targets ready to be probed (either empty list or all rate limited)
+		// No targets configured, return immediately
 		return
 	}
 

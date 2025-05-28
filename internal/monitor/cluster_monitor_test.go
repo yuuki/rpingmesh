@@ -91,14 +91,14 @@ func (m *MockProber) ResetProbeCount() {
 
 // TestableClusterMonitor wraps ClusterMonitor to accept interfaces for testing
 type TestableClusterMonitor struct {
-	agentState         AgentStateInterface
-	prober             ProberInterface
-	intervalMs         uint32
-	probeRatePerSecond int
-	scheduler          *ProbeScheduler
-	stopCh             chan struct{}
-	wg                 sync.WaitGroup
-	running            bool
+	agentState            AgentStateInterface
+	prober                ProberInterface
+	intervalMs            uint32
+	targetProbeRatePerSec int
+	scheduler             *ProbeScheduler
+	stopCh                chan struct{}
+	wg                    sync.WaitGroup
+	running               bool
 }
 
 // NewTestableClusterMonitor creates a new TestableClusterMonitor
@@ -106,16 +106,16 @@ func NewTestableClusterMonitor(
 	agentState AgentStateInterface,
 	prober ProberInterface,
 	intervalMs uint32,
-	probeRatePerSecond int,
+	targetProbeRatePerSec int,
 ) *TestableClusterMonitor {
 	return &TestableClusterMonitor{
-		agentState:         agentState,
-		prober:             prober,
-		intervalMs:         intervalMs,
-		probeRatePerSecond: probeRatePerSecond,
-		scheduler:          NewProbeScheduler(),
-		stopCh:             make(chan struct{}),
-		running:            false,
+		agentState:            agentState,
+		prober:                prober,
+		intervalMs:            intervalMs,
+		targetProbeRatePerSec: targetProbeRatePerSec,
+		scheduler:             NewProbeScheduler(),
+		stopCh:                make(chan struct{}),
+		running:               false,
 	}
 }
 
@@ -186,7 +186,7 @@ func (c *TestableClusterMonitor) UpdatePinglist(pinglist []*controller_agent.Pin
 	}
 
 	// Update the scheduler with new targets
-	c.scheduler.UpdateTargets(probeTargets, c.probeRatePerSecond)
+	c.scheduler.UpdateTargets(probeTargets, c.targetProbeRatePerSec)
 }
 
 // runSequentialProbeWorker runs the main sequential probe loop
@@ -273,10 +273,14 @@ func TestProbeScheduler_UpdateTargets(t *testing.T) {
 		{GID: "gid1", QPN: 1003}, // Same GID as first target
 	}
 
-	scheduler.UpdateTargets(targets, 10)
+	scheduler.UpdateTargets(targets, 5) // 5 per-target rate
 
 	assert.Equal(t, 3, scheduler.GetTargetCount())
-	assert.Equal(t, 10, scheduler.probeRatePerSecond)
+
+	// Check that we have rate limiters for unique GIDs
+	targetRate, uniqueTargets := scheduler.GetRateInfo()
+	assert.Equal(t, 5, targetRate)
+	assert.Equal(t, 2, uniqueTargets) // Only 2 unique GIDs: gid1 and gid2
 }
 
 func TestProbeScheduler_GetNextTarget(t *testing.T) {
@@ -287,11 +291,10 @@ func TestProbeScheduler_GetNextTarget(t *testing.T) {
 		{GID: "gid2", QPN: 1002},
 	}
 
-	scheduler.UpdateTargets(targets, 1000) // High rate to avoid rate limiting
+	scheduler.UpdateTargets(targets, 0) // Disable rate limiting for pure round-robin test
 
 	// Debug: Check scheduler state
 	t.Logf("Target count: %d", scheduler.GetTargetCount())
-	t.Logf("Rate per second: %d", scheduler.probeRatePerSecond)
 
 	// Should return targets in round-robin fashion
 	target1 := scheduler.GetNextTarget()
@@ -313,27 +316,97 @@ func TestProbeScheduler_GetNextTarget(t *testing.T) {
 	assert.Equal(t, "gid1", target3.GID) // Back to first target
 }
 
-func TestProbeScheduler_RateLimiting(t *testing.T) {
+func TestProbeScheduler_PerTargetRateLimiting(t *testing.T) {
 	scheduler := NewProbeScheduler()
 
 	targets := []probe.PingTarget{
 		{GID: "gid1", QPN: 1001},
 	}
 
-	scheduler.UpdateTargets(targets, 1) // Very low rate (1 per second)
+	scheduler.UpdateTargets(targets, 2) // 2 per-target rate (500ms interval)
 
-	// First call should succeed
+	// Measure time for multiple calls to the same target
+	start := time.Now()
+
+	// First call should succeed immediately
 	target1 := scheduler.GetNextTarget()
 	assert.NotNil(t, target1)
+	assert.Equal(t, "gid1", target1.GID)
 
-	// Immediate second call should be rate limited (return nil)
+	// Second call to same target should block for rate limiting
 	target2 := scheduler.GetNextTarget()
-	assert.Nil(t, target2)
+	assert.NotNil(t, target2)
+	assert.Equal(t, "gid1", target2.GID)
 
-	// Wait for rate limit to reset and try again
-	time.Sleep(1100 * time.Millisecond) // Wait slightly more than 1 second
+	elapsed := time.Since(start)
+	assert.GreaterOrEqual(t, elapsed, 450*time.Millisecond,
+		"Per-target rate limiting should enforce minimum interval of ~500ms for 2 per second")
+	assert.LessOrEqual(t, elapsed, 600*time.Millisecond,
+		"Per-target rate limiting should not take too long")
+}
+
+func TestProbeScheduler_MultiTargetRateLimiting(t *testing.T) {
+	scheduler := NewProbeScheduler()
+
+	targets := []probe.PingTarget{
+		{GID: "gid1", QPN: 1001},
+		{GID: "gid2", QPN: 1002},
+	}
+
+	// Use a moderate per-target rate to test the behavior
+	scheduler.UpdateTargets(targets, 4) // 4 per-target rate (250ms interval)
+
+	start := time.Now()
+
+	// First call should get gid1
+	target1 := scheduler.GetNextTarget()
+	assert.NotNil(t, target1)
+	assert.Equal(t, "gid1", target1.GID)
+
+	// Second call should get gid2 (different target, so no rate limiting)
+	target2 := scheduler.GetNextTarget()
+	assert.NotNil(t, target2)
+	assert.Equal(t, "gid2", target2.GID)
+
+	// Third call should get gid1 again, but will block due to rate limiting
 	target3 := scheduler.GetNextTarget()
 	assert.NotNil(t, target3)
+	assert.Equal(t, "gid1", target3.GID)
+
+	elapsed := time.Since(start)
+	// Should have blocked for at least 250ms for the third call
+	assert.GreaterOrEqual(t, elapsed, 200*time.Millisecond,
+		"Should block for rate limiting on third call")
+}
+
+func TestProbeScheduler_RatelimitIntegration(t *testing.T) {
+	scheduler := NewProbeScheduler()
+
+	targets := []probe.PingTarget{
+		{GID: "gid1", QPN: 1001},
+	}
+
+	// Test with 2 probes per second
+	scheduler.UpdateTargets(targets, 2)
+
+	// Measure time for multiple calls
+	start := time.Now()
+
+	// First call should succeed immediately
+	target1 := scheduler.GetNextTarget()
+	assert.NotNil(t, target1)
+	assert.Equal(t, "gid1", target1.GID)
+
+	// Second call should block for rate limiting
+	target2 := scheduler.GetNextTarget()
+	assert.NotNil(t, target2)
+	assert.Equal(t, "gid1", target2.GID)
+
+	elapsed := time.Since(start)
+	assert.GreaterOrEqual(t, elapsed, 450*time.Millisecond,
+		"Rate limiting should enforce minimum interval of ~500ms for 2 per second")
+	assert.LessOrEqual(t, elapsed, 600*time.Millisecond,
+		"Rate limiting should not take too long")
 }
 
 func TestClusterMonitor_SequentialProbing(t *testing.T) {

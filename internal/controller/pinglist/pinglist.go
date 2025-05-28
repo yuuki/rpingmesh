@@ -139,7 +139,7 @@ func (p *PingLister) generateRandomPriority() uint32 {
 
 // generateRequesterSpecificPort generates a port number specific to the requester-target pair
 func (p *PingLister) generateRequesterSpecificPort(requesterGID, targetGID string) uint32 {
-	// Create a deterministic but unique port based on requester and target GIDs
+	// Create a deterministic but unique port based on requester and target GIee
 	hash := p.hashGIDPair(requesterGID, targetGID)
 	// Use ephemeral port range (49152-65535)
 	return uint32((hash % 16384) + 49152)

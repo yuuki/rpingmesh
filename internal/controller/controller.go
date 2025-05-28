@@ -83,14 +83,16 @@ func (c *Controller) Start() error {
 		}
 	}()
 
-	// Start background cleanup task
-	c.wg.Add(1)
-	go c.runPeriodicCleanup()
+	// Note: Periodic cleanup is disabled to prevent agents from receiving empty pinglists
+	// The CleanupStaleEntries method is still available for manual cleanup if needed
 
 	return nil
 }
 
 // runPeriodicCleanup periodically cleans up stale entries
+// NOTE: This function is currently disabled to prevent agents from receiving empty pinglists
+// which would cause them to stop execution. The CleanupStaleEntries method is still available
+// for manual cleanup operations if needed.
 func (c *Controller) runPeriodicCleanup() {
 	defer c.wg.Done()
 

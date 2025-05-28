@@ -60,12 +60,12 @@ sequenceDiagram
     Note over R: Responder Delay = T4-T3
 ```
 
-### Intelligent Problem Detection (To be implemented)
+### Intelligent Problem Detection (WIP)
 - **RNIC vs. network failure** distinction through ToR-mesh probing
 - **Real-time anomaly detection** with minimal false positives
 - **Service impact assessment** to prioritize critical issues
 
-### Service-Aware Monitoring (To be implemented)
+### Service-Aware Monitoring (WIP)
 - **Automatic service flow discovery** using eBPF tracing
 - **Path-specific probing** following actual service traffic
 - **5-tuple aware** measurements for ECMP environments
@@ -215,12 +215,12 @@ Advanced analytics engine delivering:
 
 ### Technical Stack
 
-- **Go Programming Language** with Cgo for RDMA integration
+- **Go**: with Cgo for RDMA integration
 - **RDMA Verbs**: [`libibverbs`](https://github.com/linux-rdma/rdma-core/tree/master/libibverbs) Cgo wrapper for low-level RDMA operations
-- **eBPF**: [`cilium/ebpf`](https://github.com/cilium/ebpf) library for service flow monitoring
-- **gRPC**: Communication with each component
+- **gRPC**: for communication with each component
 - **RQLite**: Database for Controller [https://rqlite.io/](https://rqlite.io/)
-- **OpenTelemetry**: Distributed tracing for Agent and Controller
+- **OpenTelemetry**: for probe metrics instrumentation
+- **eBPF**: [`cilium/ebpf`](https://github.com/cilium/ebpf) library for service flow monitoring
 
 ## 🛠️ Quick Start
 
@@ -231,40 +231,7 @@ Advanced analytics engine delivering:
 - Docker (recommended) or native Go 1.24+ environment
 - Root privileges or appropriate capabilities
 
-### Docker Deployment (Recommended)
-
-```bash
-# Build the system
-make build
-
-# Deploy Agent
-make run-agent
-
-# Deploy Controller (separate host)
-make run-controller
-
-# Deploy Analyzer (separate host)
-make run-analyzer
-```
-
-### Native Build
-
-```bash
-# Install dependencies (Ubuntu/Debian)
-sudo apt-get install -y \
-    clang llvm libbpf-dev libelf-dev \
-    libibverbs-dev librdmacm-dev \
-    linux-headers-$(uname -r)
-
-# Generate eBPF bindings
-./scripts/generate_ebpf.sh
-
-# Build components
-make build-native
-
-# Run Agent
-sudo ./bin/agent --config agent.yaml
-```
+TBD
 
 ## 📊 Monitoring Modes
 
@@ -276,7 +243,7 @@ Continuous network health assessment across the entire RoCE cluster:
 - **Always-on operation**: Independent of running services
 - **Comprehensive SLA tracking**: RTT, packet loss, and processing delays
 
-### Service Tracing
+### Service Tracing (WIP)
 Dynamic monitoring of active service communications:
 
 - **Automatic flow discovery**: eBPF-based connection tracking

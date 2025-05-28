@@ -213,8 +213,9 @@ func (u *UDQueue) handleRecvCompletion(gwc *GoWorkCompletion) bool { // Returns 
 	}
 
 	// Get the buffer address for this slot
-	slotAddr := u.RecvSlots[slot]
-	recvBufForSlot := unsafe.Pointer(slotAddr)
+	// Convert uintptr to unsafe.Pointer - this is safe as long as the underlying
+	// memory is still valid and RecvSlots contains valid memory addresses
+	recvBufForSlot := unsafe.Pointer(u.RecvSlots[slot]) // nolint:govet
 
 	var probePkt *ProbePacket
 

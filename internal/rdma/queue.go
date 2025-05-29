@@ -83,6 +83,23 @@ type UDQueue struct {
 	ackHandler AckHandlerFunc
 }
 
+// destroyCQEx safely destroys an extended completion queue by converting it to base CQ first
+func destroyCQEx(cqEx *C.struct_ibv_cq_ex, deviceName string, context string) {
+	if cqEx == nil {
+		return
+	}
+
+	baseCQ := C.ibv_cq_ex_to_cq(cqEx)
+	if baseCQ != nil {
+		C.ibv_destroy_cq(baseCQ)
+	} else {
+		log.Error().
+			Str("device", deviceName).
+			Str("context", context).
+			Msg("Failed to get base CQ from extended CQ for destruction")
+	}
+}
+
 // CreateUDQueue creates a UD queue pair for sending and receiving probe packets
 func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandler AckHandlerFunc) (*UDQueue, error) {
 	if !rnic.IsOpen {
@@ -106,12 +123,7 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 			C.ibv_destroy_qp(qp)
 		}
 		if cq != nil {
-			base_cq_to_destroy := C.ibv_cq_ex_to_cq(cq) // Direct call
-			if base_cq_to_destroy != nil {
-				C.ibv_destroy_cq(base_cq_to_destroy)
-			} else {
-				log.Error().Str("device", rnic.DeviceName).Msg("Failed to get base CQ from extended CQ during CreateUDQueue failure path")
-			}
+			destroyCQEx(cq, rnic.DeviceName, "CreateUDQueue failure path")
 		}
 		if compChannel != nil {
 			C.ibv_destroy_comp_channel(compChannel)
@@ -258,15 +270,7 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 	if base_send_cq == nil || base_recv_cq == nil {
 		C.ibv_destroy_comp_channel(compChannel)
 		// If cqEx was created, try to destroy its base part
-		if cqEx != nil {
-			base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx) // Direct call
-			if base_cq_to_destroy != nil {
-				C.ibv_destroy_cq(base_cq_to_destroy)
-			} else {
-				// This case should ideally not happen if cqEx itself is not nil
-				log.Error().Msg("Failed to get base CQ from non-nil extended CQ during QP creation failure path")
-			}
-		}
+		destroyCQEx(cqEx, rnic.DeviceName, "QP creation failure path")
 		return nil, nil, nil, 0, fmt.Errorf("failed to get base CQ from extended CQ for device %s", rnic.DeviceName)
 	}
 	qpInitAttr.send_cq = base_send_cq
@@ -281,12 +285,7 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 	// Create the QP
 	qp := C.ibv_create_qp(rnic.PD, &qpInitAttr)
 	if qp == nil {
-		base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx) // Direct call
-		if base_cq_to_destroy != nil {
-			C.ibv_destroy_cq(base_cq_to_destroy)
-		} else {
-			log.Error().Str("device", rnic.DeviceName).Msg("Failed to get base CQ from extended CQ for destruction during QP creation failure")
-		}
+		destroyCQEx(cqEx, rnic.DeviceName, "QP creation failure")
 		C.ibv_destroy_comp_channel(compChannel)
 		return nil, nil, nil, 0, fmt.Errorf("failed to create QP for device %s", rnic.DeviceName)
 	}
@@ -294,12 +293,7 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 	// Modify QP to INIT state
 	if err := m.modifyQPToInit(rnic, qp); err != nil {
 		C.ibv_destroy_qp(qp)
-		base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx) // Direct call
-		if base_cq_to_destroy != nil {
-			C.ibv_destroy_cq(base_cq_to_destroy)
-		} else {
-			log.Error().Str("device", rnic.DeviceName).Msg("Failed to get base CQ from extended CQ for destruction during INIT failure")
-		}
+		destroyCQEx(cqEx, rnic.DeviceName, "INIT failure")
 		C.ibv_destroy_comp_channel(compChannel)
 		return nil, nil, nil, 0, err
 	}
@@ -307,12 +301,7 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 	// Modify QP to RTR state
 	if err := m.modifyQPToRTR(rnic, qp); err != nil {
 		C.ibv_destroy_qp(qp)
-		base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx) // Direct call
-		if base_cq_to_destroy != nil {
-			C.ibv_destroy_cq(base_cq_to_destroy)
-		} else {
-			log.Error().Str("device", rnic.DeviceName).Msg("Failed to get base CQ from extended CQ for destruction during RTR failure")
-		}
+		destroyCQEx(cqEx, rnic.DeviceName, "RTR failure")
 		C.ibv_destroy_comp_channel(compChannel)
 		return nil, nil, nil, 0, err
 	}
@@ -320,12 +309,7 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 	// Modify QP to RTS state
 	if err := m.modifyQPToRTS(rnic, qp, psn); err != nil {
 		C.ibv_destroy_qp(qp)
-		base_cq_to_destroy := C.ibv_cq_ex_to_cq(cqEx) // Direct call
-		if base_cq_to_destroy != nil {
-			C.ibv_destroy_cq(base_cq_to_destroy)
-		} else {
-			log.Error().Str("device", rnic.DeviceName).Msg("Failed to get base CQ from extended CQ for destruction during RTS failure")
-		}
+		destroyCQEx(cqEx, rnic.DeviceName, "RTS failure")
 		C.ibv_destroy_comp_channel(compChannel)
 		return nil, nil, nil, 0, err
 	}
@@ -578,12 +562,7 @@ func (u *UDQueue) Destroy() {
 	}
 
 	if u.CQ != nil {
-		base_cq_to_destroy := C.ibv_cq_ex_to_cq(u.CQ) // Direct call
-		if base_cq_to_destroy != nil {
-			C.ibv_destroy_cq(base_cq_to_destroy)
-		} else {
-			log.Error().Str("device", u.RNIC.DeviceName).Uint32("qpn", u.QPN).Msg("Failed to get base CQ from extended CQ for destruction in UDQueue.Destroy")
-		}
+		destroyCQEx(u.CQ, u.RNIC.DeviceName, "UDQueue.Destroy")
 		u.CQ = nil
 	}
 

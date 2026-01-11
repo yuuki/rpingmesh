@@ -862,38 +862,42 @@ func (p *Prober) HandleIncomingRDMAPacket(ackInfo *rdma.IncomingAckInfo) {
 		return
 	}
 
-	// Try to find session using multiple strategies
+	// Try to find session using multiple strategies (prefer seqNum to avoid flow label collisions)
 	var session *PingSession
 	var sessionKey string
 
-	// Strategy 1: Use flow label (original approach)
 	flowLabelKey := ackInfo.ProcessedWC.FlowLabel
-	session = p.getSessionByFlowLabel(flowLabelKey)
+	sourceGid := ackInfo.ProcessedWC.SGID
+
+	// Strategy 1: Search by sequence number and (optional) source GID
+	session = p.findSessionByPacketInfo(ackInfo.Packet.SequenceNum, sourceGid)
 	if session != nil {
 		sessionKey = session.SessionKey
 		// Update statistics using atomic operation
-		atomic.AddUint64(&p.stats.SessionsFoundByFlow, 1)
+		atomic.AddUint64(&p.stats.SessionsFoundBySeqNum, 1)
 
 		log.Trace().
-			Uint32("found_by_flowLabel", flowLabelKey).
+			Uint64("found_by_seqNum", ackInfo.Packet.SequenceNum).
+			Str("sourceGid", sourceGid).
 			Str("sessionKey", sessionKey).
-			Msg("[prober_handler]: Found session by flow label")
+			Msg("[prober_handler]: Found session by sequence number and GID")
 	} else {
-		// Strategy 2: Search by sequence number and source/dest GIDs
-		sourceGid := ackInfo.ProcessedWC.SGID
-		// We need to find the session by searching through all active sessions
-		// This is less efficient but more reliable
-		session = p.findSessionByPacketInfo(ackInfo.Packet.SequenceNum, sourceGid)
-		if session != nil {
-			sessionKey = session.SessionKey
-			// Update statistics using atomic operation
-			atomic.AddUint64(&p.stats.SessionsFoundBySeqNum, 1)
+		// Strategy 2: Fallback to flow label only when it's non-zero and unique
+		if flowLabelKey != 0 {
+			session = p.getSessionByFlowLabel(flowLabelKey)
+			if session != nil {
+				sessionKey = session.SessionKey
+				// Update statistics using atomic operation
+				atomic.AddUint64(&p.stats.SessionsFoundByFlow, 1)
 
-			log.Trace().
-				Uint64("found_by_seqNum", ackInfo.Packet.SequenceNum).
-				Str("sourceGid", sourceGid).
-				Str("sessionKey", sessionKey).
-				Msg("[prober_handler]: Found session by sequence number and GID")
+				log.Trace().
+					Uint32("found_by_flowLabel", flowLabelKey).
+					Str("sessionKey", sessionKey).
+					Msg("[prober_handler]: Found session by flow label (fallback)")
+			} else {
+				// Update statistics for not found using atomic operation
+				atomic.AddUint64(&p.stats.SessionsNotFound, 1)
+			}
 		} else {
 			// Update statistics for not found using atomic operation
 			atomic.AddUint64(&p.stats.SessionsNotFound, 1)
@@ -1033,11 +1037,17 @@ func (p *Prober) getSession(sessionKey string) *PingSession {
 // getSessionByFlowLabel retrieves a session by flow label (fallback method).
 func (p *Prober) getSessionByFlowLabel(flowLabel uint32) *PingSession {
 	var foundSession *PingSession
+	var foundCount int
 	p.sessions.Range(func(key, value interface{}) bool {
 		session := value.(*PingSession)
 		if session.FlowLabel == flowLabel {
 			foundSession = session
-			return false // Stop iteration
+			foundCount++
+			if foundCount > 1 {
+				// Ambiguous flow label, do not select a session
+				foundSession = nil
+				return false // Stop iteration
+			}
 		}
 		return true // Continue iteration
 	})
@@ -1051,7 +1061,7 @@ func (p *Prober) findSessionByPacketInfo(seqNum uint64, sourceGid string) *PingS
 		sessionKey := sessionKeyValue.(string)
 		if session := p.getSession(sessionKey); session != nil {
 			// Verify the source GID matches (additional validation)
-			if session.TargetGid == sourceGid {
+			if sourceGid == "" || session.TargetGid == sourceGid {
 				log.Trace().
 					Uint64("seqNum", seqNum).
 					Str("sourceGid", sourceGid).
@@ -1078,7 +1088,7 @@ func (p *Prober) findSessionByPacketInfo(seqNum uint64, sourceGid string) *PingS
 	var foundSession *PingSession
 	p.sessions.Range(func(key, value interface{}) bool {
 		session := value.(*PingSession)
-		if session.SequenceNum == seqNum && session.TargetGid == sourceGid {
+		if session.SequenceNum == seqNum && (sourceGid == "" || session.TargetGid == sourceGid) {
 			foundSession = session
 			return false // Stop iteration
 		}

@@ -125,15 +125,18 @@ func (u *Uploader) Start() error {
 // Stop stops the uploader
 func (u *Uploader) Stop() {
 	u.mutex.Lock()
-	defer u.mutex.Unlock()
-
 	if !u.running {
+		u.mutex.Unlock()
 		return
 	}
+	u.mutex.Unlock()
 
 	u.cancel()
 	u.wg.Wait()
+
+	u.mutex.Lock()
 	u.running = false
+	u.mutex.Unlock()
 	log.Info().Msg("Uploader stopped")
 }
 

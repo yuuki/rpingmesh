@@ -660,14 +660,28 @@ func (a *Agent) Run() error {
 	// Set up signal handling for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	log.Debug().Msg("Signal handlers set up")
 
-	// Start the agent
+	// Start the agent and surface startup failures
+	startErrCh := make(chan error, 1)
 	go func() {
-		if err := a.Start(); err != nil {
-			log.Error().Err(err).Msg("Failed to start agent")
-		}
+		startErrCh <- a.Start()
 	}()
+
+	// Wait for startup to finish or for an early signal
+	select {
+	case err := <-startErrCh:
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to start agent")
+			a.Stop()
+			return err
+		}
+	case sig := <-sigCh:
+		log.Info().Str("signal", sig.String()).Msg("Received signal during startup, shutting down gracefully...")
+		a.Stop()
+		return nil
+	}
 
 	// Wait for the first signal
 	sig := <-sigCh

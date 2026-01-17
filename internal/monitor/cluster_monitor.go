@@ -311,7 +311,8 @@ func (c *ClusterMonitor) processNextProbe() {
 	// Get the next target - this will block until a target is available according to rate limiting
 	target := c.scheduler.GetNextTarget()
 	if target == nil {
-		// No targets configured, return immediately
+		// No targets configured, sleep to avoid busy loop
+		time.Sleep(100 * time.Millisecond)
 		return
 	}
 

@@ -108,6 +108,7 @@ type ClusterMonitor struct {
 	agentState            *state.AgentState
 	prober                *probe.Prober
 	intervalMs            uint32
+	timeoutMs             uint32
 	targetProbeRatePerSec int
 	scheduler             *ProbeScheduler
 	stopCh                chan struct{}
@@ -120,12 +121,14 @@ func NewClusterMonitor(
 	agentState *state.AgentState,
 	prober *probe.Prober,
 	intervalMs uint32,
+	timeoutMs uint32,
 	targetProbeRatePerSec int,
 ) *ClusterMonitor {
 	return &ClusterMonitor{
 		agentState:            agentState,
 		prober:                prober,
 		intervalMs:            intervalMs,
+		timeoutMs:             timeoutMs,
 		targetProbeRatePerSec: targetProbeRatePerSec,
 		scheduler:             NewProbeScheduler(),
 		stopCh:                make(chan struct{}),
@@ -247,6 +250,16 @@ func (c *ClusterMonitor) UpdatePinglist(pinglist []*controller_agent.PingTarget)
 		Int("probe_targets", len(probeTargets)).
 		Int("skipped_targets", skippedCount).
 		Msg("Updated cluster monitoring pinglist for sequential processing")
+}
+
+// UpdateTimeout updates the timeout value for probe operations
+func (c *ClusterMonitor) UpdateTimeout(timeoutMs uint32) {
+	if timeoutMs == 0 {
+		log.Warn().Msg("Received zero timeout value, ignoring update")
+		return
+	}
+	c.timeoutMs = timeoutMs
+	log.Debug().Uint32("timeout_ms", timeoutMs).Msg("Updated probe timeout")
 }
 
 // shouldSkipLinkLocalTarget determines if a target should be skipped due to link-local GID constraints
@@ -379,7 +392,7 @@ func (c *ClusterMonitor) processNextProbe() {
 	}
 
 	// Send probe with a timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.intervalMs)*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.timeoutMs)*time.Millisecond)
 	defer cancel()
 
 	// Execute the probe

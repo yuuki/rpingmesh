@@ -107,7 +107,7 @@ sudo apt-get install -y build-essential
 Go 1.24.3（arm64）を VM に導入する場合:
 
 ```bash
-GO_VERSION=1.24.3
+GO_VERSION=1.25
 curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz -o /tmp/go${GO_VERSION}.linux-arm64.tar.gz
 sudo rm -rf /usr/local/go
 sudo tar -C /usr/local -xzf /tmp/go${GO_VERSION}.linux-arm64.tar.gz

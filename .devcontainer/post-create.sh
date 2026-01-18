@@ -164,8 +164,7 @@ echo "=============================================="
 echo ""
 
 echo "Installing Claude Code..."
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
-npm install -g @anthropic-ai/claude-code
+curl -fsSL https://claude.ai/install.sh | bash
 
 # Find the workspace directory
 WORKSPACE_DIR=${WORKSPACE_DIR:-$(pwd)}

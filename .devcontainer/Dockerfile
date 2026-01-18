@@ -1,4 +1,4 @@
-FROM golang:1.24-bullseye
+FROM golang:1.25-bookworm
 
 ARG KERNEL_VERSION
 ENV KERNEL_VERSION=${KERNEL_VERSION}

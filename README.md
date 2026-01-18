@@ -228,7 +228,7 @@ Advanced analytics engine delivering:
 
 - Linux kernel 5.8+ with eBPF support
 - RDMA-capable network interfaces
-- Docker (recommended) or native Go 1.24+ environment
+- Docker (recommended) or native Go 1.25+ environment
 - Root privileges or appropriate capabilities
 
 TBD

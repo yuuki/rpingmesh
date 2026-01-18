@@ -1,6 +1,6 @@
 module github.com/yuuki/rpingmesh
 
-go 1.24.3
+go 1.25
 
 require (
 	github.com/cilium/ebpf v0.18.0

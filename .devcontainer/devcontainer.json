@@ -40,5 +40,8 @@
   "mounts": [
     "type=volume,source=rpingmesh-go-cache,target=/go/pkg"
   ],
+  "containerEnv": {
+    "RDMA_ENABLED": "1"
+  },
   "remoteUser": "root"
 }

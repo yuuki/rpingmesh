@@ -2,6 +2,20 @@
 
 対象: macOS（arm64）で `colima` を使い、Linux VM 上で RpingMesh の RDMA/eBPF を含む動作確認・テストを実施する。
 
+## 代替: Devcontainer を使用
+
+より簡単なセットアップとして、事前構成済みの devcontainer を使用できます:
+
+- **[Devcontainer RDMA セットアップガイド](./devcontainer-rdma-setup.md)** を参照
+- **メリット:**
+  - 自動環境セットアップ
+  - プリインストール済みツールと依存関係
+  - 起動時の検証チェック
+  - トラブルシューティング用ヘルパースクリプト
+- **対象:** RDMA 開発環境（soft-RoCE）に焦点。eBPF は将来の拡張として保留
+
+このガイドは、devcontainer の代わりに Colima VM で直接実行したい場合に使用してください。
+
 ## 目標（成功条件）
 
 - Linux VM 内で本リポジトリを参照できる（マウント）

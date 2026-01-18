@@ -15,10 +15,12 @@ RUN apt-get update && apt-get install -y \
     llvm \
     libbpf-dev \
     libelf-dev \
-    bpftool \
     pkg-config \
     libibverbs-dev \
     librdmacm-dev \
+    rdma-core \
+    ibverbs-utils \
+    build-essential \
     dpkg-dev \
     linux-libc-dev \
     iproute2 \

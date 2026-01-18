@@ -238,10 +238,12 @@ func (a *Agent) Start() error {
 	}
 
 	// Create cluster monitor
+	// Use ProbeIntervalMS as initial timeout (will be updated from controller)
 	a.clusterMonitor = monitor.NewClusterMonitor(
 		a.agentState,
 		a.prober,
 		a.config.ProbeIntervalMS,
+		a.config.ProbeIntervalMS, // Initial timeout, will be updated from controller
 		a.config.TargetProbeRatePerSecond,
 	)
 	if err := a.clusterMonitor.Start(); err != nil {
@@ -498,6 +500,7 @@ func (a *Agent) updatePinglist() {
 	allInterTorTargets := make([]*controller_agent.PingTarget, 0)
 
 	var lastIntervalMs uint32
+	var lastTimeoutMs uint32
 
 	// Get pinglist for each local RNIC to ensure unique flow labels
 	for _, localRnic := range localRnics {
@@ -509,7 +512,7 @@ func (a *Agent) updatePinglist() {
 		log.Debug().Str("local_rnic_gid", localRnic.GID).Msg("Getting pinglist for local RNIC")
 
 		// Get ToR-mesh pinglist for this RNIC
-		torTargets, intervalMs, _, err := a.controllerClient.GetPinglist(
+		torTargets, intervalMs, timeoutMs, err := a.controllerClient.GetPinglist(
 			localRnic,
 			a.agentState.GetHostName(),
 			controller_agent.PinglistRequest_TOR_MESH,
@@ -542,6 +545,9 @@ func (a *Agent) updatePinglist() {
 		if intervalMs > 0 {
 			lastIntervalMs = intervalMs
 		}
+		if timeoutMs > 0 {
+			lastTimeoutMs = timeoutMs
+		}
 	}
 
 	// Log combined ToR-mesh targets grouped by AgentID
@@ -567,6 +573,12 @@ func (a *Agent) updatePinglist() {
 		log.Debug().Uint32("old_interval_ms", a.config.ProbeIntervalMS).Uint32("new_interval_ms", lastIntervalMs).Msg("Updating probe interval")
 		a.config.ProbeIntervalMS = lastIntervalMs
 		log.Info().Uint32("interval_ms", lastIntervalMs).Msg("Updated probe interval from controller")
+	}
+
+	// Update probe timeout if controller specified it
+	if lastTimeoutMs > 0 {
+		a.clusterMonitor.UpdateTimeout(lastTimeoutMs)
+		log.Info().Uint32("timeout_ms", lastTimeoutMs).Msg("Updated probe timeout from controller")
 	}
 
 	// Update cluster monitor's pinglist with combined targets

@@ -1,4 +1,4 @@
-FROM golang:1.24-bullseye AS builder
+FROM golang:1.25-bookworm AS builder
 
 WORKDIR /app
 
@@ -17,7 +17,7 @@ RUN mkdir -p /app && \
     /app/bin/controller --create-config --config-output /app/controller.yaml || true
 
 # Runtime image
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 WORKDIR /app
 

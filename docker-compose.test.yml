@@ -16,7 +16,7 @@ services:
 
   # Test execution container
   controller_test:
-    image: golang:1.24-bullseye
+    image: golang:1.24-bookworm
     volumes:
       - go_mod_cache:/go/pkg/mod
       - go_build_cache:/root/.cache/go-build

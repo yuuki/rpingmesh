@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ### Building
-- `make build-local` - Build binaries locally (requires Go 1.24.3+, clang, libbpf-dev)
+- `make build-local` - Build binaries locally (requires Go 1.25+, clang, libbpf-dev)
 - `make build` - Build both controller and agent with Docker
 - `make build-controller` - Build controller with Docker
 - `make build-agent` - Build agent with Docker

@@ -1,81 +1,81 @@
-# macOS（Apple Silicon）+ colima で Tier 3（soft-RoCE + eBPF）統合テストを回す手順
+# macOS (Apple Silicon) + Colima: Running Tier 3 (soft-RoCE + eBPF) Integration Tests
 
-対象: macOS（arm64）で `colima` を使い、Linux VM 上で RpingMesh の RDMA/eBPF を含む動作確認・テストを実施する。
+Target: Use `colima` on macOS (arm64) to run RpingMesh's RDMA/eBPF verification and testing on a Linux VM.
 
-## 代替: Devcontainer を使用（推奨）
+## Alternative: Using Devcontainer (Recommended)
 
-より簡単なセットアップとして、事前構成済みの devcontainer を使用できます:
+As a simpler setup option, you can use a pre-configured devcontainer:
 
-- **[Devcontainer RDMA セットアップガイド](./devcontainer-rdma-setup.md)** を参照
-- **メリット:**
-  - 自動環境セットアップ
-  - プリインストール済みツールと依存関係
-  - 起動時の検証チェック
-  - トラブルシューティング用ヘルパースクリプト
-  - privileged モードと必要な権限の自動設定
-  - eBPFとRDMAの完全サポート
-- **対象:** RDMA開発環境（soft-RoCE）とeBPF開発の両方
+- **See [Devcontainer RDMA Setup Guide](./devcontainer-rdma-setup.md)**
+- **Benefits:**
+  - Automatic environment setup
+  - Pre-installed tools and dependencies
+  - Validation checks on startup
+  - Helper scripts for troubleshooting
+  - Automatic configuration of privileged mode and required capabilities
+  - Full eBPF and RDMA support
+- **Scope:** Both RDMA development environment (soft-RoCE) and eBPF development
 
-**Colima + Devcontainer の組み合わせが最も推奨される開発環境です。**
+**Combining Colima + Devcontainer is the most recommended development environment.**
 
-このガイドは、devcontainer の代わりに Colima VM で直接実行したい場合に使用してください。
+Use this guide if you want to run directly on Colima VM instead of devcontainer.
 
-### Devcontainer 使用時の注意事項
+### Notes When Using Devcontainer in Colima Environment
 
-Colima環境でdevcontainerを使用する場合:
+If using devcontainer in a Colima environment:
 
-1. **devcontainer.jsonの設定が必要**
-   - `--privileged` モード
-   - `CAP_BPF` ケーパビリティ
-   - `/sys/kernel/debug` debugfsマウント
+1. **devcontainer.json configuration required**
+   - `--privileged` mode
+   - `CAP_BPF` capability
+   - `/sys/kernel/debug` debugfs mount
 
-2. **環境診断ツールの活用**
+2. **Use diagnostic tools**
    ```bash
-   # コンテナ内で実行
+   # Run inside container
    .devcontainer/check-rdma-readiness.sh
    ```
 
-3. **既知の制限事項**
-   - eBPF CO-RE Relocation: Colimaカーネルとの互換性問題が発生する可能性
-   - `/sys/kernel/btf` は読めるが、モジュール構成によって制限される場合あり
-   - 対処: eBPFテストをSKIPする、または別の検証方法を使用
+3. **Known limitations**
+   - eBPF CO-RE Relocation: Compatibility issues with Colima kernel may occur
+   - `/sys/kernel/btf` is readable but may be restricted by module configuration
+   - Workaround: Skip eBPF tests or use alternative verification methods
 
-## 目標（成功条件）
+## Goals (Success Criteria)
 
-- Linux VM 内で本リポジトリを参照できる（マウント）
-- VM 内で `rdma_rxe`（soft-RoCE）が有効化できる（`rdma link show` に RXE が出る）
-- VM 内で eBPF 実行前提（debugfs / memlock / 権限）を満たせる
-- VM 内で `go test ./...` が実行できる（失敗する場合は、失敗理由が再現可能な形で記録される）
+- Repository is accessible (mounted) inside Linux VM
+- `rdma_rxe` (soft-RoCE) can be enabled in VM (`rdma link show` displays RXE)
+- eBPF execution prerequisites are met in VM (debugfs / memlock / privileges)
+- `go test ./...` can run in VM (if failures occur, reasons are documented reproducibly)
 
-## 0. 前提
+## 0. Prerequisites
 
-- Homebrew が使える
-- `docker` CLI がインストール済み
-- （推奨）`make generate-bpf` を VM 内で回せるように、VM 内に `clang/llvm/libbpf-dev/bpftool` 等を入れる
-- eBPF 生成物は **arm64 対応が必要**（`docs/plans/2026-01-17-macos-dev-env-design.md` の「multi-arch 化」参照）
+- Homebrew is available
+- `docker` CLI is installed
+- (Recommended) Install `clang/llvm/libbpf-dev/bpftool` etc. in VM so `make generate-bpf` can run
+- eBPF artifacts **must support arm64** (see "multi-arch" in `docs/plans/2026-01-17-macos-dev-env-design.md`)
 
-## 1. colima の起動（例）
+## 1. Starting Colima (Example)
 
-ホスト macOS 側:
+On host macOS:
 
 ```bash
 colima start --arch aarch64 --cpu 6 --memory 10 --disk 80
 colima status
 ```
 
-参考（実測）:
+Reference (measured):
 - colima: 0.9.1
 - VM OS: Ubuntu 24.04.1 LTS
 - kernel: 6.8.0-50-generic
 - arch: aarch64
 
-VM に入る:
+Enter VM:
 
 ```bash
 colima ssh
 ```
 
-VM 側で最低限の確認:
+Basic verification in VM:
 
 ```bash
 uname -a
@@ -84,26 +84,26 @@ ip link
 df -h
 ```
 
-## 2. リポジトリが VM から見えることを確認
+## 2. Verify Repository is Accessible from VM
 
-VM から macOS のホームディレクトリが見えるかは環境差があります。まずは以下のどちらかで確認します。
+Whether macOS home directory is visible from VM varies by environment. First, check with one of:
 
 ```bash
 ls /Users || true
 ls $HOME || true
 ```
 
-リポジトリが見えたら（例）:
+If repository is visible (example):
 
 ```bash
 cd /Users/y-tsubouchi/src/github.com/yuuki/rpingmesh
 ```
 
-見えない場合は、colima のマウント設定を調整し、**VM 内からソースが参照できる状態**を先に作ります。
+If not visible, adjust colima mount settings first to **make source accessible from VM**.
 
-## 3. VM 内に依存パッケージを導入
+## 3. Install Dependencies in VM
 
-OS を確認し、Debian/Ubuntu 系なら以下を目安に導入します（パッケージ名は多少ズレることがあります）。
+Check OS, then install for Debian/Ubuntu (package names may vary):
 
 ```bash
 sudo apt-get update
@@ -115,12 +115,12 @@ sudo apt-get install -y \
   linux-headers-$(uname -r) || true
 ```
 
-補足（Ubuntu 24.04 / arm64 の実測）:
-- `bpftool` は `linux-tools-common` / `linux-tools-$(uname -r)` に含まれるため、必要に応じて追加
-- `ibv_devinfo` は `ibverbs-utils` を入れる
-- RDMA の cgo ビルドには `build-essential` が必要
+Notes (measured on Ubuntu 24.04 / arm64):
+- `bpftool` is in `linux-tools-common` / `linux-tools-$(uname -r)`, add if needed
+- `ibv_devinfo` requires `ibverbs-utils`
+- RDMA cgo build requires `build-essential`
 
-実際に使用した追加コマンド:
+Additional commands actually used:
 
 ```bash
 sudo apt-get install -y linux-tools-common linux-tools-$(uname -r) || true
@@ -128,7 +128,7 @@ sudo apt-get install -y ibverbs-utils
 sudo apt-get install -y build-essential
 ```
 
-Go 1.24.3（arm64）を VM に導入する場合:
+To install Go 1.24.3 (arm64) on VM:
 
 ```bash
 GO_VERSION=1.25
@@ -140,7 +140,7 @@ export PATH=/usr/local/go/bin:$PATH
 go version
 ```
 
-RDMA/eBPF の確認:
+Verify RDMA/eBPF:
 
 ```bash
 bpftool version || true
@@ -148,9 +148,9 @@ rdma version || true
 ibv_devinfo || true
 ```
 
-## 4. soft-RoCE（RXE）を有効化
+## 4. Enable soft-RoCE (RXE)
 
-モジュールをロード:
+Load modules:
 
 ```bash
 sudo modprobe rdma_rxe
@@ -158,36 +158,36 @@ sudo modprobe ib_core || true
 sudo modprobe ib_uverbs || true
 ```
 
-VM の NIC 名を確認（例: `eth0`）:
+Check VM's NIC name (example: `eth0`):
 
 ```bash
 ip link
 ip route
 ```
 
-RXE デバイス作成:
+Create RXE device:
 
 ```bash
-sudo rdma link add rxe0 type rxe netdev <VMのNIC名>
+sudo rdma link add rxe0 type rxe netdev <VM_NIC_NAME>
 rdma link show
 ```
 
-確認（`/sys/class/infiniband` が存在すれば期待に近い状態）:
+Verification (if `/sys/class/infiniband` exists, environment is close to expected):
 
 ```bash
 ls -la /sys/class/infiniband || true
 ibv_devinfo | head -n 40 || true
 ```
 
-実測ログ（例）:
-- `rdma link show` で `rxe0/1 state ACTIVE ... netdev eth0` が表示
-- `ibv_devinfo` で `hca_id: rxe0` が確認できる
+Example measured logs:
+- `rdma link show` displays `rxe0/1 state ACTIVE ... netdev eth0`
+- `ibv_devinfo` confirms `hca_id: rxe0`
 
-失敗した場合の記録ポイント:
-- `modprobe rdma_rxe` が失敗する（モジュールが無い/カーネル構成）
-- `rdma link add` が失敗する（`rdma-core` 未導入/IF 名ミス/権限不足）
+Key points when failures occur:
+- `modprobe rdma_rxe` fails (module missing/kernel config issue)
+- `rdma link add` fails (rdma-core not installed/interface name error/permission issue)
 
-## 5. eBPF 実行前提を満たす
+## 5. Meet eBPF Execution Prerequisites
 
 debugfs:
 
@@ -201,54 +201,54 @@ memlock:
 ulimit -l unlimited || true
 ```
 
-（任意）kprobe 対象関数が存在するかの当たりを付ける:
+(Optional) Check if kprobe target functions exist:
 
 ```bash
 sudo grep -w "ib_modify_qp_with_udata" /proc/kallsyms | head -n 5 || true
 ```
 
-補足（実測）:
-- `/sys/kernel/btf/ib_core` と `/sys/kernel/btf/ib_uverbs` が存在
+Notes (measured):
+- `/sys/kernel/btf/ib_core` and `/sys/kernel/btf/ib_uverbs` exist
 
-## 6. テスト/動作確認の回し方（VM 内）
+## 6. Running Tests/Verification (in VM)
 
-### 6.1 まずはコンパイル/単体テスト（ハード依存を除く）
+### 6.1 First: Compilation/Unit Tests (Excluding Hardware Dependencies)
 
 ```bash
 go version
 go test ./... -count=1
 ```
 
-### 6.2 RDMA/eBPF を含むテスト（環境が揃った場合のみ）
+### 6.2 Tests Including RDMA/eBPF (Only if Environment is Ready)
 
-eBPF ロード系（権限が必要）:
+eBPF loading (requires privileges):
 
 ```bash
 sudo -E go test ./internal/ebpf -run TestBPFProgramLoading -count=1 -v
 ```
 
-RDMA デバイス検出（soft-RoCE を入れている前提）:
+RDMA device detection (assuming soft-RoCE is installed):
 
 ```bash
 sudo -E go test ./internal/rdma -run TestRDMAEnvironmentDetection -count=1 -v
 ```
 
-実測結果:
-- `TestRDMAEnvironmentDetection` は soft-RoCE（rxe0）で PASS
-- eBPF は **CO-RE relocation エラーで SKIP** になるケースがある
-  - 例: `bad CO-RE relocation: invalid func unknown#...`
-  - この場合、`/sys/kernel/btf` は読めているが、カーネル/モジュール構成や CO-RE 互換性が原因の可能性が高い
+Measured results:
+- `TestRDMAEnvironmentDetection` passes with soft-RoCE (rxe0)
+- eBPF **may SKIP with CO-RE relocation error** in some cases
+  - Example: `bad CO-RE relocation: invalid func unknown#...`
+  - This likely indicates `/sys/kernel/btf` is readable but kernel/module configuration or CO-RE compatibility is the issue
 
-## 7. 期待通りに動かない場合の切り分け
+## 7. Troubleshooting When Things Don't Work
 
-- `internal/ebpf` がビルドできない: eBPF 生成物が `amd64` 固定の可能性が高い（multi-arch 化が必要）
-- `modprobe rdma_rxe` が失敗: colima VM のカーネルに RXE が入っていない（VM/カーネル選定の見直しが必要）
-- eBPF のロードが失敗: `debugfs`/memlock/権限/カーネル関数の有無（`ib_*`）を順に確認
+- `internal/ebpf` won't build: eBPF artifacts likely fixed to `amd64` (multi-arch needed)
+- `modprobe rdma_rxe` fails: Colima VM kernel lacks RXE (VM/kernel selection needs review)
+- eBPF loading fails: Check debugfs/memlock/privileges/kernel function availability (`ib_*`) in order
 
-## 8. 実測環境メモ（このリポジトリでの検証結果）
+## 8. Measured Environment Notes (Verification Results for This Repository)
 
 - colima: 0.9.1
 - VM: Ubuntu 24.04.1 LTS / kernel 6.8.0-50-generic / aarch64
-- mount: `/Users/y-tsubouchi` が virtiofs で見える
-- RDMA: `rdma_rxe` により `rxe0` を作成、`ibv_devinfo` で確認済み
-- eBPF: `TestBPFProgramLoading` は CO-RE relocation エラーにより SKIP（要追加調査）
+- mount: `/Users/y-tsubouchi` visible via virtiofs
+- RDMA: `rxe0` created via `rdma_rxe`, verified with `ibv_devinfo`
+- eBPF: `TestBPFProgramLoading` skipped due to CO-RE relocation error (requires further investigation)

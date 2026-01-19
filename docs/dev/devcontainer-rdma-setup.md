@@ -1,254 +1,254 @@
-# Devcontainer RDMA セットアップガイド
+# Devcontainer RDMA Setup Guide
 
-## 概要
+## Overview
 
-R-Pingmesh の devcontainer は RDMA（soft-RoCE）開発環境を提供します。このガイドでは、セットアップ、検証、トラブルシューティング方法を説明します。
+R-Pingmesh's devcontainer provides an RDMA (soft-RoCE) development environment. This guide explains setup, verification, and troubleshooting procedures.
 
-## 前提条件
+## Prerequisites
 
-- Docker または互換コンテナランタイム
-- VS Code + Remote-Containers 拡張機能（または GitHub Codespaces）
-- **RDMA 完全動作のため:**
-  - Linux ホスト（カーネル 5.4+ 推奨）
-  - ホストカーネルモジュール: `rdma_rxe`, `ib_core`, `ib_uverbs`
+- Docker or compatible container runtime
+- VS Code + Remote-Containers extension (or GitHub Codespaces)
+- **For full RDMA functionality:**
+  - Linux host (kernel 5.4+ recommended)
+  - Host kernel modules: `rdma_rxe`, `ib_core`, `ib_uverbs`
 
-## 自動セットアップ
+## Automatic Setup
 
-devcontainer 起動時に `post-create.sh` が自動的に以下を実行します:
+When devcontainer starts, `post-create.sh` automatically executes:
 
-1. RDMA カーネルモジュールのロード
-2. 最初の ethernet インターフェースに soft-RoCE を作成
-3. RDMA 環境の検証
-4. ヘルパースクリプト（`setup-soft-roce.sh`）の作成
+1. Load RDMA kernel modules
+2. Create soft-RoCE on the first ethernet interface
+3. Validate RDMA environment
+4. Create helper scripts (`setup-soft-roce.sh`)
 
-初期化出力を確認し、警告やエラーがないかチェックしてください。
+Check initialization output and verify there are no warnings or errors.
 
-## 検証
+## Verification
 
-### 自動検証
+### Automatic Verification
 
-コンテナ起動後、検証スクリプトを実行:
+After container startup, run the validation script:
 
 ```bash
 .devcontainer/validate-rdma-environment.sh
 ```
 
-### 手動検証
+### Manual Verification
 
-#### RDMA ツール確認
+#### Check RDMA Tools
 
 ```bash
-# rdma コマンド
+# rdma command
 rdma version
 
-# ibv_devinfo コマンド
+# ibv_devinfo command
 ibv_devinfo -l
 ```
 
-#### RDMA デバイス確認
+#### Check RDMA Devices
 
 ```bash
-# RDMA リンクの確認
+# Check RDMA links
 rdma link show
-# 期待される出力:
+# Expected output:
 # link rxe0/1 state ACTIVE physical_state LINK_UP netdev eth0
 
-# InfiniBand デバイス確認
+# Check InfiniBand devices
 ls -la /sys/class/infiniband
-# 期待される出力: rxe0 ディレクトリ
+# Expected output: rxe0 directory
 
-# デバイス詳細情報
+# Device details
 ibv_devinfo | head -n 20
-# 期待される出力: hca_id: rxe0 とその詳細
+# Expected output: hca_id: rxe0 and details
 ```
 
-#### RDMA テスト実行
+#### Run RDMA Tests
 
 ```bash
-# RDMA デバイス初期化テスト（soft-RoCE 必要）
+# RDMA device initialization test (requires soft-RoCE)
 go test ./internal/rdma -run TestDeviceInit -v
 
-# RDMA パッケージ全体のテスト
+# Test entire RDMA package
 go test ./internal/rdma -v
 ```
 
-#### ビルド確認
+#### Verify Build
 
 ```bash
-# RDMA パッケージのビルド（cgo）
+# Build RDMA package (cgo)
 go build ./internal/rdma
 
-# Agent のビルド
+# Build Agent
 go build ./cmd/agent
 ```
 
-## 手動 soft-RoCE セットアップ
+## Manual soft-RoCE Setup
 
-自動セットアップが失敗した場合、ヘルパースクリプトを使用:
+If automatic setup fails, use the helper script:
 
 ```bash
-# 利用可能なネットワークインターフェース確認
+# Check available network interfaces
 ip link show
 
-# デフォルトインターフェースで soft-RoCE 作成
+# Create soft-RoCE on default interface
 setup-soft-roce.sh
 
-# 特定のインターフェースを指定
+# Specify specific interface
 setup-soft-roce.sh eth0
 ```
 
-## トラブルシューティング
+## Troubleshooting
 
-### クイック診断
+### Quick Diagnosis
 
-問題が発生した場合、まず診断ツールを実行:
+If problems occur, first run the diagnostic tool:
 
 ```bash
 .devcontainer/check-rdma-readiness.sh
 ```
 
-このツールは以下を自動チェック:
-- プラットフォームとホスト環境
-- コンテナのケーパビリティ
-- カーネルモジュールの状態
-- RDMAデバイスの可用性
-- eBPFサポート
-- プラットフォーム別のガイダンス
+This tool automatically checks:
+- Platform and host environment
+- Container capabilities
+- Kernel module status
+- RDMA device availability
+- eBPF support
+- Platform-specific guidance
 
-### soft-RoCE 作成が失敗する
+### soft-RoCE Creation Fails
 
-**症状:** `rdma link add` が失敗、または警告メッセージ
+**Symptoms:** `rdma link add` fails or warning messages
 
-**原因と対処:**
+**Causes and Solutions:**
 
-1. **カーネルモジュールが利用不可**
+1. **Kernel modules unavailable**
    ```bash
-   # コンテナ内で確認
+   # Check in container
    lsmod | grep rdma_rxe
 
-   # ホストマシンで確認・ロード
+   # Check and load on host machine
    sudo modprobe rdma_rxe
    sudo modprobe ib_core
    sudo modprobe ib_uverbs
 
-   # 確認
+   # Verify
    lsmod | grep rdma
    ```
 
-2. **権限不足**
-   - devcontainer は privileged モードと必要な capabilities（NET_ADMIN, SYS_ADMIN, CAP_BPF）を持っています
-   - 診断ツールで権限を確認: `.devcontainer/check-rdma-readiness.sh`
-   - それでも失敗する場合、ホスト側の設定が必要な可能性があります
+2. **Insufficient privileges**
+   - devcontainer has privileged mode and required capabilities (NET_ADMIN, SYS_ADMIN, CAP_BPF)
+   - Verify capabilities with diagnostic tool: `.devcontainer/check-rdma-readiness.sh`
+   - If still failing, host-side configuration may be needed
 
-3. **ネットワークインターフェースが見つからない**
+3. **Network interface not found**
    ```bash
-   # コンテナ内のインターフェース確認
+   # Check interfaces in container
    ip link show
 
-   # 手動で特定のインターフェースを指定
+   # Manually specify interface
    setup-soft-roce.sh <interface-name>
    ```
 
-### RDMA テストが SKIP される
+### RDMA Tests Are Skipped
 
-**症状:** `go test ./internal/rdma` で一部テストが SKIP
+**Symptoms:** Some tests skip with `go test ./internal/rdma`
 
-**期待される動作:**
-- soft-RoCE がない環境では一部テストが SKIP されるのは正常です
-- ハードウェア RDMA NIC が必要なテストも SKIP されます
+**Expected behavior:**
+- It's normal for some tests to skip in environments without soft-RoCE
+- Tests requiring hardware RDMA NIC also skip
 
-**確認すべきこと:**
-- `TestDeviceInit` は soft-RoCE があれば PASS すべき
-- SKIP の理由がログに出力されるので確認
+**Things to check:**
+- `TestDeviceInit` should PASS if soft-RoCE is available
+- Skip reasons are logged in output
 
-### cgo ビルドが失敗する
+### Cgo Build Fails
 
-**症状:** `go build` で「C compiler not found」や「library not found」エラー
+**Symptoms:** `go build` errors like "C compiler not found" or "library not found"
 
-**対処:**
+**Solutions:**
 
-1. **build-essential 確認**
+1. **Verify build-essential**
    ```bash
    dpkg -l | grep build-essential
    gcc --version
    ```
 
-2. **RDMA ライブラリ確認**
+2. **Check RDMA libraries**
    ```bash
    ldconfig -p | grep libibverbs
    ldconfig -p | grep librdmacm
    ```
 
-3. **ライブラリが見つからない場合**
+3. **If libraries not found**
    ```bash
-   # コンテナを再ビルド（Dockerfile の変更が反映されていない可能性）
+   # Rebuild container (Dockerfile changes may not be reflected)
    # VS Code: Command Palette > "Rebuild Container"
    ```
 
-### デバイスが表示されない
+### Devices Not Showing
 
-**症状:** `rdma link show` で何も表示されない、または `ibv_devinfo` がデバイスを検出しない
+**Symptoms:** `rdma link show` shows nothing, or `ibv_devinfo` doesn't detect devices
 
-**対処:**
+**Solutions:**
 
-1. **soft-RoCE を手動作成**
+1. **Create soft-RoCE manually**
    ```bash
    setup-soft-roce.sh
    ```
 
-2. **ホストカーネルサポート確認**
+2. **Check host kernel support**
    ```bash
-   # ホストマシンで
+   # On host machine
    modinfo rdma_rxe
-   # 出力があれば、カーネルが RXE をサポートしています
+   # If output appears, kernel supports RXE
    ```
 
-3. **コンテナ設定の確認**
-   - devcontainer.json が最新版であることを確認
-   - 必要な設定: `--privileged`, `CAP_BPF`, debugfs マウント
-   - VS Code: "Rebuild Container" で設定を反映
+3. **Verify container configuration**
+   - Ensure devcontainer.json is up-to-date
+   - Required settings: `--privileged`, `CAP_BPF`, debugfs mount
+   - VS Code: "Rebuild Container" to apply settings
 
-## コンテナの制限事項
+## Container Limitations
 
-devcontainer 環境では以下の制限があります:
+The devcontainer environment has the following constraints:
 
-### できること
-- ✅ soft-RoCE の使用（ホストモジュールロード済みの場合）
-- ✅ RDMA アプリケーションの開発とテスト
-- ✅ cgo を使った RDMA コードのビルド
-- ✅ UD (Unreliable Datagram) の送受信テスト
-- ✅ eBPF プログラムのロードと実行
-- ✅ RDMA トレーシング（eBPF ServiceTracer）
+### What's Supported
+- ✅ Using soft-RoCE (if host modules are loaded)
+- ✅ Developing and testing RDMA applications
+- ✅ Building RDMA code with cgo
+- ✅ Testing UD (Unreliable Datagram) send/receive
+- ✅ Loading and running eBPF programs
+- ✅ RDMA tracing (eBPF ServiceTracer)
 
-### 制約事項
-- ⚠️ カーネルモジュールのロードはホスト環境に依存
-- ⚠️ 実 RDMA NIC へのアクセスにはデバイスパススルーが必要
-- ⚠️ プラットフォームによる制限（Docker Desktop vs Colima）
+### Constraints
+- ⚠️ Kernel module loading depends on host environment
+- ⚠️ Accessing real RDMA NICs requires device passthrough
+- ⚠️ Platform-specific limitations (Docker Desktop vs Colima)
 
-### プラットフォーム別の対応
+### Platform-Specific Support
 
-**Linux ホスト:**
-- ✅ 完全なRDMA/eBPFサポート
-- カーネルモジュールのロードが可能
+**Linux Host:**
+- ✅ Full RDMA/eBPF support
+- Kernel modules can be loaded
 
 **macOS + Colima:**
-- ✅ 完全なRDMA/eBPFサポート
-- カーネルモジュールのカスタマイズが可能
-- 推奨環境
+- ✅ Full RDMA/eBPF support
+- Kernel modules customizable
+- Recommended environment
 
 **macOS + Docker Desktop:**
-- ⚠️ 制限付きサポート
-- カーネルモジュールのカスタマイズに制限
-- Colimaへの移行を推奨（[macOS Colima VM セットアップガイド](./macos-colima-vm.md)参照）
+- ⚠️ Limited support
+- Kernel module customization restricted
+- Migration to Colima recommended ([macOS Colima VM Setup Guide](./macos-colima-vm.md))
 
-## ホスト環境の準備
+## Host Environment Preparation
 
-完全な RDMA 機能を使うため、ホスト側で以下を準備:
+To use full RDMA features, prepare the host:
 
-### Ubuntu/Debian ホスト
+### Ubuntu/Debian Host
 
 ```bash
-# RDMA パッケージのインストール
+# Install RDMA packages
 sudo apt-get update
 sudo apt-get install -y \
     rdma-core \
@@ -256,149 +256,149 @@ sudo apt-get install -y \
     librdmacm-dev \
     linux-headers-$(uname -r)
 
-# カーネルモジュールのロード
+# Load kernel modules
 sudo modprobe rdma_rxe
 sudo modprobe ib_core
 sudo modprobe ib_uverbs
 
-# 確認
+# Verify
 lsmod | grep rdma
 ```
 
-### macOS ホスト
+### macOS Host
 
-macOS では Docker Desktop を使用しますが、Linux VM 上で動作するため:
+On macOS, Docker Desktop runs on a Linux VM, so:
 
-1. **代替: Colima VM を使用**
-   - [macOS Colima VM セットアップガイド](./macos-colima-vm.md)参照
-   - Colima は Linux VM として動作し、RDMA カーネルモジュールをサポート可能
+1. **Alternative: Use Colima VM**
+   - See [macOS Colima VM Setup Guide](./macos-colima-vm.md)
+   - Colima runs as a Linux VM and can support RDMA kernel modules
 
-2. **Docker Desktop の制限**
-   - Docker Desktop の Linux VM はカスタマイズが困難
-   - RDMA カーネルモジュールが利用できない可能性が高い
-   - 開発とビルドは可能ですが、RDMA デバイステストは制限される
+2. **Docker Desktop Limitations**
+   - Docker Desktop's Linux VM is difficult to customize
+   - RDMA kernel modules likely unavailable
+   - Development and builds are possible, but RDMA device testing is limited
 
-## 開発ワークフロー
+## Development Workflow
 
-### 1. コンテナ起動
-- VS Code で「Reopen in Container」
-- 初期化出力を確認（RDMA セットアップのステータス）
+### 1. Start Container
+- In VS Code, select "Reopen in Container"
+- Check initialization output (RDMA setup status)
 
-### 2. 環境検証
+### 2. Verify Environment
 ```bash
 .devcontainer/validate-rdma-environment.sh
 ```
 
-### 3. 開発とテスト
+### 3. Development and Testing
 ```bash
-# コード変更
+# Make code changes
 
-# ビルド確認
+# Verify build
 go build ./cmd/agent
 
-# RDMA テスト実行
+# Run RDMA tests
 go test ./internal/rdma -v
 
-# 全体テスト
+# Run full tests
 go test ./... -v
 ```
 
-### 4. トラブルシュー ト
-- 検証スクリプトで問題特定
-- 必要に応じて `setup-soft-roce.sh` 実行
-- ホスト環境の確認
+### 4. Troubleshooting
+- Use validation script to identify issues
+- Run `setup-soft-roce.sh` if needed
+- Check host environment
 
-## 既知の問題
+## Known Issues
 
-### Issue: コンテナ再起動後に soft-RoCE が消える
+### Issue: soft-RoCE Disappears After Container Restart
 
-**原因:** RDMA デバイスはコンテナのネットワーク名前空間に作成されるため
+**Cause:** RDMA devices are created in the container's network namespace
 
-**対処:** コンテナ起動時に自動セットアップが実行されます。失敗した場合は手動で `setup-soft-roce.sh` を実行
+**Solution:** Automatic setup runs when container starts. If it fails, manually run `setup-soft-roce.sh`
 
-### Issue: ibv_devinfo で「No IB devices found」
+### Issue: ibv_devinfo Shows "No IB devices found"
 
-**原因:** soft-RoCE デバイスが作成されていない
+**Cause:** soft-RoCE device not created
 
-**対処:**
+**Solution:**
 ```bash
-# 手動セットアップ
+# Manual setup
 setup-soft-roce.sh
 
-# 確認
+# Verify
 rdma link show
 ibv_devinfo
 ```
 
-### Issue: ホストで rdma_rxe が見つからない
+### Issue: rdma_rxe Not Found on Host
 
-**原因:** ホストカーネルが RXE モジュールを含んでいない
+**Cause:** Host kernel doesn't include RXE module
 
-**対処:**
-1. カーネルアップデート、または
-2. RXE サポート付きカーネルの使用、または
-3. Colima などの代替ソリューションを使用
+**Solution:**
+1. Kernel update, or
+2. Use kernel with RXE support, or
+3. Use alternative solution like Colima
 
-## 参考情報
+## References
 
-- [macOS Colima VM セットアップ](./macos-colima-vm.md) - macOS 開発者向け
-- [RDMA Development Guide](../README.md) - RDMA コンセプトと API
-- [Soft-RoCE Documentation](https://github.com/SoftRoCE/rxe-dev/wiki) - soft-RoCE 詳細
+- [macOS Colima VM Setup](./macos-colima-vm.md) - For macOS developers
+- [RDMA Development Guide](../README.md) - RDMA concepts and APIs
+- [Soft-RoCE Documentation](https://github.com/SoftRoCE/rxe-dev/wiki) - Detailed soft-RoCE info
 
-## 環境変数
+## Environment Variables
 
-devcontainer で設定される環境変数:
+Environment variables set in devcontainer:
 
-- `RDMA_ENABLED=1` - RDMA 機能が有効であることを示す
-- `GOPATH=/go` - Go ワークスペース
-- `GO111MODULE=on` - Go モジュールモード
+- `RDMA_ENABLED=1` - Indicates RDMA features are enabled
+- `GOPATH=/go` - Go workspace
+- `GO111MODULE=on` - Go module mode
 
-## 追加リソース
+## Additional Resources
 
-### RDMA コマンドリファレンス
+### RDMA Command Reference
 
 ```bash
-# デバイス一覧
+# List devices
 rdma dev show
 
-# リンク状態
+# Link status
 rdma link show
 
-# リソース確認
+# Show resources
 rdma resource show
 
-# InfiniBand デバイス情報
+# InfiniBand device info
 ibv_devices
 ibv_devinfo
 
-# デバイス詳細
+# Device details
 ibv_devinfo -d rxe0
 ```
 
-### デバッグコマンド
+### Debug Commands
 
 ```bash
-# カーネルモジュール確認
+# Check kernel modules
 lsmod | grep -E "rdma|ib_"
 
-# システムログ確認
+# Check system logs
 dmesg | grep -i rdma
 dmesg | grep -i rxe
 
-# ネットワークインターフェース
+# Network interfaces
 ip link show
 
-# ライブラリ確認
+# Check libraries
 ldconfig -p | grep -E "ibverbs|rdmacm"
 ```
 
-## まとめ
+## Summary
 
-devcontainer は RDMA 開発環境を自動的にセットアップします:
+devcontainer automatically sets up the RDMA development environment:
 
-1. ✅ **自動セットアップ:** 起動時に RDMA 環境を初期化
-2. ✅ **検証ツール:** `validate-rdma-environment.sh` で環境確認
-3. ✅ **リカバリー:** `setup-soft-roce.sh` で手動セットアップ可能
-4. ⚠️ **制約理解:** コンテナとホストの制限を認識
+1. ✅ **Automatic setup:** Initialize RDMA environment at startup
+2. ✅ **Validation tools:** Use `validate-rdma-environment.sh` to verify environment
+3. ✅ **Recovery:** Use `setup-soft-roce.sh` for manual setup
+4. ⚠️ **Understand constraints:** Be aware of container and host limitations
 
-問題が発生した場合は、検証スクリプトを実行し、エラーメッセージに従って対処してください。
+If problems occur, run the validation script and follow error messages to resolve.

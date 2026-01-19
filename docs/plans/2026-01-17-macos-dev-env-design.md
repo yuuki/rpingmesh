@@ -1,151 +1,151 @@
-# macOS上での開発/単体テスト対応（ハードウェア非依存） 調査メモ
+# macOS Development and Unit Testing (Hardware-Independent) Investigation Notes
 
-作成日: 2026-01-17
+**Created:** 2026-01-17
 
-## 背景
+## Background
 
-RpingMesh は RDMA（`libibverbs`）および eBPF（Linux kernel）に依存し、TMA デバイス等の特殊ハードウェアがない環境では、そのままではビルド・動作確認・単体テストが困難です。  
-一方で、ローカル開発（特に macOS）では「ロジック部分の単体テスト」「コンフィグ/CLI/シリアライゼーション」「コントロールプレーン（gRPC/DB 周り）」の高速フィードバックが重要です。
+RpingMesh depends on RDMA (`libibverbs`) and eBPF (Linux kernel), making it difficult to build, verify, and run unit tests in environments without specialized hardware like RDMA NICs.
+Meanwhile, for local development (especially on macOS), fast feedback is important for "unit testing of logic", "config/CLI/serialization", and "control plane (gRPC/DB)".
 
-本メモは、**macOS 上で動作確認と単体テストを回せる開発環境**を整備するための阻害要因を洗い出し、現実的な対応方針を比較します。
+This memo identifies blockers for setting up **a development environment where we can verify functionality and run unit tests on macOS**, and compares realistic approaches.
 
-## 現状の確認（実測）
+## Current Status (Measured)
 
-macOS（darwin）上で以下を実行すると、ビルド段階で失敗しました（テスト実行以前にコンパイル不能）。
+When running the following on macOS (darwin), build failed at compilation stage (unable to compile before test execution).
 
-実行コマンド:
+Command:
 
 ```bash
 go test ./... -run TestDoesNotExist -count=0
 ```
 
-主な失敗要因（抜粋）:
+Main failure reasons (excerpts):
 
-- `internal/rdma`: `#include <infiniband/verbs.h>` が見つからずビルド失敗
-  - 例: `internal/rdma/packet.go:5:11: fatal error: 'infiniband/verbs.h' file not found`
-- `internal/ebpf`: 生成物/依存が darwin に存在せずビルド失敗
-  - M1/M2 等（`GOARCH=arm64`）の場合、`rdmatracing_x86_bpfel.go` が `amd64` 前提のため型/関数が未定義になる
-  - `github.com/cilium/ebpf/ringbuf` は Linux 前提の API で、darwin では型が存在しない/提供されない
+- `internal/rdma`: Build fails because `#include <infiniband/verbs.h>` is not found
+  - Example: `internal/rdma/packet.go:5:11: fatal error: 'infiniband/verbs.h' file not found`
+- `internal/ebpf`: Build fails because generated artifacts/dependencies don't exist on darwin
+  - For M1/M2 (with `GOARCH=arm64`), `rdmatracing_x86_bpfel.go` assumes `amd64`, causing undefined types/functions
+  - `github.com/cilium/ebpf/ringbuf` is Linux-specific API; types don't exist/aren't provided on darwin
 
-副次的に、`internal/agent` / `internal/monitor` / `internal/probe` / `internal/state` は `internal/rdma` を経由して darwin ビルドが破綻します。
+As a consequence, `internal/agent` / `internal/monitor` / `internal/probe` / `internal/state` fail to build on darwin via `internal/rdma`.
 
-## macOS対応における阻害要因（整理）
+## Blockers for macOS Support (Summary)
 
-### 1) RDMA（cgo + libibverbs）前提がパッケージ境界に露出している
+### 1) RDMA (cgo + libibverbs) Dependency Exposed at Package Boundary
 
-- `internal/rdma` は cgo を前提としており、darwin でコンパイルできません。
-- さらに、`internal/state` / `internal/probe` / `internal/monitor` / `internal/agent` が `internal/rdma` の具体型（`*rdma.RDMAManager`, `*rdma.RNIC`, `*rdma.UDQueue` 等）に強く依存しています。
+- `internal/rdma` requires cgo and cannot compile on darwin.
+- Furthermore, `internal/state` / `internal/probe` / `internal/monitor` / `internal/agent` strongly depend on concrete types from `internal/rdma` (e.g., `*rdma.RDMAManager`, `*rdma.RNIC`, `*rdma.UDQueue`).
 
-→ **OS/ハード依存を build tag とスタブ/抽象化で隔離**しない限り、macOS で `go test` を回せません。
+→ **Cannot run `go test` on macOS unless OS/hardware dependencies are isolated using build tags and stubs/abstractions.**
 
-### 2) eBPF は Linux（かつ特定アーキテクチャ）前提
+### 2) eBPF is Linux (and Specific Architecture) Dependent
 
-- `internal/ebpf/rdma_tracing.go` は Linux 特有の syscall/rlimit/BTF/kprobe/ringbuf を利用しています。
-- 生成された `rdmatracing_x86_bpfel.go` が `amd64` 前提で、Apple Silicon（arm64）の macOS ではビルドに必要な型/関数が存在しません。
+- `internal/ebpf/rdma_tracing.go` uses Linux-specific syscalls/rlimit/BTF/kprobe/ringbuf.
+- Generated `rdmatracing_x86_bpfel.go` assumes `amd64`; on Apple Silicon (arm64) macOS, necessary types/functions don't exist for compilation.
 
-→ **eBPF 実装を linux 限定にし、非 Linux では no-op/stub にする**のが現実的です（少なくとも単体テスト実行のため）。
+→ **Practically, eBPF should be limited to Linux, with no-op/stub on non-Linux** (at least for unit test execution).
 
-### 3) Docker/DevContainer での「Linux上で実行」は有効だが、Apple Silicon での罠がある
+### 3) Docker/DevContainer's "Run on Linux" is Effective, but Apple Silicon Has Pitfalls
 
-- `Dockerfile.agent` は `GOOS=linux GOARCH=amd64` 固定でビルドしています。
-- Apple Silicon 環境だと、Docker が `linux/arm64` をデフォルトにするため、**amd64 バイナリを arm64 コンテナで実行して失敗**する可能性があります（`--platform linux/amd64` か multiarch 対応が必要）。
-- `.devcontainer/devcontainer.json` は JSONC としては成立し得ますが、`mounts` の配列にカンマ欠落があり（少なくとも現状の見た目では）実環境で読み込み失敗する恐れがあります。
+- `Dockerfile.agent` is fixed to `GOOS=linux GOARCH=amd64`.
+- On Apple Silicon, Docker defaults to `linux/arm64`, risking **amd64 binary execution in arm64 container failure** (requires `--platform linux/amd64` or multiarch support).
+- `.devcontainer/devcontainer.json` could be valid JSONC, but missing commas in the `mounts` array (at least in current appearance) may cause loading failures in real environments.
 
-→ 「macOS上で開発する」=「macOSホスト上で直接 go test」だけでなく、**macOS上で Linux コンテナ/VM を回す**選択肢も整理が必要です。
+→ **"Developing on macOS" requires both "directly running `go test` on macOS host" and "running Linux containers/VMs on macOS"** - both options need clarification.
 
-## 目標（成功条件）
+## Success Criteria (Goals)
 
-最低ライン（Tier 1）:
-- macOS 上で `go test ./...` が **コンパイルエラーなく完走**し、ハードウェア依存テストはスキップされる
-- 追加依存（rqlite 等）は Docker で供給できる（`make test-local` を macOS で実行できる）
+**Minimum (Tier 1):**
+- `go test ./...` on macOS **completes without compilation errors**; hardware-dependent tests are skipped
+- Additional dependencies (rqlite, etc.) can be provided via Docker (can run `make test-local` on macOS)
 
-望ましい（Tier 2）:
-- macOS 上で `cmd/agent` が **「RDMA/eBPF 無効」モードで起動**し、コントロールプレーンの疎通（設定読み込み・gRPC 接続・DB 参照等）まで確認できる
+**Desirable (Tier 2):**
+- `cmd/agent` **starts in "RDMA/eBPF disabled" mode** on macOS, allowing verification of control plane communication (config loading, gRPC connection, DB access, etc.)
 
-Tier 3（今回選択）:
-- macOS 上の Linux VM（lima/colima 等）で **soft-RoCE + eBPF を含む統合テスト**を再現できる
+**Tier 3 (Selected for this plan):**
+- **Integration tests including soft-RoCE + eBPF** can be reproduced on macOS Linux VM (lima/colima, etc.)
 
-## アプローチ案（比較）
+## Approach Options (Comparison)
 
-### 案A（推奨）: build tag + スタブで「macOSでも全部コンパイル」させ、単体テストを回す
+### Option A (Recommended): build tags + stubs to "compile everything on macOS", run unit tests
 
-狙い:
-- ロジックの単体テスト（config/registry/pinglist/prober/monitor の純粋ロジック）を macOS で高速に回す
-- RDMA/eBPF に触れる部分は linux 限定とし、macOS では no-op/stub でコンパイルだけ通す
+Goal:
+- Run unit tests of logic (config/registry/pinglist/prober/monitor pure logic) fast on macOS
+- Parts touching RDMA/eBPF are Linux-only; on macOS they're no-op/stub and only compile
 
-具体:
-- `internal/rdma` を `linux && cgo` 実装と、それ以外のスタブ実装に分割（型・メソッドシグネチャを維持）
-- `internal/ebpf` を `linux` 実装と、それ以外のスタブ実装に分割
-- `internal/ebpf/*_test.go` のうち実カーネル依存のものは `//go:build linux` を付けて macOS ではビルド対象外にする（あるいはスタブ実装に合わせて Skip）
+Specifics:
+- Split `internal/rdma` into `linux && cgo` implementation and stub implementation for others (maintain types/method signatures)
+- Split `internal/ebpf` into `linux` implementation and stub implementation for others
+- For `internal/ebpf/*_test.go` tests that depend on real kernel, add `//go:build linux` to exclude from macOS build targets (or skip matching stub implementation)
 
-メリット:
-- macOS 上で `go test ./...` が回る（高速フィードバック）
-- CI は従来通り Linux/Docker で担保できる
+Advantages:
+- `go test ./...` runs on macOS (fast feedback)
+- CI continues to ensure correctness on Linux/Docker
 
-デメリット:
-- スタブ/抽象化の設計が必要（短期的にはコード変更量が増える）
+Disadvantages:
+- Stub/abstraction design needed (code changes in short term)
 
-### 案B: macOS では devcontainer/Docker のみを正式サポート（ホストでの go test は諦める）
+### Option B: Support macOS Only via devcontainer/Docker (Give Up Host go test)
 
-狙い:
-- 「macOS 上で Linux を動かす」ことで RDMA/eBPF に近い環境を維持する
+Goal:
+- Maintain RDMA/eBPF environment via "running Linux on macOS"
 
-メリット:
-- 既存の Docker ベースのワークフロー（`make test`）と親和性が高い
+Advantages:
+- High compatibility with existing Docker-based workflow (`make test`)
 
-デメリット:
-- Apple Silicon の `linux/amd64` 固定ビルドや eBPF/特権/カーネルの制約により、結局 “動かない” 可能性が残る
-- ローカルの軽量単体テストの回転が遅くなる
+Disadvantages:
+- Due to Apple Silicon `linux/amd64` fixed builds and eBPF/privilege/kernel constraints, "won't work" risk remains
+- Local lightweight unit test iteration becomes slow
 
-### 案C: macOS で Linux VM（lima/colima）を整備し、そこで `make test` を回す
+### Option C: Prepare Linux VM (lima/colima) on macOS, Run `make test` There
 
-狙い:
-- Docker Desktop の制約を避け、Linux カーネル上で eBPF 等を扱えるようにする
+Goal:
+- Avoid Docker Desktop constraints, handle eBPF/soft-RoCE on Linux kernel
 
-メリット:
-- eBPF/soft-RoCE を含む統合テストを再現しやすい
+Advantages:
+- Integration tests including eBPF/soft-RoCE easier to reproduce
 
-デメリット:
-- 導入コストが高い（VM/ネットワーク/権限/soft-RoCE）
-- 目的が「単体テストの高速化」なら過剰
+Disadvantages:
+- High onboarding cost (VM/network/privileges/soft-RoCE)
+- Overkill if goal is "fast unit test iteration"
 
-## Tier 3 実現のための技術論点（重要）
+## Tier 3 Technical Considerations (Important)
 
-### 1) Apple Silicon（arm64）と eBPF 生成物のアーキテクチャ整合
+### 1) Apple Silicon (arm64) and eBPF Artifact Architecture Alignment
 
-現状、`internal/ebpf/rdma_tracing.go` の `go:generate` は `-target amd64` 固定であり、生成された Go バインディング（`internal/ebpf/rdmatracing_x86_bpfel.go`）も `//go:build 386 || amd64` です。  
-そのため、**linux/arm64 の VM（例: Apple Silicon でネイティブに動く Ubuntu VM）では eBPF パッケージがビルドできません**。
+Currently, `go:generate` in `internal/ebpf/rdma_tracing.go` is fixed to `-target amd64`, and generated Go bindings (`internal/ebpf/rdmatracing_x86_bpfel.go`) are `//go:build 386 || amd64`.
+**On a linux/arm64 VM (e.g., Ubuntu VM running natively on Apple Silicon), the eBPF package won't build.**
 
-Tier 3 を Apple Silicon でネイティブに回すには、どちらかが必要です:
+To run Tier 3 natively on Apple Silicon, one of these is necessary:
 
-- (推奨) eBPF 生成を multi-arch 化し、`arm64` 用の生成物（例: `rdmatracing_arm64_bpfel.go` / `*.o`）を用意する
-- もしくは、x86_64（amd64）Linux VM を用意してそこで実行する（Apple Silicon では QEMU エミュレーションになり遅い）
+- (Recommended) Multi-arch eBPF generation; provide `arm64` artifacts (e.g., `rdmatracing_arm64_bpfel.go` / `*.o`)
+- Alternatively, run x86_64 (amd64) Linux VM (QEMU emulation on Apple Silicon is slow)
 
-### 2) soft-RoCE（RXE）セットアップ
+### 2) soft-RoCE (RXE) Setup
 
-soft-RoCE は Linux 上で `rdma_rxe` を使い、既存 NIC を RDMA デバイスとして扱えるようにします（`rdma link add rxe0 type rxe netdev <iface>`）。  
-VM のネットワーク IF 名は環境により異なるため、`ip link` / `rdma link show` を前提に手順を組みます。
+soft-RoCE uses `rdma_rxe` on Linux to treat existing NICs as RDMA devices (`rdma link add rxe0 type rxe netdev <iface>`).
+VM network interface names vary by environment, so procedures assume `ip link` / `rdma link show`.
 
-### 3) eBPF 実行要件
+### 3) eBPF Execution Requirements
 
-- `debugfs` のマウント（`/sys/kernel/debug`）
-- `ulimit -l unlimited`（MEMLOCK）
-- root 権限（または CAP_BPF/CAP_SYS_ADMIN）
-- kprobe 対象関数（`ib_modify_qp_with_udata` 等）がカーネルに存在すること
+- debugfs mount (`/sys/kernel/debug`)
+- `ulimit -l unlimited` (MEMLOCK)
+- root privileges (or CAP_BPF/CAP_SYS_ADMIN)
+- kprobe target functions (e.g., `ib_modify_qp_with_udata`) must exist in kernel
 
-## 推奨方針（Tier 3）
+## Recommended Approach (Tier 3)
 
-まず **案A（build tag + スタブ）で Tier 1 を確実に達成**したうえで、**案C（Linux VM）で Tier 3 を追加**します。
+First, **achieve Tier 1 reliably with Option A (build tags + stubs)**, then **add Tier 3 with Option C (Linux VM)**.
 
-理由:
-- 現状の最大の痛点は「macOS で `go test` がコンパイルすら通らない」こと
-- RDMA/eBPF の統合テストは Linux（VM）に寄せた方が、再現性と安定性が高い
+Rationale:
+- Current biggest pain point is "macOS `go test` won't even compile"
+- RDMA/eBPF integration tests better suited to Linux (VM) for reproducibility and stability
 
-## 要確認（1つだけ質問）
+## One Clarification Question
 
-お使いの Mac はどちらですか？
+What Mac do you use?
 
-1. Intel Mac（amd64）
-2. Apple Silicon（arm64）
+1. Intel Mac (amd64)
+2. Apple Silicon (arm64)
 
-（2 の場合、Tier 3 は「arm64 ネイティブ VM + eBPF multi-arch 化」か「amd64 VM（エミュレーション）」のどちらで進めるのが良いか判断します。）
+(For case 2, Tier 3 determination: "arm64 native VM + eBPF multi-arch" or "amd64 VM (emulation)" - which is preferable?)

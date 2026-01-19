@@ -1,33 +1,33 @@
-# macOS開発環境（ハードウェア非依存） Implementation Plan
+# macOS Development Environment (Hardware-Independent) Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** macOS（darwin）上で `go test ./...` を実行できるようにし、RDMA/eBPF 依存部分は Linux 専用として隔離する（ハードウェアがなくても単体テストが回る）。
+**Goal:** Enable `go test ./...` to run on macOS (darwin) by isolating RDMA/eBPF dependencies to Linux only (unit tests run without specialized hardware).
 
-**Architecture:** RDMA/eBPF を build tag で `linux` 実装と `!linux` スタブ実装に分離し、上位層（agent/monitor/probe/state）はスタブでもコンパイル可能な API（型/メソッドシグネチャ）を維持する。統合テストは Linux（Docker/CI）に寄せる。
+**Architecture:** Split RDMA/eBPF into `linux` implementation and `!linux` stub implementation using build tags. Upper layers (agent/monitor/probe/state) maintain a stub-compatible API (types/method signatures). Integration tests are directed to Linux (Docker/CI).
 
-**Tech Stack:** Go build tags（`//go:build`）、Go 単体テスト、Docker（rqlite 供給）、（任意）DevContainer
+**Tech Stack:** Go build tags (`//go:build`), Go unit tests, Docker (rqlite provisioning), (optional) DevContainer
 
 ---
 
-### Task 1: 現状の失敗を再現し、ゴールを固定する
+### Task 1: Reproduce Current Failure and Lock Down Goals
 
 **Files:**
 - Modify: `docs/plans/2026-01-17-macos-dev-env-design.md`
 
-**Step 1: 失敗再現（macOS）**
+**Step 1: Reproduce Failure (macOS)**
 
 Run: `go test ./... -run TestDoesNotExist -count=0`
-Expected: `internal/rdma` の `infiniband/verbs.h` 不在、および `internal/ebpf` の未定義エラーが発生
+Expected: `internal/rdma` missing `infiniband/verbs.h`, and `internal/ebpf` undefined errors occur
 
-**Step 2: ゴール定義**
+**Step 2: Define Goals**
 
-- macOS で `go test ./...` が完走（必要なテストは Skip、コンパイルエラーはゼロ）
-- Linux では従来通り `make test` が動く（少なくとも壊さない）
+- `go test ./...` runs to completion on macOS (required tests skip, zero compilation errors)
+- `make test` continues to work on Linux as before (at minimum, don't break it)
 
 **Step 3: Commit**
 
-`docs` の更新のみでコミットする場合:
+If only updating `docs`:
 ```bash
 git add docs/plans/2026-01-17-macos-dev-env-design.md
 git commit -m "docs: add macOS dev env investigation notes"
@@ -35,7 +35,7 @@ git commit -m "docs: add macOS dev env investigation notes"
 
 ---
 
-### Task 2: `internal/ebpf` を linux 実装とスタブに分割する
+### Task 2: Split `internal/ebpf` into Linux Implementation and Stub
 
 **Files:**
 - Modify: `internal/ebpf/rdma_tracing.go`
@@ -44,26 +44,26 @@ git commit -m "docs: add macOS dev env investigation notes"
 - Modify: `internal/ebpf/bpf_integration_test.go`
 - Modify: `internal/ebpf/bpf_e2e_test.go`
 
-**Step 1: 型/定数を OS 非依存に分離**
+**Step 1: Separate Types/Constants to OS-Independent Code**
 
-- `RdmaConnTuple` / 定数群 / ヘルパー（`EventTypeString()` 等）を **import 依存のないファイル**へ移す
-- `init()` の struct サイズ検証は linux のみで実施（スタブ環境では panic しない）
+- Move `RdmaConnTuple` / constants / helpers (like `EventTypeString()`) to **files with no import dependencies**
+- Perform struct size validation in `init()` for Linux only (don't panic in stub environments)
 
-**Step 2: Linux 実装ファイルを作る**
+**Step 2: Create Linux Implementation File**
 
-`internal/ebpf/rdma_tracing_linux.go`（例）:
+`internal/ebpf/rdma_tracing_linux.go` (example):
 
 ```go
 //go:build linux
 
 package ebpf
 
-// 既存の ServiceTracer 実装（ringbuf/kprobe/BTF/rlimit 依存）をここへ移動
+// Move existing ServiceTracer implementation here (depends on ringbuf/kprobe/BTF/rlimit)
 ```
 
-**Step 3: 非 Linux スタブを作る**
+**Step 3: Create Non-Linux Stub**
 
-`internal/ebpf/rdma_tracing_stub.go`（例）:
+`internal/ebpf/rdma_tracing_stub.go` (example):
 
 ```go
 //go:build !linux
@@ -85,15 +85,15 @@ func (t *ServiceTracer) Events() <-chan RdmaConnTuple {
 func (t *ServiceTracer) GetStatistics() (map[string]uint64, error) { return map[string]uint64{}, nil }
 ```
 
-**Step 4: テストを linux 限定にする**
+**Step 4: Limit Tests to Linux**
 
-- `internal/ebpf/bpf_integration_test.go` と `internal/ebpf/bpf_e2e_test.go` に `//go:build linux` を追加
-- macOS では `internal/ebpf` のテストがコンパイル対象外になり、スタブで上位層はビルド可能になる
+- Add `//go:build linux` to `internal/ebpf/bpf_integration_test.go` and `internal/ebpf/bpf_e2e_test.go`
+- On macOS, `internal/ebpf` tests will be excluded from compilation targets, and upper layers build successfully with stubs
 
-**Step 5: ローカル検証（macOS）**
+**Step 5: Local Verification (macOS)**
 
 Run: `go test ./internal/ebpf -run TestDoesNotExist -count=0`
-Expected: PASS（テスト実行はしないがコンパイルが通る）
+Expected: PASS (tests don't execute but compilation succeeds)
 
 **Step 6: Commit**
 
@@ -104,7 +104,7 @@ git commit -m "fix: make ebpf package buildable on non-linux"
 
 ---
 
-### Task 3: `internal/rdma` を linux+cgo 実装とスタブに分割する
+### Task 3: Split `internal/rdma` into Linux+Cgo Implementation and Stub
 
 **Files:**
 - Modify: `internal/rdma/device.go`
@@ -112,38 +112,38 @@ git commit -m "fix: make ebpf package buildable on non-linux"
 - Modify: `internal/rdma/cq.go`
 - Modify: `internal/rdma/packet.go`
 - Create: `internal/rdma/rdma_stub.go`
-- (必要なら) Create: `internal/rdma/types.go`
+- (If needed) Create: `internal/rdma/types.go`
 
-**Step 1: linux+cgo ファイルに build tag を付与**
+**Step 1: Add Build Tags to Linux+Cgo Files**
 
-各ファイル先頭に付与（例）:
+Add to the beginning of each file (example):
 
 ```go
 //go:build linux && cgo
 ```
 
-**Step 2: 非 Linux 用スタブを追加**
+**Step 2: Add Non-Linux Stub**
 
-`internal/rdma/rdma_stub.go` に、上位層が参照する型/関数/メソッドを定義する（例）:
+Define types/functions/methods referenced by upper layers in `internal/rdma/rdma_stub.go` (example):
 
 - `type RNIC struct { DeviceName, GID, IPAddr string; ProberQueue, ResponderQueue *UDQueue; ... }`
 - `type RDMAManager struct { Devices []*RNIC }`
-- `func NewRDMAManager() (*RDMAManager, error)`（`unsupported` を返す）
-- `func (m *RDMAManager) CreateSenderAndResponderQueues(...) error`（`unsupported`）
+- `func NewRDMAManager() (*RDMAManager, error)` (returns `unsupported`)
+- `func (m *RDMAManager) CreateSenderAndResponderQueues(...) error` (`unsupported`)
 - `type UDQueue struct { RNIC *RNIC; QPN uint32; QueueType UDQueueType }`
-- `func (u *UDQueue) SendProbePacket(...) (time.Time, error)`（`unsupported`）
-- `func (u *UDQueue) ReceivePacket(...) (*ProbePacket, time.Time, *ProcessedWorkCompletion, error)`（`unsupported`）
-- `func (u *UDQueue) Destroy()`（no-op）
+- `func (u *UDQueue) SendProbePacket(...) (time.Time, error)` (`unsupported`)
+- `func (u *UDQueue) ReceivePacket(...) (*ProbePacket, time.Time, *ProcessedWorkCompletion, error)` (`unsupported`)
+- `func (u *UDQueue) Destroy()` (no-op)
 
-**Step 3: テストの扱いを整理**
+**Step 3: Organize Test Handling**
 
-- `internal/rdma/device_test.go` の `TestRDMAEnvironmentDetection` は、スタブの `NewRDMAManager()` がエラーを返すことで自然に Skip されるようにする（現在の実装はその形に近い）
-- “純 Go” のテスト（パケット構造・シリアライズ等）は macOS でも走らせたい場合、必要な型を `types.go` に寄せる（cgo 依存を避ける）
+- For `TestRDMAEnvironmentDetection` in `internal/rdma/device_test.go`, ensure it naturally skips when the stub's `NewRDMAManager()` returns an error (current implementation is close to this)
+- For "pure Go" tests (packet structures, serialization, etc.) that should run on macOS, move necessary types to `types.go` (avoid cgo dependencies)
 
-**Step 4: ローカル検証（macOS）**
+**Step 4: Local Verification (macOS)**
 
 Run: `go test ./internal/rdma -count=1`
-Expected: PASS（ハード依存は Skip、残りは成功）
+Expected: PASS (hardware-dependent tests skip, rest succeed)
 
 **Step 5: Commit**
 
@@ -154,20 +154,20 @@ git commit -m "fix: make rdma package buildable on non-linux via stubs"
 
 ---
 
-### Task 4: 上位パッケージ（agent/state/monitor/probe）が macOS でビルドできることを確認する
+### Task 4: Verify Upper-Layer Packages (agent/state/monitor/probe) Build on macOS
 
 **Files:**
-- Modify (必要なら): `internal/ebpf/*`, `internal/rdma/*`（不足 API が出た場合）
+- Modify (if needed): `internal/ebpf/*`, `internal/rdma/*` (if missing APIs appear)
 
-**Step 1: コンパイル検証**
+**Step 1: Compilation Verification**
 
 Run: `go test ./... -run TestDoesNotExist -count=0`
-Expected: PASS（コンパイルエラー 0）
+Expected: PASS (zero compilation errors)
 
-**Step 2: 単体テスト実行**
+**Step 2: Execute Unit Tests**
 
 Run: `go test ./... -count=1`
-Expected: PASS（rqlite が必要なテストは別途）
+Expected: PASS (tests requiring rqlite handled separately)
 
 **Step 3: Commit**
 
@@ -178,17 +178,17 @@ git commit -m "test: enable running unit tests on macOS"
 
 ---
 
-### Task 5: rqlite 依存を macOS で簡単に起動できるようにする
+### Task 5: Make rqlite Dependency Easy to Launch on macOS
 
 **Files:**
 - Create: `scripts/rqlite-local-up.sh`
 - Create: `scripts/rqlite-local-down.sh`
 - Modify: `Makefile`
-- (任意) Create: `docs/dev/macos.md`
+- (Optional) Create: `docs/dev/macos.md`
 
-**Step 1: rqlite 起動スクリプト**
+**Step 1: rqlite Startup Scripts**
 
-`scripts/rqlite-local-up.sh`（例）:
+`scripts/rqlite-local-up.sh` (example):
 
 ```bash
 #!/usr/bin/env bash
@@ -196,7 +196,7 @@ set -euo pipefail
 docker run --rm -d --name rpingmesh-rqlite -p 4001:4001 rqlite/rqlite:8.37.0 -http-addr "0.0.0.0:4001"
 ```
 
-`scripts/rqlite-local-down.sh`（例）:
+`scripts/rqlite-local-down.sh` (example):
 
 ```bash
 #!/usr/bin/env bash
@@ -204,12 +204,12 @@ set -euo pipefail
 docker rm -f rpingmesh-rqlite 2>/dev/null || true
 ```
 
-**Step 2: Makefile ターゲット追加**
+**Step 2: Add Makefile Targets**
 
 - `make rqlite-up` / `make rqlite-down`
-- `make test-local` の前提を README/Docs に明記
+- Document prerequisites for `make test-local` in README/Docs
 
-**Step 3: ローカル検証**
+**Step 3: Local Verification**
 
 Run: `make rqlite-up`
 Run: `make test-local`
@@ -224,18 +224,18 @@ git commit -m "chore: add rqlite helpers for local testing"
 
 ---
 
-### Task 6: （任意）Apple Silicon で Docker ワークフローが動くように platform を明示する
+### Task 6: (Optional) Explicitly Pin Platform for Docker Workflow on Apple Silicon
 
 **Files:**
 - Modify: `docker-compose.test.yml`
 - Modify: `docker-compose.build.yml`
 - Modify: `docker-compose.yml`
 
-**Step 1: `platform: linux/amd64` を追加**
+**Step 1: Add `platform: linux/amd64`**
 
-`agent_test` / `agent` / `agent-builder` など、`GOARCH=amd64` バイナリを実行するサービスに限定して追加する。
+Add to services that execute `GOARCH=amd64` binaries only (e.g., `agent_test` / `agent` / `agent-builder`).
 
-**Step 2: ローカル検証**
+**Step 2: Local Verification**
 
 Run: `docker compose -f docker-compose.test.yml up --build agent_test --abort-on-container-exit`
 
@@ -248,98 +248,98 @@ git commit -m "chore: pin linux/amd64 platform for agent containers"
 
 ---
 
-### Task 7: Tier 3（Linux VM）で soft-RoCE + eBPF 統合テスト環境を作る
+### Task 7: Create Tier 3 (Linux VM) Integration Test Environment with soft-RoCE + eBPF
 
 **Files:**
 - Modify: `docs/plans/2026-01-17-macos-dev-env-design.md:1`
 - Create: `docs/dev/macos-colima-vm.md`
 
-**Step 1: どの VM で進めるか決める（分岐点）**
+**Step 1: Decide Which VM to Use (Decision Point)**
 
-- Intel Mac: `linux/amd64` VM を前提にしてよい
-- Apple Silicon（今回の選択）:
-  - `colima` で `linux/arm64` ネイティブ VM（推奨）
-  - eBPF 生成物の multi-arch 化（Task 8）を前提にする
+- Intel Mac: Can assume `linux/amd64` VM
+- Apple Silicon (current choice):
+  - `colima` with `linux/arm64` native VM (recommended)
+  - Prerequisite: multi-arch eBPF generation (Task 8)
 
-**Step 2: Linux VM を起動し、リポジトリを VM にマウントする**
+**Step 2: Launch Linux VM and Mount Repository to VM**
 
-VM の選択肢:
+VM options:
 - lima
 - colima
 - multipass
 
-今回の選択（colima）に固定し、具体手順は `docs/dev/macos-colima-vm.md` に記載する。
+Fix to current choice (colima) with detailed steps in `docs/dev/macos-colima-vm.md`.
 
-**Step 3: VM 内にビルド/実行依存を入れる（例: Debian/Ubuntu 系）**
+**Step 3: Install Build/Runtime Dependencies in VM (Example: Debian/Ubuntu)**
 
-例（パッケージ名はディストリにより差あり）:
-- Go（`go env` で確認）
+Examples (package names vary by distribution):
+- Go (verify with `go env`)
 - `clang`, `llvm`, `libbpf-dev`, `bpftool`, `libelf-dev`, `pkg-config`
 - `libibverbs-dev`, `librdmacm-dev`, `rdma-core`
-- `linux-headers-$(uname -r)`（可能なら）
-- `protobuf-compiler`（`make generate-proto` が必要な場合）
+- `linux-headers-$(uname -r)` (if available)
+- `protobuf-compiler` (if `make generate-proto` is needed)
 - `iproute2`, `iputils-ping`
 
-**Step 4: soft-RoCE（RXE）を有効化する**
+**Step 4: Enable soft-RoCE (RXE)**
 
-例:
+Example:
 ```bash
 sudo modprobe rdma_rxe
 ip link
 rdma link show
-sudo rdma link add rxe0 type rxe netdev <VMのNIC名>
+sudo rdma link add rxe0 type rxe netdev <VM_NIC_NAME>
 rdma link show
 ```
 
-**Step 5: eBPF 実行前提を満たす**
+**Step 5: Satisfy eBPF Execution Prerequisites**
 
-例:
+Example:
 ```bash
 sudo mount -t debugfs none /sys/kernel/debug || true
 ulimit -l unlimited || true
 ```
 
-**Step 6: 統合テストを回す**
+**Step 6: Run Integration Tests**
 
-最低限:
-- `make generate`（VM で生成できる場合）
+Minimum:
+- `make generate` (if VM can generate)
 - `go test ./...`
 
-RDMA/eBPF を含めたい場合:
-- 対象テストを `-run` で絞って実行し、Skip/Fail の理由をログに残す
+To include RDMA/eBPF:
+- Run targeted tests with `-run` flag, keeping logs of Skip/Fail reasons
 
-**Step 7: 記録を残す**
+**Step 7: Document Results**
 
-`docs/dev/macos-colima-vm.md` に以下を記載:
-- VM 種別/OS/カーネル/アーキ（`uname -a`）
-- RXE セットアップ手順（使用 IF 名）
-- `go test` 実行結果（成功/Skip/失敗のログ）
+Record in `docs/dev/macos-colima-vm.md`:
+- VM type/OS/kernel/architecture (`uname -a`)
+- RXE setup procedure (interface name used)
+- `go test` execution results (success/skip/fail logs)
 
 ---
 
-### Task 8: （Apple Silicon 推奨）eBPF 生成物を multi-arch 化して linux/arm64 VM で動かす
+### Task 8: (Recommended for Apple Silicon) Generate Multi-Arch eBPF Bindings for linux/arm64 VM
 
 **Files:**
 - Modify: `internal/ebpf/rdma_tracing.go`
-- Run: `make generate-bpf`（VM 内）
-- Create (generated): `internal/ebpf/rdmatracing_arm64_bpfel.go` 等
+- Run: `make generate-bpf` (in VM)
+- Create (generated): `internal/ebpf/rdmatracing_arm64_bpfel.go`, etc.
 
-**Step 1: bpf2go の `-target` を追加して arm64 生成を可能にする**
+**Step 1: Add `-target` to bpf2go to Enable arm64 Generation**
 
-方針例:
-- `go:generate` を 2 回に分けて `amd64` と `arm64` を生成する
-- 生成ファイルは bpf2go の規約に従いコミットする（手編集しない）
+Approach example:
+- Split `go:generate` into two invocations for `amd64` and `arm64`
+- Commit generated files following bpf2go conventions (don't hand-edit)
 
-**Step 2: linux/arm64 VM で `make generate-bpf` を実行**
+**Step 2: Run `make generate-bpf` in linux/arm64 VM**
 
 Run: `make generate-bpf`
-Expected: arm64 向けの `*_bpfel.go` と `*.o` が生成される
+Expected: arm64 `*_bpfel.go` and `*.o` files are generated
 
-**Step 3: linux/arm64 VM で `go test ./internal/ebpf -count=1` を実行**
+**Step 3: Run `go test ./internal/ebpf -count=1` in linux/arm64 VM**
 
 Expected:
-- 権限/機能不足なら Skip（ただしコンパイルは成功）
-- 条件が揃う環境なら eBPF のロードに成功する
+- Skip if permissions/features insufficient (but compilation succeeds)
+- Load eBPF successfully if all conditions are met
 
 **Step 4: Commit**
 

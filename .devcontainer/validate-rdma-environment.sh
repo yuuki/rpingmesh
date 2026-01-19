@@ -191,6 +191,22 @@ else
 fi
 echo ""
 
+# Platform detection
+echo "=================================================="
+echo "Platform Information"
+echo "=================================================="
+PLATFORM=$(uname -s)
+echo "Platform: $PLATFORM"
+
+if [ -f /.dockerenv ] || grep -q docker /proc/1/cgroup 2>/dev/null; then
+    if [ -d /colima ]; then
+        echo "Host: macOS with Colima VM (recommended)"
+    else
+        echo "Host: Docker container"
+    fi
+fi
+echo ""
+
 # Summary
 echo "=================================================="
 echo "Validation Summary"
@@ -207,14 +223,38 @@ if [ $ERRORS -eq 0 ]; then
         echo "Common fixes:"
         echo "  - No RDMA devices: Run 'setup-soft-roce.sh'"
         echo "  - Module load failures: Check host kernel support"
+        echo ""
+        echo "For detailed diagnosis, run:"
+        echo "  .devcontainer/check-rdma-readiness.sh"
     fi
     exit 0
 else
     echo "❌ RDMA environment has critical errors. Please fix issues above."
     echo ""
-    echo "Troubleshooting:"
-    echo "  1. Ensure RDMA packages are installed"
-    echo "  2. Check build-essential for cgo support"
-    echo "  3. Run 'setup-soft-roce.sh' to create soft-RoCE device"
+    echo "Troubleshooting steps:"
+    echo "  1. Run detailed diagnostics: .devcontainer/check-rdma-readiness.sh"
+    echo "  2. Ensure RDMA packages are installed"
+    echo "  3. Check build-essential for cgo support"
+    echo "  4. Run 'setup-soft-roce.sh' to create soft-RoCE device"
+    echo ""
+    echo "Platform-specific guidance:"
+    echo ""
+    echo "Linux host:"
+    echo "  - Load kernel modules: sudo modprobe rdma_rxe"
+    echo "  - Full RDMA/eBPF support available"
+    echo ""
+    echo "macOS + Colima:"
+    echo "  - Ensure Colima VM is running: colima status"
+    echo "  - Full RDMA/eBPF support available"
+    echo "  - See: docs/dev/macos-colima-vm.md"
+    echo ""
+    echo "macOS + Docker Desktop:"
+    echo "  - Limited RDMA support"
+    echo "  - Consider switching to Colima for better compatibility"
+    echo "  - See: docs/dev/macos-colima-vm.md"
+    echo ""
+    echo "Documentation:"
+    echo "  - Devcontainer setup: docs/dev/devcontainer-rdma-setup.md"
+    echo "  - Colima setup: docs/dev/macos-colima-vm.md"
     exit 1
 fi

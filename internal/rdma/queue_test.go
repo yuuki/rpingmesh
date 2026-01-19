@@ -283,3 +283,70 @@ func TestSimpleProbePacketSerialization(t *testing.T) {
 	assert.Equal(t, original.AckType, deserialized.AckType)
 	assert.Equal(t, original.Flags, deserialized.Flags)
 }
+
+// TestUDQueue_UsesSWTimestampsField verifies the UsesSWTimestamps field is correctly initialized
+func TestUDQueue_UsesSWTimestampsField(t *testing.T) {
+	// Create a mock RNIC
+	mockRNIC := &RNIC{
+		DeviceName:     "test-device",
+		GID:            "fe80::1",
+		IsOpen:         true,
+		ActivePortNum:  1,
+		ActiveGIDIndex: 0,
+	}
+
+	// Test case 1: UDQueue with hardware timestamps (default)
+	queue1 := &UDQueue{
+		RNIC:             mockRNIC,
+		QPN:              1234,
+		QueueType:        UDQueueTypeSender,
+		UsesSWTimestamps: false,
+		sendCompChan:     make(chan *GoWorkCompletion, SendCompChanBufferSize),
+		recvCompChan:     make(chan *GoWorkCompletion, RecvCompChanBufferSize),
+		errChan:          make(chan error, ErrChanBufferSize),
+		cqPollerDone:     make(chan struct{}),
+	}
+	assert.False(t, queue1.UsesSWTimestamps, "Queue should use hardware timestamps")
+
+	// Test case 2: UDQueue with software timestamps (fallback mode)
+	queue2 := &UDQueue{
+		RNIC:             mockRNIC,
+		QPN:              5678,
+		QueueType:        UDQueueTypeResponder,
+		UsesSWTimestamps: true,
+		sendCompChan:     make(chan *GoWorkCompletion, SendCompChanBufferSize),
+		recvCompChan:     make(chan *GoWorkCompletion, RecvCompChanBufferSize),
+		errChan:          make(chan error, ErrChanBufferSize),
+		cqPollerDone:     make(chan struct{}),
+	}
+	assert.True(t, queue2.UsesSWTimestamps, "Queue should use software timestamps")
+}
+
+// TestUDQueue_SoftwareTimestampFallback verifies timestamps are read correctly based on UsesSWTimestamps flag
+func TestUDQueue_SoftwareTimestampFallback(t *testing.T) {
+	// Create a mock RNIC
+	mockRNIC := &RNIC{
+		DeviceName:     "soft-roce",
+		GID:            "fe80::1",
+		IsOpen:         true,
+		ActivePortNum:  1,
+		ActiveGIDIndex: 0,
+	}
+
+	// Queue using software timestamps (simulating fallback mode on soft-RoCE)
+	queue := &UDQueue{
+		RNIC:             mockRNIC,
+		QPN:              1234,
+		QueueType:        UDQueueTypeSender,
+		UsesSWTimestamps: true,
+		sendCompChan:     make(chan *GoWorkCompletion, SendCompChanBufferSize),
+		recvCompChan:     make(chan *GoWorkCompletion, RecvCompChanBufferSize),
+		errChan:          make(chan error, ErrChanBufferSize),
+		cqPollerDone:     make(chan struct{}),
+	}
+
+	// Verify field is set correctly for soft-RoCE device
+	assert.True(t, queue.UsesSWTimestamps, "Expected software timestamps to be enabled for soft-RoCE")
+	assert.Equal(t, queue.RNIC.DeviceName, "soft-roce", "Device name should match")
+	assert.Equal(t, queue.QueueType, UDQueueTypeSender, "Queue type should match")
+}

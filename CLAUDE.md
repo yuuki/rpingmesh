@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Language Standards
+
+**All code comments and documentation must be in English.**
+
+- All code comments in `.go`, `.c`, and other source files must be written in English
+- All documentation files (`.md`) must be written in English
+- Commit messages must be in English
+- PR descriptions and issue comments should be in English for accessibility to all contributors
+- This ensures consistency across the project and improves collaboration with international developers
+
 ## Commands
 
 ### Building
@@ -200,6 +210,13 @@ Configure OTLP exporters via environment variables:
 - Check protobuf definitions in `proto/` directories
 
 ## Important Development Patterns
+
+### Code Comments and Documentation
+- Write all code comments in English for clarity and consistency
+- Use clear, descriptive comments explaining the "why" rather than the "what"
+- Documentation files (`.md`) must be in English
+- All commit messages and PR descriptions should be in English
+- This enables better collaboration and accessibility for all contributors
 
 ### Error Handling
 - Use `github.com/rs/zerolog` for structured logging (not standard `log` package)

@@ -98,8 +98,17 @@ func (u *UDQueue) processCQCompletions(cqEx *C.struct_ibv_cq_ex) {
 // cqEx must point to a valid WC when this function is called.
 func (u *UDQueue) processSingleWC(cqEx *C.struct_ibv_cq_ex) {
 	// At this point, cqEx points to the current valid completion
-	// Fields like wr_id and status can be accessed directly from cqEx if it's defined to expose them.
-	// For extended WCs, typically we use the ibv_wc_read_* functions.
+	// Extract work completion fields, handling timestamps adaptively
+	var completionTimestampNS uint64
+
+	if u.UsesSWTimestamps {
+		// Software timestamp: use current time as approximation
+		completionTimestampNS = uint64(time.Now().UnixNano())
+	} else {
+		// Hardware timestamp: read from CQ extended attributes
+		completionTimestampNS = uint64(C.ibv_wc_read_completion_wallclock_ns(cqEx))
+	}
+
 	gwc := &GoWorkCompletion{
 		WRID:                  uint64(cqEx.wr_id),
 		Status:                int(cqEx.status),
@@ -108,7 +117,7 @@ func (u *UDQueue) processSingleWC(cqEx *C.struct_ibv_cq_ex) {
 		ByteLen:               uint32(C.ibv_wc_read_byte_len(cqEx)),
 		SrcQP:                 uint32(C.ibv_wc_read_src_qp(cqEx)),
 		WCFlags:               uint32(C.ibv_wc_read_wc_flags(cqEx)),
-		CompletionWallclockNS: uint64(C.ibv_wc_read_completion_wallclock_ns(cqEx)),
+		CompletionWallclockNS: completionTimestampNS,
 	}
 	log.Trace().
 		Str("qpn", fmt.Sprintf("0x%x", u.QPN)).

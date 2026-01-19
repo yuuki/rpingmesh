@@ -268,6 +268,7 @@ func (u *UDQueue) SendProbePacket(
 			Uint64("hw_timestamp_ns", wc.CompletionWallclockNS).
 			Time("t2", t2).
 			Int("send_slot", sendSlot).
+			Bool("sw_timestamp", u.UsesSWTimestamps).
 			Msg("Send completion successful for probe packet")
 		return t1, t2, nil
 	case err := <-u.errChan:

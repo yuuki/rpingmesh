@@ -46,16 +46,17 @@ const (
 
 // UDQueue represents a UD QP and associated resources
 type UDQueue struct {
-	RNIC        *RNIC
-	QP          *C.struct_ibv_qp
-	CQ          *C.struct_ibv_cq_ex
-	CompChannel *C.struct_ibv_comp_channel
-	SendMR      *C.struct_ibv_mr
-	RecvMR      *C.struct_ibv_mr
-	SendBuf     unsafe.Pointer
-	RecvBuf     unsafe.Pointer
-	QPN         uint32
-	QueueType   UDQueueType // Type of queue (sender or responder)
+	RNIC             *RNIC
+	QP               *C.struct_ibv_qp
+	CQ               *C.struct_ibv_cq_ex
+	CompChannel      *C.struct_ibv_comp_channel
+	SendMR           *C.struct_ibv_mr
+	RecvMR           *C.struct_ibv_mr
+	SendBuf          unsafe.Pointer
+	RecvBuf          unsafe.Pointer
+	QPN              uint32
+	QueueType        UDQueueType // Type of queue (sender or responder)
+	UsesSWTimestamps bool        // True if using software timestamps instead of hardware timestamps
 
 	// Slot-based buffer management for receive operations
 	RecvSlots     []uintptr  // Array of receive buffer slot addresses
@@ -110,7 +111,7 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 	}
 
 	// Step 1: Create QP resources
-	qp, cq, compChannel, psn, err := m.createQueuePair(rnic)
+	qp, cq, compChannel, psn, usesSWTimestamps, err := m.createQueuePair(rnic)
 	if err != nil {
 		return nil, err
 	}
@@ -133,21 +134,22 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 
 	// Step 3: Create UDQueue struct
 	udQueue := &UDQueue{
-		RNIC:         rnic,
-		QP:           qp,
-		CQ:           cq,
-		CompChannel:  compChannel,
-		SendMR:       sendMR,
-		RecvMR:       recvMR,
-		SendBuf:      sendBuf,
-		RecvBuf:      recvBuf,
-		QPN:          uint32(qp.qp_num),
-		QueueType:    queueType,
-		sendCompChan: make(chan *GoWorkCompletion, SendCompChanBufferSize), // Buffered channel
-		recvCompChan: make(chan *GoWorkCompletion, RecvCompChanBufferSize), // Buffered channel
-		errChan:      make(chan error, ErrChanBufferSize),                  // Buffered channel
-		cqPollerDone: make(chan struct{}),
-		ackHandler:   ackHandler,
+		RNIC:             rnic,
+		QP:               qp,
+		CQ:               cq,
+		CompChannel:      compChannel,
+		SendMR:           sendMR,
+		RecvMR:           recvMR,
+		SendBuf:          sendBuf,
+		RecvBuf:          recvBuf,
+		QPN:              uint32(qp.qp_num),
+		QueueType:        queueType,
+		UsesSWTimestamps: usesSWTimestamps,
+		sendCompChan:     make(chan *GoWorkCompletion, SendCompChanBufferSize), // Buffered channel
+		recvCompChan:     make(chan *GoWorkCompletion, RecvCompChanBufferSize), // Buffered channel
+		errChan:          make(chan error, ErrChanBufferSize),                  // Buffered channel
+		cqPollerDone:     make(chan struct{}),
+		ackHandler:       ackHandler,
 	}
 
 	// Initialize slot arrays for buffer management
@@ -224,38 +226,68 @@ func (m *RDMAManager) CreateUDQueue(rnic *RNIC, queueType UDQueueType, ackHandle
 		Uint32("psn", psn).
 		Uint32("qkey", DefaultQKey).
 		Str("queueType", getQueueTypeString(queueType)).
+		Bool("software_timestamps", udQueue.UsesSWTimestamps).
 		Msg("Created UD queue pair")
 
 	return udQueue, nil
 }
 
 // createQueuePair creates a Queue Pair and puts it in the RTS state
-func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_ibv_cq_ex, *C.struct_ibv_comp_channel, uint32, error) {
+// Returns: qp, cq, compChannel, psn, usesSoftwareTimestamps, error
+func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_ibv_cq_ex, *C.struct_ibv_comp_channel, uint32, bool, error) {
 	// Create a completion event channel
 	compChannel := C.ibv_create_comp_channel(rnic.Context)
 	if compChannel == nil {
-		return nil, nil, nil, 0, fmt.Errorf("failed to create completion channel for device %s", rnic.DeviceName)
+		return nil, nil, nil, 0, false, fmt.Errorf("failed to create completion channel for device %s", rnic.DeviceName)
 	}
 
-	// Create extended completion queue
+	// Create extended completion queue with conditional hardware timestamp support
 	var cqAttr C.struct_ibv_cq_init_attr_ex
-	// It's good practice to zero out C structs allocated on Go side before filling them.
-	// However, C.memset might not be the most idiomatic way from Go if we fill all relevant fields.
-	// Explicitly setting fields ensures clarity.
-	cqAttr.cqe = C.uint32_t(CQSize) // Ensure correct type for cqe
+	cqAttr.cqe = C.uint32_t(CQSize)
 	cqAttr.cq_context = nil
 	cqAttr.channel = compChannel
 	cqAttr.comp_vector = 0
-	// Ensure all parts of the bitwise OR are C.uint64_t
-	cqAttr.wc_flags = C.uint64_t(C.IBV_WC_EX_WITH_BYTE_LEN) |
-		C.uint64_t(C.IBV_WC_EX_WITH_SRC_QP) |
-		C.uint64_t(C.IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK)
-	// All other fields in cqAttr will be zero by default Go struct initialization if not set.
 
-	cqEx := C.ibv_create_cq_ex(rnic.Context, &cqAttr)
+	// Base flags that are always supported
+	baseFlags := C.uint64_t(C.IBV_WC_EX_WITH_BYTE_LEN) | C.uint64_t(C.IBV_WC_EX_WITH_SRC_QP)
+
+	// Try creating with hardware timestamps first
+	cqAttr.wc_flags = baseFlags | C.uint64_t(C.IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK)
+	var cqEx *C.struct_ibv_cq_ex
+	var usesSoftwareTimestamps bool = false
+
+	cqEx = C.ibv_create_cq_ex(rnic.Context, &cqAttr)
+
 	if cqEx == nil {
-		C.ibv_destroy_comp_channel(compChannel)
-		return nil, nil, nil, 0, fmt.Errorf("failed to create extended CQ for device %s: %s", rnic.DeviceName, syscall.Errno(C.get_errno()).Error())
+		errno := syscall.Errno(C.get_errno())
+		if errno == syscall.EOPNOTSUPP {
+			// Hardware timestamp not supported, fallback to software timestamps
+			log.Warn().
+				Str("device", rnic.DeviceName).
+				Msg("Hardware timestamp CQ creation failed (EOPNOTSUPP), falling back to software timestamps")
+
+			// Retry without hardware timestamp flag
+			cqAttr.wc_flags = baseFlags
+			cqEx = C.ibv_create_cq_ex(rnic.Context, &cqAttr)
+			usesSoftwareTimestamps = true
+		}
+
+		// Final check if CQ creation succeeded
+		if cqEx == nil {
+			C.ibv_destroy_comp_channel(compChannel)
+			return nil, nil, nil, 0, false, fmt.Errorf("failed to create extended CQ for device %s: %s", rnic.DeviceName, syscall.Errno(C.get_errno()).Error())
+		}
+	}
+
+	// Log the timestamp mode being used
+	if usesSoftwareTimestamps {
+		log.Info().
+			Str("device", rnic.DeviceName).
+			Msg("Extended CQ created with software timestamps (degraded precision for RTT measurements)")
+	} else {
+		log.Debug().
+			Str("device", rnic.DeviceName).
+			Msg("Extended CQ created with hardware timestamps")
 	}
 
 	// Generate random PSN as in ud_pingpong.c (24 bit value)
@@ -271,7 +303,7 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 		C.ibv_destroy_comp_channel(compChannel)
 		// If cqEx was created, try to destroy its base part
 		destroyCQEx(cqEx, rnic.DeviceName, "QP creation failure path")
-		return nil, nil, nil, 0, fmt.Errorf("failed to get base CQ from extended CQ for device %s", rnic.DeviceName)
+		return nil, nil, nil, 0, false, fmt.Errorf("failed to get base CQ from extended CQ for device %s", rnic.DeviceName)
 	}
 	qpInitAttr.send_cq = base_send_cq
 	qpInitAttr.recv_cq = base_recv_cq
@@ -287,7 +319,7 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 	if qp == nil {
 		destroyCQEx(cqEx, rnic.DeviceName, "QP creation failure")
 		C.ibv_destroy_comp_channel(compChannel)
-		return nil, nil, nil, 0, fmt.Errorf("failed to create QP for device %s", rnic.DeviceName)
+		return nil, nil, nil, 0, false, fmt.Errorf("failed to create QP for device %s", rnic.DeviceName)
 	}
 
 	// Modify QP to INIT state
@@ -295,7 +327,7 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 		C.ibv_destroy_qp(qp)
 		destroyCQEx(cqEx, rnic.DeviceName, "INIT failure")
 		C.ibv_destroy_comp_channel(compChannel)
-		return nil, nil, nil, 0, err
+		return nil, nil, nil, 0, false, err
 	}
 
 	// Modify QP to RTR state
@@ -303,7 +335,7 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 		C.ibv_destroy_qp(qp)
 		destroyCQEx(cqEx, rnic.DeviceName, "RTR failure")
 		C.ibv_destroy_comp_channel(compChannel)
-		return nil, nil, nil, 0, err
+		return nil, nil, nil, 0, false, err
 	}
 
 	// Modify QP to RTS state
@@ -311,10 +343,10 @@ func (m *RDMAManager) createQueuePair(rnic *RNIC) (*C.struct_ibv_qp, *C.struct_i
 		C.ibv_destroy_qp(qp)
 		destroyCQEx(cqEx, rnic.DeviceName, "RTS failure")
 		C.ibv_destroy_comp_channel(compChannel)
-		return nil, nil, nil, 0, err
+		return nil, nil, nil, 0, false, err
 	}
 
-	return qp, cqEx, compChannel, psn, nil
+	return qp, cqEx, compChannel, psn, usesSoftwareTimestamps, nil
 }
 
 // modifyQPToInit transitions the QP to INIT state

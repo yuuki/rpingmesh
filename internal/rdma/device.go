@@ -66,7 +66,7 @@ func NewRDMAManager() (*RDMAManager, error) {
 	defer C.ibv_free_device_list(deviceList)
 
 	if numDevices == 0 {
-		return nil, fmt.Errorf("no RDMA devices found")
+		return nil, fmt.Errorf("no RDMA devices found - run '.devcontainer/check-rdma-readiness.sh' for diagnosis or see docs/dev/devcontainer-rdma-setup.md")
 	}
 
 	// Iterate through all devices

@@ -46,15 +46,25 @@ services:
       target: builder
       args:
         - KERNEL_VERSION=${KERNEL_VERSION:-5.15.0-generic}
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - CAP_BPF
     volumes:
       - go_mod_cache:/go/pkg/mod
       - go_build_cache:/root/.cache/go-build
+      - /sys/kernel/debug:/sys/kernel/debug:ro
     working_dir: /app
     environment:
       - CGO_ENABLED=1
+      - RDMA_TEST_ENABLED=1
     entrypoint: []
     command: >
       sh -c "
+        echo 'Setting up test environment...' &&
+        modprobe rdma_rxe 2>/dev/null || echo 'RDMA modules unavailable (will SKIP RDMA tests)' &&
+        rdma link add rxe_test0 type rxe netdev eth0 2>/dev/null || echo 'soft-RoCE unavailable' &&
         echo 'Running agent tests...' &&
         go test -v ./internal/agent/... -count=1
       "

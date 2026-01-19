@@ -99,6 +99,22 @@ setup-soft-roce.sh eth0
 
 ## トラブルシューティング
 
+### クイック診断
+
+問題が発生した場合、まず診断ツールを実行:
+
+```bash
+.devcontainer/check-rdma-readiness.sh
+```
+
+このツールは以下を自動チェック:
+- プラットフォームとホスト環境
+- コンテナのケーパビリティ
+- カーネルモジュールの状態
+- RDMAデバイスの可用性
+- eBPFサポート
+- プラットフォーム別のガイダンス
+
 ### soft-RoCE 作成が失敗する
 
 **症状:** `rdma link add` が失敗、または警告メッセージ
@@ -120,7 +136,8 @@ setup-soft-roce.sh eth0
    ```
 
 2. **権限不足**
-   - devcontainer は既に必要な capabilities（NET_ADMIN, SYS_ADMIN）を持っています
+   - devcontainer は privileged モードと必要な capabilities（NET_ADMIN, SYS_ADMIN, CAP_BPF）を持っています
+   - 診断ツールで権限を確認: `.devcontainer/check-rdma-readiness.sh`
    - それでも失敗する場合、ホスト側の設定が必要な可能性があります
 
 3. **ネットワークインターフェースが見つからない**
@@ -186,9 +203,10 @@ setup-soft-roce.sh eth0
    # 出力があれば、カーネルが RXE をサポートしています
    ```
 
-3. **コンテナの制限**
-   - devcontainer は `--privileged` を使用していません
-   - 一部の操作にはホスト側での準備が必要です
+3. **コンテナ設定の確認**
+   - devcontainer.json が最新版であることを確認
+   - 必要な設定: `--privileged`, `CAP_BPF`, debugfs マウント
+   - VS Code: "Rebuild Container" で設定を反映
 
 ## コンテナの制限事項
 
@@ -199,11 +217,29 @@ devcontainer 環境では以下の制限があります:
 - ✅ RDMA アプリケーションの開発とテスト
 - ✅ cgo を使った RDMA コードのビルド
 - ✅ UD (Unreliable Datagram) の送受信テスト
+- ✅ eBPF プログラムのロードと実行
+- ✅ RDMA トレーシング（eBPF ServiceTracer）
 
 ### 制約事項
-- ❌ カーネルモジュールの直接ロード（ホスト権限必要）
-- ❌ 実 RDMA NIC へのアクセス（デバイスパススルー必要）
-- ❌ Privileged モード操作（devcontainer 制限）
+- ⚠️ カーネルモジュールのロードはホスト環境に依存
+- ⚠️ 実 RDMA NIC へのアクセスにはデバイスパススルーが必要
+- ⚠️ プラットフォームによる制限（Docker Desktop vs Colima）
+
+### プラットフォーム別の対応
+
+**Linux ホスト:**
+- ✅ 完全なRDMA/eBPFサポート
+- カーネルモジュールのロードが可能
+
+**macOS + Colima:**
+- ✅ 完全なRDMA/eBPFサポート
+- カーネルモジュールのカスタマイズが可能
+- 推奨環境
+
+**macOS + Docker Desktop:**
+- ⚠️ 制限付きサポート
+- カーネルモジュールのカスタマイズに制限
+- Colimaへの移行を推奨（[macOS Colima VM セットアップガイド](./macos-colima-vm.md)参照）
 
 ## ホスト環境の準備
 

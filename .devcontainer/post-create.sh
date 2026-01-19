@@ -34,6 +34,21 @@ echo "Initializing RDMA Environment"
 echo "=============================================="
 echo ""
 
+# Platform detection
+PLATFORM=$(uname -s)
+echo "Detected platform: $PLATFORM"
+
+if [ "$PLATFORM" = "Linux" ]; then
+  echo "Full RDMA setup will be attempted..."
+else
+  echo ""
+  echo "⚠️  Platform: $PLATFORM"
+  echo "    RDMA device tests will be SKIPPED"
+  echo "    Code development and builds will work normally"
+  echo ""
+fi
+echo ""
+
 # Load RDMA kernel modules
 echo "Loading RDMA kernel modules..."
 modprobe rdma_rxe 2>/dev/null && echo "  ✓ rdma_rxe loaded" || echo "  ⚠ rdma_rxe module not available (may need host kernel support)"
@@ -49,10 +64,14 @@ if [ -n "$FIRST_NIC" ]; then
 
     # Attempt soft-RoCE setup
     echo "  Setting up soft-RoCE on $FIRST_NIC..."
+    RDMA_SETUP_SUCCESS=false
     if rdma link add rxe0 type rxe netdev "$FIRST_NIC" 2>/dev/null; then
         echo "  ✓ soft-RoCE device rxe0 created successfully"
+        RDMA_SETUP_SUCCESS=true
     else
         echo "  ⚠ soft-RoCE creation failed (may need host permissions or kernel module)"
+        echo "    Run 'check-rdma-readiness.sh' for diagnosis"
+        echo "    Or manually setup: 'setup-soft-roce.sh'"
     fi
 else
     echo "  ⚠ No suitable network interface found for soft-RoCE"
@@ -155,11 +174,35 @@ else
 fi
 echo ""
 
+# Save setup state to environment variable
+if [ "${RDMA_SETUP_SUCCESS:-false}" = "true" ]; then
+    echo "export RDMA_AVAILABLE=true" >> ~/.bashrc
+    echo "export RDMA_AVAILABLE=true" >> ~/.profile
+    [ -f ~/.config/fish/config.fish ] && echo "set -gx RDMA_AVAILABLE true" >> ~/.config/fish/config.fish
+else
+    echo "export RDMA_AVAILABLE=false" >> ~/.bashrc
+    echo "export RDMA_AVAILABLE=false" >> ~/.profile
+    [ -f ~/.config/fish/config.fish ] && echo "set -gx RDMA_AVAILABLE false" >> ~/.config/fish/config.fish
+fi
+
 echo "=============================================="
 echo "RDMA initialization complete!"
 echo ""
-echo "If soft-RoCE setup failed, retry manually:"
-echo "  setup-soft-roce.sh [interface-name]"
+if [ "${RDMA_SETUP_SUCCESS:-false}" = "true" ]; then
+    echo "✅ RDMA environment is ready"
+    echo ""
+    echo "Next steps:"
+    echo "  - Run diagnostics: check-rdma-readiness.sh"
+    echo "  - Run tests: go test ./internal/rdma -v"
+    echo "  - Build agent: make build-local"
+else
+    echo "⚠️  RDMA setup incomplete"
+    echo ""
+    echo "Troubleshooting:"
+    echo "  - Run diagnostics: check-rdma-readiness.sh"
+    echo "  - Manual setup: setup-soft-roce.sh [interface-name]"
+    echo "  - See documentation: docs/dev/devcontainer-rdma-setup.md"
+fi
 echo "=============================================="
 echo ""
 

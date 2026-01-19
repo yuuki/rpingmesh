@@ -7,10 +7,12 @@
     }
   },
   "runArgs": [
+    "--privileged",
     "--cap-add=SYS_PTRACE",
     "--cap-add=NET_ADMIN",
     "--cap-add=SYS_ADMIN",
     "--cap-add=IPC_LOCK",
+    "--cap-add=CAP_BPF",
     "--security-opt", "seccomp=unconfined"
   ],
   "postCreateCommand": "bash .devcontainer/post-create.sh",
@@ -38,7 +40,8 @@
   "workspaceFolder": "/workspace",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
   "mounts": [
-    "type=volume,source=rpingmesh-go-cache,target=/go/pkg"
+    "type=volume,source=rpingmesh-go-cache,target=/go/pkg",
+    "type=bind,source=/sys/kernel/debug,target=/sys/kernel/debug"
   ],
   "containerEnv": {
     "RDMA_ENABLED": "1"

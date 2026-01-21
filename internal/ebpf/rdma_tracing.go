@@ -71,12 +71,14 @@ type RdmaConnTuple struct {
 // Go doesn't have static_assert, but we can check at runtime
 const expectedStructSize = 80
 
-func init() {
-	// Verify struct size matches eBPF definition
+// ValidateStructSize verifies RdmaConnTuple size matches eBPF definition
+// This should be called before using eBPF tracing functionality
+func ValidateStructSize() error {
 	actualSize := int(unsafe.Sizeof(RdmaConnTuple{}))
 	if actualSize != expectedStructSize {
-		panic(fmt.Sprintf("RdmaConnTuple size mismatch: expected %d bytes, got %d bytes", expectedStructSize, actualSize))
+		return fmt.Errorf("RdmaConnTuple size mismatch: expected %d bytes, got %d bytes", expectedStructSize, actualSize)
 	}
+	return nil
 }
 
 // EventTypeString returns the string representation of the event type
@@ -192,7 +194,10 @@ func isPermissionError(err error) bool {
 
 // NewServiceTracer creates a new ServiceTracer instance
 func NewServiceTracer() (*ServiceTracer, error) {
-	// Check if running with sufficient privileges
+	if err := ValidateStructSize(); err != nil {
+		return nil, err
+	}
+
 	if err := checkPrivileges(); err != nil {
 		return nil, fmt.Errorf("insufficient privileges: %w", err)
 	}

@@ -292,10 +292,9 @@ func (c *ClusterMonitor) shouldSkipLinkLocalTarget(sourceGID, targetGID, sourceD
 
 // isLinkLocalGID checks if a GID is a link-local IPv6 address (fe80::)
 func (c *ClusterMonitor) isLinkLocalGID(gid string) bool {
-	if len(gid) < 4 {
+	if len(gid) < 5 {
 		return false
 	}
-	// Check if GID starts with "fe80:" (case-insensitive)
 	prefix := gid[:5]
 	return prefix == "fe80:" || prefix == "FE80:"
 }

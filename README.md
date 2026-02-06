@@ -1,351 +1,429 @@
-# R-Pingmesh
+# gwq - Git Worktree Manager
 
-[![Go Tests](https://github.com/yuuki/rpingmesh/actions/workflows/go-test.yml/badge.svg)](https://github.com/yuuki/rpingmesh/actions/workflows/go-test.yml)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/yuuki/rpingmesh)
+`gwq` is a CLI tool for efficiently managing Git worktrees. Like how `ghq` manages repository clones, `gwq` provides intuitive operations for creating, switching, and deleting worktrees using a fuzzy finder interface.
 
-R-Pingmesh is still *under heavy development*. Please do not use it in production.
+![](./docs/assets/usage.gif)
 
-> **The service-aware RoCE network monitoring and diagnostic system based on end-to-end active probing.**
+## Why gwq?
 
-R-Pingmesh is a production-ready monitoring system designed for RDMA over Converged Ethernet (RoCE) networks. Built on cutting-edge research from SIGCOMM 2024, it delivers unprecedented visibility into RoCE network performance, enabling rapid detection and precise localization of network problems that can severely impact distributed services.
+Git worktrees allow you to check out multiple branches from the same repository into separate directories. This is particularly powerful when:
 
-## Why R-Pingmesh?
+- Working on multiple features simultaneously
+- Running parallel AI coding agents on different tasks
+- Reviewing code while developing new features
+- Testing changes without disrupting your main workspace
 
-Modern data centers rely heavily on RoCE networks for high-performance computing workloads like distributed machine learning and storage systems. As these networks scale to tens of thousands of RNICs, traditional monitoring approaches fall short:
+### AI Coding Agent Workflows
 
-- **Single-point failures** can devastate entire training clusters
-- **Performance bottlenecks** masquerade as network issues
-- **Troubleshooting** becomes time-consuming and error-prone
-- **Service impact assessment** remains largely guesswork
-
-R-Pingmesh solves these challenges with **active probing**, **precise measurements**, and **service-aware monitoring**.
-
-## 🚀 Key Capabilities
-
-### Network Performance Measurement
-- **Accurate RTT measurement** using commodity RDMA NICs
-- **End-host processing delay** separation from network latency
-- **Sub-microsecond precision** with CQE timestamps
-
-```mermaid
-%%{init: {'theme':'base', 'themeVariables': {'primaryTextColor':'#333333', 'fontSize':'14px'}}}%%
-sequenceDiagram
-    participant P as Prober
-    participant PN as Prober RNIC
-    participant N as RoCE Network
-    participant RN as Responder RNIC
-    participant R as Responder
-
-    Note over P,R: RTT Measurement Process
-
-    P->>P: T1: Application post send
-    P->>PN: Post probe packet
-    PN->>PN: T2: CQE send completion (HW timestamp)
-    PN->>N: Probe packet transmission
-    N->>RN: Network delivery
-    RN->>RN: T3: CQE receive (HW timestamp)
-    RN->>R: Deliver to application
-    R->>R: Process probe packet
-    R->>RN: Post ACK packet
-    RN->>RN: T4: CQE ACK send (HW timestamp)
-    RN->>N: ACK transmission
-    N->>PN: Network delivery
-    PN->>PN: T5: CQE ACK receive (HW timestamp)
-    PN->>P: Completion notification
-    P->>P: T6: Application poll complete
-
-    Note over P,R: Calculations
-    Note over P: Network RTT = (T5-T2) - (T4-T3)
-    Note over P: Prober Delay = (T6-T1) - (T5-T2)
-    Note over R: Responder Delay = T4-T3
-```
-
-### Intelligent Problem Detection (WIP)
-- **RNIC vs. network failure** distinction through ToR-mesh probing
-- **Real-time anomaly detection** with minimal false positives
-- **Service impact assessment** to prioritize critical issues
-
-### Service-Aware Monitoring (WIP)
-- **Automatic service flow discovery** using eBPF tracing
-- **Path-specific probing** following actual service traffic
-- **5-tuple aware** measurements for ECMP environments
-
-```mermaid
-%%{init: {'theme':'base', 'themeVariables': {'primaryTextColor':'#333333', 'fontSize':'14px'}}}%%
-flowchart TD
-    subgraph "Service Discovery Process"
-        A[Application creates RDMA connection] --> B[eBPF hooks modify_qp syscall]
-        B --> C{QP State = RTR?}
-        C -->|Yes| D[Extract 5-tuple:<br/>Src/Dst GID, Src/Dst QPN]
-        C -->|No| E[Ignore event]
-        D --> F[Send event to userspace via ring buffer]
-        F --> G[Agent receives connection event]
-        G --> H[Query Controller for target RNIC info]
-        H --> I[Start service-specific probing]
-        I --> J[Monitor actual service path]
-    end
-
-    subgraph "Monitoring Modes Comparison"
-        direction LR
-        K[Cluster Monitoring<br/>• Always-on<br/>• ToR-mesh coverage<br/>• Network health]
-        L[Service Tracing<br/>• Dynamic<br/>• Follows real traffic<br/>• Service-aware]
-    end
-
-    style A fill:#E8F5E8
-    style D fill:#FFF3E0
-    style I fill:#E3F2FD
-    style J fill:#F3E5F5
-```
-
-## 🏗️ Architecture
-
-R-Pingmesh consists of three core components.
-
-```mermaid
-%%{init: {'theme':'base', 'themeVariables': {'primaryTextColor':'#333333', 'lineColor':'#666666', 'fontSize':'16px'}}}%%
-flowchart TD
-    %% Agent Layer
-    A1["🖥️ Agent (Host 1)<br/>────────────────<br/>RDMA Manager<br/>eBPF Service Tracer<br/>Active Probing Engine<br/>Path Tracer<br/>Controller Client<br/>Upload Client"]
-
-    A1_HW["⚙️ Hardware Layer<br/>────────────────<br/>RDMA Hardware<br/>UD Queue Pairs<br/>CQE Timestamps"]
-
-    A1_KERNEL["🔧 Kernel Layer<br/>────────────────<br/>eBPF Programs<br/>modify_qp/destroy_qp<br/>Ring Buffer Events"]
-
-    AN["🖥️ Agent (Host N)<br/>────────────────<br/>Core Modules<br/>RDMA Hardware<br/>eBPF Programs"]
-
-    %% Network Infrastructure
-    NET["🌐 RoCE Network<br/>────────────────<br/>RoCE Fabric<br/>ToR Switches<br/>Spine Switches<br/>Active Probing Paths"]
-
-    %% Controller
-    C["🎛️ Controller<br/>────────────────<br/>RNIC Registry<br/>Pinglist Generator<br/>gRPC Server<br/>Configuration Manager"]
-
-    C_DB["💾 Controller Storage<br/>────────────────<br/>RNIC Database<br/>GID → RNIC Info<br/>ToR ID → RNIC List"]
-
-    %% Analyzer
-    AZ["📊 Analyzer<br/>────────────────<br/>Data Ingestion API<br/>Anomaly Detection<br/>Root Cause Analysis<br/>SLA Tracker"]
-
-    %% Monitoring Capabilities
-    MONITORING["🔍 Monitoring Modes<br/>────────────────<br/>• Cluster Monitoring<br/>  (ToR-mesh, Inter-ToR)<br/>• Service Tracing<br/>  (eBPF Flow Discovery)<br/>• Path Tracing<br/>  (Network Topology)<br/>• Anomaly Detection<br/>  (RNIC vs Network)"]
-
-    %% OpenTelemetry Integration
-    OTLP["📡 OpenTelemetry (OTLP)<br/>────────────────<br/>RTT Metrics Export"]
-
-    %% Vertical Flow
-    A1 --> A1_HW
-    A1 --> A1_KERNEL
-    A1_HW --> NET
-    A1_KERNEL --> NET
-    AN --> NET
-
-    NET --> C
-    C --> C_DB
-
-    C --> AZ
-
-    AZ --> MONITORING
-    A1 -.-> MONITORING
-    AN -.-> MONITORING
-
-    %% OpenTelemetry Integration
-    A1 -->|"OTLP Export<br/>RTT Metrics"| OTLP
-    AN -->|"OTLP Export"| OTLP
-    OTLP --> MONITORING
-
-    %% Communication Labels
-    A1 -.->|"Active Probing<br/>RTT Measurement"| NET
-    AN -.->|"Active Probing"| NET
-    A1 <-.->|"gRPC Registration<br/>Pinglists"| C
-    AN <-.->|"gRPC"| C
-    A1 -->|"gRPC Upload<br/>Probe Results"| AZ
-    AN -->|"Data Upload"| AZ
-
-    %% Styling
-    classDef agentClass fill:#4CAF50,stroke:#2E7D32,stroke-width:3px,color:#fff,font-weight:bold
-    classDef controllerClass fill:#2196F3,stroke:#1565C0,stroke-width:3px,color:#fff,font-weight:bold
-    classDef analyzerClass fill:#FF9800,stroke:#E65100,stroke-width:3px,color:#fff,font-weight:bold
-    classDef networkClass fill:#E3F2FD,stroke:#1976D2,stroke-width:3px,color:#1976D2,font-weight:bold
-    classDef storageClass fill:#9E9E9E,stroke:#424242,stroke-width:3px,color:#fff,font-weight:bold
-        classDef monitoringClass fill:#F3E5F5,stroke:#7B1FA2,stroke-width:3px,color:#7B1FA2,font-weight:bold
-    classDef otlpClass fill:#E8F5E8,stroke:#4CAF50,stroke-width:3px,color:#2E7D32,font-weight:bold
-
-    class A1,AN agentClass
-    class C controllerClass
-    class AZ analyzerClass
-    class NET networkClass
-    class A1_HW,A1_KERNEL,C_DB storageClass
-    class MONITORING monitoringClass
-    class OTLP otlpClass
-```
-
-### Agent
-Deployed on every RoCE host, the Agent performs:
-- **Active probing** using UD Queue Pairs
-- **Service flow monitoring** via eBPF programs
-- **Path tracing** for network topology discovery
-- **Real-time measurements** with hardware timestamps
-
-### Controller
-Centralized coordination service providing:
-- **RNIC registry** management
-- **Pinglist generation** (ToR-mesh and Inter-ToR)
-- **Target resolution** for service tracing
-- **Configuration distribution**
-
-### Analyzer
-Advanced analytics engine delivering:
-- **Anomaly detection** and root cause analysis
-- **SLA tracking** and performance trending
-- **Service impact assessment**
-- **Alert generation** and escalation
-
-### Communication Flow
-
-- **Agent ↔ Controller (gRPC):**
-  - Agent registers RNICs with Controller on startup
-  - Agent requests Pinglists for Cluster Monitoring (ToR-mesh, Inter-ToR)
-  - Agent requests target RNIC information for Service Tracing
-
-- **Agent → Analyzer (gRPC):**
-  - Agent uploads probe results (RTT, delays, timeouts)
-  - Agent uploads path trace information
-  - Agent uploads aggregated local statistics
-
-- **Controller → Agent (gRPC responses):**
-  - Controller provides Pinglists and RNIC information based on Agent requests
-
-### Technical Stack
-
-- **Go**: with Cgo for RDMA integration
-- **RDMA Verbs**: [`libibverbs`](https://github.com/linux-rdma/rdma-core/tree/master/libibverbs) Cgo wrapper for low-level RDMA operations
-- **gRPC**: for communication with each component
-- **RQLite**: Database for Controller [https://rqlite.io/](https://rqlite.io/)
-- **OpenTelemetry**: for probe metrics instrumentation
-- **eBPF**: [`cilium/ebpf`](https://github.com/cilium/ebpf) library for service flow monitoring
-
-## 🛠️ Quick Start
-
-### Prerequisites
-
-- Linux kernel 5.8+ with eBPF support
-- RDMA-capable network interfaces
-- Docker (recommended) or native Go 1.25+ environment
-- Root privileges or appropriate capabilities
-
-TBD
-
-## 📊 Monitoring Modes
-
-### Cluster Monitoring
-Continuous network health assessment across the entire RoCE cluster:
-
-- **ToR-mesh probing**: Detects faulty RNICs and local issues
-- **Inter-ToR probing**: Monitors switch and link health
-- **Always-on operation**: Independent of running services
-- **Comprehensive SLA tracking**: RTT, packet loss, and processing delays
-
-### Service Tracing (WIP)
-Dynamic monitoring of active service communications:
-
-- **Automatic flow discovery**: eBPF-based connection tracking
-- **Path-specific measurements**: Follows actual service traffic
-- **Service impact correlation**: Links network issues to service performance
-- **Real-time adaptation**: Adjusts to changing service patterns
-
-## 🔧 Configuration
-
-### Agent Configuration
-```yaml
-# agent.yaml
-controller:
-  address: "controller.example.com:8080"
-
-analyzer:
-  address: "analyzer.example.com:8081"
-
-probing:
-  interval: "1s"
-  timeout: "5s"
-
-ebpf:
-  enabled: true
-  buffer_size: 1024
-```
-
-### Controller Configuration
-```yaml
-# controller.yaml
-server:
-  address: ":8080"
-
-database:
-  type: "sqlite"
-  path: "/data/controller.db"
-
-pinglist:
-  tor_mesh_size: 10
-  inter_tor_coverage: 0.1
-```
-
-## 📈 Performance
-
-R-Pingmesh is designed for production environments with minimal overhead:
-
-- **CPU Usage**: <1% per RNIC under normal load
-- **Memory Footprint**: ~50MB per Agent instance
-- **Network Overhead**: <0.1% of link capacity
-- **Measurement Accuracy**: Sub-microsecond precision
-- **Scalability**: Tested with 10,000+ RNICs
-
-## 🔬 Research Foundation
-
-R-Pingmesh is based on the research paper:
-
-> Kefei Liu, Zhuo Jiang, Jiao Zhang, Shixian Guo, Xuan Zhang, Yangyang Bai, Yongbin Dong, Feng Luo, Zhang Zhang, Lei Wang, Xiang Shi, Haohan Xu, Yang Bai, Dongyang Song, Haoran Wei, Bo Li, Yongchen Pan, Tian Pan, Tao Huang, "R-Pingmesh: A Service-Aware RoCE Network Monitoring and Diagnostic System", the 38th annual conference of the ACM Special Interest Group on Data Communication (SIGCOMM), 2024.
-
-Key innovations include:
-- Novel timestamp-based RTT measurement using CQE events
-- ToR-mesh probing for RNIC anomaly detection
-- eBPF-based service flow discovery with minimal overhead
-- Service-aware impact assessment methodology
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-### Development Setup
+One of the most powerful applications of `gwq` is enabling parallel AI coding workflows. Instead of having a single AI agent work sequentially through tasks, you can leverage multiple worktrees to have multiple AI agents work on different parts of your project simultaneously:
 
 ```bash
-# Clone repository
-git clone https://github.com/yuuki/rpingmesh.git
-cd rpingmesh
+# Create worktrees for parallel development
+gwq add -b feature/authentication
+gwq add -b feature/data-visualization
+gwq add -b bugfix/login-issue
 
-# Run tests
-make test
+# Each AI agent can work in its own worktree
+cd $(gwq get authentication) && claude
+cd $(gwq get visualization) && claude
+cd $(gwq get login) && claude
 
-# Build and test locally
-make build-local
-make test-local
+# Monitor all agent activity in real-time
+gwq status --watch
 ```
 
-## 📚 Documentation
+Since each worktree has its own working directory with isolated files, AI agents can work at full speed without merge conflicts. This approach is ideal for independent tasks, parallel migrations, and code review workflows.
 
-- [Software Design Document](docs/software_design.md) - Comprehensive technical design
-- [Architecture Diagrams](docs/) - Visual system overview
-  - [System Architecture (SVG)](docs/architecture_diagram.svg)
-  - [RTT Measurement Process (SVG)](docs/rtt_measurement_diagram.svg)
-- [Architecture Overview](docs/architecture.md)
-- [Deployment Guide](docs/deployment.md)
-- [Configuration Reference](docs/configuration.md)
-- [Troubleshooting](docs/troubleshooting/)
-- [API Documentation](docs/api.md)
+## Installation
 
-## 📄 License
+### Homebrew (macOS/Linux)
+```bash
+brew install d-kuro/tap/gwq
+```
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+### Using Go
+```bash
+go install github.com/d-kuro/gwq/cmd/gwq@latest
+```
 
-The eBPF programs in `internal/ebpf/bpf/` are dual-licensed under MIT and GPLv2.
+### From Source
+```bash
+git clone https://github.com/d-kuro/gwq.git
+cd gwq
+go build -o gwq ./cmd/gwq
+```
 
-## 🙏 Acknowledgments
+## Quick Start
 
-- The original R-Pingmesh research team
-- The Go, RDMA, eBPF, and Linux communities
+```bash
+# Create a new worktree with new branch
+gwq add -b feature/new-ui
+
+# List all worktrees
+gwq list
+
+# Check status of all worktrees
+gwq status
+
+# Get worktree path (for cd)
+cd $(gwq get feature)
+
+# Execute command in worktree
+gwq exec feature -- npm test
+
+# Remove a worktree
+gwq remove feature/old-ui
+```
+
+## Features
+
+- **Fuzzy Finder Interface**: Built-in fuzzy finder for intuitive branch and worktree selection
+- **Global Worktree Management**: Access all your worktrees across repositories from anywhere
+- **Status Dashboard**: Monitor all worktrees' git status, changes, and activity at a glance
+- **Tmux Integration**: Run and manage long-running processes in persistent tmux sessions
+- **Tab Completion**: Full shell completion support for branches, worktrees, and configuration
+
+## Commands
+
+### `gwq add`
+
+Create a new worktree.
+
+```bash
+# Create worktree with new branch
+gwq add -b feature/new-ui
+
+# Create from existing branch
+gwq add main
+
+# Interactive branch selection
+gwq add -i
+
+# Stay in worktree directory after creation
+gwq add -s feature/new-ui
+```
+
+**Flags**: `-b` (new branch), `-i` (interactive), `-s` (stay), `-f` (force)
+
+### `gwq list`
+
+Display all worktrees.
+
+```bash
+# Simple list
+gwq list
+
+# Detailed information
+gwq list -v
+
+# JSON format
+gwq list --json
+
+# Show all worktrees globally
+gwq list -g
+```
+
+**Flags**: `-v` (verbose), `-g` (global), `--json`
+
+### `gwq get`
+
+Get worktree path. Useful for shell command substitution.
+
+```bash
+# Get path and change directory
+cd $(gwq get feature)
+
+# Get from global worktrees
+gwq get -g myapp:feature
+```
+
+**Flags**: `-g` (global), `-0` (null-terminated)
+
+### `gwq cd`
+
+Change to worktree directory by launching a new shell.
+
+```bash
+# Change to a worktree
+gwq cd feature
+
+# Interactive selection
+gwq cd
+```
+
+**Flags**: `-g` (global)
+
+### `gwq exec`
+
+Execute command in worktree directory.
+
+```bash
+# Run tests in feature branch
+gwq exec feature -- npm test
+
+# Stay in directory after command
+gwq exec -s feature -- npm install
+```
+
+**Flags**: `-g` (global), `-s` (stay)
+
+### `gwq remove`
+
+Delete a worktree.
+
+```bash
+# Interactive selection
+gwq remove
+
+# Delete by pattern
+gwq remove feature/old
+
+# Also delete the branch
+gwq remove -b feature/completed
+
+# Force delete unmerged branch
+gwq remove -b --force-delete-branch feature/abandoned
+
+# Preview deletion
+gwq remove --dry-run feature/old
+```
+
+**Flags**: `-f` (force), `-b` (delete branch), `--force-delete-branch`, `-g` (global), `--dry-run`
+
+### `gwq status`
+
+Monitor the status of all worktrees.
+
+```bash
+# Table view
+gwq status
+
+# Watch mode (auto-refresh)
+gwq status --watch
+
+# Filter by status
+gwq status --filter changed
+
+# Sort by activity
+gwq status --sort activity
+
+# Output formats
+gwq status --json
+gwq status --csv
+```
+
+**Flags**: `-w` (watch), `-f` (filter), `-s` (sort), `-v` (verbose), `-g` (global), `--json`, `--csv`
+
+### `gwq tmux`
+
+Manage tmux sessions for long-running processes.
+
+```bash
+# List sessions
+gwq tmux list
+
+# Run command in new session
+gwq tmux run "npm run dev"
+
+# Run with custom ID
+gwq tmux run --id dev-server "npm run dev"
+
+# Attach to session
+gwq tmux attach dev-server
+
+# Kill session
+gwq tmux kill dev-server
+```
+
+### `gwq config`
+
+Manage configuration.
+
+```bash
+# Show configuration
+gwq config list
+
+# Set global value (default)
+gwq config set worktree.basedir ~/worktrees
+
+# Set local value (writes to .gwq.toml in current directory)
+gwq config set --local finder.preview false
+
+# Get value
+gwq config get worktree.basedir
+```
+
+**Flags**: `--local` (write to local config instead of global)
+
+### `gwq prune`
+
+Clean up deleted worktree information.
+
+```bash
+gwq prune
+```
+
+## Global Worktree Management
+
+`gwq` automatically discovers all worktrees in your configured base directory:
+
+- **Outside Git Repositories**: Shows all worktrees in the base directory
+- **Inside Git Repositories**: Shows only worktrees for the current repository (use `-g` to see all)
+- **No Registry Required**: Uses filesystem scanning instead of maintaining a separate registry
+
+## Shell Integration
+
+### Tab Completion
+
+**Bash:**
+```bash
+source <(gwq completion bash)
+```
+
+**Zsh:**
+```bash
+source <(gwq completion zsh)
+```
+
+**Fish:**
+```bash
+gwq completion fish > ~/.config/fish/completions/gwq.fish
+```
+
+**PowerShell:**
+```powershell
+gwq completion powershell | Out-String | Invoke-Expression
+```
+
+## Configuration
+
+### Configuration Files
+
+gwq uses two configuration files:
+
+| File | Location | Purpose |
+|------|----------|---------|
+| Global | `~/.config/gwq/config.toml` | Default settings for all projects |
+| Local | `.gwq.toml` (current directory) | Project-specific overrides |
+
+Local configuration takes precedence over global settings.
+
+**Example global config** (`~/.config/gwq/config.toml`):
+
+```toml
+[worktree]
+basedir = "~/worktrees"
+auto_mkdir = true
+
+[finder]
+preview = true
+
+[naming]
+template = "{{.Host}}/{{.Owner}}/{{.Repository}}/{{.Branch}}"
+sanitize_chars = { "/" = "-", ":" = "-" }
+
+[ui]
+icons = true
+tilde_home = true
+
+[[repository_settings]]
+repository = "~/src/myproject"
+copy_files = ["templates/.env.example"]
+setup_commands = ["npm install"]
+```
+
+### Key Settings
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `worktree.basedir` | Base directory for worktrees | `~/worktrees` |
+| `naming.template` | Directory naming template | `{{.Host}}/{{.Owner}}/{{.Repository}}/{{.Branch}}` |
+| `ui.tilde_home` | Display `~` instead of full home path | `true` |
+| `ui.icons` | Show icons in output | `true` |
+
+### Per-Repository Setup
+
+Configure automatic file copying and setup commands per repository. These settings can be defined in both global and local configuration files.
+
+```toml
+[[repository_settings]]
+repository = "~/src/myproject"
+copy_files = ["templates/.env.example", "config/*.json"]
+setup_commands = ["npm install", "npm run setup"]
+```
+
+#### Merge Behavior
+
+When both global and local configs define `repository_settings`, they are merged using the `repository` field as the key:
+
+- **Same repository**: Local settings completely override global
+- **Different repositories**: Both are kept
+
+**Example:**
+
+Global config (`~/.config/gwq/config.toml`):
+```toml
+[[repository_settings]]
+repository = "~/src/project-a"
+setup_commands = ["npm install"]
+
+[[repository_settings]]
+repository = "~/src/project-b"
+setup_commands = ["go mod download"]
+```
+
+Local config (`.gwq.toml`):
+```toml
+[[repository_settings]]
+repository = "~/src/project-a"
+setup_commands = ["yarn install", "yarn build"]
+
+[[repository_settings]]
+repository = "~/src/project-c"
+setup_commands = ["make setup"]
+```
+
+**Merged result:**
+| Repository | Source | Commands |
+|------------|--------|----------|
+| `project-a` | Local (override) | `yarn install`, `yarn build` |
+| `project-b` | Global | `go mod download` |
+| `project-c` | Local (new) | `make setup` |
+
+## Advanced Usage
+
+### Unified Workflow with ghq and fzf
+
+For a powerful development workflow, you can integrate `gwq` with [ghq](https://github.com/x-motemen/ghq) (repository manager) and [fzf](https://github.com/junegunn/fzf) (fuzzy finder). This combination is particularly effective for parallel AI coding agent workflows.
+
+The key idea is to place worktrees alongside your cloned repositories under the same root directory, enabling unified fuzzy search across both. This consolidates all your development directories into a single searchable location.
+
+For detailed configuration and shell function setup, see: [ghq × gwq × fzf でつくる並列コーディングエージェント開発環境](https://zenn.dev/shunk031/articles/ghq-gwq-fzf-worktree)
+
+## Directory Structure
+
+`gwq` organizes worktrees using a URL-based hierarchy:
+
+```
+~/worktrees/
+├── github.com/
+│   └── user/
+│       └── myapp/
+│           ├── feature-auth/
+│           └── feature-api/
+└── gitlab.com/
+    └── company/
+        └── project/
+            └── feature-x/
+```
+
+This structure prevents naming conflicts and preserves context about which repository a worktree belongs to.
+
+## Requirements
+
+- Git 2.5+ (for worktree support)
+- Go 1.24+ (for building from source)
+
+## License
+
+Apache License 2.0 - see [LICENSE](LICENSE) file for details.

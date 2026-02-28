@@ -32,6 +32,7 @@ type ClusterMonitor struct {
 	requesterGID   string
 	updateInterval time.Duration
 	running        atomic.Bool
+	stopCh         chan struct{}
 	wg             sync.WaitGroup
 	logger         zerolog.Logger
 }
@@ -57,6 +58,7 @@ func NewClusterMonitor(
 		torID:          torID,
 		requesterGID:   requesterGID,
 		updateInterval: interval,
+		stopCh:         make(chan struct{}),
 		logger:         log.With().Str("component", "cluster_monitor").Logger(),
 	}
 }
@@ -83,18 +85,22 @@ func (m *ClusterMonitor) Start(ctx context.Context) error {
 }
 
 // Stop signals the monitor goroutine to exit and waits for it to finish.
-// It is safe to call Stop multiple times.
+// Closing stopCh wakes the goroutine immediately without waiting for the
+// next ticker interval. It is safe to call Stop multiple times.
 func (m *ClusterMonitor) Stop() {
 	if !m.running.CompareAndSwap(true, false) {
 		return // not running
 	}
+	close(m.stopCh)
 	m.wg.Wait()
 	m.logger.Info().Msg("ClusterMonitor stopped")
 }
 
 // monitorLoop is the main background loop. It fetches pinglists once
 // immediately on start, then on every tick of the update interval.
-// If the context is cancelled or running is set to false, the loop exits.
+// The loop exits when the context is cancelled or Stop closes stopCh.
+// Using stopCh ensures the goroutine exits immediately on Stop rather
+// than blocking until the next ticker interval (up to 30 s).
 func (m *ClusterMonitor) monitorLoop(ctx context.Context) {
 	defer m.wg.Done()
 
@@ -105,15 +111,13 @@ func (m *ClusterMonitor) monitorLoop(ctx context.Context) {
 	ticker := time.NewTicker(m.updateInterval)
 	defer ticker.Stop()
 
-	for m.running.Load() {
+	for {
 		select {
+		case <-m.stopCh:
+			return
 		case <-ctx.Done():
-			m.running.Store(false)
 			return
 		case <-ticker.C:
-			if !m.running.Load() {
-				return
-			}
 			m.updateTargets(ctx)
 		}
 	}

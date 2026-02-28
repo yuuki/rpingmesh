@@ -457,17 +457,17 @@ func GetLastError() string {
 // using big-endian byte order. The buffer must be at least ProbePacketSize
 // (40) bytes long.
 //
-// Wire layout (40 bytes):
+// Wire layout (40 bytes) — must match zig/src/packet.zig serializeProbePacket:
 //
 //	[0]      Version
 //	[1]      MsgType
 //	[2]      AckType
 //	[3]      Flags
-//	[4:8]    Reserved (zero padding)
-//	[8:16]   SequenceNum (big-endian uint64)
-//	[16:24]  T1 (big-endian uint64)
-//	[24:32]  T3 (big-endian uint64)
-//	[32:40]  T4 (big-endian uint64)
+//	[4:12]   SequenceNum (big-endian uint64)
+//	[12:20]  T1 (big-endian uint64)
+//	[20:28]  T3 (big-endian uint64)
+//	[28:36]  T4 (big-endian uint64)
+//	[36:40]  Reserved (zero padding)
 func SerializeProbePacket(pkt *ProbePacket, buf []byte) {
 	_ = buf[ProbePacketSize-1] // bounds check hint
 
@@ -475,15 +475,16 @@ func SerializeProbePacket(pkt *ProbePacket, buf []byte) {
 	buf[1] = pkt.MsgType
 	buf[2] = pkt.AckType
 	buf[3] = pkt.Flags
-	// bytes 4-7: reserved padding
-	buf[4] = 0
-	buf[5] = 0
-	buf[6] = 0
-	buf[7] = 0
-	binary.BigEndian.PutUint64(buf[8:16], pkt.SequenceNum)
-	binary.BigEndian.PutUint64(buf[16:24], pkt.T1)
-	binary.BigEndian.PutUint64(buf[24:32], pkt.T3)
-	binary.BigEndian.PutUint64(buf[32:40], pkt.T4)
+	binary.BigEndian.PutUint64(buf[4:12], pkt.SequenceNum)
+	binary.BigEndian.PutUint64(buf[12:20], pkt.T1)
+	binary.BigEndian.PutUint64(buf[20:28], pkt.T3)
+	binary.BigEndian.PutUint64(buf[28:36], pkt.T4)
+	// bytes 36-39: reserved padding (already zero from caller if slice was zeroed,
+	// but we zero explicitly to guarantee wire cleanliness)
+	buf[36] = 0
+	buf[37] = 0
+	buf[38] = 0
+	buf[39] = 0
 }
 
 // DeserializeProbePacket deserializes a ProbePacket from the provided byte
@@ -497,10 +498,10 @@ func DeserializeProbePacket(buf []byte) *ProbePacket {
 		MsgType:     buf[1],
 		AckType:     buf[2],
 		Flags:       buf[3],
-		SequenceNum: binary.BigEndian.Uint64(buf[8:16]),
-		T1:          binary.BigEndian.Uint64(buf[16:24]),
-		T3:          binary.BigEndian.Uint64(buf[24:32]),
-		T4:          binary.BigEndian.Uint64(buf[32:40]),
+		SequenceNum: binary.BigEndian.Uint64(buf[4:12]),
+		T1:          binary.BigEndian.Uint64(buf[12:20]),
+		T3:          binary.BigEndian.Uint64(buf[20:28]),
+		T4:          binary.BigEndian.Uint64(buf[28:36]),
 	}
 }
 

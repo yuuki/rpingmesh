@@ -210,17 +210,17 @@ func (r *Responder) Destroy() {
 // SendFirstAck and SendSecondAck functions expect the original received
 // packet bytes to extract the sequence number and original timestamps.
 //
-// Wire layout (40 bytes):
+// Wire layout (40 bytes) — must match zig/src/packet.zig serializeProbePacket:
 //
 //	[0]      Version
 //	[1]      MsgType (0 = probe)
 //	[2]      AckType (0 = none)
 //	[3]      Flags
-//	[4:8]    Reserved (zero padding)
-//	[8:16]   SequenceNum (big-endian uint64)
-//	[16:24]  T1 (big-endian uint64)
-//	[24:32]  T3 (big-endian uint64)
-//	[32:40]  T4 (big-endian uint64)
+//	[4:12]   SequenceNum (big-endian uint64)
+//	[12:20]  T1 (big-endian uint64)
+//	[20:28]  T3 (big-endian uint64)
+//	[28:36]  T4 (big-endian uint64)
+//	[36:40]  Reserved (zero padding)
 func buildRecvPacketPayload(event *rdmabridge.CompletionEvent) []byte {
 	buf := make([]byte, rdmabridge.ProbePacketSize)
 
@@ -228,11 +228,11 @@ func buildRecvPacketPayload(event *rdmabridge.CompletionEvent) []byte {
 	buf[1] = rdmabridge.MsgTypeProbe
 	buf[2] = rdmabridge.AckTypeNone
 	buf[3] = event.Flags
-	// bytes 4-7: reserved padding (already zero from make)
-	binary.BigEndian.PutUint64(buf[8:16], event.SequenceNum)
-	binary.BigEndian.PutUint64(buf[16:24], event.T1)
-	binary.BigEndian.PutUint64(buf[24:32], event.T3)
-	binary.BigEndian.PutUint64(buf[32:40], event.T4)
+	binary.BigEndian.PutUint64(buf[4:12], event.SequenceNum)
+	binary.BigEndian.PutUint64(buf[12:20], event.T1)
+	binary.BigEndian.PutUint64(buf[20:28], event.T3)
+	binary.BigEndian.PutUint64(buf[28:36], event.T4)
+	// bytes 36-39: reserved padding (already zero from make)
 
 	return buf
 }

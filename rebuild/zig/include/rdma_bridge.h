@@ -125,11 +125,23 @@ typedef struct {
  *
  * Returned by rdma_send_probe(). Contains the T1 (post time) and T2
  * (send completion time) timestamps, plus an error indicator.
+ *
+ * Size: 24 bytes (8 + 8 + 4 + 4 explicit padding).
+ * The Zig extern struct (t1_ns u64 + t2_ns u64 + err i32) is 20 bytes of
+ * fields but Zig pads the extern struct to 24 bytes to satisfy the 8-byte
+ * alignment of the u64 members. The C struct must match: without an explicit
+ * _pad field the C compiler also pads to 24 bytes implicitly, but the
+ * explicit field makes the intent clear and prevents accidental shrinkage.
+ * On x86-64 Linux SysV ABI a struct > 16 bytes is returned via a hidden
+ * pointer, so both sides must agree on sizeof. Verified by the Zig test:
+ *   try std.testing.expectEqual(@as(usize, 24), @sizeOf(SendResult));
  */
 typedef struct {
     uint64_t t1_ns;              /* T1: time just before posting the send (ns) */
     uint64_t t2_ns;              /* T2: send completion timestamp from CQ (ns) */
     int32_t  error;              /* 0 = success, nonzero = error code */
+    uint32_t _pad;               /* Explicit trailing padding to reach 24 bytes,
+                                  * matching Zig extern struct alignment. */
 } rdma_send_result_t;
 
 /* =========================================================================

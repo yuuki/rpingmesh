@@ -303,8 +303,14 @@ func (a *Agent) Stop(ctx context.Context) {
 // Run is the main lifecycle method. It initializes the agent, starts all
 // components, blocks until the context is cancelled (e.g., by a signal),
 // and then performs a graceful shutdown.
+//
+// Stop is always called after a successful (even partial) Initialize so that
+// any resources allocated before a failure are released.
 func (a *Agent) Run(ctx context.Context) error {
 	if err := a.Initialize(ctx); err != nil {
+		// Stop is safe to call with partially initialised state because
+		// every resource field in Stop is guarded by a nil check.
+		a.Stop(ctx)
 		return fmt.Errorf("agent initialization failed: %w", err)
 	}
 

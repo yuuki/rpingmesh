@@ -1,5 +1,5 @@
 # R-Pingmesh Rebuild - Build System
-# Requires: Go 1.24+, Zig 0.13+, protoc, clang, libibverbs-dev, librdmacm-dev
+# Requires: Go 1.26+, Zig 0.16+, protoc, clang, libibverbs-dev, librdmacm-dev
 
 .PHONY: all build build-zig build-go build-controller build-agent \
         generate generate-proto clean test test-go help
@@ -82,4 +82,4 @@ help:
 	@echo "  clean           Remove all build artifacts"
 	@echo ""
 	@echo "Requirements:"
-	@echo "  Go 1.24+, Zig 0.13+, protoc, libibverbs-dev, librdmacm-dev"
+	@echo "  Go 1.26+, Zig 0.16+, protoc, libibverbs-dev, librdmacm-dev"

@@ -160,8 +160,8 @@ rebuild/
 
 | Dependency | Version | Purpose |
 |------------|---------|---------|
-| Go | 1.24.3+ | Agent and controller binaries |
-| Zig | 0.13+ | RDMA data-path library |
+| Go | 1.26.0+ | Agent and controller binaries |
+| Zig | 0.16+ | RDMA data-path library |
 | protoc | 3.x | Protocol buffer compilation |
 | protoc-gen-go | latest | Go protobuf codegen |
 | protoc-gen-go-grpc | latest | Go gRPC codegen |

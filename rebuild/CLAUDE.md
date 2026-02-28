@@ -14,7 +14,7 @@ All commands must be run from within the `rebuild/` directory. This is a separat
 
 ```bash
 make build           # Full pipeline: Zig library → protobuf codegen → Go binaries
-make build-zig       # Build zig/zig-out/lib/librdmabridge.a only (requires Zig 0.13+)
+make build-zig       # Build zig/zig-out/lib/librdmabridge.a only (requires Zig 0.16+)
 make generate-proto  # Regenerate protobuf Go bindings
 make build-controller  # CGO_ENABLED=0, no Zig link
 make build-agent       # CGO_ENABLED=1, links librdmabridge.a
@@ -101,8 +101,8 @@ Environment variables: `RQLITE_DB_URI` for controller database connection.
 
 ## Requirements
 
-- Go 1.24+
-- Zig 0.13+
+- Go 1.26+
+- Zig 0.16+
 - protoc, protoc-gen-go, protoc-gen-go-grpc
 - libibverbs-dev, librdmacm-dev (Linux only; for agent build and RDMA testing)
 - rqlite (for controller and integration tests)

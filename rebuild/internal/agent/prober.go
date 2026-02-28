@@ -61,6 +61,7 @@ type Prober struct {
 	agentEpoch    uint32 // Random epoch prefix for sequence number collision prevention
 	resultChan    chan *probe.ProbeResult
 	running       atomic.Bool
+	stopCh        chan struct{} // closed by Stop() to wake goroutines immediately
 	wg            sync.WaitGroup
 	probeInterval time.Duration
 	probeTimeout  uint32 // ms
@@ -87,6 +88,7 @@ func NewProber(device *rdmabridge.Device, ring *rdmabridge.EventRing, probeInter
 		pending:       make(map[uint64]*pendingProbe),
 		agentEpoch:    rand.Uint32(),
 		resultChan:    make(chan *probe.ProbeResult, resultChanSize),
+		stopCh:        make(chan struct{}),
 		probeInterval: time.Duration(probeIntervalMS) * time.Millisecond,
 		probeTimeout:  probeSendTimeoutMS,
 		logger:        log.With().Str("component", "prober").Logger(),
@@ -122,11 +124,14 @@ func (p *Prober) Start(ctx context.Context) error {
 }
 
 // Stop signals both background goroutines to exit and waits for them
-// to finish. It is safe to call Stop multiple times.
+// to finish. It is safe to call Stop multiple times. Closing stopCh
+// wakes goroutines immediately instead of waiting for the next ticker
+// or sleep to fire.
 func (p *Prober) Stop() {
 	if !p.running.CompareAndSwap(true, false) {
 		return // not running
 	}
+	close(p.stopCh)
 	p.wg.Wait()
 	p.logger.Info().Msg("Prober stopped")
 }
@@ -167,6 +172,10 @@ func (p *Prober) probeLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			p.running.Store(false)
+			return
+		case <-p.stopCh:
+			// Stop() was called; exit immediately without waiting for
+			// the next ticker fire, which could be up to probeInterval away.
 			return
 		case <-ticker.C:
 			tickCount++
@@ -264,17 +273,45 @@ func (p *Prober) ackProcessLoop(ctx context.Context) {
 
 	p.logger.Info().Msg("ACK process loop started")
 
+	// idleTimer is reused on each empty-poll iteration to avoid allocating
+	// a new timer on every spin. Reset is safe here because we always drain
+	// it before calling Reset (see time.Timer documentation).
+	idleTimer := time.NewTimer(idleSleep)
+	defer idleTimer.Stop()
+
 	for p.running.Load() {
+		// Check for shutdown or context cancellation on every iteration,
+		// even when the ring is continuously delivering events.
 		select {
 		case <-ctx.Done():
 			p.running.Store(false)
+			return
+		case <-p.stopCh:
 			return
 		default:
 		}
 
 		events := p.ring.Poll(maxBatch)
 		if len(events) == 0 {
-			time.Sleep(idleSleep)
+			// No events yet; wait briefly before polling again.
+			// Select on stopCh and ctx.Done() so we exit immediately
+			// when Stop() is called rather than finishing the sleep.
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(idleSleep)
+			select {
+			case <-ctx.Done():
+				p.running.Store(false)
+				return
+			case <-p.stopCh:
+				// Stop() was called; exit without waiting for the idle sleep.
+				return
+			case <-idleTimer.C:
+			}
 			continue
 		}
 
@@ -468,8 +505,13 @@ func (p *Prober) GetQueueInfo() rdmabridge.QueueInfo {
 
 // Destroy stops the prober if it is running and destroys the underlying
 // RDMA queue, freeing all associated resources (QP, CQ, MRs).
+//
+// After Stop() returns all producer goroutines have exited, so closing
+// resultChan here is safe. Consumers using "for range" will exit cleanly
+// when the channel is closed.
 func (p *Prober) Destroy() {
 	p.Stop()
+	close(p.resultChan)
 	if p.queue != nil {
 		p.queue.Destroy()
 		p.queue = nil

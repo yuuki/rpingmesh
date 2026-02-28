@@ -1,0 +1,10 @@
+# R-Pingmesh Controller Configuration
+
+# Server settings
+listen_addr: ":50051"
+
+# Database
+database_uri: "http://localhost:4001"  # rqlite address
+
+# Logging
+log_level: "info"                       # debug, info, warn, error

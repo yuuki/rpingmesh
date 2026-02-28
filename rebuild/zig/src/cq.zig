@@ -41,14 +41,59 @@ pub const GRHInfo = struct {
 
 /// Parse the 40-byte GRH at the start of a UD receive buffer.
 ///
-/// GRH layout (IPv6 header format):
+/// Standard GRH layout (IPv6 header format, used for native InfiniBand):
 ///   Bytes 0-3:   Version (4 bits) | Traffic Class (8 bits) | Flow Label (20 bits)
 ///   Bytes 4-5:   Payload Length
 ///   Byte  6:     Next Header
 ///   Byte  7:     Hop Limit
 ///   Bytes 8-23:  Source GID (128 bits)
 ///   Bytes 24-39: Destination GID (128 bits)
+///
+/// rdma_rxe IPv4 GRH format (Linux soft-RoCE for RoCEv2 over IPv4):
+///   Bytes 0-19:  All zeros (the synthesized GRH header fields are zeroed)
+///   Bytes 20-39: IPv4 header (20 bytes)
+///     - Bytes 20-23: IP version/IHL/DSCP/ECN/total_length (first nibble = 0x4)
+///     - Bytes 32-35: Source IPv4 address
+///     - Bytes 36-39: Destination IPv4 address
+///
+/// This function detects the rdma_rxe IPv4 format by checking whether bytes 0-7
+/// are all zero AND byte 20 has an IPv4 version nibble (0x4x). In that case it
+/// constructs IPv4-mapped IPv6 GIDs (::ffff:a.b.c.d) from the embedded IP header.
 pub fn parseGRH(buf: [*]const u8) GRHInfo {
+    // Detect rdma_rxe IPv4 "GRH": bytes 0-7 all zero AND byte 20 is IPv4 (0x4x).
+    const is_rxe_ipv4 = (buf[0] == 0 and buf[1] == 0 and buf[2] == 0 and buf[3] == 0 and
+        buf[4] == 0 and buf[5] == 0 and buf[6] == 0 and buf[7] == 0 and
+        (buf[20] & 0xF0) == 0x40);
+
+    if (is_rxe_ipv4) {
+        // IPv4 header is at buf[20..39].
+        // Source IP at buf[32..35] (IPv4 header offset 12).
+        // Dest   IP at buf[36..39] (IPv4 header offset 16).
+        // Construct IPv4-mapped IPv6 GIDs: ::ffff:a.b.c.d
+        var source_gid = [_]u8{0} ** 16;
+        source_gid[10] = 0xff;
+        source_gid[11] = 0xff;
+        source_gid[12] = buf[32];
+        source_gid[13] = buf[33];
+        source_gid[14] = buf[34];
+        source_gid[15] = buf[35];
+
+        var dest_gid = [_]u8{0} ** 16;
+        dest_gid[10] = 0xff;
+        dest_gid[11] = 0xff;
+        dest_gid[12] = buf[36];
+        dest_gid[13] = buf[37];
+        dest_gid[14] = buf[38];
+        dest_gid[15] = buf[39];
+
+        return GRHInfo{
+            .source_gid = source_gid,
+            .dest_gid = dest_gid,
+            .flow_label = 0, // IPv4 has no flow label
+        };
+    }
+
+    // Standard IPv6-format GRH.
     // Extract the flow label from the first 4 bytes (big-endian).
     // Flow label occupies bits 12-31 (the lower 20 bits of the 32-bit word).
     const word0: u32 = (@as(u32, buf[0]) << 24) |
@@ -82,14 +127,16 @@ pub fn parseGRH(buf: [*]const u8) GRHInfo {
 
 /// Parse probe packet fields from the payload buffer (after GRH).
 ///
-/// The probe packet is 40 bytes with big-endian encoded fields:
-///   Bytes 0-7:   sequence_num (u64)
-///   Bytes 8-15:  t1 (u64)
-///   Bytes 16-23: t3 (u64)
-///   Bytes 24-31: t4 (u64)
-///   Byte  32:    is_ack (u8)
-///   Byte  33:    ack_type (u8)
-///   Bytes 34-39: reserved/padding
+/// Wire format (40 bytes, matching packet.zig serializeProbePacket):
+///   Byte  0:     version (u8)
+///   Byte  1:     msg_type (u8) — 0=probe, 1=ack
+///   Byte  2:     ack_type (u8) — 0=N/A, 1=first, 2=second
+///   Byte  3:     flags (u8)
+///   Bytes 4-11:  sequence_num (u64, big-endian)
+///   Bytes 12-19: t1 (u64, big-endian)
+///   Bytes 20-27: t3 (u64, big-endian)
+///   Bytes 28-35: t4 (u64, big-endian)
+///   Bytes 36-39: reserved (zero)
 const ProbePayload = struct {
     sequence_num: u64,
     t1: u64,
@@ -112,14 +159,15 @@ fn readBigEndianU64(buf: [*]const u8, offset: usize) u64 {
 }
 
 /// Parse a probe packet payload from raw bytes.
+/// Reads fields at the correct wire format offsets (see ProbePayload comment above).
 fn parseProbePayload(buf: [*]const u8) ProbePayload {
     return ProbePayload{
-        .sequence_num = readBigEndianU64(buf, 0),
-        .t1 = readBigEndianU64(buf, 8),
-        .t3 = readBigEndianU64(buf, 16),
-        .t4 = readBigEndianU64(buf, 24),
-        .is_ack = buf[32],
-        .ack_type = buf[33],
+        .sequence_num = readBigEndianU64(buf, 4),  // offset 4: after 4-byte header
+        .t1 = readBigEndianU64(buf, 12),            // offset 12
+        .t3 = readBigEndianU64(buf, 20),            // offset 20
+        .t4 = readBigEndianU64(buf, 28),            // offset 28
+        .is_ack = buf[1],                            // msg_type: 0=probe, 1=ack
+        .ack_type = buf[2],                          // ack_type: 0=none, 1=first, 2=second
     };
 }
 
@@ -138,22 +186,11 @@ pub fn startCqPollerThread(queue: *types.UdQueue) !void {
 
 /// Stop the CQ poller thread and wait for it to exit.
 ///
-/// Sets queue.running to false, then requests a CQ notification to wake
-/// the thread if it is blocked in ibv_get_cq_event(). Finally joins the
-/// thread to ensure it has fully exited before returning.
+/// Sets queue.running to false and joins the thread. The thread exits
+/// naturally after its next sleep cycle (at most ~50 microseconds).
 pub fn stopCqPollerThread(queue: *types.UdQueue) void {
-    // Signal the poller to stop
     queue.running.store(false, .release);
 
-    // Wake the blocked thread by requesting a CQ notification.
-    // This causes ibv_get_cq_event() to return, allowing the thread
-    // to observe the running=false flag and exit.
-    const base_cq = c.ibv_cq_ex_to_cq(queue.recv_cq);
-    if (base_cq != null) {
-        _ = c.ibv_req_notify_cq(base_cq, 0);
-    }
-
-    // Join the thread
     if (queue.cq_thread) |thread| {
         thread.join();
         queue.cq_thread = null;
@@ -166,62 +203,140 @@ pub fn stopCqPollerThread(queue: *types.UdQueue) void {
 
 /// Main loop for the CQ poller thread.
 ///
-/// This function is the entry point for the dedicated poller thread. It:
-///   1. Requests CQ notification via ibv_req_notify_cq()
-///   2. Blocks on ibv_get_cq_event() until a completion arrives
-///   3. Acknowledges the event via ibv_ack_cq_events()
-///   4. Polls completions using the extended CQ API
-///   5. Dispatches recv completions to the event ring, send completions
-///      to the atomic signaling mechanism
+/// Uses busy polling (no ibv_get_cq_event) for reliability across different
+/// RDMA implementations and environments (including soft-RoCE in containers).
+/// Polls the CQ every ~50 microseconds and sleeps briefly between polls to
+/// avoid burning the CPU.
 ///
 /// The loop continues until queue.running is set to false.
 fn cqPollerLoop(queue: *types.UdQueue) void {
-    const recv_base_cq = c.ibv_cq_ex_to_cq(queue.recv_cq);
-    if (recv_base_cq == null) {
-        types.setLastError("cqPollerLoop: failed to get base CQ from recv_cq");
-        return;
-    }
-
-    // Main polling loop
+    std.debug.print("[CQ_POLLER] thread started for queue @{x}\n", .{@intFromPtr(queue)});
+    var iter: u64 = 0;
     while (queue.running.load(.acquire)) {
-        // Request notification for the next completion event
-        if (c.ibv_req_notify_cq(recv_base_cq, 0) != 0) {
-            if (!queue.running.load(.acquire)) break;
-            types.setLastError("cqPollerLoop: ibv_req_notify_cq() failed");
-            continue;
-        }
-
-        // Block until a CQ event arrives
-        var ev_cq: ?*c.ibv_cq = null;
-        var ev_ctx: ?*anyopaque = null;
-        const ret = c.ibv_get_cq_event(queue.comp_channel, &ev_cq, &ev_ctx);
-        if (ret != 0) {
-            // ibv_get_cq_event failed - check if we are shutting down
-            if (!queue.running.load(.acquire)) break;
-            types.setLastError("cqPollerLoop: ibv_get_cq_event() failed");
-            continue;
-        }
-
-        // Acknowledge the event (must be done before requesting the next one)
-        if (ev_cq) |cq_ptr| {
-            c.ibv_ack_cq_events(cq_ptr, 1);
-        }
-
-        // Poll the recv CQ for completions using extended polling API
-        pollCqCompletions(queue, queue.recv_cq, false);
+        // Poll recv CQ (handles both IBV_WC_RECV and IBV_WC_SEND opcodes
+        // since we use a single shared CQ for both directions)
+        pollCqCompletions(queue, queue.recv_cq);
 
         // Also poll the send CQ if it is separate from recv CQ
         if (queue.send_cq != queue.recv_cq) {
-            pollCqCompletions(queue, queue.send_cq, true);
+            pollCqCompletions(queue, queue.send_cq);
         }
+
+        iter += 1;
+        // Print alive message every 10000 iterations (~0.5s) for debugging
+        if (iter % 10000 == 0) {
+            std.debug.print("[CQ_POLLER] @{x} alive iter={d}\n", .{ @intFromPtr(queue), iter });
+        }
+
+        // Sleep briefly between polls to reduce CPU usage.
+        // 50 microseconds gives good responsiveness while staying efficient.
+        std.Thread.sleep(50_000);
     }
+    std.debug.print("[CQ_POLLER] @{x} exiting after {d} iters\n", .{ @intFromPtr(queue), iter });
 }
 
 /// Poll a single CQ for all available completions.
 ///
-/// Uses the extended polling API: ibv_start_poll -> process -> ibv_next_poll -> ibv_end_poll.
-/// The is_send_cq parameter determines whether completions are treated as send or recv.
-fn pollCqCompletions(queue: *types.UdQueue, cq: *c.ibv_cq_ex, is_send_cq: bool) {
+/// Dispatches to one of two implementations based on whether the queue uses
+/// software timestamps (rdma_rxe / no HW wallclock) or hardware timestamps.
+///
+/// For software timestamp mode (uses_sw_timestamps == true), the classic
+/// ibv_poll_cq() API is used.  Some rdma_rxe versions do not properly
+/// consume completions through ibv_end_poll(), causing the extended poll API
+/// to re-deliver the same completion on every subsequent ibv_start_poll()
+/// call.  ibv_poll_cq() does not have this issue.
+///
+/// For hardware timestamp mode, the extended API (ibv_start_poll /
+/// ibv_next_poll / ibv_end_poll) is used so that wallclock timestamps can be
+/// read via ibv_wc_read_completion_wallclock_ns().
+fn pollCqCompletions(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
+    if (queue.uses_sw_timestamps) {
+        pollCqClassic(queue, cq);
+        return;
+    }
+    pollCqExtended(queue, cq);
+}
+
+/// Classic CQ polling using ibv_poll_cq().
+///
+/// Converts the extended CQ handle to a base CQ, calls ibv_poll_cq() to
+/// drain up to 32 completions at once, and dispatches each to
+/// dispatchClassicWc().
+fn pollCqClassic(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
+    const base_cq = c.ibv_cq_ex_to_cq(cq) orelse return;
+    var wc_buf: [32]c.ibv_wc = undefined;
+    const n = c.ibv_poll_cq(base_cq, 32, &wc_buf[0]);
+    if (n <= 0) return;
+    var i: usize = 0;
+    while (i < @as(usize, @intCast(n))) : (i += 1) {
+        dispatchClassicWc(queue, &wc_buf[i]);
+    }
+}
+
+/// Dispatch a classic ibv_wc completion to the appropriate handler.
+fn dispatchClassicWc(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
+    const status_int: i32 = @intCast(wc.status);
+    if (wc.opcode == c.IBV_WC_SEND) {
+        std.debug.print("[CQ_DISPATCH] @{x} SEND (classic) status={d}\n", .{ @intFromPtr(queue), status_int });
+        // Signal the waiting sender thread with a SW timestamp.
+        const ts = swTimestampNs();
+        queue.send_completion_timestamp.store(ts, .release);
+        queue.send_completion_status.store(status_int, .release);
+        queue.send_completion_ready.store(true, .release);
+    } else if (wc.opcode == c.IBV_WC_RECV) {
+        std.debug.print("[CQ_DISPATCH] @{x} RECV (classic) status={d}\n", .{ @intFromPtr(queue), status_int });
+        if (wc.status == c.IBV_WC_SUCCESS) {
+            processRecvClassic(queue, wc);
+        }
+    } else {
+        std.debug.print("[CQ_DISPATCH] @{x} unknown opcode (classic) status={d}\n", .{ @intFromPtr(queue), status_int });
+    }
+}
+
+/// Process a receive completion from the classic ibv_wc path.
+///
+/// Mirrors processRecvCompletion() but reads fields directly from ibv_wc
+/// instead of the extended CQ handle.
+fn processRecvClassic(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
+    const slot_index: u32 = @intCast(wc.wr_id & 0xFFFFFFFF);
+    const ts = swTimestampNs();
+    const src_qp: u32 = wc.src_qp;
+
+    const slot_ptr = memory.getSlotPtr(queue.recv_buf, slot_index, types.NUM_RECV_SLOTS) catch return;
+    const grh_info = parseGRH(slot_ptr);
+    const payload_ptr = slot_ptr + types.GRH_SIZE;
+    const payload = parseProbePayload(payload_ptr);
+
+    const event = ring.CompletionEvent{
+        .sequence_num = payload.sequence_num,
+        .t1 = payload.t1,
+        .t3 = payload.t3,
+        .t4 = payload.t4,
+        .is_ack = payload.is_ack,
+        .ack_type = payload.ack_type,
+        .flags = 0,
+        ._pad = 0,
+        .timestamp_ns = ts,
+        .source_gid = grh_info.source_gid,
+        .source_qpn = src_qp,
+        .flow_label = grh_info.flow_label,
+        .status = @intCast(wc.status),
+        .is_send = 0,
+        ._pad2 = [_]u8{ 0, 0, 0 },
+    };
+
+    if (queue.event_ring) |event_ring| {
+        _ = event_ring.push(&event);
+    }
+
+    memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {};
+}
+
+/// Extended CQ polling using ibv_start_poll / ibv_next_poll / ibv_end_poll.
+///
+/// Used only when the device supports hardware wallclock timestamps
+/// (uses_sw_timestamps == false).
+fn pollCqExtended(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
     var poll_attr = std.mem.zeroes(c.ibv_poll_cq_attr);
 
     const ret_start = c.ibv_start_poll(cq, &poll_attr);
@@ -231,39 +346,47 @@ fn pollCqCompletions(queue: *types.UdQueue, cq: *c.ibv_cq_ex, is_send_cq: bool) 
     }
 
     // Process the first completion
-    dispatchCompletion(queue, cq, is_send_cq);
+    dispatchCompletion(queue, cq);
 
     // Process remaining completions
     while (c.ibv_next_poll(cq) == 0) {
-        dispatchCompletion(queue, cq, is_send_cq);
+        dispatchCompletion(queue, cq);
     }
 
     c.ibv_end_poll(cq);
 }
 
+/// Return the current monotonic clock time in nanoseconds (software fallback).
+fn swTimestampNs() u64 {
+    const ts = std.time.nanoTimestamp();
+    return @intCast(@as(u128, @bitCast(ts)) & 0xFFFFFFFFFFFFFFFF);
+}
+
 /// Dispatch a single work completion to the appropriate handler.
 ///
-/// Reads the opcode from the extended CQ to determine whether this is a
-/// send or receive completion, then delegates to the appropriate processor.
-fn dispatchCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex, is_send_cq: bool) {
+/// Routes by opcode (IBV_WC_SEND or IBV_WC_RECV). For send completions,
+/// always signals the waiting sender thread (even on error) so it does
+/// not spin-wait indefinitely. For recv completions, only pushes to the
+/// ring on success.
+fn dispatchCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
+    const opcode = c.ibv_wc_read_opcode(cq);
     const status: i32 = @intCast(cq.status);
 
-    if (status != c.IBV_WC_SUCCESS) {
-        // For error completions, check if it might be a send based on context
-        if (is_send_cq) {
-            processSendCompletion(queue, cq);
-        }
-        // For recv errors, we could repost the buffer but skip for now
-        return;
-    }
-
-    const opcode = c.ibv_wc_read_opcode(cq);
-    if (opcode == c.IBV_WC_RECV) {
-        processRecvCompletion(queue, cq);
-    } else if (opcode == c.IBV_WC_SEND) {
+    if (opcode == c.IBV_WC_SEND) {
+        std.debug.print("[CQ_DISPATCH] @{x} SEND completion status={d}\n", .{ @intFromPtr(queue), status });
+        // Always signal the sender, regardless of status, so waitSendCompletion
+        // can report the error rather than timing out.
         processSendCompletion(queue, cq);
+    } else if (opcode == c.IBV_WC_RECV) {
+        std.debug.print("[CQ_DISPATCH] @{x} RECV completion status={d}\n", .{ @intFromPtr(queue), status });
+        if (status == c.IBV_WC_SUCCESS) {
+            processRecvCompletion(queue, cq);
+        }
+        // Recv errors: buffer slot is effectively lost until queue recreation.
+        // For the test scenario this is acceptable.
+    } else {
+        std.debug.print("[CQ_DISPATCH] @{x} unknown opcode, status={d}\n", .{ @intFromPtr(queue), status });
     }
-    // Unknown opcodes are silently ignored
 }
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,9 @@ pkg/ebpf/bpf/include/vmlinux.h
 pkg/ebpf/rdmaTracing_*.go
 pkg/ebpf/rdmaTracing.o
 
+# Zig build cache
+.zig-cache/
+
 # Binaries and build artifacts
 /bin/
 /tmp/

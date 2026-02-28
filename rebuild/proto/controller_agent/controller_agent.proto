@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package controller_agent;
+
+option go_package = "github.com/yuuki/rpingmesh/rebuild/proto/controller_agent";
+
+// ControllerService provides agent registration and pinglist distribution.
+// This is the simplified rebuild version without GetTargetRnicInfo (eBPF out of scope).
+service ControllerService {
+    // RegisterAgent registers an agent and its RNICs with the controller.
+    rpc RegisterAgent(AgentRegistrationRequest) returns (AgentRegistrationResponse);
+    // GetPinglist returns the list of targets for an agent to probe.
+    rpc GetPinglist(PinglistRequest) returns (PinglistResponse);
+}
+
+// RnicInfo describes an RDMA NIC.
+message RnicInfo {
+    string gid = 1;
+    uint32 qpn = 2;
+    string ip_address = 3;
+    string host_name = 4;
+    string tor_id = 5;
+    string device_name = 6;
+}
+
+// AgentRegistrationRequest is sent by agents to register with the controller.
+message AgentRegistrationRequest {
+    string agent_id = 1;
+    string agent_ip = 2;
+    string hostname = 3;
+    string tor_id = 4;
+    repeated RnicInfo rnics = 5;
+}
+
+// AgentRegistrationResponse is returned after agent registration.
+message AgentRegistrationResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// PinglistType determines what kind of pinglist to generate.
+enum PinglistType {
+    TOR_MESH = 0;     // All RNICs within the same ToR
+    INTER_TOR = 1;    // Sample RNICs from other ToRs
+}
+
+// PinglistRequest asks for a set of probe targets.
+message PinglistRequest {
+    string agent_id = 1;
+    string tor_id = 2;
+    string requester_gid = 3;
+    PinglistType type = 4;
+}
+
+// PingTarget describes a single probe target.
+message PingTarget {
+    string target_gid = 1;
+    uint32 target_qpn = 2;
+    string target_ip = 3;
+    string target_hostname = 4;
+    string target_tor_id = 5;
+    string target_device_name = 6;
+    // source_port is metadata only (not enforced at the RDMA layer).
+    uint32 source_port = 7;
+    // flow_label is used for ECMP path diversity via ibv_ah_attr.grh.flow_label.
+    uint32 flow_label = 8;
+    uint32 priority = 9;
+}
+
+// PinglistResponse contains the list of targets to probe.
+message PinglistResponse {
+    repeated PingTarget targets = 1;
+    PinglistType type = 2;
+}

@@ -1,0 +1,44 @@
+# Build stage for the rpingmesh controller.
+# CGO_ENABLED=0 — no RDMA or Zig dependencies needed.
+FROM golang:1.26-bookworm AS builder
+
+# Install protoc and Go protobuf plugins for code generation.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/* \
+    && go install google.golang.org/protobuf/cmd/protoc-gen-go@latest \
+    && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+WORKDIR /app
+
+# Copy module files first for Docker layer caching.
+COPY go.mod ./
+# go.sum may not exist yet; copy conditionally.
+COPY go.su[m] ./
+
+# Copy proto definitions and generate Go bindings.
+COPY proto/ proto/
+RUN cd proto/controller_agent && \
+    protoc --go_out=. --go_opt=paths=source_relative \
+           --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+           controller_agent.proto
+
+# Copy remaining source and resolve dependencies.
+COPY . .
+RUN go mod tidy && go mod download
+
+# Build the controller binary.
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/rpingmesh-controller ./cmd/controller/
+
+# Runtime image — minimal footprint.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /app/bin/rpingmesh-controller ./rpingmesh-controller
+
+EXPOSE 50051
+ENTRYPOINT ["./rpingmesh-controller"]

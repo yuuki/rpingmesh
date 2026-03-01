@@ -2,7 +2,8 @@
 # Requires: Go 1.26+, Zig 0.16+, protoc, clang, libibverbs-dev, librdmacm-dev
 
 .PHONY: all build build-zig build-go build-controller build-agent \
-        generate generate-proto clean test test-go test-e2e setup-colima help
+        generate generate-proto clean test test-go \
+        test-e2e setup-colima test-e2e-controller clean-e2e-controller help
 
 # Directories
 ZIG_DIR := zig
@@ -71,6 +72,16 @@ test-e2e:
 	docker compose -f docker-compose.e2e.yml run --rm --build rdma-e2e
 	@echo "==> e2e tests complete"
 
+# Run Agent-to-Controller E2E tests (requires Docker, no RDMA needed)
+test-e2e-controller:
+	@echo "==> Running Agent-to-Controller E2E tests..."
+	COMPOSE_FILE=docker-compose.e2e-controller.yml docker compose up --build --abort-on-container-exit e2e_test
+	@echo "==> E2E tests complete"
+
+# Clean up Agent-to-Controller E2E Docker resources
+clean-e2e-controller:
+	COMPOSE_FILE=docker-compose.e2e-controller.yml docker compose down -v
+
 # Clean build artifacts
 clean:
 	@echo "==> Cleaning build artifacts..."
@@ -83,19 +94,21 @@ help:
 	@echo "R-Pingmesh Rebuild Build System"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all             Build everything (default)"
-	@echo "  build           Build Zig library, generate proto, build Go"
-	@echo "  build-zig       Build Zig RDMA bridge static library"
-	@echo "  build-go        Build Go controller and agent binaries"
-	@echo "  build-controller Build controller binary only"
-	@echo "  build-agent     Build agent binary only"
-	@echo "  generate        Generate all code (proto)"
-	@echo "  generate-proto  Generate protobuf Go code"
-	@echo "  test            Run tests"
-	@echo "  test-go         Run Go tests"
-	@echo "  setup-colima    Install rdma_rxe kernel module on Colima VM (run once)"
-	@echo "  test-e2e        Run RDMA e2e tests via Docker (requires Colima)"
-	@echo "  clean           Remove all build artifacts"
+	@echo "  all                  Build everything (default)"
+	@echo "  build                Build Zig library, generate proto, build Go"
+	@echo "  build-zig            Build Zig RDMA bridge static library"
+	@echo "  build-go             Build Go controller and agent binaries"
+	@echo "  build-controller     Build controller binary only"
+	@echo "  build-agent          Build agent binary only"
+	@echo "  generate             Generate all code (proto)"
+	@echo "  generate-proto       Generate protobuf Go code"
+	@echo "  test                 Run tests"
+	@echo "  test-go              Run Go tests"
+	@echo "  setup-colima         Install rdma_rxe kernel module on Colima VM (run once)"
+	@echo "  test-e2e             Run RDMA e2e tests via Docker (requires Colima)"
+	@echo "  test-e2e-controller  Run Agent-to-Controller E2E tests (Docker)"
+	@echo "  clean-e2e-controller Clean up Agent-to-Controller E2E Docker resources"
+	@echo "  clean                Remove all build artifacts"
 	@echo ""
 	@echo "Requirements:"
 	@echo "  Go 1.26+, Zig 0.16+, protoc, libibverbs-dev, librdmacm-dev"

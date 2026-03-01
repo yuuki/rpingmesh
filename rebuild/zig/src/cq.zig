@@ -303,6 +303,15 @@ fn processRecvClassic(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
     const src_qp: u32 = wc.src_qp;
 
     const slot_ptr = memory.getSlotPtr(queue.recv_buf, slot_index, types.NUM_RECV_SLOTS) catch return;
+
+    // IBV_WC_GRH (bit 0) indicates the driver wrote a GRH into the receive
+    // buffer.  For RoCEv2 UD this should always be set, but if it is not we
+    // cannot determine the sender's GID — repost the buffer and drop.
+    if ((wc.wc_flags & 1) == 0) {
+        memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {};
+        return;
+    }
+
     const grh_info = parseGRH(slot_ptr);
     const payload_ptr = slot_ptr + types.GRH_SIZE;
     const payload = parseProbePayload(payload_ptr);
@@ -415,6 +424,10 @@ pub fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
         // Slot index out of bounds - cannot process
         return;
     };
+
+    // Note: The extended CQ does not request IBV_WC_EX_WITH_FLAGS, so
+    // wc_flags is unavailable here.  For RoCEv2 UD the GRH is always
+    // present (the classic path checks IBV_WC_GRH as a defensive guard).
 
     // Parse GRH from the first 40 bytes of the receive buffer
     const grh_info = parseGRH(slot_ptr);

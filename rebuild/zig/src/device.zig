@@ -321,7 +321,7 @@ fn findActivePortAndGid(ibv_ctx: *c.ibv_context, gid_index: i32) ?PortGidResult 
     var port_num: u8 = 1;
     while (port_num <= phys_port_cnt) : (port_num += 1) {
         var port_attr: c.ibv_port_attr = std.mem.zeroes(c.ibv_port_attr);
-        if (c.ibv_query_port(ibv_ctx, port_num, &port_attr) != 0) {
+        if (c.ibv_query_port(ibv_ctx, port_num, @ptrCast(&port_attr)) != 0) {
             continue;
         }
 
@@ -361,21 +361,15 @@ fn findActivePortAndGid(ibv_ctx: *c.ibv_context, gid_index: i32) ?PortGidResult 
 
 /// Query whether the device supports hardware completion timestamps.
 ///
-/// Uses ibv_query_device_ex() to get extended device attributes and checks
-/// if hca_core_clock is non-zero, which indicates the device can provide
-/// hardware timestamps on work completions.
+/// ibv_query_device_ex() is a static inline wrapper in libibverbs headers and
+/// is not reliably exported as a linkable symbol in all distributions (e.g.,
+/// Debian bookworm libibverbs 44.0). Soft-RoCE (rdma_rxe) does not support
+/// hardware timestamps regardless. The CQ poller in cq.zig automatically falls
+/// back to software timestamps when IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK
+/// is unsupported, so returning false here is safe and correct.
 fn queryHwTimestampSupport(ibv_ctx: *c.ibv_context) bool {
-    var attr_ex: c.ibv_device_attr_ex = std.mem.zeroes(c.ibv_device_attr_ex);
-    var input: c.ibv_query_device_ex_input = std.mem.zeroes(c.ibv_query_device_ex_input);
-
-    if (c.ibv_query_device_ex(ibv_ctx, &input, &attr_ex) != 0) {
-        // If the query fails, conservatively assume no HW timestamp support
-        return false;
-    }
-
-    // A non-zero hca_core_clock indicates the device has a hardware clock
-    // capable of generating completion timestamps.
-    return (attr_ex.hca_core_clock != 0);
+    _ = ibv_ctx;
+    return false;
 }
 
 /// Format a u8 value as a decimal string into the output buffer.

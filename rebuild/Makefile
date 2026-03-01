@@ -2,7 +2,7 @@
 # Requires: Go 1.26+, Zig 0.16+, protoc, clang, libibverbs-dev, librdmacm-dev
 
 .PHONY: all build build-zig build-go build-controller build-agent \
-        generate generate-proto clean test test-go help
+        generate generate-proto clean test test-go test-e2e setup-colima help
 
 # Directories
 ZIG_DIR := zig
@@ -23,7 +23,7 @@ build: build-zig generate build-go
 # Build Zig static library
 build-zig:
 	@echo "==> Building Zig RDMA bridge library..."
-	cd $(ZIG_DIR) && zig build -Doptimize=ReleaseSafe
+	cd $(ZIG_DIR) && zig build
 	@echo "==> Zig library built: $(ZIG_OUT)/lib/librdmabridge.a"
 
 # Generate protobuf code
@@ -57,6 +57,20 @@ test-go:
 	go test -v ./internal/probe/...
 	@echo "==> Tests complete"
 
+# Install rdma_rxe kernel module on the Colima VM (run once before first test-e2e).
+# Requires colima to be running: colima start
+setup-colima:
+	@chmod +x scripts/setup-colima-rdma.sh
+	@bash scripts/setup-colima-rdma.sh
+
+# Run RDMA e2e tests via Docker (requires Colima or Docker with privileged containers).
+# Sets up two soft-RoCE devices (rxe0, rxe1) and runs TestRDMAE2E.
+# First-time setup: run 'make setup-colima' to install rdma_rxe on the Colima VM.
+test-e2e:
+	@echo "==> Running RDMA e2e tests (soft-RoCE, rxe0+rxe1)..."
+	docker compose -f docker-compose.e2e.yml run --rm --build rdma-e2e
+	@echo "==> e2e tests complete"
+
 # Clean build artifacts
 clean:
 	@echo "==> Cleaning build artifacts..."
@@ -79,7 +93,10 @@ help:
 	@echo "  generate-proto  Generate protobuf Go code"
 	@echo "  test            Run tests"
 	@echo "  test-go         Run Go tests"
+	@echo "  setup-colima    Install rdma_rxe kernel module on Colima VM (run once)"
+	@echo "  test-e2e        Run RDMA e2e tests via Docker (requires Colima)"
 	@echo "  clean           Remove all build artifacts"
 	@echo ""
 	@echo "Requirements:"
 	@echo "  Go 1.26+, Zig 0.16+, protoc, libibverbs-dev, librdmacm-dev"
+	@echo "  For test-e2e: colima running, run 'make setup-colima' first"

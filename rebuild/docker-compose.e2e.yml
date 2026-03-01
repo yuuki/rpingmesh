@@ -1,0 +1,27 @@
+# docker-compose.e2e.yml - RDMA e2e test environment using soft-RoCE.
+#
+# Creates two soft-RoCE devices inside a privileged container:
+#   rxe0 -> eth0   (prober)
+#   rxe1 -> dummy0 (responder, 10.200.0.1/24)
+#
+# Usage:
+#   make test-e2e
+#   docker compose -f docker-compose.e2e.yml run --rm rdma-e2e
+
+services:
+  rdma-e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+      args:
+        GO_VERSION: "1.26.0"
+        ZIG_VERSION: "0.15.2"
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - IPC_LOCK
+    network_mode: host
+    volumes:
+      - /lib/modules:/lib/modules:ro
+    working_dir: /workspace/rebuild

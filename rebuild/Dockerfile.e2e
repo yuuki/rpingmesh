@@ -1,0 +1,56 @@
+# Dockerfile.e2e - Build image for RDMA e2e tests using soft-RoCE on Colima.
+#
+# Builds the Zig RDMA bridge library and compiles the e2e test binary.
+# At runtime, the container loads rdma_rxe, creates two soft-RoCE devices
+# (rxe0 on eth0, rxe1 on dummy0), and runs TestRDMAE2E.
+#
+# Usage:
+#   docker compose -f docker-compose.e2e.yml run --rm rdma-e2e
+#
+# Requirements:
+#   - Privileged container with NET_ADMIN, SYS_ADMIN, IPC_LOCK capabilities
+#   - Host kernel with rdma_rxe and dummy module support
+
+FROM debian:bookworm-slim
+
+ARG GO_VERSION=1.26.0
+ARG ZIG_VERSION=0.15.2
+
+# Install runtime and build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils make gcc libc6-dev \
+        libibverbs-dev librdmacm-dev rdma-core \
+        iproute2 kmod iputils-ping iptables tcpdump \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Go from the official distribution
+RUN set -eux; \
+    DPKG_ARCH="$(dpkg --print-architecture)"; \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${DPKG_ARCH}.tar.gz" | tar -xz -C /usr/local; \
+    /usr/local/go/bin/go version
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPATH=/go
+
+# Install Zig (URL format: zig-<arch>-linux-<version>.tar.xz)
+RUN set -eux; \
+    DPKG_ARCH="$(dpkg --print-architecture)"; \
+    ZIG_ARCH="$([ "${DPKG_ARCH}" = "arm64" ] && echo "aarch64" || echo "x86_64")"; \
+    curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" \
+        | tar -xJ -C /usr/local; \
+    ln -sf "/usr/local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig; \
+    zig version
+
+WORKDIR /workspace/rebuild
+
+# Copy rebuild/ source tree
+COPY . .
+
+# Build the Zig RDMA bridge static library (librdmabridge.a)
+RUN make build-zig
+
+# Verify the e2e test package compiles with CGO and the bridge library
+RUN CGO_ENABLED=1 go test -c -o /dev/null ./e2e/
+
+RUN chmod +x scripts/run-e2e.sh
+
+ENTRYPOINT ["/workspace/rebuild/scripts/run-e2e.sh"]

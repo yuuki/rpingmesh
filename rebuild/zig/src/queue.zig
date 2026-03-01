@@ -26,8 +26,6 @@ const c = types.c;
 pub const QueueError = error{
     /// Memory allocation failed for the UdQueue struct.
     OutOfMemory,
-    /// ibv_create_comp_channel() returned null.
-    CreateCompChannelFailed,
     /// ibv_create_cq_ex() returned null (both HW and SW timestamp attempts).
     CreateCqFailed,
     /// ibv_create_qp() returned null.
@@ -80,17 +78,11 @@ pub fn createQueue(
     };
     errdefer std.heap.page_allocator.destroy(queue);
 
-    // Step 1: Create completion channel for event-driven CQ notification
-    const comp_channel = c.ibv_create_comp_channel(dev.ctx) orelse {
-        types.setLastError("ibv_create_comp_channel() failed");
-        return QueueError.CreateCompChannelFailed;
-    };
-    errdefer _ = c.ibv_destroy_comp_channel(comp_channel);
-
-    // Step 2: Create extended CQs with conditional HW timestamp support.
+    // Step 1: Create extended CQs with conditional HW timestamp support.
     // First try with wallclock timestamp; if the device does not support it
     // (returns EOPNOTSUPP/ENOTSUP), retry without the timestamp flag.
-    const cq_result = createExtendedCqs(dev, comp_channel) orelse {
+    // We use busy-polling (no completion channel) for simplicity and reliability.
+    const cq_result = createExtendedCqs(dev) orelse {
         // Error message already set by createExtendedCqs
         return QueueError.CreateCqFailed;
     };
@@ -101,19 +93,19 @@ pub fn createQueue(
         }
     }
 
-    // Step 3: Create the UD QP
+    // Step 2: Create the UD QP
     const qp = createUdQp(dev, cq_result.send_cq, cq_result.recv_cq) orelse {
         types.setLastError("ibv_create_qp() failed");
         return QueueError.CreateQpFailed;
     };
     errdefer _ = c.ibv_destroy_qp(qp);
 
-    // Step 4: Transition QP through INIT -> RTR -> RTS
+    // Step 3: Transition QP through INIT -> RTR -> RTS
     try transitionQpToInit(dev, qp);
     try transitionQpToRtr(qp);
     try transitionQpToRts(qp);
 
-    // Step 5: Allocate send and receive buffers
+    // Step 4: Allocate send and receive buffers
     const send_bufset = memory.allocateBuffers(dev, types.NUM_SEND_SLOTS) catch {
         types.setLastError("failed to allocate send buffers");
         return QueueError.BufferAllocFailed;
@@ -150,19 +142,18 @@ pub fn createQueue(
         .send_slot_states = [_]types.SlotState{types.SlotState.Free} ** types.NUM_SEND_SLOTS,
         .recv_slot_states = [_]types.SlotState{types.SlotState.Free} ** types.NUM_RECV_SLOTS,
         .running = std.atomic.Value(bool).init(false),
-        .comp_channel = comp_channel,
         .send_completion_ready = std.atomic.Value(bool).init(false),
         .send_completion_timestamp = std.atomic.Value(u64).init(0),
         .send_completion_status = std.atomic.Value(i32).init(0),
     };
 
-    // Step 6: Post initial receive buffers
+    // Step 5: Post initial receive buffers
     memory.postInitialRecvBuffers(qp, recv_bufset.mr, recv_bufset.buf, types.INITIAL_RECV_BUFFERS) catch {
         types.setLastError("failed to post initial recv buffers");
         return QueueError.PostRecvFailed;
     };
 
-    // Step 7: Start the CQ poller thread
+    // Step 6: Start the CQ poller thread
     cq.startCqPollerThread(queue) catch {
         types.setLastError("failed to start CQ poller thread");
         return QueueError.StartPollerFailed;
@@ -182,8 +173,7 @@ pub fn createQueue(
 ///   2. Destroy the QP
 ///   3. Free send/recv buffers and deregister MRs
 ///   4. Destroy CQs
-///   5. Destroy the completion channel
-///   6. Free the queue struct
+///   5. Free the queue struct
 pub fn destroyQueue(queue: *types.UdQueue) void {
     // Stop the CQ poller thread (sets running=false and joins)
     cq.stopCqPollerThread(queue);
@@ -195,22 +185,19 @@ pub fn destroyQueue(queue: *types.UdQueue) void {
     _ = c.ibv_dereg_mr(queue.send_mr);
     const send_total = @as(usize, types.NUM_SEND_SLOTS) * @as(usize, types.SLOT_SIZE);
     const send_slice = queue.send_buf[0..send_total];
-    std.heap.page_allocator.free(@alignCast(send_slice));
+    std.heap.page_allocator.free(send_slice);
 
     // Free recv buffers and deregister recv MR
     _ = c.ibv_dereg_mr(queue.recv_mr);
     const recv_total = @as(usize, types.NUM_RECV_SLOTS) * @as(usize, types.SLOT_SIZE);
     const recv_slice = queue.recv_buf[0..recv_total];
-    std.heap.page_allocator.free(@alignCast(recv_slice));
+    std.heap.page_allocator.free(recv_slice);
 
     // Destroy CQs (convert from ibv_cq_ex back to ibv_cq for destruction)
     destroyCqEx(queue.recv_cq);
     if (queue.send_cq != queue.recv_cq) {
         destroyCqEx(queue.send_cq);
     }
-
-    // Destroy the completion channel
-    _ = c.ibv_destroy_comp_channel(queue.comp_channel);
 
     // Free the queue struct
     std.heap.page_allocator.destroy(queue);
@@ -282,11 +269,12 @@ const ExtendedCqResult = struct {
 ///
 /// The Go implementation uses a single CQ for both send and recv. We follow the
 /// same pattern here: both send_cq and recv_cq point to the same CQ.
-fn createExtendedCqs(dev: *types.RdmaDevice, comp_channel: *c.ibv_comp_channel) ?ExtendedCqResult {
+/// No completion channel is used; the CQ poller uses busy polling instead.
+fn createExtendedCqs(dev: *types.RdmaDevice) ?ExtendedCqResult {
     var cq_attr = std.mem.zeroes(c.ibv_cq_init_attr_ex);
     cq_attr.cqe = types.CQ_SIZE;
     cq_attr.cq_context = null;
-    cq_attr.channel = comp_channel;
+    cq_attr.channel = null; // No completion channel; use busy polling
     cq_attr.comp_vector = 0;
 
     // Base flags: byte length and source QP are always needed

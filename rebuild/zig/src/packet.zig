@@ -417,8 +417,7 @@ pub fn sendProbe(
     const t1_ns = getMonotonicNs();
 
     // Perform the send
-    const t2_ns = sendPacketInternal(queue, target_gid, flow_label, target_qpn, &pkt, timeout_ms) catch |err| {
-        _ = err;
+    const t2_ns = sendPacketInternal(queue, target_gid, flow_label, target_qpn, &pkt, timeout_ms) catch {
         return SendResult{
             .t1_ns = t1_ns,
             .t2_ns = 0,
@@ -936,7 +935,7 @@ test "findFreeSendSlot and freeSendSlot basic behavior" {
 }
 
 test "findFreeSendSlot returns null when all slots busy" {
-    var states: [types.NUM_SEND_SLOTS]types.SlotState = [_]types.SlotState{.InUse} ** types.NUM_SEND_SLOTS;
+    const states: [types.NUM_SEND_SLOTS]types.SlotState = [_]types.SlotState{.InUse} ** types.NUM_SEND_SLOTS;
 
     // All slots are InUse, should not find any
     var found: ?u32 = null;
@@ -976,7 +975,7 @@ test "getMonotonicNs is monotonic" {
     for (0..1000) |i| {
         sum += i;
     }
-    _ = sum;
+    if (sum == 0) unreachable; // prevent optimizer from eliminating the loop
     const t2 = getMonotonicNs();
     try std.testing.expect(t2 >= t1);
 }

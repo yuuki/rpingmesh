@@ -200,11 +200,6 @@ pub const UdQueue = struct {
     /// during queue destruction to signal the poller to exit.
     running: std.atomic.Value(bool),
 
-    /// Completion channel for event-driven CQ notification.
-    /// Used with ibv_get_cq_event() / ibv_req_notify_cq() to block until
-    /// a completion arrives, avoiding busy-polling.
-    comp_channel: *c.ibv_comp_channel,
-
     // ----- Send completion signaling (synchronous send path) -----
 
     /// Atomic flag set by the CQ poller when a send completion is ready.
@@ -240,24 +235,34 @@ pub fn bytesToGid(bytes: [16]u8) c.ibv_gid {
     return c.ibv_gid{ .raw = bytes };
 }
 
-/// Format a 16-byte GID as a colon-separated hex string for display.
+/// Format a 16-byte GID as an IPv6-style colon-separated hex string.
 ///
-/// Produces output like "fe:80:00:00:00:00:00:00:00:00:00:00:00:00:00:01".
-/// The returned buffer is exactly 64 bytes: 47 chars of hex + colons,
-/// null-terminated, with remaining bytes zeroed.
+/// Produces 8 groups of 4 hex digits separated by colons, compatible with
+/// both standard IPv6 notation and InfiniBand GID notation used by
+/// probe.ParseGID in the Go layer.
+/// Example: "fe80:0000:0000:0000:0000:0000:0000:0001"
+///
+/// The returned buffer is 64 bytes: 39 chars used, null-terminated,
+/// remaining bytes zeroed.
 pub fn gidToString(gid_bytes: [16]u8) [64]u8 {
     const hex_chars = "0123456789abcdef";
     var result: [64]u8 = [_]u8{0} ** 64;
     var pos: usize = 0;
 
-    for (gid_bytes, 0..) |byte, i| {
-        if (i > 0) {
+    for (0..8) |group| {
+        if (group > 0) {
             result[pos] = ':';
             pos += 1;
         }
-        result[pos] = hex_chars[byte >> 4];
+        const hi = gid_bytes[group * 2];
+        const lo = gid_bytes[group * 2 + 1];
+        result[pos] = hex_chars[hi >> 4];
         pos += 1;
-        result[pos] = hex_chars[byte & 0x0f];
+        result[pos] = hex_chars[hi & 0x0f];
+        pos += 1;
+        result[pos] = hex_chars[lo >> 4];
+        pos += 1;
+        result[pos] = hex_chars[lo & 0x0f];
         pos += 1;
     }
     // Remaining bytes are already zero from initialization.
@@ -309,13 +314,21 @@ test "gidToBytes and bytesToGid roundtrip" {
     try std.testing.expectEqualSlices(u8, &original, &back);
 }
 
-test "gidToString produces colon-separated hex" {
+test "gidToString produces IPv6-style 8-group hex" {
     const gid_bytes = [16]u8{ 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
     const result = gidToString(gid_bytes);
-    const expected = "fe:80:00:00:00:00:00:00:00:00:00:00:00:00:00:01";
+    const expected = "fe80:0000:0000:0000:0000:0000:0000:0001";
     try std.testing.expectEqualStrings(expected, result[0..expected.len]);
     // Verify null termination
     try std.testing.expectEqual(@as(u8, 0), result[expected.len]);
+}
+
+test "gidToString IPv4-mapped GID" {
+    // ::ffff:10.200.0.1 in raw bytes
+    const gid_bytes = [16]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x0a, 0xc8, 0x00, 0x01 };
+    const result = gidToString(gid_bytes);
+    const expected = "0000:0000:0000:0000:0000:ffff:0ac8:0001";
+    try std.testing.expectEqualStrings(expected, result[0..expected.len]);
 }
 
 test "setLastError and getLastError" {

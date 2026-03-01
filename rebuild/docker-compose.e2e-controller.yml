@@ -1,0 +1,50 @@
+services:
+  # rqlite — distributed SQLite used by the controller's RNIC registry.
+  rqlite:
+    image: rqlite/rqlite:8.37.0
+    command: -http-addr "0.0.0.0:4001"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:4001/status"]
+      interval: 3s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # Controller — gRPC service that manages agent registration and pinglists.
+  controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    environment:
+      - RPINGMESH_DATABASE_URI=http://rqlite:4001
+      - RPINGMESH_LISTEN_ADDR=:50051
+      - RPINGMESH_LOG_LEVEL=debug
+    depends_on:
+      rqlite:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50051"]
+      interval: 3s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # E2E test runner — simulates agent behaviour via GRPCControllerClient.
+  e2e_test:
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e-controller
+    environment:
+      - CONTROLLER_ADDR=controller:50051
+      - RQLITE_URL=http://rqlite:4001
+      - CGO_ENABLED=0
+    depends_on:
+      controller:
+        condition: service_healthy
+    command: >
+      go test -v -count=1 -timeout 120s ./e2e/controller/...
+    restart: "no"
+
+volumes:
+  go_mod_cache:
+  go_build_cache:

@@ -1,11 +1,12 @@
-// Package e2e contains end-to-end tests that exercise the Agent-to-Controller
-// gRPC communication path through a real rqlite-backed Controller.
+// Package controller contains end-to-end tests that exercise the
+// Agent-to-Controller gRPC communication path through a real rqlite-backed
+// Controller.
 //
 // These tests require a running Controller (connected to rqlite). The
 // controller address is read from the CONTROLLER_ADDR environment variable
-// (default: "localhost:50051"). Use docker-compose.e2e.yml to start the
-// required infrastructure.
-package e2e
+// (default: "localhost:50051"). Use docker-compose.e2e-controller.yml to
+// start the required infrastructure.
+package controller
 
 import (
 	"context"

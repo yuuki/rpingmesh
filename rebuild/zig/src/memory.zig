@@ -86,7 +86,7 @@ pub fn allocateBuffers(dev: *types.RdmaDevice, num_slots: u32) MemoryError!Buffe
 
     // Allocate page-aligned memory. The page_allocator produces page-aligned
     // allocations by default, but we explicitly request the alignment.
-    const buf = std.heap.page_allocator.alignedAlloc(u8, PAGE_SIZE, total_size) catch {
+    const buf = std.heap.page_allocator.alignedAlloc(u8, @as(std.mem.Alignment, @enumFromInt(@ctz(@as(usize, PAGE_SIZE)))), total_size) catch {
         types.setLastError("failed to allocate page-aligned buffer");
         return MemoryError.AllocFailed;
     };
@@ -126,7 +126,7 @@ pub fn freeBuffers(buf_set: *BufferSet) void {
 
     // Free the page-aligned buffer
     const slice = buf_set.buf[0..buf_set.size];
-    std.heap.page_allocator.free(@alignCast(slice));
+    std.heap.page_allocator.free(slice);
 
     // Zero out the struct to prevent dangling pointer use
     buf_set.buf = undefined;

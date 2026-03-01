@@ -1,50 +1,27 @@
+# docker-compose.e2e.yml - RDMA e2e test environment using soft-RoCE.
+#
+# Creates two soft-RoCE devices inside a privileged container:
+#   rxe0 -> eth0   (prober)
+#   rxe1 -> dummy0 (responder, 10.200.0.1/24)
+#
+# Usage:
+#   make test-e2e
+#   docker compose -f docker-compose.e2e.yml run --rm rdma-e2e
+
 services:
-  # rqlite — distributed SQLite used by the controller's RNIC registry.
-  rqlite:
-    image: rqlite/rqlite:8.37.0
-    command: -http-addr "0.0.0.0:4001"
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:4001/status"]
-      interval: 3s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
-
-  # Controller — gRPC service that manages agent registration and pinglists.
-  controller:
-    build:
-      context: .
-      dockerfile: Dockerfile.controller
-    environment:
-      - RPINGMESH_DATABASE_URI=http://rqlite:4001
-      - RPINGMESH_LISTEN_ADDR=:50051
-      - RPINGMESH_LOG_LEVEL=debug
-    depends_on:
-      rqlite:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 50051"]
-      interval: 3s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
-
-  # E2E test runner — simulates agent behaviour via GRPCControllerClient.
-  e2e_test:
+  rdma-e2e:
     build:
       context: .
       dockerfile: Dockerfile.e2e
-    environment:
-      - CONTROLLER_ADDR=controller:50051
-      - RQLITE_URL=http://rqlite:4001
-      - CGO_ENABLED=0
-    depends_on:
-      controller:
-        condition: service_healthy
-    command: >
-      go test -v -count=1 -timeout 120s ./e2e/...
-    restart: "no"
-
-volumes:
-  go_mod_cache:
-  go_build_cache:
+      args:
+        GO_VERSION: "1.26.0"
+        ZIG_VERSION: "0.15.2"
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - IPC_LOCK
+    network_mode: host
+    volumes:
+      - /lib/modules:/lib/modules:ro
+    working_dir: /workspace/rebuild

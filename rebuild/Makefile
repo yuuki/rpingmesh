@@ -2,7 +2,7 @@
 # Requires: Go 1.26+, Zig 0.16+, protoc, clang, libibverbs-dev, librdmacm-dev
 
 .PHONY: all build build-zig build-go build-controller build-agent \
-        generate generate-proto clean test test-go help
+        generate generate-proto clean test test-go test-e2e clean-e2e help
 
 # Directories
 ZIG_DIR := zig
@@ -57,6 +57,16 @@ test-go:
 	go test -v ./internal/probe/...
 	@echo "==> Tests complete"
 
+# Run Agent-to-Controller E2E tests (requires Docker)
+test-e2e:
+	@echo "==> Running Agent-to-Controller E2E tests..."
+	COMPOSE_FILE=docker-compose.e2e.yml docker compose up --build --abort-on-container-exit e2e_test
+	@echo "==> E2E tests complete"
+
+# Clean up E2E Docker resources
+clean-e2e:
+	COMPOSE_FILE=docker-compose.e2e.yml docker compose down -v
+
 # Clean build artifacts
 clean:
 	@echo "==> Cleaning build artifacts..."
@@ -79,7 +89,9 @@ help:
 	@echo "  generate-proto  Generate protobuf Go code"
 	@echo "  test            Run tests"
 	@echo "  test-go         Run Go tests"
+	@echo "  test-e2e        Run Agent-to-Controller E2E tests (Docker)"
 	@echo "  clean           Remove all build artifacts"
+	@echo "  clean-e2e       Clean up E2E Docker resources"
 	@echo ""
 	@echo "Requirements:"
 	@echo "  Go 1.26+, Zig 0.16+, protoc, libibverbs-dev, librdmacm-dev"

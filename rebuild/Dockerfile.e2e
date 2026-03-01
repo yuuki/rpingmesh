@@ -45,6 +45,9 @@ WORKDIR /workspace/rebuild
 # Copy rebuild/ source tree
 COPY . .
 
+# Resolve all Go module dependencies (go.mod starts minimal)
+RUN go mod tidy
+
 # Build the Zig RDMA bridge static library (librdmabridge.a)
 RUN make build-zig
 

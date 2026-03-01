@@ -91,6 +91,29 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string) (*MetricsCol
 		),
 	)
 
+	mc, err := registerInstruments(provider)
+	if err != nil {
+		return nil, err
+	}
+
+	mc.logger.Info().
+		Str("collector_addr", collectorAddr).
+		Dur("flush_interval", periodicReaderInterval).
+		Msg("MetricsCollector initialized")
+
+	return mc, nil
+}
+
+// NewMetricsCollectorWithProvider creates a MetricsCollector using the given
+// MeterProvider. This is intended for testing where the caller supplies a
+// provider backed by a ManualReader for in-memory metric verification.
+func NewMetricsCollectorWithProvider(provider *sdkmetric.MeterProvider) (*MetricsCollector, error) {
+	return registerInstruments(provider)
+}
+
+// registerInstruments creates histogram and counter instruments on the given
+// provider's meter and returns a MetricsCollector with all instruments wired up.
+func registerInstruments(provider *sdkmetric.MeterProvider) (*MetricsCollector, error) {
 	meter := provider.Meter("rpingmesh.agent")
 
 	// Register histogram instruments with explicit bucket boundaries
@@ -153,12 +176,6 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string) (*MetricsCol
 		return nil, err
 	}
 
-	logger := log.With().Str("component", "telemetry").Logger()
-	logger.Info().
-		Str("collector_addr", collectorAddr).
-		Dur("flush_interval", periodicReaderInterval).
-		Msg("MetricsCollector initialized")
-
 	return &MetricsCollector{
 		meterProvider:  provider,
 		networkRTT:     networkRTT,
@@ -167,7 +184,7 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string) (*MetricsCol
 		probeSuccess:   probeSuccess,
 		probeFailed:    probeFailed,
 		probeTotal:     probeTotal,
-		logger:         logger,
+		logger:         log.With().Str("component", "telemetry").Logger(),
 	}, nil
 }
 

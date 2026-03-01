@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl xz-utils make gcc libc6-dev \
         libibverbs-dev librdmacm-dev rdma-core \
         iproute2 kmod iputils-ping iptables tcpdump \
+        protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Go from the official distribution
@@ -44,6 +45,19 @@ WORKDIR /workspace/rebuild
 
 # Copy rebuild/ source tree
 COPY . .
+
+# Install protoc Go plugins for gRPC code generation
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest \
+    && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+# Resolve all Go module dependencies (go.mod starts minimal)
+RUN go mod tidy
+
+# Generate protobuf Go bindings (required before compiling packages that import them)
+RUN cd proto/controller_agent && \
+    protoc --go_out=. --go_opt=paths=source_relative \
+           --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+           controller_agent.proto
 
 # Build the Zig RDMA bridge static library (librdmabridge.a)
 RUN make build-zig

@@ -336,7 +336,7 @@ log "Starting RDMA e2e tests..."
 # Temporarily disable exit-on-error so post-test diagnostics always run.
 set +e
 env RDMA_E2E_ENABLED=1 \
-    go test -v -timeout 60s -run "^TestRDMAE2E" ./e2e/
+    go test -v -timeout 120s -run "^(TestRDMAE2E|TestProbeToOTelMetrics)" ./e2e/
 EXIT_CODE=$?
 set -e
 

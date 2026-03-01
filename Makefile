@@ -1,4 +1,4 @@
-.PHONY: build agent-up debugfs-volume generate-config generate-proto generate-bpf generate test-controller test-agent test clean-compose build-local build-debug
+.PHONY: build agent-up debugfs-volume generate-config generate-proto generate-bpf generate test-controller test-agent test test-e2e clean-compose build-local build-debug
 
 # Default configuration
 VERSION := 0.1.0
@@ -107,6 +107,11 @@ test-agent:
 test:
 	@echo "Running all tests with Docker..."
 	@KERNEL_VERSION=$(KERNEL_VERSION) docker compose -f docker-compose.test.yml up --build controller_test agent_test --abort-on-container-exit
+
+# Run RDMA e2e tests via rebuild/ (requires Colima or Docker with privileged containers)
+# Sets up two soft-RoCE devices (rxe0 on eth0, rxe1 on dummy0) and runs TestRDMAE2E.
+test-e2e:
+	@$(MAKE) -C rebuild test-e2e
 
 test-local:
 	@echo "Running all Go tests locally"

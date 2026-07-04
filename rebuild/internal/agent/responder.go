@@ -4,7 +4,6 @@ package agent
 
 import (
 	"context"
-	"encoding/binary"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,8 +25,15 @@ type Responder struct {
 	ring    *rdmabridge.EventRing
 	device  *rdmabridge.Device
 	running atomic.Bool
+	stopMu  sync.Mutex    // guards stopCh (re)creation across Start/Stop
+	stopCh  chan struct{} // closed by Stop() to wake the process loop immediately
 	wg      sync.WaitGroup
-	logger  zerolog.Logger
+
+	// queueMu guards access to the queue pointer so that GetQueueInfo cannot
+	// race with Destroy() setting queue to nil.
+	queueMu sync.RWMutex
+
+	logger zerolog.Logger
 }
 
 // NewResponder creates a new Responder with a responder-type RDMA queue
@@ -56,6 +62,13 @@ func (r *Responder) Start(ctx context.Context) error {
 		return nil // already running
 	}
 
+	// Recreate stopCh so the responder can be restarted after a previous
+	// Stop() closed it. Stop() has already waited for the old goroutine to
+	// exit (running is false here), so nothing references the old channel.
+	r.stopMu.Lock()
+	r.stopCh = make(chan struct{})
+	r.stopMu.Unlock()
+
 	r.wg.Add(1)
 	go r.processLoop(ctx)
 
@@ -66,11 +79,15 @@ func (r *Responder) Start(ctx context.Context) error {
 }
 
 // Stop signals the responder to stop processing and waits for the
-// background goroutine to exit.
+// background goroutine to exit. Closing stopCh wakes the loop immediately
+// instead of waiting out an idle sleep or a long in-flight ACK batch.
 func (r *Responder) Stop() {
 	if !r.running.CompareAndSwap(true, false) {
 		return // not running
 	}
+	r.stopMu.Lock()
+	close(r.stopCh)
+	r.stopMu.Unlock()
 	r.wg.Wait()
 	r.logger.Info().Msg("Responder stopped")
 }
@@ -87,22 +104,57 @@ func (r *Responder) processLoop(ctx context.Context) {
 		idleSleep = 100 * time.Microsecond
 	)
 
+	// idleTimer is reused on each empty-poll iteration to avoid allocating a
+	// new timer on every spin.
+	idleTimer := time.NewTimer(idleSleep)
+	defer idleTimer.Stop()
+
 	for r.running.Load() {
-		// Check for context cancellation.
+		// Check for shutdown or context cancellation on every iteration.
 		select {
 		case <-ctx.Done():
 			r.running.Store(false)
+			return
+		case <-r.stopCh:
 			return
 		default:
 		}
 
 		events := r.ring.Poll(maxBatch)
 		if len(events) == 0 {
-			time.Sleep(idleSleep)
+			// No events yet; wait briefly, but wake immediately on shutdown so
+			// Stop() is not delayed by the idle sleep.
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(idleSleep)
+			select {
+			case <-ctx.Done():
+				r.running.Store(false)
+				return
+			case <-r.stopCh:
+				return
+			case <-idleTimer.C:
+			}
 			continue
 		}
 
 		for i := range events {
+			// Each handleEvent may block for up to two ACK sends
+			// (ackSendTimeoutMS each). Across a full batch that is many
+			// seconds, so check for shutdown before every event to keep Stop()
+			// responsive.
+			select {
+			case <-ctx.Done():
+				r.running.Store(false)
+				return
+			case <-r.stopCh:
+				return
+			default:
+			}
 			r.handleEvent(&events[i])
 		}
 	}
@@ -189,8 +241,14 @@ func (r *Responder) handleEvent(event *rdmabridge.CompletionEvent) {
 
 // GetQueueInfo returns the queue metadata (QPN, timestamp mode) for
 // registration with the controller so that remote probers know where
-// to send probes.
+// to send probes. It is safe to call after Destroy(): a zero-valued QueueInfo
+// is returned once the queue has been torn down.
 func (r *Responder) GetQueueInfo() rdmabridge.QueueInfo {
+	r.queueMu.RLock()
+	defer r.queueMu.RUnlock()
+	if r.queue == nil {
+		return rdmabridge.QueueInfo{}
+	}
 	return r.queue.Info
 }
 
@@ -198,10 +256,12 @@ func (r *Responder) GetQueueInfo() rdmabridge.QueueInfo {
 // RDMA queue, freeing all associated resources (QP, CQ, MRs).
 func (r *Responder) Destroy() {
 	r.Stop()
+	r.queueMu.Lock()
 	if r.queue != nil {
 		r.queue.Destroy()
 		r.queue = nil
 	}
+	r.queueMu.Unlock()
 	r.logger.Info().Msg("Responder destroyed")
 }
 
@@ -224,15 +284,20 @@ func (r *Responder) Destroy() {
 func buildRecvPacketPayload(event *rdmabridge.CompletionEvent) []byte {
 	buf := make([]byte, rdmabridge.ProbePacketSize)
 
-	buf[0] = rdmabridge.PacketVersion
-	buf[1] = rdmabridge.MsgTypeProbe
-	buf[2] = rdmabridge.AckTypeNone
-	buf[3] = event.Flags
-	binary.BigEndian.PutUint64(buf[4:12], event.SequenceNum)
-	binary.BigEndian.PutUint64(buf[12:20], event.T1)
-	binary.BigEndian.PutUint64(buf[20:28], event.T3)
-	binary.BigEndian.PutUint64(buf[28:36], event.T4)
-	// bytes 36-39: reserved padding (already zero from make)
+	// Reuse the single canonical wire-format serializer so the offset layout
+	// lives in exactly one place (rdmabridge.SerializeProbePacket) rather than
+	// being re-implemented here.
+	pkt := &rdmabridge.ProbePacket{
+		Version:     rdmabridge.PacketVersion,
+		MsgType:     rdmabridge.MsgTypeProbe,
+		AckType:     rdmabridge.AckTypeNone,
+		Flags:       event.Flags,
+		SequenceNum: event.SequenceNum,
+		T1:          event.T1,
+		T3:          event.T3,
+		T4:          event.T4,
+	}
+	rdmabridge.SerializeProbePacket(pkt, buf)
 
 	return buf
 }

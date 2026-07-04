@@ -104,7 +104,7 @@ func TestCalculateRTT_ExceedsMaxSaneRTT(t *testing.T) {
 		T1: 1_000_000_000,
 		T2: 1_000_000_000,
 		T3: 2_000_000_000,
-		T4: 2_000_000_001,                        // Tiny responder delay
+		T4: 2_000_000_001,                          // Tiny responder delay
 		T5: 1_000_000_000 + uint64(11*time.Second), // 11s round trip
 		T6: 1_000_000_000 + uint64(12*time.Second),
 	}
@@ -146,6 +146,52 @@ func TestCalculateRTT_ExceedsMaxSaneDelay(t *testing.T) {
 	rtt := CalculateRTT(result)
 	if rtt.Valid {
 		t.Fatal("expected invalid RTT result when ResponderDelay exceeds max sane bound")
+	}
+}
+
+func TestCalculateRTT_NegativeProberDelay(t *testing.T) {
+	// A negative ProberDelay = (T6-T1) - (T5-T2) indicates clock skew or a
+	// T1/T6 clock-domain mismatch. Here (T5-T2) exceeds (T6-T1) while
+	// NetworkRTT and ResponderDelay stay valid, so the ProberDelay check is
+	// the one that must reject the result.
+	result := &ProbeResult{
+		T1: 100_000,
+		T2: 100_000, // T5-T2 = 200000
+		T3: 150_000,
+		T4: 151_000, // ResponderDelay = 1000 (valid)
+		T5: 300_000, // NetworkRTT = (300000-100000) - 1000 = 199000 (valid)
+		T6: 250_000, // T6-T1 = 150000 < T5-T2 = 200000 => ProberDelay = -50000
+	}
+
+	rtt := CalculateRTT(result)
+	if rtt.Valid {
+		t.Fatal("expected invalid RTT result for negative ProberDelay")
+	}
+	if rtt.ProberDelay >= 0 {
+		t.Errorf("expected negative ProberDelay, got %d", rtt.ProberDelay)
+	}
+}
+
+func TestCalculateRTT_ExceedsMaxSaneProberDelay(t *testing.T) {
+	// ProberDelay exceeds the 1s bound while all other components stay valid.
+	// This is the signature of a wall-clock-contaminated T6 (the exact bug the
+	// T6 clock-domain fix addresses): T6 sits ~2s beyond T1 in an unrelated
+	// domain, inflating (T6-T1) far past (T5-T2).
+	result := &ProbeResult{
+		T1: 100_000,
+		T2: 100_000, // T5-T2 = 200000
+		T3: 150_000,
+		T4: 151_000, // ResponderDelay = 1000 (valid)
+		T5: 300_000, // NetworkRTT = 199000 (valid)
+		T6: 300_000 + uint64(2*time.Second),
+	}
+
+	rtt := CalculateRTT(result)
+	if rtt.Valid {
+		t.Fatal("expected invalid RTT result when ProberDelay exceeds max sane bound")
+	}
+	if rtt.ProberDelay <= MaxSaneDelay {
+		t.Errorf("expected ProberDelay > MaxSaneDelay, got %d", rtt.ProberDelay)
 	}
 }
 
@@ -299,12 +345,12 @@ func TestCalculateRTT_RealisticTimestamps(t *testing.T) {
 	baseNS := uint64(1_000_000_000_000) // 1000 seconds in nanoseconds
 
 	result := &ProbeResult{
-		T1: baseNS,                  // Prober starts sending
-		T2: baseNS + 1_000,         // 1us later: NIC send completion
-		T3: baseNS + 25_000,        // 25us later: responder receives
-		T4: baseNS + 26_000,        // 1us responder processing
-		T5: baseNS + 51_000,        // 51us from T1: first ACK arrives at prober
-		T6: baseNS + 52_000,        // 1us later: second ACK arrives
+		T1: baseNS,          // Prober starts sending
+		T2: baseNS + 1_000,  // 1us later: NIC send completion
+		T3: baseNS + 25_000, // 25us later: responder receives
+		T4: baseNS + 26_000, // 1us responder processing
+		T5: baseNS + 51_000, // 51us from T1: first ACK arrives at prober
+		T6: baseNS + 52_000, // 1us later: second ACK arrives
 	}
 
 	rtt := CalculateRTT(result)

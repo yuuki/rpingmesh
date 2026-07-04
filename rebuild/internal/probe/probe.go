@@ -49,7 +49,7 @@ type ProbeResult struct {
 	T3             uint64 // Responder recv timestamp (NIC HW or SW)
 	T4             uint64 // Responder first ACK send completion timestamp
 	T5             uint64 // Prober first ACK recv timestamp (NIC HW or SW)
-	T6             uint64 // Prober second ACK recv time (Go MONOTONIC)
+	T6             uint64 // Prober second ACK recv time (CLOCK_MONOTONIC, same domain as T1)
 	Success        bool
 	ErrorMessage   string
 	TargetIP       string
@@ -170,6 +170,32 @@ func CalculateRTT(result *ProbeResult) *RTTResult {
 			ResponderDelay:  responderDelay,
 			Valid:           false,
 			ValidationError: fmt.Sprintf("ResponderDelay (%d ns) exceeds max sane bound (%d ns)", responderDelay, MaxSaneDelay),
+		}
+	}
+
+	// Validate: ProberDelay must be non-negative. A negative value indicates
+	// clock skew or a T6/T1 clock-domain mismatch (T1 and T6 must both be
+	// CLOCK_MONOTONIC on the prober host for this term to be meaningful).
+	if proberDelay < 0 {
+		return &RTTResult{
+			NetworkRTT:      networkRTT,
+			ProberDelay:     proberDelay,
+			ResponderDelay:  responderDelay,
+			Valid:           false,
+			ValidationError: fmt.Sprintf("negative ProberDelay (%d ns) indicates clock skew or T1/T6 clock-domain mismatch", proberDelay),
+		}
+	}
+
+	// Validate: ProberDelay should not exceed the sanity bound. This mirrors
+	// the ResponderDelay check so that a corrupted or wall-clock-contaminated
+	// T6 cannot slip through as a valid measurement.
+	if proberDelay > MaxSaneDelay {
+		return &RTTResult{
+			NetworkRTT:      networkRTT,
+			ProberDelay:     proberDelay,
+			ResponderDelay:  responderDelay,
+			Valid:           false,
+			ValidationError: fmt.Sprintf("ProberDelay (%d ns) exceeds max sane bound (%d ns)", proberDelay, MaxSaneDelay),
 		}
 	}
 

@@ -29,9 +29,21 @@ const (
 	DefaultInterTorSampleSize = 5
 )
 
+// dbConn is the subset of gorqlite.Connection's API used by RnicRegistry. It
+// is declared here, at the point of use, so that RnicRegistry's methods can
+// be unit tested against a fake connection instead of a real rqlite-backed
+// one.
+type dbConn interface {
+	Close()
+	WriteOneContext(ctx context.Context, sqlStatement string) (gorqlite.WriteResult, error)
+	WriteOneParameterizedContext(ctx context.Context, statement gorqlite.ParameterizedStatement) (gorqlite.WriteResult, error)
+	WriteParameterizedContext(ctx context.Context, sqlStatements []gorqlite.ParameterizedStatement) ([]gorqlite.WriteResult, error)
+	QueryOneParameterizedContext(ctx context.Context, statement gorqlite.ParameterizedStatement) (gorqlite.QueryResult, error)
+}
+
 // RnicRegistry manages RNIC information stored in rqlite.
 type RnicRegistry struct {
-	conn *gorqlite.Connection
+	conn dbConn
 
 	// activeThresholdSec is the "active" window (seconds) used by queries
 	// that only consider recently-updated RNIC entries.
@@ -132,39 +144,53 @@ func (r *RnicRegistry) initializeSchema() error {
 	return nil
 }
 
-// RegisterRNICs upserts all of the given RNIC entries for a single agent as
-// one atomic rqlite transaction (WriteParameterizedContext executes all
-// statements as a single transaction). This guarantees that a partial
-// failure (e.g. a constraint violation on one RNIC) never leaves some of the
-// agent's RNICs registered while others are silently dropped. The
-// last_updated_epoch field is set to the current Unix timestamp (seconds)
-// for every row.
+// RegisterRNICs replaces the full set of RNIC entries registered for a
+// single agent as one atomic rqlite transaction (WriteParameterizedContext
+// executes all statements as a single transaction): it first deletes every
+// existing row for agentID, then inserts one row per entry in rnics. This
+// set-replacement semantics (rather than a per-RNIC upsert) ensures that
+// RNICs no longer reported by the agent (e.g. a NIC removed, an allowlist
+// change, or a QP recreated with a new QPN) are removed immediately instead
+// of lingering in the registry - and therefore in pinglists - until the
+// stale-threshold window expires. This holds even when rnics is empty (the
+// agent currently has no RNICs at all): the DELETE still runs, on its own,
+// so the agent's previously-registered rows don't linger either. This is
+// safe for the agent's periodic heartbeat re-registration too, since the
+// agent always sends its complete current RNIC set on every registration
+// and heartbeat call (see buildRegistrationRequest in
+// internal/agent/agent.go), never a partial delta. The whole operation
+// still runs in a single transaction, so a partial failure (e.g. a
+// constraint violation on one RNIC) never leaves the agent with some RNICs
+// deleted and none re-inserted. The last_updated_epoch field is set to the
+// current Unix timestamp (seconds) for every row.
 func (r *RnicRegistry) RegisterRNICs(
 	ctx context.Context,
 	agentID string,
 	agentIP string,
 	rnics []*controller_agent.RnicInfo,
 ) error {
-	if len(rnics) == 0 {
-		return nil
-	}
-
 	log.Info().
 		Str("agentID", agentID).
 		Int("rnicCount", len(rnics)).
 		Msg("Registering RNICs")
 
-	upsertSQL := `
+	deleteSQL := `DELETE FROM rnics WHERE agent_id = ?;`
+
+	insertSQL := `
 	INSERT OR REPLACE INTO rnics
 	(rnic_gid, qpn, agent_id, agent_ip, rnic_ip, tor_id, hostname, device_name, last_updated_epoch)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`
 
 	now := time.Now().Unix()
 
-	statements := make([]gorqlite.ParameterizedStatement, 0, len(rnics))
+	statements := make([]gorqlite.ParameterizedStatement, 0, len(rnics)+1)
+	statements = append(statements, gorqlite.ParameterizedStatement{
+		Query:     deleteSQL,
+		Arguments: []interface{}{agentID},
+	})
 	for _, rnic := range rnics {
 		statements = append(statements, gorqlite.ParameterizedStatement{
-			Query: upsertSQL,
+			Query: insertSQL,
 			Arguments: []interface{}{
 				rnic.GetGid(),
 				rnic.GetQpn(),
@@ -181,10 +207,14 @@ func (r *RnicRegistry) RegisterRNICs(
 
 	results, err := r.conn.WriteParameterizedContext(ctx, statements)
 	if err != nil {
-		return fmt.Errorf("failed to register RNICs: %w", err)
+		return fmt.Errorf("failed to replace RNICs: %w", err)
 	}
 
-	for i, res := range results {
+	if results[0].Err != nil {
+		return fmt.Errorf("failed to delete stale RNICs for agent %s: %w", agentID, results[0].Err)
+	}
+
+	for i, res := range results[1:] {
 		if res.Err != nil {
 			return fmt.Errorf("failed to register RNIC %s: %w", rnics[i].GetGid(), res.Err)
 		}

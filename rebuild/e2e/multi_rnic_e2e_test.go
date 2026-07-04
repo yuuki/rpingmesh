@@ -55,14 +55,14 @@ func TestMultiRNICBothDevicesProbe(t *testing.T) {
 	defer rdmaCtx.Destroy()
 
 	// --- Devices: rxe0 and rxe1, each acting as BOTH a prober and a responder ---
-	devA, err := rdmaCtx.OpenDeviceByName(proberDeviceName, gidIndex)
+	devA, err := rdmaCtx.OpenDeviceByName(proberDeviceName, gidIndex, testServiceLevel, testTrafficClass)
 	if err != nil {
 		t.Fatalf("open device %q: %v", proberDeviceName, err)
 	}
 	defer devA.Close()
 	t.Logf("device A (%s): GID=%s IP=%s", proberDeviceName, devA.Info.GID, devA.Info.IPAddr)
 
-	devB, err := rdmaCtx.OpenDeviceByName(responderDeviceName, gidIndex)
+	devB, err := rdmaCtx.OpenDeviceByName(responderDeviceName, gidIndex, testServiceLevel, testTrafficClass)
 	if err != nil {
 		t.Fatalf("open device %q: %v", responderDeviceName, err)
 	}

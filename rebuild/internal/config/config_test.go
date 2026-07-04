@@ -318,6 +318,51 @@ func TestLoadAgentConfig_NegativeGIDIndex(t *testing.T) {
 	}
 }
 
+func TestLoadAgentConfig_ServiceLevelAndTrafficClassDefaults(t *testing.T) {
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ServiceLevel != 0 {
+		t.Errorf("ServiceLevel = %d, want 0", cfg.ServiceLevel)
+	}
+	if cfg.TrafficClass != 0 {
+		t.Errorf("TrafficClass = %d, want 0", cfg.TrafficClass)
+	}
+}
+
+func TestLoadAgentConfig_NegativeServiceLevel(t *testing.T) {
+	t.Setenv("RPINGMESH_SERVICE_LEVEL", "-1")
+
+	if _, err := LoadAgentConfig("", nil); err == nil {
+		t.Fatal("expected an error for a negative service_level, got nil")
+	}
+}
+
+func TestLoadAgentConfig_ServiceLevelExceedsMax(t *testing.T) {
+	t.Setenv("RPINGMESH_SERVICE_LEVEL", "8")
+
+	if _, err := LoadAgentConfig("", nil); err == nil {
+		t.Fatal("expected an error for service_level=8 (max is 7), got nil")
+	}
+}
+
+func TestLoadAgentConfig_NegativeTrafficClass(t *testing.T) {
+	t.Setenv("RPINGMESH_TRAFFIC_CLASS", "-1")
+
+	if _, err := LoadAgentConfig("", nil); err == nil {
+		t.Fatal("expected an error for a negative traffic_class, got nil")
+	}
+}
+
+func TestLoadAgentConfig_TrafficClassExceedsMax(t *testing.T) {
+	t.Setenv("RPINGMESH_TRAFFIC_CLASS", "256")
+
+	if _, err := LoadAgentConfig("", nil); err == nil {
+		t.Fatal("expected an error for traffic_class=256 (max is 255), got nil")
+	}
+}
+
 func TestLoadAgentConfig_ZeroProbeInterval(t *testing.T) {
 	t.Setenv("RPINGMESH_PROBE_INTERVAL_MS", "0")
 
@@ -350,6 +395,46 @@ func TestAgentConfig_Validate(t *testing.T) {
 		{
 			name:    "zero flow label rotation period",
 			cfg:     AgentConfig{GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 0},
+			wantErr: true,
+		},
+		{
+			name: "valid service level and traffic class at bounds",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				ServiceLevel: 7, TrafficClass: 255,
+			},
+			wantErr: false,
+		},
+		{
+			name: "negative service level",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				ServiceLevel: -1,
+			},
+			wantErr: true,
+		},
+		{
+			name: "service level exceeds max",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				ServiceLevel: 8,
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative traffic class",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				TrafficClass: -1,
+			},
+			wantErr: true,
+		},
+		{
+			name: "traffic class exceeds max",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				TrafficClass: 256,
+			},
 			wantErr: true,
 		},
 	}

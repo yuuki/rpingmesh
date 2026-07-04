@@ -14,7 +14,7 @@ All commands must be run from within the `rebuild/` directory. This is a separat
 
 ```bash
 make build           # Full pipeline: Zig library → protobuf codegen → Go binaries
-make build-zig       # Build zig/zig-out/lib/librdmabridge.a only (requires Zig 0.16+)
+make build-zig       # Build zig/zig-out/lib/librdmabridge.a only (requires Zig 0.15.2)
 make generate-proto  # Regenerate protobuf Go bindings
 make build-controller  # CGO_ENABLED=0, no Zig link
 make build-agent       # CGO_ENABLED=1, links librdmabridge.a
@@ -30,9 +30,11 @@ After modifying Zig source in `zig/src/`: run `make build-zig` before `make buil
 make test                                       # go test -v ./internal/probe/... (pure Go, no RDMA hardware needed)
 go test -v ./internal/probe/... -run TestName  # Run a specific test
 go test -race ./internal/probe/...             # Run with race detector
+make vet                                        # go vet ./...
+make test-all                                   # go test on all packages except ./e2e/... (Linux, full CGO/RDMA build env)
 ```
 
-The `internal/probe/` package is the only package with tests that run without RDMA hardware. Tests requiring actual RDMA devices or soft-RoCE must be run on Linux with the appropriate hardware.
+The `internal/probe/` package is the only package guaranteed to have tests that run without RDMA hardware; other packages may or may not have tests depending on what has been added. `make test-all` runs everything except `./e2e/...`, which requires either live infrastructure (`test-e2e-controller`) or RDMA hardware/soft-RoCE (`test-e2e`) and is exercised via those dedicated targets instead. Tests requiring actual RDMA devices or soft-RoCE must be run on Linux with the appropriate hardware.
 
 ## Architecture
 
@@ -46,7 +48,7 @@ R-Pingmesh rebuild is a clean-room redesign of the SIGCOMM 2024 R-Pingmesh syste
 
 **Ring buffer event delivery** — Zig's CQ poller thread writes `rdma_completion_event_t` into a lock-free SPSC ring buffer. Go polls via `rdma_event_ring_poll()` in a goroutine — never as a Cgo callback. This is why `EventRing` must be created *before* `Queue` and passed into `rdma_create_queue()`. The ring is shared between the Zig producer and Go consumer across `internal/rdmabridge/bridge.go` ↔ `zig/src/ring.zig`.
 
-**40-byte BigEndian wire format** — The probe packet uses explicit BigEndian serialization (no packed structs). The format is defined in `zig/src/packet.zig` and must stay in sync with `internal/probe/types.go`. Both sides implement independent `serialize`/`deserialize` functions. A version byte at offset 0 enables future format changes.
+**40-byte BigEndian wire format** — The probe packet uses explicit BigEndian serialization (no packed structs). The format is defined in `zig/src/packet.zig` (send/recv, GRH parsing) and must stay in sync with the Go side of the bridge: `internal/rdmabridge/bridge.go` (Serialize/Deserialize across the Cgo boundary) and `internal/agent/responder.go` (interprets the decoded fields). Both sides implement independent `serialize`/`deserialize` functions. A version byte at offset 0 enables future format changes.
 
 **Sequence number format** — `high 32 bits = random agentEpoch | low 32 bits = monotonic counter`. The epoch is randomised on startup to prevent ACK misrouting after agent restarts. Defined in `internal/agent/prober.go`.
 
@@ -78,7 +80,7 @@ The Zig library exposes a C-ABI defined in `zig/include/rdma_bridge.h`. The Go b
 | T3 | Responder NIC HW recv completion | `zig/src/cq.zig` on responder |
 | T4 | Responder NIC HW first-ACK send completion | `zig/src/cq.zig` on responder |
 | T5 | Prober NIC HW first-ACK recv completion | `zig/src/cq.zig` on prober |
-| T6 | Go `time.Now().UnixNano()` when second ACK is processed | `internal/agent/prober.go` |
+| T6 | Go `CLOCK_MONOTONIC` via `unix.ClockGettime()` when second ACK is processed | `internal/agent/prober.go` |
 
 Metrics: `NetworkRTT = (T5-T2)-(T4-T3)`, `ProberDelay = (T6-T1)-(T5-T2)`, `ResponderDelay = T4-T3`.
 
@@ -102,7 +104,7 @@ Environment variables: `RQLITE_DB_URI` for controller database connection.
 ## Requirements
 
 - Go 1.26+
-- Zig 0.16+
+- Zig 0.15.2 (the version verified in e2e/CI; see `build.zig`, `Dockerfile.e2e`, `docker-compose.e2e.yml`)
 - protoc, protoc-gen-go, protoc-gen-go-grpc
 - libibverbs-dev, librdmacm-dev (Linux only; for agent build and RDMA testing)
 - rqlite (for controller and integration tests)

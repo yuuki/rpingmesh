@@ -83,7 +83,7 @@ Prober                          Responder
 | T3 | NIC recv completion (CQ) | HW wallclock (fallback: SW) |
 | T4 | NIC send completion (CQ) | HW wallclock (fallback: SW) |
 | T5 | NIC recv completion (CQ) | HW wallclock (fallback: SW) |
-| T6 | Go, upon processing second ACK | `time.Now()` (Go monotonic) |
+| T6 | Go, upon processing second ACK | `CLOCK_MONOTONIC` via `unix.ClockGettime()` |
 
 HW timestamp support is detected at device open time via `ibv_query_device_ex`.
 When HW timestamps are unavailable (`EOPNOTSUPP`), software timestamps from
@@ -161,7 +161,7 @@ rebuild/
 | Dependency | Version | Purpose |
 |------------|---------|---------|
 | Go | 1.26.0+ | Agent and controller binaries |
-| Zig | 0.16+ | RDMA data-path library |
+| Zig | 0.15.2 | RDMA data-path library (the version verified in e2e/CI; see `build.zig`, `Dockerfile.e2e`) |
 | protoc | 3.x | Protocol buffer compilation |
 | protoc-gen-go | latest | Go protobuf codegen |
 | protoc-gen-go-grpc | latest | Go gRPC codegen |
@@ -416,6 +416,14 @@ sudo rdma link add rxe0 type rxe netdev eth0
 # Then run the agent against a local controller and rqlite instance
 ```
 
+> **Note:** `TestProbeToOTelMetrics` (the full probe-to-OTel e2e test, see
+> `make test-e2e`) asserts on the *shape* of the recorded metrics rather than
+> requiring every probe to succeed (`probeSuccess == 0` is tolerated). Under
+> soft-RoCE, software timestamps and the shared-namespace veth topology used
+> in CI are not guaranteed to produce a fully successful probe/ACK round
+> trip on every run, so this test does not guarantee the success path is
+> always exercised end-to-end.
+
 ## Development
 
 ### Modifying the Zig Library
@@ -457,9 +465,48 @@ sudo rdma link add rxe0 type rxe netdev eth0
 - **No TLS on gRPC.** Controller-agent communication uses plaintext gRPC, assuming
   a trusted internal network. mTLS can be added via gRPC transport credentials.
 
-- **No rate limiting on probe sends.** The `target_probe_rate_per_second` config
-  field is defined but not enforced with a token bucket. The probe interval
-  provides coarse rate control.
+- **Only a single, uniform probe rate cap.** The Prober enforces
+  `target_probe_rate_per_second` as a per-target cap (the aggregate limit
+  scales with the pinglist size). The paper's per-probe-type differentiated
+  rates (e.g. ToR-mesh probes at 10pps, with a separate rate for inter-ToR
+  probes) are not implemented.
+
+- **Inter-ToR pinglist coverage is a simplified random sample, not a
+  probabilistic ECMP coverage guarantee.** The paper's Eq. (1) derives the
+  number of samples needed to cover ECMP paths with a target probability;
+  this rebuild instead picks a fixed, configurable number of random ToRs
+  (`N`) without that coverage-probability derivation.
+
+- **No periodic 5-tuple rotation.** The paper rotates ~20% of probe 5-tuples
+  every hour to shift ECMP path selection over time and catch a wider set of
+  paths. This rebuild's `flow_label` is derived deterministically from
+  `(requester_gid, target_gid)` and does not rotate.
+
+- **Analyzer and Service Tracing remain out of scope.** As noted above, the
+  data-aggregation/anomaly-detection Analyzer (switch/link fault
+  localization, priority ranking) and eBPF-based service tracing from the
+  original design are not part of this rebuild.
+
+- **No agent self-protection.** There is no hard CPU/memory cap on the
+  agent process and no fail-closed behavior (e.g. backing off or shutting
+  down probing) when local resource usage or error rates spike.
+
+- **Address Handle `sl` / `traffic_class` are always 0.** `ibv_ah_attr`
+  fields used for PFC priority (service level) and DSCP (traffic class) are
+  not configurable. Deployments relying on PFC/DSCP-based QoS should be
+  aware probes do not carry the expected markings.
+
+- **No automatic recovery from RDMA device runtime failures.** If an RDMA
+  device fails or is removed after the agent has started, there is no
+  detection/re-initialization path; the affected Prober/Responder simply
+  stops functioning until the agent is restarted.
+
+- **No systemd unit or OS packaging.** Deployment artifacts (systemd units,
+  .deb/.rpm packages, etc.) are not provided. There is intentionally no
+  Agent Dockerfile: the agent binary requires `CGO_ENABLED=1` and a real (or
+  soft-RoCE) RDMA device, which is impractical to containerize generically;
+  only the Controller (`Dockerfile.controller`) and test-only images
+  (`Dockerfile.e2e`, `Dockerfile.e2e-controller`) are provided.
 
 ## References
 

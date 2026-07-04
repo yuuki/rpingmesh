@@ -233,15 +233,68 @@ func TestRegisterRNICs_TransactionErrorPropagates(t *testing.T) {
 	}
 }
 
-func TestRegisterRNICs_EmptyRNICsIsNoOp(t *testing.T) {
+func TestRegisterRNICs_EmptyRNICsStillDeletesAgentRows(t *testing.T) {
 	fake := &fakeConn{}
 	reg := newTestRegistry(fake)
 
+	// An agent whose current RNIC set became empty (all NICs lost, or all
+	// removed by an allowlist change) must still have its previously
+	// registered rows deleted - the empty set is itself the agent's current
+	// state, and set-replacement semantics apply just as much as when the
+	// set shrinks but isn't empty.
 	if err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(fake.writeParameterizedCalls) != 0 {
-		t.Errorf("WriteParameterizedContext called %d times, want 0 for an empty RNIC set", len(fake.writeParameterizedCalls))
+
+	if len(fake.writeParameterizedCalls) != 1 {
+		t.Fatalf("WriteParameterizedContext called %d times, want 1 (a delete-only batch)", len(fake.writeParameterizedCalls))
+	}
+	batch := fake.writeParameterizedCalls[0]
+	if len(batch) != 1 {
+		t.Fatalf("got %d statements, want 1 (just the DELETE, no RNICs to insert)", len(batch))
+	}
+	if !strings.Contains(batch[0].Query, "DELETE FROM rnics") {
+		t.Errorf("statement 0 query = %q, want a DELETE FROM rnics", batch[0].Query)
+	}
+	if len(batch[0].Arguments) != 1 || batch[0].Arguments[0] != "agent-1" {
+		t.Errorf("delete arguments = %v, want [agent-1]", batch[0].Arguments)
+	}
+}
+
+func TestRegisterRNICs_ReRegistrationWithEmptySetRemovesAllPreviousRows(t *testing.T) {
+	fake := &fakeConn{}
+	reg := newTestRegistry(fake)
+	ctx := context.Background()
+
+	// Register two different agents, each with their own RNICs.
+	if err := reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1"), testRnic("gid-2")}); err != nil {
+		t.Fatalf("agent-1 registration: unexpected error: %v", err)
+	}
+	if err := reg.RegisterRNICs(ctx, "agent-2", "10.0.0.2", []*controller_agent.RnicInfo{testRnic("gid-3")}); err != nil {
+		t.Fatalf("agent-2 registration: unexpected error: %v", err)
+	}
+
+	// agent-1 re-registers reporting no RNICs at all (e.g. every NIC was
+	// lost or removed from the allowlist). This must still delete agent-1's
+	// rows so they don't linger, scoped only to agent-1 - agent-2's rows
+	// must be untouched.
+	if err := reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", nil); err != nil {
+		t.Fatalf("agent-1 empty re-registration: unexpected error: %v", err)
+	}
+
+	if len(fake.writeParameterizedCalls) != 3 {
+		t.Fatalf("WriteParameterizedContext called %d times, want 3", len(fake.writeParameterizedCalls))
+	}
+
+	thirdBatch := fake.writeParameterizedCalls[2]
+	if len(thirdBatch) != 1 {
+		t.Fatalf("third batch has %d statements, want 1 (a delete-only batch)", len(thirdBatch))
+	}
+	if !strings.Contains(thirdBatch[0].Query, "DELETE FROM rnics") {
+		t.Fatalf("third batch statement 0 = %q, want a DELETE FROM rnics", thirdBatch[0].Query)
+	}
+	if got := thirdBatch[0].Arguments[0]; got != "agent-1" {
+		t.Errorf("third batch delete agent_id = %v, want agent-1 (must not touch agent-2's rows)", got)
 	}
 }
 

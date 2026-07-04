@@ -152,24 +152,23 @@ func (r *RnicRegistry) initializeSchema() error {
 // RNICs no longer reported by the agent (e.g. a NIC removed, an allowlist
 // change, or a QP recreated with a new QPN) are removed immediately instead
 // of lingering in the registry - and therefore in pinglists - until the
-// stale-threshold window expires. This is safe for the agent's periodic
-// heartbeat re-registration too, since the agent always sends its complete
-// current RNIC set on every registration and heartbeat call (see
-// buildRegistrationRequest in internal/agent/agent.go), never a partial
-// delta. The whole operation still runs in a single transaction, so a
-// partial failure (e.g. a constraint violation on one RNIC) never leaves the
-// agent with some RNICs deleted and none re-inserted. The last_updated_epoch
-// field is set to the current Unix timestamp (seconds) for every row.
+// stale-threshold window expires. This holds even when rnics is empty (the
+// agent currently has no RNICs at all): the DELETE still runs, on its own,
+// so the agent's previously-registered rows don't linger either. This is
+// safe for the agent's periodic heartbeat re-registration too, since the
+// agent always sends its complete current RNIC set on every registration
+// and heartbeat call (see buildRegistrationRequest in
+// internal/agent/agent.go), never a partial delta. The whole operation
+// still runs in a single transaction, so a partial failure (e.g. a
+// constraint violation on one RNIC) never leaves the agent with some RNICs
+// deleted and none re-inserted. The last_updated_epoch field is set to the
+// current Unix timestamp (seconds) for every row.
 func (r *RnicRegistry) RegisterRNICs(
 	ctx context.Context,
 	agentID string,
 	agentIP string,
 	rnics []*controller_agent.RnicInfo,
 ) error {
-	if len(rnics) == 0 {
-		return nil
-	}
-
 	log.Info().
 		Str("agentID", agentID).
 		Int("rnicCount", len(rnics)).

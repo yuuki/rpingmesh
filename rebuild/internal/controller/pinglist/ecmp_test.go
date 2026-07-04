@@ -70,7 +70,8 @@ func TestComputeFlowLabelCount_MonotonicInProbability(t *testing.T) {
 // generator's PingTarget construction (seed/count stamping) can be tested
 // without a real registry.
 type fakeRnicSource struct {
-	torMesh []*controller_agent.RnicInfo
+	torMesh  []*controller_agent.RnicInfo
+	interTor []*controller_agent.RnicInfo
 }
 
 func (f *fakeRnicSource) GetRNICsByToR(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
@@ -78,7 +79,7 @@ func (f *fakeRnicSource) GetRNICsByToR(_ context.Context, _ string) ([]*controll
 }
 
 func (f *fakeRnicSource) GetSampleRNICsFromOtherToRs(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
-	return nil, nil
+	return f.interTor, nil
 }
 
 // TestPinglistCarriesSeedAndCount verifies that generated PingTargets carry the

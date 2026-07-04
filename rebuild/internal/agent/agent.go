@@ -167,6 +167,17 @@ func (a *Agent) Initialize(ctx context.Context) error {
 				Msg("Failed to create metrics collector, continuing without metrics")
 		} else {
 			a.metrics = mc
+			// Surface event-ring drop counts (rings were created in step 4,
+			// above) as an OTel observable counter. A growing count means the
+			// Go poller goroutine is not draining rdma_event_ring_poll fast
+			// enough and completion events are being silently discarded.
+			if err := a.metrics.RegisterEventRingDropCallback(map[string]func() uint64{
+				"prober":    a.proberRing.DropCount,
+				"responder": a.responderRingDropCount,
+			}); err != nil {
+				a.logger.Warn().Err(err).
+					Msg("Failed to register event ring drop count callback")
+			}
 		}
 	} else {
 		a.logger.Info().Msg("Metrics collection is disabled")
@@ -608,4 +619,18 @@ func (a *Agent) createEventRings() error {
 		Int("responder_rings", len(a.respRings)).
 		Msg("Event rings created")
 	return nil
+}
+
+// responderRingDropCount sums EventRing.DropCount() across every responder
+// ring (one per device). Used as the "responder" reader for
+// telemetry.MetricsCollector.RegisterEventRingDropCallback, which reports a
+// single ring="responder" data point rather than one per device to keep
+// metric cardinality low (matching the source_tor/target_tor-only
+// convention used elsewhere in this package).
+func (a *Agent) responderRingDropCount() uint64 {
+	var total uint64
+	for _, ring := range a.respRings {
+		total += ring.DropCount()
+	}
+	return total
 }

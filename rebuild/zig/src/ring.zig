@@ -296,6 +296,19 @@ export fn rdma_event_ring_destroy(ring_ptr: ?*EventRing) void {
     r.destroy();
 }
 
+/// Get the total number of events dropped due to ring-full conditions.
+///
+/// Exported as `rdma_event_ring_drop_count` for the C ABI. Wraps
+/// EventRing.getDropCount() so the Go side can surface it as an OTel
+/// observable counter (see internal/rdmabridge and internal/telemetry) --
+/// a growing count means the Go consumer is not draining rdma_event_ring_poll
+/// fast enough and completion events are being silently discarded.
+/// Returns 0 for a null ring pointer.
+export fn rdma_event_ring_drop_count(ring_ptr: ?*EventRing) u64 {
+    const r = ring_ptr orelse return 0;
+    return r.getDropCount();
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

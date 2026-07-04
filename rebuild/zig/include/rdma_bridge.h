@@ -388,6 +388,18 @@ int32_t rdma_event_ring_poll(rdma_event_ring_t ring,
  */
 void rdma_event_ring_destroy(rdma_event_ring_t ring);
 
+/*
+ * rdma_event_ring_drop_count - Get the total number of events dropped
+ *
+ * Events are dropped when the ring is full, i.e. the Go-side consumer is
+ * not calling rdma_event_ring_poll() fast enough. Monotonically increasing
+ * for the lifetime of the ring; intended for OTel observability.
+ *
+ * @param ring  Ring handle from rdma_event_ring_create()
+ * @return      Total dropped event count (0 for a NULL ring)
+ */
+uint64_t rdma_event_ring_drop_count(rdma_event_ring_t ring);
+
 /* =========================================================================
  * Error Reporting
  * ========================================================================= */

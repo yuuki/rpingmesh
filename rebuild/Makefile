@@ -3,7 +3,7 @@
 # clang, libibverbs-dev, librdmacm-dev
 
 .PHONY: all build build-zig build-go build-controller build-agent \
-        generate generate-proto clean test test-go test-all vet \
+        generate generate-proto clean test test-go test-zig test-all vet \
         test-e2e setup-colima test-e2e-controller clean-e2e-controller help
 
 # Directories
@@ -62,6 +62,15 @@ test-go:
 	go test -v ./internal/probe/...
 	@echo "==> Tests complete"
 
+# Run Zig unit tests (types.zig, ring.zig, cq.zig, etc.). Pure Zig, no Go/CGO
+# involved, but still needs libibverbs/librdmacm headers on the build host
+# (some modules @cImport them), so like build-zig this is Linux-only in
+# practice (see Dockerfile.e2e).
+test-zig:
+	@echo "==> Running Zig unit tests..."
+	cd $(ZIG_DIR) && zig build test
+	@echo "==> Zig tests complete"
+
 # Run `go vet` across the whole module.
 vet:
 	@echo "==> Running go vet..."
@@ -70,10 +79,11 @@ vet:
 
 # Run all Go tests in the module (excluding ./e2e/..., which requires live
 # infrastructure or RDMA hardware/soft-RoCE and is exercised by
-# test-e2e / test-e2e-controller instead). Requires the full CGO/RDMA build
-# environment (libibverbs-dev, librdmacm-dev, librdmabridge.a already built),
-# so this is intended for Linux, not local macOS development.
-test-all:
+# test-e2e / test-e2e-controller instead), plus the Zig unit tests. Requires
+# the full CGO/RDMA build environment (libibverbs-dev, librdmacm-dev,
+# librdmabridge.a already built), so this is intended for Linux, not local
+# macOS development.
+test-all: test-zig
 	@echo "==> Running all Go tests (excluding ./e2e/...)..."
 	go test $$(go list ./... | grep -v '/e2e')
 	@echo "==> Tests complete"
@@ -124,8 +134,9 @@ help:
 	@echo "  generate-proto       Generate protobuf Go code"
 	@echo "  test                 Run tests"
 	@echo "  test-go              Run Go tests (internal/probe only, pure Go)"
+	@echo "  test-zig             Run Zig unit tests (zig build test)"
 	@echo "  vet                  Run go vet ./..."
-	@echo "  test-all             Run go test on all packages except ./e2e/... (Linux, full build env)"
+	@echo "  test-all             Run go test on all packages except ./e2e/..., plus test-zig (Linux, full build env)"
 	@echo "  setup-colima         Install rdma_rxe kernel module on Colima VM (run once)"
 	@echo "  test-e2e             Run RDMA e2e tests via Docker (requires Colima)"
 	@echo "  test-e2e-controller  Run Agent-to-Controller E2E tests (Docker)"

@@ -32,6 +32,7 @@ type ClusterMonitor struct {
 	requesterGID   string
 	updateInterval time.Duration
 	running        atomic.Bool
+	stopMu         sync.Mutex // guards stopCh (re)creation across Start/Stop
 	stopCh         chan struct{}
 	wg             sync.WaitGroup
 	logger         zerolog.Logger
@@ -82,6 +83,15 @@ func (m *ClusterMonitor) Start(ctx context.Context) error {
 		return nil // already running
 	}
 
+	// Recreate stopCh so the monitor can be started again after a previous
+	// Stop() closed it. Stop() has already waited for the old goroutine to exit
+	// (running is false here), so nothing references the old channel. Without
+	// this, a Stop->Start cycle would leave monitorLoop reading an
+	// already-closed stopCh and returning immediately, leaving the loop dead.
+	m.stopMu.Lock()
+	m.stopCh = make(chan struct{})
+	m.stopMu.Unlock()
+
 	m.wg.Add(1)
 	go m.monitorLoop(ctx)
 
@@ -102,7 +112,9 @@ func (m *ClusterMonitor) Stop() {
 	if !m.running.CompareAndSwap(true, false) {
 		return // not running
 	}
+	m.stopMu.Lock()
 	close(m.stopCh)
+	m.stopMu.Unlock()
 	m.wg.Wait()
 	m.logger.Info().Msg("ClusterMonitor stopped")
 }

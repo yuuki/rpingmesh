@@ -45,6 +45,12 @@ pub const NUM_SEND_SLOTS: u32 = 32;
 /// Number of receive slots in the receive memory region.
 pub const NUM_RECV_SLOTS: u32 = 32;
 
+/// Sentinel for `UdQueue.send_completion_wr_id` meaning "no completion has
+/// been published for the current in-flight send yet". A genuine send wr_id
+/// is a slot index (0..NUM_SEND_SLOTS-1), so this all-ones value can never
+/// collide with a real completion.
+pub const SEND_WR_ID_NONE: u64 = std.math.maxInt(u64);
+
 /// Size of each buffer slot: MR_SIZE (payload) + GRH_SIZE (header).
 /// For receive buffers the hardware writes GRH_SIZE bytes of GRH followed
 /// by up to MR_SIZE bytes of payload into each slot.
@@ -187,8 +193,12 @@ pub const UdQueue = struct {
     /// Back-pointer to the parent device.
     device: *RdmaDevice,
 
-    /// Per-slot state tracking for send buffers.
-    send_slot_states: [NUM_SEND_SLOTS]SlotState,
+    /// Per-slot state tracking for send buffers, stored atomically (as the
+    /// SlotState enum's u8 tag). Slots are allocated by the sender thread via
+    /// allocSendSlot() and freed by the CQ poller thread via freeSendSlot()
+    /// once a send completion arrives, so the two threads access this array
+    /// concurrently; the atomic access keeps that race-free.
+    send_slot_states: [NUM_SEND_SLOTS]std.atomic.Value(u8),
 
     /// Per-slot state tracking for receive buffers.
     recv_slot_states: [NUM_RECV_SLOTS]SlotState,
@@ -199,30 +209,73 @@ pub const UdQueue = struct {
 
     // ----- Send completion signaling (synchronous send path) -----
     //
-    // IMPORTANT invariant: these three fields form a single-slot mailbox,
-    // not a queue. They implicitly assume "one UdQueue is driven by at most
-    // one sender goroutine/thread at a time" -- i.e. a caller posts a send
-    // WR, then immediately waits on send_completion_ready before posting
-    // another. If this queue is ever shared by multiple concurrent senders
-    // (e.g. a future change that parallelizes probing across goroutines
-    // using the same UdQueue), a second sendPacketInternal() call could
-    // overwrite send_completion_ready/timestamp/status while a first call
-    // is still spinning on waitSendCompletion(), causing one sender to read
-    // the other's completion (wrong timestamp) or to hang. Do not remove
-    // the "1 Queue = 1 sender at a time" contract without replacing this
-    // mailbox with a per-request completion slot (e.g. keyed by wr_id).
+    // These fields form a single-slot mailbox, not a queue. They assume
+    // "one UdQueue is driven by at most one sender thread at a time" -- a
+    // caller posts a send WR, then waits on waitSendCompletion() before
+    // posting another. The mailbox is matched by wr_id (= the send slot
+    // index): the CQ poller publishes the completed send's wr_id LAST, with
+    // release ordering, after writing timestamp/status; the waiting sender
+    // spins until it observes ITS OWN wr_id (acquire) and only then trusts
+    // timestamp/status.
+    //
+    // wr_id matching is what makes a LATE completion harmless: if a send
+    // times out, its slot is deliberately left allocated (not reused) until
+    // its completion finally arrives, so a stale completion publishes a wr_id
+    // that no current waiter is looking for and is simply ignored -- it can
+    // no longer be misread as the next send's T2/status. Because there is a
+    // single sender and a QP delivers send completions in post order, the
+    // current send's completion is always the last to be published, so the
+    // waiter reliably observes its own wr_id without needing to reset the
+    // mailbox from the consumer side (which would risk a lost wakeup).
+    //
+    // Do not remove the "1 Queue = 1 sender at a time" contract without
+    // replacing this mailbox with a per-request completion slot.
 
-    /// Atomic flag set by the CQ poller when a send completion is ready.
-    /// The sender thread spins on this after posting a send WR.
-    send_completion_ready: std.atomic.Value(bool),
+    /// wr_id (send slot index) of the most recently published send completion,
+    /// or SEND_WR_ID_NONE if none is pending. Written LAST by the CQ poller
+    /// with release ordering; read by the sender with acquire ordering. The
+    /// sender resets it to SEND_WR_ID_NONE just before posting so a reused
+    /// slot's previous completion value cannot false-match.
+    send_completion_wr_id: std.atomic.Value(u64),
 
-    /// Send completion timestamp (nanoseconds). Written by the CQ poller,
-    /// read by the sender after send_completion_ready becomes true.
+    /// Send completion timestamp (nanoseconds). Written by the CQ poller
+    /// before send_completion_wr_id, read by the sender once it matches wr_id.
     send_completion_timestamp: std.atomic.Value(u64),
 
     /// Send completion status. 0 = success, nonzero = RDMA error code.
-    /// Written by the CQ poller alongside the timestamp.
+    /// Written by the CQ poller before send_completion_wr_id.
     send_completion_status: std.atomic.Value(i32),
+
+    /// Atomically allocate a free send slot, transitioning it from Free to
+    /// InUse. Returns the slot index, or null if every slot is currently in
+    /// use. Called from the sender thread. The CAS makes concurrent
+    /// allocation safe and, combined with freeSendSlot() running on the CQ
+    /// poller, keeps the send_slot_states array race-free.
+    pub fn allocSendSlot(self: *UdQueue) ?u32 {
+        for (0..NUM_SEND_SLOTS) |i| {
+            const idx: u32 = @intCast(i);
+            if (self.send_slot_states[idx].cmpxchgStrong(
+                @intFromEnum(SlotState.Free),
+                @intFromEnum(SlotState.InUse),
+                .acq_rel,
+                .monotonic,
+            ) == null) {
+                return idx;
+            }
+        }
+        return null;
+    }
+
+    /// Mark a send slot Free so it can be reused. Called by the CQ poller when
+    /// a send completion arrives (the sole reclaim point for a posted WR's
+    /// slot, so a late post-timeout completion still returns its slot), and by
+    /// the sender only for slots whose WR was never actually posted (early
+    /// error paths).
+    pub fn freeSendSlot(self: *UdQueue, slot_index: u32) void {
+        if (slot_index < NUM_SEND_SLOTS) {
+            self.send_slot_states[slot_index].store(@intFromEnum(SlotState.Free), .release);
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------

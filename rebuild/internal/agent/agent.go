@@ -6,6 +6,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -58,6 +59,11 @@ type Agent struct {
 	proberRing *rdmabridge.EventRing
 	respRings  []*rdmabridge.EventRing
 	logger     zerolog.Logger
+
+	// agentIP is the host's outbound IP toward the controller, reported in the
+	// registration request's agent_ip field. Best-effort: empty if it cannot be
+	// determined, which never blocks registration.
+	agentIP string
 
 	// heartbeatStopCh and heartbeatWg control the lifecycle of the
 	// background heartbeat goroutine that periodically re-registers with
@@ -166,6 +172,18 @@ func (a *Agent) Initialize(ctx context.Context) error {
 		a.logger.Info().Msg("Metrics collection is disabled")
 	}
 
+	// Determine the host's outbound IP toward the controller so it can be
+	// reported in the registration. Best-effort: on failure agentIP stays
+	// empty and registration proceeds unaffected.
+	a.agentIP = outboundIP(a.cfg.ControllerAddr)
+	if a.agentIP != "" {
+		a.logger.Info().Str("agent_ip", a.agentIP).Msg("Determined agent outbound IP")
+	} else {
+		a.logger.Warn().
+			Str("controller_addr", a.cfg.ControllerAddr).
+			Msg("Could not determine agent outbound IP; registering without agent_ip")
+	}
+
 	// Step 8: Register with the controller.
 	a.logger.Info().Msg("Registering with controller")
 	if err := a.registerWithController(ctx); err != nil {
@@ -222,10 +240,28 @@ func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRe
 
 	return &controller_agent.AgentRegistrationRequest{
 		AgentId:  a.cfg.AgentID,
+		AgentIp:  a.agentIP,
 		Hostname: a.cfg.HostName,
 		TorId:    a.cfg.TorID,
 		Rnics:    rnics,
 	}
+}
+
+// outboundIP returns the local source IP the kernel would use to reach
+// controllerAddr, via the classic connectionless UDP-dial trick: dialing a UDP
+// address performs a route lookup and binds a local address but sends no
+// packets, so LocalAddr() reveals the outbound interface IP. It is best-effort
+// and returns "" on any error (e.g. an addr with no host such as ":50051").
+func outboundIP(controllerAddr string) string {
+	conn, err := net.Dial("udp", controllerAddr)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && udpAddr.IP != nil && !udpAddr.IP.IsUnspecified() {
+		return udpAddr.IP.String()
+	}
+	return ""
 }
 
 // registerAttemptErr builds an error describing why a single registration

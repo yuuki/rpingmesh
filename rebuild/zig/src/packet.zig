@@ -223,48 +223,47 @@ pub fn deserializeProbePacket(buf: *const [40]u8) ProbePacket {
 // Send slot management
 // ---------------------------------------------------------------------------
 
-/// Find a free send slot in the queue.
+/// Find a free send slot in the queue, atomically marking it InUse.
 ///
-/// Scans the send_slot_states array for a slot in the Free state.
-/// If found, marks it as InUse and returns the slot index.
-/// Returns null if no free slot is available.
+/// Thin wrapper over UdQueue.allocSendSlot(). Returns the slot index, or null
+/// if no free slot is available.
 pub fn findFreeSendSlot(queue: *types.UdQueue) ?u32 {
-    for (0..types.NUM_SEND_SLOTS) |i| {
-        const idx: u32 = @intCast(i);
-        if (queue.send_slot_states[idx] == .Free) {
-            queue.send_slot_states[idx] = .InUse;
-            return idx;
-        }
-    }
-    return null;
+    return queue.allocSendSlot();
 }
 
-/// Free a send slot, marking it as available for reuse.
+/// Free a send slot, marking it as available for reuse. Thin wrapper over
+/// UdQueue.freeSendSlot().
 pub fn freeSendSlot(queue: *types.UdQueue, slot_index: u32) void {
-    if (slot_index < types.NUM_SEND_SLOTS) {
-        queue.send_slot_states[slot_index] = .Free;
-    }
+    queue.freeSendSlot(slot_index);
 }
 
 // ---------------------------------------------------------------------------
 // Send completion waiting
 // ---------------------------------------------------------------------------
 
-/// Wait for a send completion by spinning on the atomic flag.
+/// Wait for the send completion whose wr_id equals expected_wr_id.
 ///
-/// The CQ poller thread sets send_completion_ready to true after processing
-/// a send completion. This function spins until the flag is set or the
-/// timeout expires.
+/// The CQ poller publishes each completed send by writing timestamp/status and
+/// then storing the completed wr_id LAST (release). This function spins until
+/// the mailbox shows ITS OWN wr_id (acquire) and only then reads the matching
+/// timestamp/status. Completions for OTHER wr_ids (e.g. a late completion from
+/// a previously timed-out send whose slot was intentionally left allocated)
+/// are ignored, which is what prevents send-completion crosstalk: a stale
+/// completion can no longer be misread as this send's T2/status.
+///
+/// Because there is a single sender per queue and a QP reports send completions
+/// in post order, this send's completion is always the last to be published,
+/// so once its wr_id appears it will not be overwritten. The waiter therefore
+/// never needs to reset the mailbox (which could race the poller's next store
+/// and lose a wakeup).
 ///
 /// Returns the send completion timestamp on success, or an error on timeout
 /// or completion failure.
-pub fn waitSendCompletion(queue: *types.UdQueue, timeout_ms: u32) PacketError!u64 {
+pub fn waitSendCompletion(queue: *types.UdQueue, expected_wr_id: u64, timeout_ms: u32) PacketError!u64 {
     const timeout_ns: u64 = @as(u64, timeout_ms) * 1_000_000;
     const start_ns: u64 = getMonotonicNs();
 
-    // Spin-wait on the send_completion_ready atomic flag
-    while (!queue.send_completion_ready.load(.acquire)) {
-        // Check for timeout
+    while (queue.send_completion_wr_id.load(.acquire) != expected_wr_id) {
         const elapsed = getMonotonicNs() - start_ns;
         if (elapsed >= timeout_ns) {
             types.setLastError("timed out waiting for send completion");
@@ -275,15 +274,15 @@ pub fn waitSendCompletion(queue: *types.UdQueue, timeout_ms: u32) PacketError!u6
         std.atomic.spinLoopHint();
     }
 
-    // Check completion status
-    const status = queue.send_completion_status.load(.acquire);
+    // Our wr_id is published; the release/acquire handoff guarantees the
+    // timestamp/status written before it are visible.
+    const status = queue.send_completion_status.load(.monotonic);
     if (status != 0) {
         types.setLastError("send completion reported error status");
         return PacketError.SendCompletionFailed;
     }
 
-    // Read the completion timestamp
-    return queue.send_completion_timestamp.load(.acquire);
+    return queue.send_completion_timestamp.load(.monotonic);
 }
 
 // ---------------------------------------------------------------------------
@@ -321,12 +320,23 @@ fn sendPacketInternal(
     pkt: *const ProbePacket,
     timeout_ms: u32,
 ) PacketError!u64 {
-    // Step 1: Find a free send slot
+    // Step 1: Find a free send slot. Slots are freed by the CQ poller when the
+    // send completes, so a slot is available only if its previous WR has fully
+    // completed -- never one with an outstanding (e.g. timed-out) WR.
     const slot_index = findFreeSendSlot(queue) orelse {
         types.setLastError("no free send slot available");
         return PacketError.NoFreeSendSlot;
     };
-    errdefer freeSendSlot(queue, slot_index);
+    // wr_id == slot index. With no slot reuse while a WR is outstanding, the
+    // slot index uniquely identifies the in-flight send for mailbox matching.
+    const wr_id: u64 = @intCast(slot_index);
+
+    // Slot-freeing ownership below is deliberate: until ibv_post_send succeeds
+    // there is no outstanding WR, so this function must free the slot on every
+    // early-error path. Once the WR is posted, the slot must NOT be freed here
+    // -- the CQ poller frees it when the completion arrives, even if that is a
+    // late completion after a SendTimeout. Freeing (and reusing) an
+    // outstanding WR's slot is exactly what causes send-completion crosstalk.
 
     // Step 2: Get the slot buffer pointer and serialize the packet
     const slot_ptr = memory.getSlotPtr(queue.send_buf, slot_index, types.NUM_SEND_SLOTS) catch {
@@ -345,8 +355,12 @@ fn sendPacketInternal(
     };
     defer queue_module.destroyAddressHandle(ah);
 
-    // Step 4: Reset the send completion flag before posting
-    queue.send_completion_ready.store(false, .release);
+    // Step 4: Reset the completion mailbox before posting so that a reused
+    // slot's previous completion value cannot false-match our wait. Safe under
+    // the single-sender contract: our previous send on this slot already
+    // completed (that is why the slot was free), so no completion carrying
+    // this wr_id is still in flight to be lost by the reset.
+    queue.send_completion_wr_id.store(types.SEND_WR_ID_NONE, .release);
 
     // Step 5: Build and post the send work request
     var sge = c.ibv_sge{
@@ -356,7 +370,7 @@ fn sendPacketInternal(
     };
 
     var wr = std.mem.zeroes(c.ibv_send_wr);
-    wr.wr_id = @intCast(slot_index);
+    wr.wr_id = wr_id;
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = c.IBV_WR_SEND;
@@ -369,20 +383,16 @@ fn sendPacketInternal(
     const ret = c.ibv_post_send(queue.qp, &wr, &bad_wr);
     if (ret != 0) {
         types.setLastError("ibv_post_send() failed");
+        // No WR was accepted by the QP, so no completion will ever arrive to
+        // free this slot; free it here.
         freeSendSlot(queue, slot_index);
         return PacketError.PostSendFailed;
     }
 
-    // Step 6: Wait for send completion
-    const timestamp = waitSendCompletion(queue, timeout_ms) catch |err| {
-        freeSendSlot(queue, slot_index);
-        return err;
-    };
-
-    // Step 7: Free the send slot
-    freeSendSlot(queue, slot_index);
-
-    return timestamp;
+    // Step 6: Wait for this send's completion (matched by wr_id). On timeout we
+    // intentionally leave the slot allocated: the WR is still outstanding and
+    // its (late) completion is the only safe point to reclaim the slot.
+    return try waitSendCompletion(queue, wr_id, timeout_ms);
 }
 
 // ---------------------------------------------------------------------------

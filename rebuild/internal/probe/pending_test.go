@@ -2,13 +2,18 @@ package probe
 
 import "testing"
 
-// TestPendingMeasurement_InOrder verifies the normal case where the first ACK
-// arrives before the second ACK.
+// TestPendingMeasurement_InOrder verifies the normal case where the send-side
+// timestamps are applied first, then the first ACK, then the second ACK.
 func TestPendingMeasurement_InOrder(t *testing.T) {
-	m := NewPendingMeasurement(100, 101)
+	m := NewPendingMeasurement()
 
 	if m.Complete() {
-		t.Fatal("measurement should not be complete before any ACK")
+		t.Fatal("measurement should not be complete before any input")
+	}
+
+	m.ApplySend(100 /*t1*/, 101 /*t2*/)
+	if m.Complete() {
+		t.Fatal("measurement should not be complete after only the send timestamps")
 	}
 
 	m.ApplyFirstAck(200 /*t3*/, 301 /*t5*/)
@@ -18,7 +23,7 @@ func TestPendingMeasurement_InOrder(t *testing.T) {
 
 	m.ApplySecondAck(200 /*t3*/, 202 /*t4*/, 302 /*t6*/)
 	if !m.Complete() {
-		t.Fatal("measurement should be complete after both ACKs")
+		t.Fatal("measurement should be complete after send timestamps and both ACKs")
 	}
 
 	got := m.Result()
@@ -33,7 +38,8 @@ func TestPendingMeasurement_InOrder(t *testing.T) {
 // timestamps intact. This is the regression guard for the reorder bug where a
 // second-ACK-first arrival orphaned the first ACK and lost the measurement.
 func TestPendingMeasurement_OutOfOrder(t *testing.T) {
-	m := NewPendingMeasurement(100, 101)
+	m := NewPendingMeasurement()
+	m.ApplySend(100, 101)
 
 	// Second ACK arrives first: T3, T4, T6 recorded; T5 still unknown.
 	m.ApplySecondAck(200 /*t3*/, 202 /*t4*/, 302 /*t6*/)
@@ -54,12 +60,65 @@ func TestPendingMeasurement_OutOfOrder(t *testing.T) {
 	}
 }
 
+// TestPendingMeasurement_BothAcksBeforeSend verifies the low-latency race that
+// motivated registering the pending entry before the send: both ACKs can be
+// processed before SendProbe returns and applies T1/T2. The measurement must
+// NOT be considered complete until ApplySend supplies the send-side
+// timestamps, at which point it completes with all six timestamps intact.
+func TestPendingMeasurement_BothAcksBeforeSend(t *testing.T) {
+	m := NewPendingMeasurement()
+
+	// Both ACKs arrive while the send is still in progress (T1/T2 unknown).
+	m.ApplyFirstAck(200 /*t3*/, 301 /*t5*/)
+	m.ApplySecondAck(200 /*t3*/, 202 /*t4*/, 302 /*t6*/)
+	if m.Complete() {
+		t.Fatal("measurement must not complete before the send timestamps are applied")
+	}
+
+	// The send finally completes and records T1/T2, completing the measurement.
+	m.ApplySend(100 /*t1*/, 101 /*t2*/)
+	if !m.Complete() {
+		t.Fatal("measurement should be complete once the send timestamps arrive after both ACKs")
+	}
+
+	got := m.Result()
+	want := ProbeResult{T1: 100, T2: 101, T3: 200, T4: 202, T5: 301, T6: 302}
+	if got != want {
+		t.Errorf("Result = %+v, want %+v", got, want)
+	}
+}
+
+// TestPendingMeasurement_OneAckBeforeSend covers the mixed case where only one
+// ACK beats the send completion.
+func TestPendingMeasurement_OneAckBeforeSend(t *testing.T) {
+	m := NewPendingMeasurement()
+
+	// First ACK beats the send completion.
+	m.ApplyFirstAck(200, 301)
+	m.ApplySend(100, 101)
+	if m.Complete() {
+		t.Fatal("measurement should not be complete with only send timestamps and first ACK")
+	}
+
+	m.ApplySecondAck(200, 202, 302)
+	if !m.Complete() {
+		t.Fatal("measurement should be complete once the second ACK arrives")
+	}
+
+	got := m.Result()
+	want := ProbeResult{T1: 100, T2: 101, T3: 200, T4: 202, T5: 301, T6: 302}
+	if got != want {
+		t.Errorf("Result = %+v, want %+v", got, want)
+	}
+}
+
 // TestPendingMeasurement_FirstAckT3Wins verifies that when the two ACKs carry
 // differing T3 values (e.g., due to a responder-side quirk), the first ACK's
 // T3 is used regardless of arrival order.
 func TestPendingMeasurement_FirstAckT3Wins(t *testing.T) {
 	// First ACK arrives first, then second ACK carries a different T3.
-	m1 := NewPendingMeasurement(100, 101)
+	m1 := NewPendingMeasurement()
+	m1.ApplySend(100, 101)
 	m1.ApplyFirstAck(200, 301)
 	m1.ApplySecondAck(999 /*divergent t3*/, 202, 302)
 	if m1.Result().T3 != 200 {
@@ -68,7 +127,8 @@ func TestPendingMeasurement_FirstAckT3Wins(t *testing.T) {
 
 	// Second ACK arrives first with a divergent T3, then the first ACK
 	// overwrites it with the authoritative value.
-	m2 := NewPendingMeasurement(100, 101)
+	m2 := NewPendingMeasurement()
+	m2.ApplySend(100, 101)
 	m2.ApplySecondAck(999 /*divergent t3*/, 202, 302)
 	if m2.Result().T3 != 999 {
 		t.Errorf("out-of-order interim: T3 = %d, want 999 (only second ACK seen)", m2.Result().T3)
@@ -83,7 +143,8 @@ func TestPendingMeasurement_FirstAckT3Wins(t *testing.T) {
 // measurement produces a ProbeResult that CalculateRTT accepts as valid once
 // the caller-owned Success flag is set.
 func TestPendingMeasurement_ResultFeedsCalculateRTT(t *testing.T) {
-	m := NewPendingMeasurement(100_000, 101_000)
+	m := NewPendingMeasurement()
+	m.ApplySend(100_000, 101_000)
 	m.ApplyFirstAck(200_000, 301_000)
 	m.ApplySecondAck(200_000, 202_000, 302_000)
 

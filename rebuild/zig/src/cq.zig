@@ -290,11 +290,9 @@ fn dispatchClassicWc(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
     const status_int: i32 = @intCast(wc.status);
     if (wc.opcode == c.IBV_WC_SEND) {
         log.debug("@{x} SEND (classic) status={d}", .{ @intFromPtr(queue), status_int });
-        // Signal the waiting sender thread with a SW timestamp.
-        const ts = swTimestampNs();
-        queue.send_completion_timestamp.store(ts, .release);
-        queue.send_completion_status.store(status_int, .release);
-        queue.send_completion_ready.store(true, .release);
+        // Signal the waiting sender thread with a SW timestamp, matched by
+        // wr_id (see signalSendCompletion / the mailbox invariant in types.zig).
+        signalSendCompletion(queue, wc.wr_id, swTimestampNs(), status_int);
     } else if (wc.opcode == c.IBV_WC_RECV) {
         log.debug("@{x} RECV (classic) status={d}", .{ @intFromPtr(queue), status_int });
         if (wc.status == c.IBV_WC_SUCCESS) {
@@ -504,23 +502,34 @@ pub fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
 // Send completion processing
 // ---------------------------------------------------------------------------
 
-/// Process a single send completion.
+/// Process a single send completion (extended CQ path).
 ///
-/// Extracts the timestamp from the completion and signals the waiting sender
-/// thread via the atomic variables on the UdQueue struct. The sender thread
-/// spins on send_completion_ready after posting a send WR and reads the
-/// timestamp and status once the flag becomes true.
+/// Extracts the timestamp, status, and wr_id from the completion and hands
+/// them to signalSendCompletion(), which frees the send slot and publishes the
+/// result to the waiting sender.
 pub fn processSendCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
-    // Get timestamp
     const timestamp_ns: u64 = getCompletionTimestamp(queue, cq);
-
-    // Get completion status
     const status: i32 = @intCast(cq.status);
+    signalSendCompletion(queue, cq.wr_id, timestamp_ns, status);
+}
 
-    // Signal the waiting sender with the result
-    queue.send_completion_timestamp.store(timestamp_ns, .release);
-    queue.send_completion_status.store(status, .release);
-    queue.send_completion_ready.store(true, .release);
+/// Free the completed send's slot and publish its result to the waiting sender.
+///
+/// The slot is freed here (not by the sender) so that a late completion for a
+/// timed-out send still returns its slot for reuse. The completed wr_id is
+/// stored LAST with release ordering: the waiter in waitSendCompletion() spins
+/// on send_completion_wr_id with acquire ordering, so it only observes the
+/// timestamp/status once its own wr_id is published. See the mailbox invariant
+/// comment in types.zig.
+fn signalSendCompletion(queue: *types.UdQueue, wr_id: u64, timestamp_ns: u64, status: i32) void {
+    const slot_index: u32 = @intCast(wr_id & 0xFFFFFFFF);
+    queue.freeSendSlot(slot_index);
+
+    queue.send_completion_timestamp.store(timestamp_ns, .monotonic);
+    queue.send_completion_status.store(status, .monotonic);
+    // Publish last: this release pairs with the sender's acquire load and makes
+    // the timestamp/status above visible once the wr_id matches.
+    queue.send_completion_wr_id.store(wr_id, .release);
 }
 
 // ---------------------------------------------------------------------------

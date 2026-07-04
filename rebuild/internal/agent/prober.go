@@ -58,13 +58,15 @@ const (
 	// are masked to it before reaching ibv_ah_attr.grh.flow_label.
 	flowLabelMask = 0xFFFFF
 
-	// maxDistinctFlowLabels is the hard upper bound on how many DISTINCT flow
-	// labels can exist: the field is 20 bits, so at most 2^20 distinct values.
-	// generateFlowLabels clamps FlowLabelCount to this so a bad or malicious
-	// controller value can never make the dedup loop spin forever hunting for
-	// more distinct 20-bit labels than the space contains. The controller also
-	// validates ecmp_max_flow_labels against this bound (defense in depth).
-	maxDistinctFlowLabels = 1 << 20
+	// maxDistinctFlowLabels is the operational hard clamp on how many labels a
+	// target's set may contain. generateFlowLabels clamps FlowLabelCount to it
+	// so a bad or malicious controller value can never make the agent build a
+	// huge label set/map (stalling the send loop or OOMing) nor spin the dedup
+	// loop forever. 4096 is ~16KB per target and covers even extreme Eq.(1)
+	// configs; it mirrors config.MaxEcmpFlowLabels (defense in depth). The
+	// 20-bit flow-label field's 2^20 distinct-value ceiling is the secondary,
+	// far higher bound this stays well under.
+	maxDistinctFlowLabels = 4096
 )
 
 // clampDistinctFlowLabelCount bounds a requested flow-label count to the number
@@ -237,7 +239,22 @@ type Prober struct {
 	// goroutine (sendProbes), so it needs no lock; stale keys are pruned there.
 	labelRotation map[string]uint32
 
+	// labelCache memoizes each target's generated flow-label set so it is built
+	// once per (epoch, seed, count) rather than on every probe tick. Same GID
+	// key, same goroutine confinement, and pruned alongside labelRotation.
+	labelCache map[string]*labelSet
+
 	logger zerolog.Logger
+}
+
+// labelSet is a cached flow-label set plus the inputs that produced it, so the
+// prober can detect when a rotation-epoch or target seed/count change makes the
+// cached labels stale and must be regenerated.
+type labelSet struct {
+	epoch  uint64
+	seed   uint32
+	count  uint32
+	labels []uint32
 }
 
 // NewProber creates a new Prober with a sender-type RDMA queue bound to the
@@ -272,6 +289,7 @@ func NewProber(device *rdmabridge.Device, ring *rdmabridge.EventRing, probeInter
 		probeTimeout:               probeSendTimeoutMS,
 		flowLabelRotationPeriodSec: defaultFlowLabelRotationPeriodSec,
 		labelRotation:              make(map[string]uint32),
+		labelCache:                 make(map[string]*labelSet),
 		logger:                     log.With().Str("component", "prober").Logger(),
 	}
 
@@ -610,26 +628,53 @@ func (p *Prober) sendProbes(ctx context.Context) {
 
 // nextFlowLabel returns the flow label to use for the next probe to target and
 // advances that target's round-robin index. It is called only from the
-// probe-loop goroutine, so the unsynchronized labelRotation map access is safe.
+// probe-loop goroutine, so the unsynchronized map accesses are safe.
 func (p *Prober) nextFlowLabel(target *controller_agent.PingTarget, rotationEpoch uint64) uint32 {
-	labels := labelsForTarget(target, rotationEpoch)
 	if p.labelRotation == nil {
 		// Defensive: a Prober built via a struct literal (test helpers) rather
-		// than NewProber may have a nil map. Lazily initialize so the single
-		// probe-loop goroutine never panics writing to it.
+		// than NewProber may have nil maps. Lazily initialize so the single
+		// probe-loop goroutine never panics writing to them.
 		p.labelRotation = make(map[string]uint32)
 	}
+	labels := p.cachedLabelsForTarget(target, rotationEpoch)
 	gid := target.GetTargetGid()
 	idx := p.labelRotation[gid]
 	p.labelRotation[gid] = idx + 1
 	return labels[idx%uint32(len(labels))]
 }
 
-// pruneLabelRotation drops round-robin entries for targets absent from the
-// current pinglist, bounding labelRotation's size as targets churn. Called
-// only from the probe-loop goroutine.
+// cachedLabelsForTarget returns the target's flow-label set, regenerating it
+// only when the rotation epoch or the target's seed/count changes. Without this
+// cache, generateFlowLabels would rebuild a (potentially thousands-entry) set
+// on every probe tick for every target, stalling the send loop. The multi-label
+// set is expensive to build; the legacy single-label case is trivial and
+// bypasses the cache. Called only from the probe-loop goroutine, so the
+// unsynchronized map access is safe.
+func (p *Prober) cachedLabelsForTarget(target *controller_agent.PingTarget, rotationEpoch uint64) []uint32 {
+	count := target.GetFlowLabelCount()
+	if count <= 1 {
+		// Trivial single-label (legacy) path; no set to cache.
+		return labelsForTarget(target, rotationEpoch)
+	}
+
+	gid := target.GetTargetGid()
+	seed := target.GetFlowLabelSeed()
+	if p.labelCache == nil {
+		p.labelCache = make(map[string]*labelSet)
+	}
+	if e, ok := p.labelCache[gid]; ok && e.epoch == rotationEpoch && e.seed == seed && e.count == count {
+		return e.labels
+	}
+	labels := generateFlowLabels(seed, count, rotationEpoch)
+	p.labelCache[gid] = &labelSet{epoch: rotationEpoch, seed: seed, count: count, labels: labels}
+	return labels
+}
+
+// pruneLabelRotation drops per-target round-robin and label-cache entries for
+// targets absent from the current pinglist, bounding both maps' sizes as
+// targets churn. Called only from the probe-loop goroutine.
 func (p *Prober) pruneLabelRotation(targets []*controller_agent.PingTarget) {
-	if len(p.labelRotation) == 0 {
+	if len(p.labelRotation) == 0 && len(p.labelCache) == 0 {
 		return
 	}
 	live := make(map[string]struct{}, len(targets))
@@ -641,6 +686,11 @@ func (p *Prober) pruneLabelRotation(targets []*controller_agent.PingTarget) {
 	for gid := range p.labelRotation {
 		if _, ok := live[gid]; !ok {
 			delete(p.labelRotation, gid)
+		}
+	}
+	for gid := range p.labelCache {
+		if _, ok := live[gid]; !ok {
+			delete(p.labelCache, gid)
 		}
 	}
 }

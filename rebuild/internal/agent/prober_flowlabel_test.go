@@ -181,6 +181,43 @@ func TestNextFlowLabel_RoundRobin(t *testing.T) {
 	}
 }
 
+// TestCachedLabelsForTarget verifies the per-target label-set cache: within one
+// rotation epoch (and unchanged seed/count) the identical set is returned
+// without regenerating, while an epoch change or a seed/count change forces
+// regeneration. This keeps generateFlowLabels off the per-probe-tick hot path.
+func TestCachedLabelsForTarget(t *testing.T) {
+	target := &controller_agent.PingTarget{
+		TargetGid:      "fe80::cafe",
+		FlowLabelSeed:  0x1234,
+		FlowLabelCount: 8,
+	}
+	p := &Prober{logger: zerolog.Nop()}
+
+	a := p.cachedLabelsForTarget(target, 100)
+	b := p.cachedLabelsForTarget(target, 100)
+	// Same epoch/seed/count: the cache must return the SAME backing slice, not
+	// a freshly generated one.
+	if &a[0] != &b[0] {
+		t.Errorf("same epoch returned a regenerated set; cache not hit")
+	}
+	if len(a) != 8 {
+		t.Fatalf("cached set length = %d, want 8", len(a))
+	}
+
+	// Epoch change: must regenerate (new backing slice).
+	c := p.cachedLabelsForTarget(target, 101)
+	if &a[0] == &c[0] {
+		t.Errorf("epoch change did not regenerate the label set")
+	}
+
+	// Count change at the same epoch: must regenerate with the new size.
+	target.FlowLabelCount = 16
+	d := p.cachedLabelsForTarget(target, 101)
+	if &c[0] == &d[0] || len(d) != 16 {
+		t.Errorf("count change did not regenerate (len=%d, want 16)", len(d))
+	}
+}
+
 // TestLabelsForTarget_LegacySingleLabel verifies that FlowLabelCount <= 1
 // preserves exact legacy behavior: the single controller-provided FlowLabel is
 // used verbatim, ignoring seed and epoch.

@@ -33,11 +33,12 @@ type ControllerService struct {
 
 // NewControllerService creates a new ControllerService backed by the given
 // RNIC registry. A PinglistGenerator is automatically created from the
-// registry.
-func NewControllerService(reg registryClient) *ControllerService {
+// registry and the ECMP config, which sizes how many distinct flow labels
+// each target is probed with (Eq.(1) coverage).
+func NewControllerService(reg registryClient, ecmp pinglist.ECMPConfig) *ControllerService {
 	return &ControllerService{
 		registry: reg,
-		pinglist: pinglist.NewPinglistGenerator(reg),
+		pinglist: pinglist.NewPinglistGenerator(reg, ecmp),
 	}
 }
 

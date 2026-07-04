@@ -5,7 +5,9 @@ package agent
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -37,7 +39,142 @@ const (
 	// cadence from the probe interval, so the sweep runs at a predictable rate
 	// regardless of how frequently probes are sent.
 	stalePendingCleanupPeriod = 10 * time.Second
+
+	// defaultFlowLabelRotationPeriodSec is the fallback rotation period used
+	// when SetFlowLabelRotationPeriod has not been called (or is set to 0). It
+	// mirrors config.DefaultFlowLabelRotationPeriodSec without importing the
+	// config package.
+	defaultFlowLabelRotationPeriodSec = 3600
+
+	// flowLabelRotateStride controls which flow-label indices rotate with the
+	// epoch: every flowLabelRotateStride-th label (indices 0, 5, 10, ...) mixes
+	// the rotation epoch into its hash, so ~1/5 (20%) of a target's label set
+	// shifts each rotation period while the remaining ~80% stay stable for
+	// time-series continuity. This matches the R-Pingmesh paper's ~20%
+	// 5-tuple rotation.
+	flowLabelRotateStride = 5
+
+	// flowLabelMask is the 20-bit IPv6 flow-label field width; generated labels
+	// are masked to it before reaching ibv_ah_attr.grh.flow_label.
+	flowLabelMask = 0xFFFFF
+
+	// maxDistinctFlowLabels is the operational hard clamp on how many labels a
+	// target's set may contain. generateFlowLabels clamps FlowLabelCount to it
+	// so a bad or malicious controller value can never make the agent build a
+	// huge label set/map (stalling the send loop or OOMing) nor spin the dedup
+	// loop forever. 4096 is ~16KB per target and covers even extreme Eq.(1)
+	// configs; it mirrors config.MaxEcmpFlowLabels (defense in depth). The
+	// 20-bit flow-label field's 2^20 distinct-value ceiling is the secondary,
+	// far higher bound this stays well under.
+	maxDistinctFlowLabels = 4096
 )
+
+// clampDistinctFlowLabelCount bounds a requested flow-label count to the number
+// of distinct 20-bit labels that can exist (maxDistinctFlowLabels). Extracted
+// so the clamp decision is unit-testable without generating a huge label set.
+func clampDistinctFlowLabelCount(count uint32) uint32 {
+	if count > maxDistinctFlowLabels {
+		return maxDistinctFlowLabels
+	}
+	return count
+}
+
+// flowLabelAt deterministically derives a candidate ECMP flow label for label
+// index within a target's set, from the controller-provided seed and (for the
+// rotating subset of indices) the current rotationEpoch. It is pure: the same
+// (seed, index, rotationEpoch, attempt) always yields the same 20-bit label,
+// which is what makes the set reproducible across agents and testable.
+//
+// Only indices that are multiples of flowLabelRotateStride fold in the epoch;
+// all other indices ignore it and are therefore stable across epochs. The
+// attempt parameter is a collision-resolution nonce: attempt 0 is the primary
+// candidate (its bytes are omitted so the value is unchanged from a plain
+// hash), and generateFlowLabels advances it only when a candidate collides
+// with an already-chosen label.
+func flowLabelAt(seed, index uint32, rotationEpoch uint64, attempt uint32) uint32 {
+	h := fnv.New32a()
+	var buf [16]byte
+	binary.BigEndian.PutUint32(buf[0:4], seed)
+	binary.BigEndian.PutUint32(buf[4:8], index)
+	n := 8
+	if index%flowLabelRotateStride == 0 {
+		binary.BigEndian.PutUint64(buf[8:16], rotationEpoch)
+		n = 16
+	}
+	_, _ = h.Write(buf[:n])
+	if attempt > 0 {
+		var a [4]byte
+		binary.BigEndian.PutUint32(a[:], attempt)
+		_, _ = h.Write(a[:])
+	}
+	return h.Sum32() & flowLabelMask
+}
+
+// generateFlowLabels expands a (seed, count) pair into exactly count DISTINCT
+// deterministic 20-bit flow labels for the given rotationEpoch. A count of 0 is
+// treated as 1 so every target yields at least one label.
+//
+// Distinctness matters: the controller sizes count via Eq.(1) assuming n
+// distinct labels, so a duplicate would silently explore fewer ECMP 5-tuples
+// than the configured coverage probability requires. Masking a 32-bit hash to
+// 20 bits can collide, so each label is chosen by a set-guarded loop that
+// advances a collision nonce (flowLabelAt's attempt) until the candidate is
+// new. Termination is fast and guaranteed: the controller caps count well
+// below the 2^20 label space (default cap 64), so collisions are rare and each
+// slot resolves in ~1 attempt.
+//
+// Slots are resolved in two passes -- stable slots (index % stride != 0)
+// first, then rotating slots -- so a stable slot's dedup never depends on the
+// epoch-varying rotating slots. This keeps the ~80% stable subset byte-for-byte
+// identical across epochs (exact time-series continuity, not merely likely)
+// while the rotating subset still shifts each epoch. Dedup is applied after the
+// epoch is mixed in, so the final set is distinct for every epoch.
+func generateFlowLabels(seed, count uint32, rotationEpoch uint64) []uint32 {
+	if count == 0 {
+		count = 1
+	}
+	// Never ask for more distinct labels than the 20-bit space can hold, or the
+	// dedup loop below could never satisfy the request and would spin forever.
+	count = clampDistinctFlowLabelCount(count)
+	labels := make([]uint32, count)
+	used := make(map[uint32]struct{}, count)
+
+	assign := func(i uint32) {
+		for attempt := uint32(0); ; attempt++ {
+			v := flowLabelAt(seed, i, rotationEpoch, attempt)
+			if _, dup := used[v]; !dup {
+				used[v] = struct{}{}
+				labels[i] = v
+				return
+			}
+		}
+	}
+
+	// Pass 1: stable slots (epoch-independent dedup domain).
+	for i := uint32(0); i < count; i++ {
+		if i%flowLabelRotateStride != 0 {
+			assign(i)
+		}
+	}
+	// Pass 2: rotating slots (epoch-mixed, dedup against the full set).
+	for i := uint32(0); i < count; i++ {
+		if i%flowLabelRotateStride == 0 {
+			assign(i)
+		}
+	}
+	return labels
+}
+
+// labelsForTarget returns the flow-label set the prober cycles through for a
+// target. When FlowLabelCount <= 1 it preserves exact legacy behavior by
+// returning the single controller-provided FlowLabel; otherwise it expands
+// FlowLabelSeed + FlowLabelCount for the given epoch.
+func labelsForTarget(target *controller_agent.PingTarget, rotationEpoch uint64) []uint32 {
+	if target.GetFlowLabelCount() <= 1 {
+		return []uint32{target.GetFlowLabel()}
+	}
+	return generateFlowLabels(target.GetFlowLabelSeed(), target.GetFlowLabelCount(), rotationEpoch)
+}
 
 // pendingProbe holds the in-flight state for a single probe awaiting ACKs.
 // The 6-timestamp bookkeeping lives in the embedded PendingMeasurement, which
@@ -46,6 +183,11 @@ type pendingProbe struct {
 	target    *controller_agent.PingTarget
 	meas      *probe.PendingMeasurement
 	createdAt time.Time
+	// flowLabel is the concrete ECMP flow label this probe was actually sent
+	// with (one of the target's rotating set), recorded so the resulting
+	// ProbeResult and debug logs report the path actually exercised rather
+	// than the target's base label.
+	flowLabel uint32
 }
 
 // Prober sends probe packets to targets on a configurable interval,
@@ -85,7 +227,34 @@ type Prober struct {
 	limiter      probe.RateLimiter
 	perTargetPPS float64
 
+	// flowLabelRotationPeriodSec is the period over which the rotating subset
+	// of each target's flow-label set is refreshed. Read only by the probe-loop
+	// goroutine via flowLabelRotationEpoch; set once at construction and
+	// optionally via SetFlowLabelRotationPeriod before Start.
+	flowLabelRotationPeriodSec uint32
+
+	// labelRotation tracks the next flow-label index for each target, keyed by
+	// target GID string, so successive probes to a target use successive labels
+	// (round-robin over its set). It is accessed ONLY from the probe-loop
+	// goroutine (sendProbes), so it needs no lock; stale keys are pruned there.
+	labelRotation map[string]uint32
+
+	// labelCache memoizes each target's generated flow-label set so it is built
+	// once per (epoch, seed, count) rather than on every probe tick. Same GID
+	// key, same goroutine confinement, and pruned alongside labelRotation.
+	labelCache map[string]*labelSet
+
 	logger zerolog.Logger
+}
+
+// labelSet is a cached flow-label set plus the inputs that produced it, so the
+// prober can detect when a rotation-epoch or target seed/count change makes the
+// cached labels stale and must be regenerated.
+type labelSet struct {
+	epoch  uint64
+	seed   uint32
+	count  uint32
+	labels []uint32
 }
 
 // NewProber creates a new Prober with a sender-type RDMA queue bound to the
@@ -109,16 +278,19 @@ func NewProber(device *rdmabridge.Device, ring *rdmabridge.EventRing, probeInter
 	}
 
 	p := &Prober{
-		queue:         queue,
-		ring:          ring,
-		device:        device,
-		pending:       make(map[uint64]*pendingProbe),
-		agentEpoch:    rand.Uint32(),
-		resultChan:    make(chan *probe.ProbeResult, resultChanSize),
-		stopCh:        make(chan struct{}),
-		probeInterval: time.Duration(probeIntervalMS) * time.Millisecond,
-		probeTimeout:  probeSendTimeoutMS,
-		logger:        log.With().Str("component", "prober").Logger(),
+		queue:                      queue,
+		ring:                       ring,
+		device:                     device,
+		pending:                    make(map[uint64]*pendingProbe),
+		agentEpoch:                 rand.Uint32(),
+		resultChan:                 make(chan *probe.ProbeResult, resultChanSize),
+		stopCh:                     make(chan struct{}),
+		probeInterval:              time.Duration(probeIntervalMS) * time.Millisecond,
+		probeTimeout:               probeSendTimeoutMS,
+		flowLabelRotationPeriodSec: defaultFlowLabelRotationPeriodSec,
+		labelRotation:              make(map[string]uint32),
+		labelCache:                 make(map[string]*labelSet),
+		logger:                     log.With().Str("component", "prober").Logger(),
 	}
 
 	p.logger.Info().
@@ -196,6 +368,31 @@ func (p *Prober) SetPerTargetRateLimit(pps float64) {
 		Float64("per_target_pps", pps).
 		Int("targets", n).
 		Msg("Probe send rate limit updated")
+}
+
+// SetFlowLabelRotationPeriod sets the period over which the rotating subset of
+// each target's ECMP flow-label set is refreshed. A non-positive value keeps
+// the default (defaultFlowLabelRotationPeriodSec). It should be called before
+// Start; the field is read only by the single probe-loop goroutine.
+func (p *Prober) SetFlowLabelRotationPeriod(sec uint32) {
+	if sec == 0 {
+		sec = defaultFlowLabelRotationPeriodSec
+	}
+	p.flowLabelRotationPeriodSec = sec
+	p.logger.Info().
+		Uint32("rotation_period_sec", sec).
+		Msg("Flow-label rotation period updated")
+}
+
+// flowLabelRotationEpoch maps a wall-clock instant to the current rotation
+// epoch = floor(unixTime / period). Wall-clock is acceptable here because the
+// epoch only selects which flow labels are used, never a measurement timestamp.
+func (p *Prober) flowLabelRotationEpoch(now time.Time) uint64 {
+	period := p.flowLabelRotationPeriodSec
+	if period == 0 {
+		period = defaultFlowLabelRotationPeriodSec
+	}
+	return uint64(now.Unix()) / uint64(period)
 }
 
 // nowMonotonicNS returns the current CLOCK_MONOTONIC time in nanoseconds. It
@@ -302,6 +499,14 @@ func (p *Prober) sendProbes(ctx context.Context) {
 		return
 	}
 
+	// The rotation epoch selects which of each target's rotating labels are in
+	// effect this round; computed once per round so all targets share it.
+	rotationEpoch := p.flowLabelRotationEpoch(time.Now())
+
+	// Prune round-robin state for targets no longer in the pinglist so the map
+	// cannot grow without bound as targets churn. Confined to this goroutine.
+	p.pruneLabelRotation(targets)
+
 	for _, target := range targets {
 		// Abort the batch promptly on shutdown instead of walking the entire
 		// target list while blocking on SendProbe for each one.
@@ -340,6 +545,13 @@ func (p *Prober) sendProbes(ctx context.Context) {
 			continue
 		}
 
+		// Pick the flow label for this probe: round-robin across the target's
+		// ECMP label set so successive probes to a target exercise successive
+		// paths. Labels share the target's probe budget (the rate limiter is
+		// per-target, unaffected by the set size), trading coverage speed for
+		// bounded probe amplification.
+		flowLabel := p.nextFlowLabel(target, rotationEpoch)
+
 		// Register the pending entry BEFORE sending. SendProbe blocks until the
 		// send completion (T2), and on a low-latency RNIC an ACK can reach
 		// ackProcessLoop before SendProbe returns. Registering first guarantees
@@ -352,18 +564,21 @@ func (p *Prober) sendProbes(ctx context.Context) {
 			target:    target,
 			meas:      probe.NewPendingMeasurement(),
 			createdAt: time.Now(),
+			flowLabel: flowLabel,
 		}
 		p.pendingMu.Lock()
 		p.pending[seqNum] = pp
 		p.pendingMu.Unlock()
 
 		// Send the probe packet. SendProbe is synchronous: it posts the
-		// packet and waits for the send completion within the timeout.
+		// packet and waits for the send completion within the timeout. The
+		// per-send flow label reaches ibv_ah_attr.grh.flow_label via a fresh
+		// AH created in the Zig bridge, so no per-QP/AH state needs updating.
 		result := p.queue.SendProbe(
 			targetGID,
 			target.GetTargetQpn(),
 			seqNum,
-			target.GetFlowLabel(),
+			flowLabel,
 			p.probeTimeout,
 		)
 
@@ -379,8 +594,9 @@ func (p *Prober) sendProbes(ctx context.Context) {
 				Str("target_gid", target.GetTargetGid()).
 				Uint32("target_qpn", target.GetTargetQpn()).
 				Uint64("seq", seqNum).
+				Uint32("flow_label", flowLabel).
 				Msg("Failed to send probe packet")
-			p.emitResult(newFailedResult(seqNum, target, fmt.Sprintf("probe send failed: %v", result.Error)))
+			p.emitResult(newFailedResult(seqNum, target, flowLabel, fmt.Sprintf("probe send failed: %v", result.Error)))
 			continue
 		}
 
@@ -403,9 +619,79 @@ func (p *Prober) sendProbes(ctx context.Context) {
 			Str("target_gid", target.GetTargetGid()).
 			Uint32("target_qpn", target.GetTargetQpn()).
 			Uint64("seq", seqNum).
+			Uint32("flow_label", flowLabel).
 			Uint64("t1_ns", result.T1NS).
 			Uint64("t2_ns", result.T2NS).
 			Msg("Probe sent, awaiting ACKs")
+	}
+}
+
+// nextFlowLabel returns the flow label to use for the next probe to target and
+// advances that target's round-robin index. It is called only from the
+// probe-loop goroutine, so the unsynchronized map accesses are safe.
+func (p *Prober) nextFlowLabel(target *controller_agent.PingTarget, rotationEpoch uint64) uint32 {
+	if p.labelRotation == nil {
+		// Defensive: a Prober built via a struct literal (test helpers) rather
+		// than NewProber may have nil maps. Lazily initialize so the single
+		// probe-loop goroutine never panics writing to them.
+		p.labelRotation = make(map[string]uint32)
+	}
+	labels := p.cachedLabelsForTarget(target, rotationEpoch)
+	gid := target.GetTargetGid()
+	idx := p.labelRotation[gid]
+	p.labelRotation[gid] = idx + 1
+	return labels[idx%uint32(len(labels))]
+}
+
+// cachedLabelsForTarget returns the target's flow-label set, regenerating it
+// only when the rotation epoch or the target's seed/count changes. Without this
+// cache, generateFlowLabels would rebuild a (potentially thousands-entry) set
+// on every probe tick for every target, stalling the send loop. The multi-label
+// set is expensive to build; the legacy single-label case is trivial and
+// bypasses the cache. Called only from the probe-loop goroutine, so the
+// unsynchronized map access is safe.
+func (p *Prober) cachedLabelsForTarget(target *controller_agent.PingTarget, rotationEpoch uint64) []uint32 {
+	count := target.GetFlowLabelCount()
+	if count <= 1 {
+		// Trivial single-label (legacy) path; no set to cache.
+		return labelsForTarget(target, rotationEpoch)
+	}
+
+	gid := target.GetTargetGid()
+	seed := target.GetFlowLabelSeed()
+	if p.labelCache == nil {
+		p.labelCache = make(map[string]*labelSet)
+	}
+	if e, ok := p.labelCache[gid]; ok && e.epoch == rotationEpoch && e.seed == seed && e.count == count {
+		return e.labels
+	}
+	labels := generateFlowLabels(seed, count, rotationEpoch)
+	p.labelCache[gid] = &labelSet{epoch: rotationEpoch, seed: seed, count: count, labels: labels}
+	return labels
+}
+
+// pruneLabelRotation drops per-target round-robin and label-cache entries for
+// targets absent from the current pinglist, bounding both maps' sizes as
+// targets churn. Called only from the probe-loop goroutine.
+func (p *Prober) pruneLabelRotation(targets []*controller_agent.PingTarget) {
+	if len(p.labelRotation) == 0 && len(p.labelCache) == 0 {
+		return
+	}
+	live := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		if t != nil {
+			live[t.GetTargetGid()] = struct{}{}
+		}
+	}
+	for gid := range p.labelRotation {
+		if _, ok := live[gid]; !ok {
+			delete(p.labelRotation, gid)
+		}
+	}
+	for gid := range p.labelCache {
+		if _, ok := live[gid]; !ok {
+			delete(p.labelCache, gid)
+		}
 	}
 }
 
@@ -615,20 +901,23 @@ func (p *Prober) finalizeIfCompleteLocked(seqNum uint64, pp *pendingProbe) *prob
 	}
 
 	result := pp.meas.Result()
-	fillTargetMetadata(&result, seqNum, pp.target)
+	fillTargetMetadata(&result, seqNum, pp.flowLabel, pp.target)
 	result.Success = true
 
 	delete(p.pending, seqNum)
 	return &result
 }
 
-// fillTargetMetadata copies the sequence number and per-target metadata into a
-// ProbeResult. Shared by the success, send-failure, and stale-timeout paths so
-// they cannot diverge on which fields a result carries.
-func fillTargetMetadata(result *probe.ProbeResult, seqNum uint64, target *controller_agent.PingTarget) {
+// fillTargetMetadata copies the sequence number, the flow label actually used
+// for the probe, and per-target metadata into a ProbeResult. Shared by the
+// success, send-failure, and stale-timeout paths so they cannot diverge on
+// which fields a result carries. The flow label is passed explicitly (rather
+// than read from target.GetFlowLabel()) so the result reports the specific
+// ECMP path this probe exercised out of the target's rotating set.
+func fillTargetMetadata(result *probe.ProbeResult, seqNum uint64, flowLabel uint32, target *controller_agent.PingTarget) {
 	result.SequenceNum = seqNum
 	result.TargetQPN = target.GetTargetQpn()
-	result.FlowLabel = target.GetFlowLabel()
+	result.FlowLabel = flowLabel
 	result.TargetIP = target.GetTargetIp()
 	result.TargetHostname = target.GetTargetHostname()
 	result.TargetTorID = target.GetTargetTorId()
@@ -638,10 +927,11 @@ func fillTargetMetadata(result *probe.ProbeResult, seqNum uint64, target *contro
 }
 
 // newFailedResult builds a Success=false ProbeResult carrying the target
-// metadata and an error message, used when a probe send fails outright.
-func newFailedResult(seqNum uint64, target *controller_agent.PingTarget, errMsg string) *probe.ProbeResult {
+// metadata, the flow label the failed send used, and an error message, used
+// when a probe send fails outright.
+func newFailedResult(seqNum uint64, target *controller_agent.PingTarget, flowLabel uint32, errMsg string) *probe.ProbeResult {
 	result := &probe.ProbeResult{}
-	fillTargetMetadata(result, seqNum, target)
+	fillTargetMetadata(result, seqNum, flowLabel, target)
 	result.Success = false
 	result.ErrorMessage = errMsg
 	return result
@@ -700,7 +990,7 @@ func (p *Prober) cleanupStalePending() {
 			// Preserve any partial timestamps the measurement collected, then
 			// overlay the target metadata and failure state.
 			result := pp.meas.Result()
-			fillTargetMetadata(&result, seqNum, pp.target)
+			fillTargetMetadata(&result, seqNum, pp.flowLabel, pp.target)
 			result.Success = false
 			result.ErrorMessage = "timed out waiting for ACKs"
 			stale = append(stale, &result)

@@ -12,6 +12,12 @@ import (
 // DefaultTargetProbeRatePerSecond is the default number of probes per second per target.
 const DefaultTargetProbeRatePerSecond = 10
 
+// DefaultFlowLabelRotationPeriodSec is the default period (seconds) over which
+// the rotating subset (~20%) of a target's ECMP flow-label set is refreshed,
+// shifting a fraction of probed paths over time while most labels stay stable
+// for time-series continuity. 3600s (1h) matches the R-Pingmesh paper.
+const DefaultFlowLabelRotationPeriodSec = 3600
+
 // AgentConfig holds all configuration for the agent.
 type AgentConfig struct {
 	AgentID                   string   `mapstructure:"agent_id"`
@@ -26,6 +32,10 @@ type AgentConfig struct {
 	GIDIndex                  int      `mapstructure:"gid_index"`
 	PinglistUpdateIntervalSec uint32   `mapstructure:"pinglist_update_interval_sec"`
 	TargetProbeRatePerSecond  int      `mapstructure:"target_probe_rate_per_second"`
+	// FlowLabelRotationPeriodSec is the period over which the rotating subset
+	// of each target's ECMP flow-label set is refreshed (time-based ECMP path
+	// rotation). See DefaultFlowLabelRotationPeriodSec.
+	FlowLabelRotationPeriodSec uint32 `mapstructure:"flow_label_rotation_period_sec"`
 }
 
 // LoadAgentConfig loads agent configuration from a YAML file, environment
@@ -51,6 +61,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("gid_index", 0)
 	v.SetDefault("pinglist_update_interval_sec", 300)
 	v.SetDefault("target_probe_rate_per_second", DefaultTargetProbeRatePerSecond)
+	v.SetDefault("flow_label_rotation_period_sec", DefaultFlowLabelRotationPeriodSec)
 
 	// Enable environment variable override with RPINGMESH_ prefix.
 	// Underscores in env var names map to underscores in config keys.
@@ -104,18 +115,19 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	}
 
 	config := &AgentConfig{
-		AgentID:                   agentID,
-		HostName:                  hostname,
-		TorID:                     v.GetString("tor_id"),
-		ControllerAddr:            v.GetString("controller_addr"),
-		LogLevel:                  v.GetString("log_level"),
-		ProbeIntervalMS:           v.GetUint32("probe_interval_ms"),
-		OtelCollectorAddr:         v.GetString("otel_collector_addr"),
-		MetricsEnabled:            v.GetBool("metrics_enabled"),
-		AllowedDeviceNames:        v.GetStringSlice("allowed_device_names"),
-		GIDIndex:                  v.GetInt("gid_index"),
-		PinglistUpdateIntervalSec: v.GetUint32("pinglist_update_interval_sec"),
-		TargetProbeRatePerSecond:  v.GetInt("target_probe_rate_per_second"),
+		AgentID:                    agentID,
+		HostName:                   hostname,
+		TorID:                      v.GetString("tor_id"),
+		ControllerAddr:             v.GetString("controller_addr"),
+		LogLevel:                   v.GetString("log_level"),
+		ProbeIntervalMS:            v.GetUint32("probe_interval_ms"),
+		OtelCollectorAddr:          v.GetString("otel_collector_addr"),
+		MetricsEnabled:             v.GetBool("metrics_enabled"),
+		AllowedDeviceNames:         v.GetStringSlice("allowed_device_names"),
+		GIDIndex:                   v.GetInt("gid_index"),
+		PinglistUpdateIntervalSec:  v.GetUint32("pinglist_update_interval_sec"),
+		TargetProbeRatePerSecond:   v.GetInt("target_probe_rate_per_second"),
+		FlowLabelRotationPeriodSec: v.GetUint32("flow_label_rotation_period_sec"),
 	}
 
 	if err := config.Validate(); err != nil {
@@ -139,6 +151,11 @@ func (c *AgentConfig) Validate() error {
 		return fmt.Errorf("probe_interval_ms must be > 0, got: %d", c.ProbeIntervalMS)
 	}
 
+	// A zero rotation period would make the epoch computation divide by zero.
+	if c.FlowLabelRotationPeriodSec == 0 {
+		return fmt.Errorf("flow_label_rotation_period_sec must be > 0, got: %d", c.FlowLabelRotationPeriodSec)
+	}
+
 	return nil
 }
 
@@ -156,4 +173,5 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.Int("gid-index", 0, "GID index to use for RDMA devices (must be >= 0)")
 	flags.Uint32("pinglist-update-interval-sec", 300, "Pinglist update interval in seconds")
 	flags.Int("target-probe-rate-per-second", DefaultTargetProbeRatePerSecond, "Probe rate per second per target")
+	flags.Uint32("flow-label-rotation-period-sec", DefaultFlowLabelRotationPeriodSec, "Period (seconds) over which the rotating ~20% of each target's ECMP flow-label set is refreshed")
 }

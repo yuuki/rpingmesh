@@ -16,6 +16,7 @@ import (
 
 	"github.com/yuuki/rpingmesh/rebuild/internal/config"
 	"github.com/yuuki/rpingmesh/rebuild/internal/controller"
+	"github.com/yuuki/rpingmesh/rebuild/internal/controller/pinglist"
 	"github.com/yuuki/rpingmesh/rebuild/internal/controller/registry"
 	"github.com/yuuki/rpingmesh/rebuild/proto/controller_agent"
 )
@@ -66,6 +67,9 @@ func run(cmd *cobra.Command, args []string) error {
 		Int("activeThresholdSec", cfg.ActiveThresholdSec).
 		Int("staleThresholdSec", cfg.StaleThresholdSec).
 		Int("interTorSampleSize", cfg.InterTorSampleSize).
+		Int("ecmpPathsAssumed", cfg.EcmpPathsAssumed).
+		Float64("ecmpCoverageProbability", cfg.EcmpCoverageProbability).
+		Int("ecmpMaxFlowLabels", cfg.EcmpMaxFlowLabels).
 		Msg("Starting rpingmesh-controller")
 
 	// Initialize RNIC registry backed by rqlite.
@@ -84,8 +88,13 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// Create the controller gRPC service.
-	svc := controller.NewControllerService(reg)
+	// Create the controller gRPC service. The ECMP config sizes the per-target
+	// flow-label set (Eq.(1) coverage) each pinglist entry carries.
+	svc := controller.NewControllerService(reg, pinglist.ECMPConfig{
+		PathsAssumed:        cfg.EcmpPathsAssumed,
+		CoverageProbability: cfg.EcmpCoverageProbability,
+		MaxFlowLabels:       cfg.EcmpMaxFlowLabels,
+	})
 
 	// Create and configure the gRPC server.
 	grpcServer := grpc.NewServer()

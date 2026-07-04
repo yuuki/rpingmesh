@@ -241,6 +241,14 @@ func TestPinglistTorMesh(t *testing.T) {
 		if tgt.GetTargetIp() == "" {
 			t.Errorf("PingTarget %s has empty IP", tgt.GetTargetGid())
 		}
+		// ECMP path coverage sizing must be carried so the agent can expand a
+		// multi-flow-label set (Eq.(1)).
+		if tgt.GetFlowLabelCount() == 0 {
+			t.Errorf("PingTarget %s has zero flow_label_count", tgt.GetTargetGid())
+		}
+		if tgt.GetFlowLabelSeed() == 0 {
+			t.Errorf("PingTarget %s has zero flow_label_seed", tgt.GetTargetGid())
+		}
 	}
 }
 

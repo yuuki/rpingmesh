@@ -160,9 +160,14 @@ func (a *Agent) Initialize(ctx context.Context) error {
 		if a.cfg.TargetProbeRatePerSecond > 0 {
 			// Per-target rate cap; the prober scales the aggregate limit with the
 			// pinglist size. Differentiated per-pinglist-type rates are a
-			// documented limitation (see README Limitations).
+			// documented limitation (see README Limitations). Note the cap is
+			// per TARGET, not per flow label: a target's ECMP label set shares
+			// this budget, bounding probe amplification.
 			prober.SetPerTargetRateLimit(float64(a.cfg.TargetProbeRatePerSecond))
 		}
+		// Configure the ECMP flow-label rotation period (time-based rotation of
+		// the rotating ~20% of each target's label set).
+		prober.SetFlowLabelRotationPeriod(a.cfg.FlowLabelRotationPeriodSec)
 		a.probers = append(a.probers, prober)
 		a.logger.Info().
 			Str("device", dev.Info.DeviceName).

@@ -6,5 +6,13 @@ listen_addr: ":50051"
 # Database
 database_uri: "http://localhost:4001"  # rqlite address
 
+# ECMP path coverage (R-Pingmesh Eq.(1))
+# The controller sizes each target's flow-label set so that its ECMP paths are
+# covered with probability >= ecmp_coverage_probability, assuming
+# ecmp_paths_assumed equal-cost paths, capped at ecmp_max_flow_labels.
+ecmp_paths_assumed: 16            # Assumed ECMP fabric width (m)
+ecmp_coverage_probability: 0.9    # Target coverage probability (p, in (0,1))
+ecmp_max_flow_labels: 64          # Hard cap on labels per target (bounds amplification)
+
 # Logging
 log_level: "info"                       # debug, info, warn, error

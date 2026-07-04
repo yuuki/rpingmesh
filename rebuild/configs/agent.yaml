@@ -10,8 +10,15 @@ controller_addr: "localhost:50051"
 
 # Probing settings
 probe_interval_ms: 500           # Probe interval in milliseconds
-target_probe_rate_per_second: 10 # Max probes per second
+target_probe_rate_per_second: 10 # Max probes per second PER TARGET (shared across a target's flow labels)
 pinglist_update_interval_sec: 300 # Pinglist refresh interval
+
+# ECMP flow-label rotation
+# Period over which the rotating ~20% of each target's flow-label set is
+# refreshed, shifting a fraction of probed ECMP paths over time while the rest
+# stay stable for time-series continuity. The label COUNT is sized by the
+# controller (see controller.yaml ecmp_* settings).
+flow_label_rotation_period_sec: 3600
 
 # RDMA settings
 gid_index: 0                     # GID table index to use

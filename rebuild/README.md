@@ -208,8 +208,9 @@ via Cgo (`CGO_ENABLED=1`).
 | `tor_id` | *(required)* | Top-of-Rack switch identifier |
 | `controller_addr` | `localhost:50051` | Controller gRPC address |
 | `probe_interval_ms` | `500` | Milliseconds between probe rounds |
-| `target_probe_rate_per_second` | `10` | Max probes per second |
+| `target_probe_rate_per_second` | `10` | Max probes per second **per target** (a target's ECMP flow labels share this budget) |
 | `pinglist_update_interval_sec` | `300` | Seconds between pinglist refreshes |
+| `flow_label_rotation_period_sec` | `3600` | Period over which the rotating ~20% of each target's ECMP flow-label set is refreshed |
 | `gid_index` | `0` | GID table index on RDMA devices |
 | `allowed_device_names` | `[]` | Device filter (empty = all devices) |
 | `metrics_enabled` | `true` | Enable OpenTelemetry export |
@@ -222,6 +223,10 @@ via Cgo (`CGO_ENABLED=1`).
 |-------|---------|-------------|
 | `listen_addr` | `:50051` | gRPC listen address |
 | `database_uri` | `http://localhost:4001` | rqlite connection URI |
+| `inter_tor_sample_size` | `5` | Distinct ToRs sampled per inter-ToR pinglist |
+| `ecmp_paths_assumed` | `16` | Assumed ECMP fabric width (m) for Eq.(1) flow-label coverage sizing |
+| `ecmp_coverage_probability` | `0.9` | Target probability (p, in (0,1)) that generated flow labels cover all ECMP paths |
+| `ecmp_max_flow_labels` | `64` | Hard cap on flow labels per target (bounds probe amplification) |
 | `log_level` | `info` | Log level |
 
 ### Environment Variable Overrides
@@ -329,15 +334,58 @@ The latter requires a Connection Manager context that is unnecessary for UD
 (Unreliable Datagram) operations. `librdmacm` is linked only for its utility
 functions.
 
-### `flow_label` for ECMP Path Diversity
+### `flow_label` for ECMP Path Coverage
 
 RoCEv2 UD mode does not allow control over the UDP source port (it is
 driver-generated). Instead, the IPv6 flow label field in `ibv_ah_attr.grh` is
 used for ECMP path selection. The `source_port` field in `PingTarget` is
-metadata only and is not enforced at the RDMA layer.
+metadata only and is not enforced at the RDMA layer. The flow label reaches the
+NIC per send via a fresh `ibv_create_ah()` in the Zig bridge, so it can vary
+from one probe to the next with no per-QP state.
 
-Flow labels are generated deterministically using FNV-1a hashing of
-`(requester_gid, target_gid)`, masked to 20 bits.
+Rather than probing each `(source, target)` pair with a single deterministic
+flow label — which always pins the same ECMP path and leaves silent drops on
+other links invisible — the controller sizes a **set** of distinct flow labels
+per target so the target's ECMP paths are covered with a configured
+probability, and the agent rotates through that set.
+
+**Coverage sizing (R-Pingmesh Eq.(1), coupon-collector).** To cover all `m`
+equal-probability ECMP paths with probability at least `p`, model each probe as
+drawing one of `m` paths uniformly. Let `q = (m-1)/m` be the per-probe miss
+probability for a given path; after `n` draws that path is uncovered with
+probability `q^n`. Treating the `m` paths' coverage as independent (a standard,
+slightly conservative closed form) gives `P(cover all) ≈ (1 - q^n)^m ≥ p`,
+which solves to:
+
+```
+n = ceil( ln(1 - p^(1/m)) / ln((m-1)/m) )
+```
+
+This agrees to within one probe with the strict union bound
+`P(cover all) ≥ 1 - m·q^n`. The controller computes `n` once from
+`ecmp_paths_assumed` (m), `ecmp_coverage_probability` (p), and the
+`ecmp_max_flow_labels` cap (which bounds probe amplification), and stamps
+`flow_label_count = n` and a full 32-bit `flow_label_seed` into every
+`PingTarget` (seed + count is far smaller than a repeated label list). The
+legacy `flow_label` field remains populated (the low 20 bits of the seed) and
+is used verbatim when `flow_label_count ≤ 1`, preserving backward compatibility.
+
+**Agent expansion and rotation.** The agent derives label `i` deterministically
+from `hash(seed, i, rotationEpoch)` masked to 20 bits, and sends probes
+**round-robin** across the set (successive probes to a target use successive
+labels). The set of labels shares the target's probe budget:
+`target_probe_rate_per_second` is a per-**target** cap and is *not* multiplied
+by `n`, so enabling coverage bounds probe amplification rather than accelerating
+it. Every `flow_label_rotation_period_sec` (default 1h), the rotating subset
+(~20%, every 5th label index) folds in `rotationEpoch = floor(unixTime /
+period)` and shifts, catching a wider set of paths over time while the other
+~80% stay stable for time-series continuity. (Wall-clock time here only selects
+labels; it never enters a measurement timestamp.)
+
+The actual flow label used for each probe is reported in `ProbeResult` and in
+debug logs, but deliberately **not** as an OTel metric attribute — per-label
+cardinality would explode the metric space, so aggregate metrics stay
+ToR-level.
 
 ### ToR-Level Metric Cardinality
 
@@ -471,16 +519,12 @@ sudo rdma link add rxe0 type rxe netdev eth0
   rates (e.g. ToR-mesh probes at 10pps, with a separate rate for inter-ToR
   probes) are not implemented.
 
-- **Inter-ToR pinglist coverage is a simplified random sample, not a
-  probabilistic ECMP coverage guarantee.** The paper's Eq. (1) derives the
-  number of samples needed to cover ECMP paths with a target probability;
-  this rebuild instead picks a fixed, configurable number of random ToRs
-  (`N`) without that coverage-probability derivation.
-
-- **No periodic 5-tuple rotation.** The paper rotates ~20% of probe 5-tuples
-  every hour to shift ECMP path selection over time and catch a wider set of
-  paths. This rebuild's `flow_label` is derived deterministically from
-  `(requester_gid, target_gid)` and does not rotate.
+- **Inter-ToR *ToR selection* is a fixed-size random sample.** ECMP *path*
+  coverage per target is now sized probabilistically via Eq.(1) (see
+  [`flow_label` for ECMP Path Coverage](#flow_label-for-ecmp-path-coverage)),
+  but the choice of *which* remote ToRs an agent probes for its inter-ToR
+  pinglist is still a fixed, configurable random sample of `inter_tor_sample_size`
+  ToRs, not itself derived from a coverage-probability target.
 
 - **Analyzer and Service Tracing remain out of scope.** As noted above, the
   data-aggregation/anomaly-detection Analyzer (switch/link fault

@@ -151,6 +151,54 @@ func TestControllerConfig_Validate(t *testing.T) {
 			cfg: ControllerConfig{
 				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
 				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+			},
+			wantErr: false,
+		},
+		{
+			name: "zero ecmp paths assumed",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 0, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+			},
+			wantErr: true,
+		},
+		{
+			name: "coverage probability out of range",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 1.0, EcmpMaxFlowLabels: 64,
+			},
+			wantErr: true,
+		},
+		{
+			name: "zero ecmp max flow labels",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 0,
+			},
+			wantErr: true,
+		},
+		{
+			// A cap above the 20-bit flow-label space (2^20) could reach a
+			// PingTarget and hang the agent's distinct-label generation.
+			name: "ecmp max flow labels exceeds 20-bit space",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: MaxEcmpFlowLabels + 1,
+			},
+			wantErr: true,
+		},
+		{
+			name: "ecmp max flow labels at 20-bit boundary",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: MaxEcmpFlowLabels,
 			},
 			wantErr: false,
 		},
@@ -286,17 +334,22 @@ func TestAgentConfig_Validate(t *testing.T) {
 	}{
 		{
 			name:    "valid",
-			cfg:     AgentConfig{GIDIndex: 0, ProbeIntervalMS: 500},
+			cfg:     AgentConfig{GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600},
 			wantErr: false,
 		},
 		{
 			name:    "negative gid index",
-			cfg:     AgentConfig{GIDIndex: -1, ProbeIntervalMS: 500},
+			cfg:     AgentConfig{GIDIndex: -1, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600},
 			wantErr: true,
 		},
 		{
 			name:    "zero probe interval",
-			cfg:     AgentConfig{GIDIndex: 0, ProbeIntervalMS: 0},
+			cfg:     AgentConfig{GIDIndex: 0, ProbeIntervalMS: 0, FlowLabelRotationPeriodSec: 3600},
+			wantErr: true,
+		},
+		{
+			name:    "zero flow label rotation period",
+			cfg:     AgentConfig{GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 0},
 			wantErr: true,
 		},
 	}

@@ -5,10 +5,21 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/yuuki/rpingmesh/rebuild/internal/controller/pinglist"
 	"github.com/yuuki/rpingmesh/rebuild/proto/controller_agent"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// newTestService wraps NewControllerService with a fixed, valid ECMP config so
+// the request-handling tests need not care about Eq.(1) flow-label sizing.
+func newTestService(reg registryClient) *ControllerService {
+	return NewControllerService(reg, pinglist.ECMPConfig{
+		PathsAssumed:        16,
+		CoverageProbability: 0.9,
+		MaxFlowLabels:       64,
+	})
+}
 
 // fakeRegistry implements registryClient without any real rqlite backend,
 // so that ControllerService's RegisterAgent/GetPinglist request handling
@@ -52,7 +63,7 @@ func statusCode(t *testing.T, err error) codes.Code {
 }
 
 func TestRegisterAgent_MissingAgentID(t *testing.T) {
-	svc := NewControllerService(&fakeRegistry{})
+	svc := newTestService(&fakeRegistry{})
 
 	_, err := svc.RegisterAgent(context.Background(), &controller_agent.AgentRegistrationRequest{
 		TorId: "tor-1",
@@ -66,7 +77,7 @@ func TestRegisterAgent_MissingAgentID(t *testing.T) {
 }
 
 func TestRegisterAgent_MissingTorID(t *testing.T) {
-	svc := NewControllerService(&fakeRegistry{})
+	svc := newTestService(&fakeRegistry{})
 
 	_, err := svc.RegisterAgent(context.Background(), &controller_agent.AgentRegistrationRequest{
 		AgentId: "agent-1",
@@ -81,7 +92,7 @@ func TestRegisterAgent_MissingTorID(t *testing.T) {
 
 func TestRegisterAgent_RegistryFailure(t *testing.T) {
 	fake := &fakeRegistry{registerErr: errors.New("write failed")}
-	svc := NewControllerService(fake)
+	svc := newTestService(fake)
 
 	resp, err := svc.RegisterAgent(context.Background(), &controller_agent.AgentRegistrationRequest{
 		AgentId: "agent-1",
@@ -111,7 +122,7 @@ func TestRegisterAgent_RegistryFailure(t *testing.T) {
 
 func TestRegisterAgent_Success(t *testing.T) {
 	fake := &fakeRegistry{}
-	svc := NewControllerService(fake)
+	svc := newTestService(fake)
 
 	resp, err := svc.RegisterAgent(context.Background(), &controller_agent.AgentRegistrationRequest{
 		AgentId:  "agent-1",
@@ -146,7 +157,7 @@ func TestRegisterAgent_Success(t *testing.T) {
 }
 
 func TestGetPinglist_MissingAgentID(t *testing.T) {
-	svc := NewControllerService(&fakeRegistry{})
+	svc := newTestService(&fakeRegistry{})
 
 	_, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
 		RequesterGid: "gid-1",
@@ -160,7 +171,7 @@ func TestGetPinglist_MissingAgentID(t *testing.T) {
 }
 
 func TestGetPinglist_MissingRequesterGID(t *testing.T) {
-	svc := NewControllerService(&fakeRegistry{})
+	svc := newTestService(&fakeRegistry{})
 
 	_, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
 		AgentId: "agent-1",
@@ -174,7 +185,7 @@ func TestGetPinglist_MissingRequesterGID(t *testing.T) {
 }
 
 func TestGetPinglist_UnknownType(t *testing.T) {
-	svc := NewControllerService(&fakeRegistry{})
+	svc := newTestService(&fakeRegistry{})
 
 	_, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
 		AgentId:      "agent-1",
@@ -196,7 +207,7 @@ func TestGetPinglist_TorMeshSuccess(t *testing.T) {
 			{Gid: "peer-gid", TorId: "tor-1"},
 		},
 	}
-	svc := NewControllerService(fake)
+	svc := newTestService(fake)
 
 	resp, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
 		AgentId:      "agent-1",
@@ -217,7 +228,7 @@ func TestGetPinglist_TorMeshSuccess(t *testing.T) {
 
 func TestGetPinglist_RegistryFailure(t *testing.T) {
 	fake := &fakeRegistry{torMeshErr: errors.New("query failed")}
-	svc := NewControllerService(fake)
+	svc := newTestService(fake)
 
 	_, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
 		AgentId:      "agent-1",

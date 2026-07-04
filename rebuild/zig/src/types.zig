@@ -119,9 +119,6 @@ pub const RdmaDevice = struct {
     /// Human-readable device information matching rdma_device_info_t in the
     /// C header. This is filled during device open and returned to Go.
     device_info: DeviceInfo,
-
-    /// Whether this device supports hardware completion timestamps.
-    has_hw_timestamps: bool,
 };
 
 /// Device information struct, matching rdma_device_info_t in rdma_bridge.h.
@@ -201,6 +198,19 @@ pub const UdQueue = struct {
     running: std.atomic.Value(bool),
 
     // ----- Send completion signaling (synchronous send path) -----
+    //
+    // IMPORTANT invariant: these three fields form a single-slot mailbox,
+    // not a queue. They implicitly assume "one UdQueue is driven by at most
+    // one sender goroutine/thread at a time" -- i.e. a caller posts a send
+    // WR, then immediately waits on send_completion_ready before posting
+    // another. If this queue is ever shared by multiple concurrent senders
+    // (e.g. a future change that parallelizes probing across goroutines
+    // using the same UdQueue), a second sendPacketInternal() call could
+    // overwrite send_completion_ready/timestamp/status while a first call
+    // is still spinning on waitSendCompletion(), causing one sender to read
+    // the other's completion (wrong timestamp) or to hang. Do not remove
+    // the "1 Queue = 1 sender at a time" contract without replacing this
+    // mailbox with a per-request completion slot (e.g. keyed by wr_id).
 
     /// Atomic flag set by the CQ poller when a send completion is ready.
     /// The sender thread spins on this after posting a send WR.

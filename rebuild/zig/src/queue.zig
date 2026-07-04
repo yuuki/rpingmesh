@@ -56,13 +56,22 @@ pub const QueueError = error{
 ///
 /// This function performs the full queue initialization sequence:
 ///   1. Allocate the UdQueue struct
-///   2. Create a completion channel for event notification
-///   3. Create extended CQs (with HW timestamp fallback)
+///   2. Create extended CQs (with HW timestamp fallback)
+///   3. Allocate send and receive buffers
 ///   4. Create a UD QP with the CQs
 ///   5. Transition the QP through INIT -> RTR -> RTS states
-///   6. Allocate send and receive buffers
-///   7. Post initial receive buffers
-///   8. Start the CQ poller thread
+///   6. Post initial receive buffers
+///   7. Start the CQ poller thread
+///
+/// Buffers are allocated (step 3) before the QP is created (step 4) even
+/// though the QP has no functional dependency on them yet. This ordering is
+/// deliberate: Zig's errdefer unwinds in LIFO order, so registering the
+/// QP-destroy errdefer *after* the buffer-free errdefers guarantees that if
+/// a later step fails (e.g. postInitialRecvBuffers in step 6), the QP is
+/// destroyed before the buffers it may have posted work requests against
+/// are freed. Freeing a buffer while the QP could still reference it via an
+/// outstanding work request would risk the hardware DMA'ing into freed
+/// memory.
 ///
 /// On failure, all partially allocated resources are cleaned up before
 /// returning the error.
@@ -93,19 +102,11 @@ pub fn createQueue(
         }
     }
 
-    // Step 2: Create the UD QP
-    const qp = createUdQp(dev, cq_result.send_cq, cq_result.recv_cq) orelse {
-        types.setLastError("ibv_create_qp() failed");
-        return QueueError.CreateQpFailed;
-    };
-    errdefer _ = c.ibv_destroy_qp(qp);
-
-    // Step 3: Transition QP through INIT -> RTR -> RTS
-    try transitionQpToInit(dev, qp);
-    try transitionQpToRtr(qp);
-    try transitionQpToRts(qp);
-
-    // Step 4: Allocate send and receive buffers
+    // Step 2: Allocate send and receive buffers.
+    //
+    // Allocated before the QP (see the ordering note in the function doc
+    // comment above) so that error-path cleanup destroys the QP before
+    // freeing these buffers.
     const send_bufset = memory.allocateBuffers(dev, types.NUM_SEND_SLOTS) catch {
         types.setLastError("failed to allocate send buffers");
         return QueueError.BufferAllocFailed;
@@ -123,6 +124,22 @@ pub fn createQueue(
         var mutable_recv = recv_bufset;
         memory.freeBuffers(&mutable_recv);
     }
+
+    // Step 3: Create the UD QP.
+    //
+    // Registered after the buffer errdefers above, so on unwind this
+    // errdefer runs *first* -- the QP is destroyed before the buffers are
+    // freed.
+    const qp = createUdQp(dev, cq_result.send_cq, cq_result.recv_cq) orelse {
+        types.setLastError("ibv_create_qp() failed");
+        return QueueError.CreateQpFailed;
+    };
+    errdefer _ = c.ibv_destroy_qp(qp);
+
+    // Step 4: Transition QP through INIT -> RTR -> RTS
+    try transitionQpToInit(dev, qp);
+    try transitionQpToRtr(qp);
+    try transitionQpToRts(qp);
 
     // Initialize the queue struct
     queue.* = types.UdQueue{
@@ -147,13 +164,13 @@ pub fn createQueue(
         .send_completion_status = std.atomic.Value(i32).init(0),
     };
 
-    // Step 5: Post initial receive buffers
+    // Step 6: Post initial receive buffers
     memory.postInitialRecvBuffers(qp, recv_bufset.mr, recv_bufset.buf, types.INITIAL_RECV_BUFFERS) catch {
         types.setLastError("failed to post initial recv buffers");
         return QueueError.PostRecvFailed;
     };
 
-    // Step 6: Start the CQ poller thread
+    // Step 7: Start the CQ poller thread
     cq.startCqPollerThread(queue) catch {
         types.setLastError("failed to start CQ poller thread");
         return QueueError.StartPollerFailed;
@@ -175,23 +192,38 @@ pub fn createQueue(
 ///   4. Destroy CQs
 ///   5. Free the queue struct
 pub fn destroyQueue(queue: *types.UdQueue) void {
+    const log = std.log.scoped(.rdma_queue);
+
     // Stop the CQ poller thread (sets running=false and joins)
     cq.stopCqPollerThread(queue);
 
-    // Destroy the QP first (before CQs, as QP references them)
-    _ = c.ibv_destroy_qp(queue.qp);
+    // Destroy the QP first (before CQs, as QP references them). Log a
+    // failure instead of discarding it -- a nonzero return here is useful
+    // operational signal during teardown even though we cannot recover.
+    const qp_ret = c.ibv_destroy_qp(queue.qp);
+    if (qp_ret != 0) {
+        log.err("ibv_destroy_qp() failed with errno={d}", .{qp_ret});
+    }
 
-    // Free send buffers and deregister send MR
-    _ = c.ibv_dereg_mr(queue.send_mr);
-    const send_total = @as(usize, types.NUM_SEND_SLOTS) * @as(usize, types.SLOT_SIZE);
-    const send_slice = queue.send_buf[0..send_total];
-    std.heap.page_allocator.free(send_slice);
+    // Free send/recv buffers and deregister their MRs by delegating to
+    // memory.freeBuffers(), so the dereg-failure handling (intentional leak
+    // instead of a potential use-after-free; see memory.zig) is defined in
+    // exactly one place instead of being duplicated here.
+    var send_bufset = memory.BufferSet{
+        .buf = queue.send_buf,
+        .mr = queue.send_mr,
+        .num_slots = types.NUM_SEND_SLOTS,
+        .size = @as(usize, types.NUM_SEND_SLOTS) * @as(usize, types.SLOT_SIZE),
+    };
+    memory.freeBuffers(&send_bufset);
 
-    // Free recv buffers and deregister recv MR
-    _ = c.ibv_dereg_mr(queue.recv_mr);
-    const recv_total = @as(usize, types.NUM_RECV_SLOTS) * @as(usize, types.SLOT_SIZE);
-    const recv_slice = queue.recv_buf[0..recv_total];
-    std.heap.page_allocator.free(recv_slice);
+    var recv_bufset = memory.BufferSet{
+        .buf = queue.recv_buf,
+        .mr = queue.recv_mr,
+        .num_slots = types.NUM_RECV_SLOTS,
+        .size = @as(usize, types.NUM_RECV_SLOTS) * @as(usize, types.SLOT_SIZE),
+    };
+    memory.freeBuffers(&recv_bufset);
 
     // Destroy CQs (convert from ibv_cq_ex back to ibv_cq for destruction)
     destroyCqEx(queue.recv_cq);
@@ -226,6 +258,15 @@ pub fn createAddressHandle(
     // Global routing is required for RoCE
     ah_attr.is_global = 1;
     ah_attr.port_num = dev.port_num;
+    // Known limitation: sl and traffic_class are fixed at 0 rather than
+    // being configurable. On a production lossless fabric that relies on
+    // PFC/ECN and DSCP-to-TC mappings (RoCEv2 congestion control), probe
+    // traffic sharing traffic_class=0 with best-effort/background traffic
+    // may land in an unintended priority queue, skewing latency
+    // measurements relative to the application traffic the probes are
+    // meant to represent. Left as-is here (no behavior change); a future
+    // fix would thread a configurable DSCP/traffic_class value through
+    // from the agent configuration.
     ah_attr.sl = 0; // Service Level
 
     // GRH settings
@@ -326,7 +367,10 @@ fn createExtendedCqs(dev: *types.RdmaDevice) ?ExtendedCqResult {
 fn destroyCqEx(cq_ex: *c.ibv_cq_ex) void {
     const base_cq = c.ibv_cq_ex_to_cq(cq_ex);
     if (base_cq != null) {
-        _ = c.ibv_destroy_cq(base_cq);
+        const ret = c.ibv_destroy_cq(base_cq);
+        if (ret != 0) {
+            std.log.scoped(.rdma_queue).err("ibv_destroy_cq() failed with errno={d}", .{ret});
+        }
     }
 }
 

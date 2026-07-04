@@ -5,6 +5,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 	"github.com/yuuki/rpingmesh/rebuild/internal/probe"
 	"github.com/yuuki/rpingmesh/rebuild/internal/rdmabridge"
 	"github.com/yuuki/rpingmesh/rebuild/proto/controller_agent"
+	"golang.org/x/sys/unix"
 )
 
 // Default constants for the Prober.
@@ -30,19 +32,19 @@ const (
 	// is considered stale and eligible for cleanup.
 	stalePendingTimeout = 30 * time.Second
 
-	// stalePendingCleanupInterval determines how often the probe loop
-	// checks for stale pending probes (every N ticks of the probe loop).
-	stalePendingCleanupInterval = 100
+	// stalePendingCleanupPeriod is the wall-clock interval between stale-pending
+	// sweeps. Using elapsed time (rather than a tick count) decouples cleanup
+	// cadence from the probe interval, so the sweep runs at a predictable rate
+	// regardless of how frequently probes are sent.
+	stalePendingCleanupPeriod = 10 * time.Second
 )
 
 // pendingProbe holds the in-flight state for a single probe awaiting ACKs.
+// The 6-timestamp bookkeeping lives in the embedded PendingMeasurement, which
+// accepts the two ACKs in either arrival order.
 type pendingProbe struct {
 	target    *controller_agent.PingTarget
-	t1        uint64 // Prober send time (CLOCK_MONOTONIC via Zig)
-	t2        uint64 // NIC HW timestamp of probe send completion (or SW fallback)
-	t3        uint64 // Responder recv timestamp (filled on first ACK)
-	t4        uint64 // Responder first ACK send completion (filled on second ACK)
-	t5        uint64 // Prober first ACK recv timestamp (filled on first ACK)
+	meas      *probe.PendingMeasurement
 	createdAt time.Time
 }
 
@@ -61,11 +63,23 @@ type Prober struct {
 	agentEpoch    uint32 // Random epoch prefix for sequence number collision prevention
 	resultChan    chan *probe.ProbeResult
 	running       atomic.Bool
+	stopMu        sync.Mutex    // guards stopCh (re)creation across Start/Stop
 	stopCh        chan struct{} // closed by Stop() to wake goroutines immediately
 	wg            sync.WaitGroup
 	probeInterval time.Duration
 	probeTimeout  uint32 // ms
-	logger        zerolog.Logger
+
+	// queueMu guards access to the queue pointer so that GetQueueInfo cannot
+	// race with Destroy() setting queue to nil.
+	queueMu sync.RWMutex
+
+	// rateMu guards the send-rate limiter, which SetPerTargetRateLimit may update from
+	// a different goroutine than the probe loop.
+	rateMu       sync.Mutex // guards limiter and perTargetPPS; lock order: targetsMu -> rateMu
+	limiter      probe.RateLimiter
+	perTargetPPS float64
+
+	logger zerolog.Logger
 }
 
 // NewProber creates a new Prober with a sender-type RDMA queue bound to the
@@ -76,6 +90,13 @@ type Prober struct {
 // agent lifetimes do not collide: the high 32 bits of each sequence number
 // contain the epoch, and the low 32 bits are a monotonic counter.
 func NewProber(device *rdmabridge.Device, ring *rdmabridge.EventRing, probeIntervalMS uint32) (*Prober, error) {
+	// A zero interval would make probeLoop call time.NewTicker(0), which panics.
+	// Reject it here rather than at Start time so the misconfiguration surfaces
+	// during construction. (The signature already returns an error.)
+	if probeIntervalMS == 0 {
+		return nil, fmt.Errorf("probeIntervalMS must be greater than 0")
+	}
+
 	queue, err := device.CreateQueue(rdmabridge.QueueTypeSender, ring)
 	if err != nil {
 		return nil, err
@@ -113,6 +134,13 @@ func (p *Prober) Start(ctx context.Context) error {
 		return nil // already running
 	}
 
+	// Recreate stopCh so a prober can be started again after a previous Stop()
+	// closed it. Stop() has already waited for the old goroutines to exit
+	// (running is false here), so no goroutine references the old channel.
+	p.stopMu.Lock()
+	p.stopCh = make(chan struct{})
+	p.stopMu.Unlock()
+
 	p.wg.Add(2)
 	go p.probeLoop(ctx)
 	go p.ackProcessLoop(ctx)
@@ -131,9 +159,56 @@ func (p *Prober) Stop() {
 	if !p.running.CompareAndSwap(true, false) {
 		return // not running
 	}
+	p.stopMu.Lock()
 	close(p.stopCh)
+	p.stopMu.Unlock()
 	p.wg.Wait()
 	p.logger.Info().Msg("Prober stopped")
+}
+
+// SetPerTargetRateLimit caps the probe send rate to at most pps packets per
+// second per target. The aggregate limiter rate is recomputed as
+// pps * len(targets) here and on every UpdateTargets call, so the configured
+// per-target cadence is preserved as the pinglist grows or shrinks. A
+// non-positive pps disables rate limiting. Safe to call while running.
+func (p *Prober) SetPerTargetRateLimit(pps float64) {
+	p.targetsMu.RLock()
+	n := len(p.targets)
+	p.targetsMu.RUnlock()
+
+	p.rateMu.Lock()
+	p.perTargetPPS = pps
+	p.limiter.SetRate(pps * float64(n))
+	p.rateMu.Unlock()
+	p.logger.Info().
+		Float64("per_target_pps", pps).
+		Int("targets", n).
+		Msg("Probe send rate limit updated")
+}
+
+// nowMonotonicNS returns the current CLOCK_MONOTONIC time in nanoseconds. It
+// must be used for T6 instead of time.Now().UnixNano() (a wall-clock reading)
+// so that ProberDelay = (T6-T1) - (T5-T2) is arithmetically sound in both
+// timestamp modes:
+//
+//   - SW fallback: T1, T2, T5 are all CLOCK_MONOTONIC on the prober host, and
+//     T6 now matches that domain, so every term shares one clock.
+//   - HW timestamps: T2 and T5 are NIC wall-clock timestamps, but only their
+//     difference (T5-T2) is used, which is self-consistent within the NIC
+//     clock. T1 and T6 are the host CLOCK_MONOTONIC pair whose difference
+//     (T6-T1) is likewise self-consistent. Subtracting the two durations is
+//     valid because both clocks advance at ~1 ns/ns. Using a wall-clock T6
+//     here would instead make (T6-T1) a cross-domain difference and corrupt
+//     ProberDelay.
+func nowMonotonicNS() uint64 {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+		// clock_gettime(CLOCK_MONOTONIC) does not fail in practice on Linux;
+		// fall back to the process-monotonic reading embedded in time.Now to
+		// avoid returning zero, which the RTT validator would reject.
+		return uint64(time.Now().UnixNano())
+	}
+	return uint64(ts.Nano())
 }
 
 // UpdateTargets replaces the current list of probe targets. This is called
@@ -142,6 +217,16 @@ func (p *Prober) UpdateTargets(targets []*controller_agent.PingTarget) {
 	p.targetsMu.Lock()
 	defer p.targetsMu.Unlock()
 	p.targets = targets
+
+	// Keep the aggregate limiter in sync with the per-target rate so the
+	// per-target cadence survives pinglist size changes. Lock order is
+	// always targetsMu -> rateMu.
+	p.rateMu.Lock()
+	if p.perTargetPPS > 0 {
+		p.limiter.SetRate(p.perTargetPPS * float64(len(targets)))
+	}
+	p.rateMu.Unlock()
+
 	p.logger.Info().
 		Int("count", len(targets)).
 		Msg("Probe targets updated")
@@ -162,7 +247,7 @@ func (p *Prober) probeLoop(ctx context.Context) {
 	ticker := time.NewTicker(p.probeInterval)
 	defer ticker.Stop()
 
-	var tickCount uint64
+	lastCleanup := time.Now()
 
 	p.logger.Info().
 		Dur("interval", p.probeInterval).
@@ -178,19 +263,24 @@ func (p *Prober) probeLoop(ctx context.Context) {
 			// the next ticker fire, which could be up to probeInterval away.
 			return
 		case <-ticker.C:
-			tickCount++
-			p.sendProbes()
+			p.sendProbes(ctx)
 
-			// Periodically clean up stale pending probes to prevent memory leaks.
-			if tickCount%stalePendingCleanupInterval == 0 {
+			// Clean up stale pending probes on a wall-clock cadence so the
+			// sweep frequency does not depend on the probe interval.
+			if time.Since(lastCleanup) >= stalePendingCleanupPeriod {
 				p.cleanupStalePending()
+				lastCleanup = time.Now()
 			}
 		}
 	}
 }
 
 // sendProbes reads the current target list and sends one probe to each target.
-func (p *Prober) sendProbes() {
+// It checks for shutdown (ctx cancellation or Stop) before each target so that
+// Stop() is not blocked for up to probeSendTimeoutMS * len(targets); each
+// SendProbe can block for up to probeSendTimeoutMS, so without these checks a
+// large target list could delay shutdown by many seconds.
+func (p *Prober) sendProbes(ctx context.Context) {
 	p.targetsMu.RLock()
 	targets := make([]*controller_agent.PingTarget, len(p.targets))
 	copy(targets, p.targets)
@@ -201,8 +291,24 @@ func (p *Prober) sendProbes() {
 	}
 
 	for _, target := range targets {
+		// Abort the batch promptly on shutdown instead of walking the entire
+		// target list while blocking on SendProbe for each one.
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.stopCh:
+			return
+		default:
+		}
+
 		if target == nil {
 			continue
+		}
+
+		// Apply the optional send-rate limit, spacing sends across targets.
+		// The wait is interruptible so Stop() is not delayed by the limiter.
+		if !p.rateLimitWait(ctx) {
+			return
 		}
 
 		// Generate a globally-unique sequence number:
@@ -239,12 +345,13 @@ func (p *Prober) sendProbes() {
 			continue
 		}
 
-		// Record the pending probe with T1 and T2 from the send result.
+		// Record the pending probe with T1 and T2 from the send result. The
+		// PendingMeasurement will absorb the two ACKs in whatever order they
+		// arrive.
 		p.pendingMu.Lock()
 		p.pending[seqNum] = &pendingProbe{
 			target:    target,
-			t1:        result.T1NS,
-			t2:        result.T2NS,
+			meas:      probe.NewPendingMeasurement(result.T1NS, result.T2NS),
 			createdAt: time.Now(),
 		}
 		p.pendingMu.Unlock()
@@ -256,6 +363,32 @@ func (p *Prober) sendProbes() {
 			Uint64("t1_ns", result.T1NS).
 			Uint64("t2_ns", result.T2NS).
 			Msg("Probe sent, awaiting ACKs")
+	}
+}
+
+// rateLimitWait blocks for the duration required by the configured send-rate
+// limit before the next probe may be sent. It returns false if the wait was
+// interrupted by ctx cancellation or Stop(), in which case the caller should
+// abandon the current send batch. When rate limiting is disabled it returns
+// true immediately.
+func (p *Prober) rateLimitWait(ctx context.Context) bool {
+	p.rateMu.Lock()
+	wait := p.limiter.Reserve(time.Now())
+	p.rateMu.Unlock()
+
+	if wait <= 0 {
+		return true
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-p.stopCh:
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -357,9 +490,10 @@ func (p *Prober) handleACKEvent(event *rdmabridge.CompletionEvent) {
 	}
 }
 
-// handleFirstACK processes a first ACK event. It extracts T3 (responder
-// recv timestamp) and records T5 (prober recv timestamp from the NIC HW
-// or SW timestamp on this completion).
+// handleFirstACK processes a first ACK event. It records T3 (responder recv
+// timestamp, authoritative from the first ACK) and T5 (prober recv timestamp
+// from the NIC HW or SW timestamp on this completion). If the second ACK has
+// already arrived, this completes the measurement.
 func (p *Prober) handleFirstACK(seqNum uint64, event *rdmabridge.CompletionEvent) {
 	p.pendingMu.Lock()
 	pp, ok := p.pending[seqNum]
@@ -371,31 +505,36 @@ func (p *Prober) handleFirstACK(seqNum uint64, event *rdmabridge.CompletionEvent
 		return
 	}
 
-	// T3 is the responder's recv timestamp, carried in the ACK event.
-	pp.t3 = event.T3
-
-	// T5 is the prober's recv timestamp for the first ACK, taken from
-	// the NIC completion event (HW or SW timestamp).
-	pp.t5 = event.TimestampNS
-
+	// T5 is the prober's recv timestamp for the first ACK, taken from the NIC
+	// completion event (HW or SW timestamp). T3 is the responder recv timestamp
+	// carried in the ACK payload.
+	pp.meas.ApplyFirstAck(event.T3, event.TimestampNS)
+	result := p.finalizeIfCompleteLocked(seqNum, pp)
 	p.pendingMu.Unlock()
 
 	p.logger.Debug().
 		Uint64("seq", seqNum).
-		Uint64("t3_ns", pp.t3).
-		Uint64("t5_ns", pp.t5).
+		Uint64("t3_ns", event.T3).
+		Uint64("t5_ns", event.TimestampNS).
 		Msg("First ACK received")
+
+	if result != nil {
+		p.deliverResult(seqNum, pp.target, result)
+	}
 }
 
 // handleSecondACK processes a second ACK event, which carries T3 and T4
-// (responder-side timestamps). T6 is captured as the current Go monotonic
-// time since the ring buffer completion event does not provide a Go-side
-// timestamp for the second ACK arrival. With all 6 timestamps available,
-// it builds a ProbeResult, calculates RTT, and sends the result to the
-// results channel.
+// (responder-side timestamps). T6 is captured on the prober host from
+// CLOCK_MONOTONIC (the same clock domain as T1) because the ring buffer
+// completion event does not carry a host-side timestamp for the second ACK
+// arrival. If the first ACK has already arrived, this completes the
+// measurement; otherwise the pending entry waits for it (out-of-order ACKs are
+// supported).
 func (p *Prober) handleSecondACK(seqNum uint64, event *rdmabridge.CompletionEvent) {
-	// Capture T6 immediately upon processing the second ACK.
-	t6 := uint64(time.Now().UnixNano())
+	// Capture T6 immediately upon processing the second ACK, using the same
+	// CLOCK_MONOTONIC domain as T1 so that (T6 - T1) in ProberDelay is a valid
+	// same-domain difference.
+	t6 := nowMonotonicNS()
 
 	p.pendingMu.Lock()
 	pp, ok := p.pending[seqNum]
@@ -407,50 +546,60 @@ func (p *Prober) handleSecondACK(seqNum uint64, event *rdmabridge.CompletionEven
 		return
 	}
 
-	// The second ACK carries T3 and T4 in the event payload. If the first
-	// ACK has already filled T3, prefer the first ACK's value (it arrived
-	// earlier and is more accurate). Otherwise, use the second ACK's T3.
-	t3 := pp.t3
-	if t3 == 0 {
-		t3 = event.T3
+	// The second ACK carries T3 and T4 in the event payload. T3 here is only
+	// used if the first ACK has not yet supplied it (see PendingMeasurement).
+	pp.meas.ApplySecondAck(event.T3, event.T4, t6)
+	result := p.finalizeIfCompleteLocked(seqNum, pp)
+	p.pendingMu.Unlock()
+
+	p.logger.Debug().
+		Uint64("seq", seqNum).
+		Uint64("t4_ns", event.T4).
+		Uint64("t6_ns", t6).
+		Msg("Second ACK received")
+
+	if result != nil {
+		p.deliverResult(seqNum, pp.target, result)
 	}
-	t4 := event.T4
+}
+
+// finalizeIfCompleteLocked builds a ProbeResult and removes the pending entry
+// once both ACKs have arrived. It returns nil while the measurement is still
+// waiting for the other ACK. The caller must hold pendingMu.
+func (p *Prober) finalizeIfCompleteLocked(seqNum uint64, pp *pendingProbe) *probe.ProbeResult {
+	if !pp.meas.Complete() {
+		return nil
+	}
 
 	// Build the target GID from the pending probe's target information.
 	var targetGID [16]byte
-	parsedGID, err := probe.ParseGID(pp.target.GetTargetGid())
-	if err == nil {
+	if parsedGID, err := probe.ParseGID(pp.target.GetTargetGid()); err == nil {
 		targetGID = parsedGID
 	}
 
-	// Construct the complete ProbeResult with all 6 timestamps.
-	result := &probe.ProbeResult{
-		SequenceNum:    seqNum,
-		TargetGID:      targetGID,
-		TargetQPN:      pp.target.GetTargetQpn(),
-		FlowLabel:      pp.target.GetFlowLabel(),
-		T1:             pp.t1,
-		T2:             pp.t2,
-		T3:             t3,
-		T4:             t4,
-		T5:             pp.t5,
-		T6:             t6,
-		Success:        true,
-		TargetIP:       pp.target.GetTargetIp(),
-		TargetHostname: pp.target.GetTargetHostname(),
-		TargetTorID:    pp.target.GetTargetTorId(),
-	}
+	result := pp.meas.Result()
+	result.SequenceNum = seqNum
+	result.TargetGID = targetGID
+	result.TargetQPN = pp.target.GetTargetQpn()
+	result.FlowLabel = pp.target.GetFlowLabel()
+	result.Success = true
+	result.TargetIP = pp.target.GetTargetIp()
+	result.TargetHostname = pp.target.GetTargetHostname()
+	result.TargetTorID = pp.target.GetTargetTorId()
 
-	// Remove from pending map now that the probe is complete.
 	delete(p.pending, seqNum)
-	p.pendingMu.Unlock()
+	return &result
+}
 
-	// Calculate RTT metrics from the 6 timestamps.
+// deliverResult computes RTT metrics for a completed probe and emits it on the
+// results channel. It is called without holding pendingMu so a slow consumer
+// cannot stall ACK processing under the lock.
+func (p *Prober) deliverResult(seqNum uint64, target *controller_agent.PingTarget, result *probe.ProbeResult) {
 	rtt := probe.CalculateRTT(result)
 
 	p.logger.Debug().
 		Uint64("seq", seqNum).
-		Str("target_gid", pp.target.GetTargetGid()).
+		Str("target_gid", target.GetTargetGid()).
 		Uint64("t1", result.T1).
 		Uint64("t2", result.T2).
 		Uint64("t3", result.T3).
@@ -476,30 +625,63 @@ func (p *Prober) handleSecondACK(seqNum uint64, event *rdmabridge.CompletionEven
 
 // cleanupStalePending removes entries from the pending map that are older
 // than stalePendingTimeout. This prevents memory leaks from probes whose
-// ACK responses were lost or never arrived.
+// ACK responses were lost or never arrived. Each expired probe is emitted as
+// a failed ProbeResult so packet loss / timeouts are visible in the
+// probe_failed_total metric instead of vanishing silently.
 func (p *Prober) cleanupStalePending() {
 	now := time.Now()
-	var cleaned int
+	var stale []*probe.ProbeResult
 
 	p.pendingMu.Lock()
 	for seqNum, pp := range p.pending {
 		if now.Sub(pp.createdAt) > stalePendingTimeout {
+			result := pp.meas.Result()
+			result.SequenceNum = seqNum
+			result.TargetQPN = pp.target.GetTargetQpn()
+			result.FlowLabel = pp.target.GetFlowLabel()
+			result.Success = false
+			result.ErrorMessage = "timed out waiting for ACKs"
+			result.TargetIP = pp.target.GetTargetIp()
+			result.TargetHostname = pp.target.GetTargetHostname()
+			result.TargetTorID = pp.target.GetTargetTorId()
+			if parsedGID, err := probe.ParseGID(pp.target.GetTargetGid()); err == nil {
+				result.TargetGID = parsedGID
+			}
+			stale = append(stale, &result)
 			delete(p.pending, seqNum)
-			cleaned++
 		}
 	}
 	p.pendingMu.Unlock()
 
-	if cleaned > 0 {
+	// Emit outside pendingMu; non-blocking like deliverResult so a slow
+	// consumer cannot stall the probe loop.
+	for _, result := range stale {
+		select {
+		case p.resultChan <- result:
+		default:
+			p.logger.Warn().
+				Uint64("seq", result.SequenceNum).
+				Msg("Result channel full, dropping timed-out probe result")
+		}
+	}
+
+	if len(stale) > 0 {
 		p.logger.Info().
-			Int("cleaned", cleaned).
-			Msg("Cleaned up stale pending probes")
+			Int("cleaned", len(stale)).
+			Msg("Expired stale pending probes emitted as failures")
 	}
 }
 
 // GetQueueInfo returns the queue metadata (QPN, timestamp mode) for this
-// prober's sender queue. This can be used for logging and diagnostics.
+// prober's sender queue. This can be used for logging and diagnostics. It is
+// safe to call after Destroy(): a zero-valued QueueInfo is returned once the
+// queue has been torn down.
 func (p *Prober) GetQueueInfo() rdmabridge.QueueInfo {
+	p.queueMu.RLock()
+	defer p.queueMu.RUnlock()
+	if p.queue == nil {
+		return rdmabridge.QueueInfo{}
+	}
 	return p.queue.Info
 }
 
@@ -512,9 +694,11 @@ func (p *Prober) GetQueueInfo() rdmabridge.QueueInfo {
 func (p *Prober) Destroy() {
 	p.Stop()
 	close(p.resultChan)
+	p.queueMu.Lock()
 	if p.queue != nil {
 		p.queue.Destroy()
 		p.queue = nil
 	}
+	p.queueMu.Unlock()
 	p.logger.Info().Msg("Prober destroyed")
 }

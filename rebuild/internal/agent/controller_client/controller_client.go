@@ -7,6 +7,7 @@ package controller_client
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -14,6 +15,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+// rpcTimeout bounds every individual RPC to the controller. Without this,
+// a hung or unreachable controller would block the caller indefinitely:
+// for RegisterAgent that stalls agent startup/heartbeat, and for
+// GetPinglist that stalls ClusterMonitor.Stop() (which waits for the
+// in-flight fetch to return before the monitor goroutine can exit).
+const rpcTimeout = 10 * time.Second
 
 // GRPCControllerClient implements the agent.ControllerClient interface using
 // gRPC to communicate with the controller service. It wraps a single gRPC
@@ -82,7 +90,10 @@ func (c *GRPCControllerClient) RegisterAgent(
 		Int("rnic_count", len(req.GetRnics())).
 		Msg("Sending agent registration request")
 
-	resp, err := c.client.RegisterAgent(ctx, req)
+	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
+	resp, err := c.client.RegisterAgent(rpcCtx, req)
 	if err != nil {
 		return nil, fmt.Errorf("RegisterAgent RPC failed: %w", err)
 	}
@@ -126,7 +137,10 @@ func (c *GRPCControllerClient) GetPinglist(
 		Str("pinglist_type", ptype.String()).
 		Msg("Requesting pinglist from controller")
 
-	resp, err := c.client.GetPinglist(ctx, req)
+	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
+	resp, err := c.client.GetPinglist(rpcCtx, req)
 	if err != nil {
 		return nil, fmt.Errorf("GetPinglist RPC failed (type=%s): %w", ptype.String(), err)
 	}

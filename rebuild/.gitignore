@@ -1,0 +1,7 @@
+# Generated protobuf bindings (regenerate with `make generate-proto`)
+proto/controller_agent/*.pb.go
+
+# Build outputs
+bin/
+zig/zig-out/
+zig/.zig-cache/

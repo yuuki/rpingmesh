@@ -1,8 +1,10 @@
 # Build stage for the rpingmesh controller.
 # CGO_ENABLED=0 — no RDMA or Zig dependencies needed.
-FROM golang:1.26-bookworm AS builder
+FROM golang:1.26.0-bookworm AS builder
 
-# Install protoc and Go protobuf plugins for code generation.
+# Install protoc and Go protobuf plugins for code generation. This layer
+# only depends on apt/Go tool versions, not application source, so it stays
+# cached across source-only rebuilds.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler \
     && rm -rf /var/lib/apt/lists/* \
@@ -11,24 +13,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy module files first for Docker layer caching.
-COPY go.mod ./
-# go.sum may not exist yet; copy conditionally.
-COPY go.su[m] ./
+# Copy module files first and resolve dependencies before copying the rest
+# of the source tree, so `go mod download` is only re-run when go.mod/go.sum
+# change (not on every source edit). go.sum is trusted as-is; it is expected
+# to already be complete and committed (no `go mod tidy` in the container).
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
-# Copy proto definitions and generate Go bindings.
-COPY proto/ proto/
+# Copy remaining source and generate protobuf bindings.
+COPY . .
 RUN cd proto/controller_agent && \
     protoc --go_out=. --go_opt=paths=source_relative \
            --go-grpc_out=. --go-grpc_opt=paths=source_relative \
            controller_agent.proto
 
-# Copy remaining source and resolve dependencies.
-COPY . .
-RUN go mod tidy && go mod download
-
 # Build the controller binary.
-RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/rpingmesh-controller ./cmd/controller/
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -o /app/bin/rpingmesh-controller ./cmd/controller/
 
 # Runtime image — minimal footprint.
 FROM debian:bookworm-slim

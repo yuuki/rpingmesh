@@ -43,7 +43,7 @@ func main() {
 // starts the gRPC server, and blocks until a shutdown signal is received.
 func run(cmd *cobra.Command, args []string) error {
 	// Load configuration from file, env vars, and flags.
-	cfg, err := config.LoadControllerConfig(configPath)
+	cfg, err := config.LoadControllerConfig(configPath, cmd.Flags())
 	if err != nil {
 		return fmt.Errorf("failed to load configuration: %w", err)
 	}
@@ -63,10 +63,18 @@ func run(cmd *cobra.Command, args []string) error {
 		Str("listenAddr", cfg.ListenAddr).
 		Str("databaseURI", cfg.DatabaseURI).
 		Str("logLevel", cfg.LogLevel).
+		Int("activeThresholdSec", cfg.ActiveThresholdSec).
+		Int("staleThresholdSec", cfg.StaleThresholdSec).
+		Int("interTorSampleSize", cfg.InterTorSampleSize).
 		Msg("Starting rpingmesh-controller")
 
 	// Initialize RNIC registry backed by rqlite.
-	reg, err := registry.NewRnicRegistry(cfg.DatabaseURI)
+	reg, err := registry.NewRnicRegistry(
+		cfg.DatabaseURI,
+		cfg.ActiveThresholdSec,
+		cfg.StaleThresholdSec,
+		cfg.InterTorSampleSize,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize registry: %w", err)
 	}

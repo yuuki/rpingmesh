@@ -1,9 +1,14 @@
 // cq.zig - CQ polling thread and completion processing.
 //
 // This module implements the dedicated CQ poller thread that runs per queue.
-// It uses event-driven notification (ibv_get_cq_event / ibv_req_notify_cq)
-// to block until completions arrive, then polls them with the extended CQ API
-// (ibv_start_poll / ibv_next_poll / ibv_end_poll).
+// It uses busy polling, not event-driven notification: no completion
+// channel is created, and ibv_get_cq_event()/ibv_req_notify_cq() are never
+// called. The poller instead calls pollCqCompletions() in a loop, sleeping
+// ~50 microseconds (std.Thread.sleep) between iterations when no
+// completions are found. This trades a small, bounded amount of CPU/latency
+// for simplicity and portability across providers (see the CQ creation
+// comment in queue.zig for why a completion channel was intentionally not
+// used).
 //
 // For receive completions, the poller parses the GRH and probe payload, builds
 // a CompletionEvent, and pushes it into the SPSC ring buffer for consumption
@@ -17,6 +22,13 @@ const types = @import("types.zig");
 const ring = @import("ring.zig");
 const memory = @import("memory.zig");
 const c = types.c;
+
+/// Scoped logger for CQ poller diagnostics. These are std.log.debug calls
+/// (not std.debug.print), so by default (ReleaseSafe/ReleaseFast/ReleaseSmall,
+/// which use log level .info) they compile out entirely -- logEnabled() is
+/// evaluated at comptime, so there is zero per-completion runtime cost in
+/// production builds. Only Debug builds (log level .debug) emit them.
+const log = std.log.scoped(.cq_poller);
 
 // ---------------------------------------------------------------------------
 // GRH parsing
@@ -162,12 +174,12 @@ fn readBigEndianU64(buf: [*]const u8, offset: usize) u64 {
 /// Reads fields at the correct wire format offsets (see ProbePayload comment above).
 fn parseProbePayload(buf: [*]const u8) ProbePayload {
     return ProbePayload{
-        .sequence_num = readBigEndianU64(buf, 4),  // offset 4: after 4-byte header
-        .t1 = readBigEndianU64(buf, 12),            // offset 12
-        .t3 = readBigEndianU64(buf, 20),            // offset 20
-        .t4 = readBigEndianU64(buf, 28),            // offset 28
-        .is_ack = buf[1],                            // msg_type: 0=probe, 1=ack
-        .ack_type = buf[2],                          // ack_type: 0=none, 1=first, 2=second
+        .sequence_num = readBigEndianU64(buf, 4), // offset 4: after 4-byte header
+        .t1 = readBigEndianU64(buf, 12), // offset 12
+        .t3 = readBigEndianU64(buf, 20), // offset 20
+        .t4 = readBigEndianU64(buf, 28), // offset 28
+        .is_ack = buf[1], // msg_type: 0=probe, 1=ack
+        .ack_type = buf[2], // ack_type: 0=none, 1=first, 2=second
     };
 }
 
@@ -210,7 +222,7 @@ pub fn stopCqPollerThread(queue: *types.UdQueue) void {
 ///
 /// The loop continues until queue.running is set to false.
 fn cqPollerLoop(queue: *types.UdQueue) void {
-    std.debug.print("[CQ_POLLER] thread started for queue @{x}\n", .{@intFromPtr(queue)});
+    log.debug("thread started for queue @{x}", .{@intFromPtr(queue)});
     var iter: u64 = 0;
     while (queue.running.load(.acquire)) {
         // Poll recv CQ (handles both IBV_WC_RECV and IBV_WC_SEND opcodes
@@ -225,14 +237,14 @@ fn cqPollerLoop(queue: *types.UdQueue) void {
         iter += 1;
         // Print alive message every 10000 iterations (~0.5s) for debugging
         if (iter % 10000 == 0) {
-            std.debug.print("[CQ_POLLER] @{x} alive iter={d}\n", .{ @intFromPtr(queue), iter });
+            log.debug("@{x} alive iter={d}", .{ @intFromPtr(queue), iter });
         }
 
         // Sleep briefly between polls to reduce CPU usage.
         // 50 microseconds gives good responsiveness while staying efficient.
         std.Thread.sleep(50_000);
     }
-    std.debug.print("[CQ_POLLER] @{x} exiting after {d} iters\n", .{ @intFromPtr(queue), iter });
+    log.debug("@{x} exiting after {d} iters", .{ @intFromPtr(queue), iter });
 }
 
 /// Poll a single CQ for all available completions.
@@ -277,19 +289,19 @@ fn pollCqClassic(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
 fn dispatchClassicWc(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
     const status_int: i32 = @intCast(wc.status);
     if (wc.opcode == c.IBV_WC_SEND) {
-        std.debug.print("[CQ_DISPATCH] @{x} SEND (classic) status={d}\n", .{ @intFromPtr(queue), status_int });
+        log.debug("@{x} SEND (classic) status={d}", .{ @intFromPtr(queue), status_int });
         // Signal the waiting sender thread with a SW timestamp.
         const ts = swTimestampNs();
         queue.send_completion_timestamp.store(ts, .release);
         queue.send_completion_status.store(status_int, .release);
         queue.send_completion_ready.store(true, .release);
     } else if (wc.opcode == c.IBV_WC_RECV) {
-        std.debug.print("[CQ_DISPATCH] @{x} RECV (classic) status={d}\n", .{ @intFromPtr(queue), status_int });
+        log.debug("@{x} RECV (classic) status={d}", .{ @intFromPtr(queue), status_int });
         if (wc.status == c.IBV_WC_SUCCESS) {
             processRecvClassic(queue, wc);
         }
     } else {
-        std.debug.print("[CQ_DISPATCH] @{x} unknown opcode (classic) status={d}\n", .{ @intFromPtr(queue), status_int });
+        log.debug("@{x} unknown opcode (classic) status={d}", .{ @intFromPtr(queue), status_int });
     }
 }
 
@@ -382,19 +394,19 @@ fn dispatchCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
     const status: i32 = @intCast(cq.status);
 
     if (opcode == c.IBV_WC_SEND) {
-        std.debug.print("[CQ_DISPATCH] @{x} SEND completion status={d}\n", .{ @intFromPtr(queue), status });
+        log.debug("@{x} SEND completion status={d}", .{ @intFromPtr(queue), status });
         // Always signal the sender, regardless of status, so waitSendCompletion
         // can report the error rather than timing out.
         processSendCompletion(queue, cq);
     } else if (opcode == c.IBV_WC_RECV) {
-        std.debug.print("[CQ_DISPATCH] @{x} RECV completion status={d}\n", .{ @intFromPtr(queue), status });
+        log.debug("@{x} RECV completion status={d}", .{ @intFromPtr(queue), status });
         if (status == c.IBV_WC_SUCCESS) {
             processRecvCompletion(queue, cq);
         }
         // Recv errors: buffer slot is effectively lost until queue recreation.
         // For the test scenario this is acceptable.
     } else {
-        std.debug.print("[CQ_DISPATCH] @{x} unknown opcode, status={d}\n", .{ @intFromPtr(queue), status });
+        log.debug("@{x} unknown opcode, status={d}", .{ @intFromPtr(queue), status });
     }
 }
 
@@ -425,9 +437,26 @@ pub fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
         return;
     };
 
-    // Note: The extended CQ does not request IBV_WC_EX_WITH_FLAGS, so
-    // wc_flags is unavailable here.  For RoCEv2 UD the GRH is always
-    // present (the classic path checks IBV_WC_GRH as a defensive guard).
+    // IBV_WC_GRH (bit 0) indicates the driver wrote a GRH into the receive
+    // buffer. This mirrors the defensive check already present in
+    // processRecvClassic() below, which soft-RoCE (rdma_rxe) exercises but
+    // this extended-CQ path did not previously check at all -- meaning a
+    // production Mellanox NIC completion that ever arrives without a GRH
+    // would have had the first 40 bytes of application payload silently
+    // misparsed as a GRH (corrupting the reported source GID/flow label)
+    // instead of being safely dropped.
+    //
+    // ibv_wc_read_wc_flags() is available unconditionally here: unlike
+    // byte_len, src_qp, or the timestamp fields (which are optional CQE
+    // metadata gated by IBV_WC_EX_WITH_* flags requested at CQ creation
+    // time), wc_flags has no corresponding IBV_WC_EX_WITH_* flag in
+    // libibverbs -- it is a core field, always populated the same way
+    // opcode/status are.
+    const wc_flags = c.ibv_wc_read_wc_flags(cq);
+    if ((wc_flags & c.IBV_WC_GRH) == 0) {
+        memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {};
+        return;
+    }
 
     // Parse GRH from the first 40 bytes of the receive buffer
     const grh_info = parseGRH(slot_ptr);

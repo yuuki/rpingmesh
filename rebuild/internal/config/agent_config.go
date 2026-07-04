@@ -28,10 +28,14 @@ type AgentConfig struct {
 	TargetProbeRatePerSecond  int      `mapstructure:"target_probe_rate_per_second"`
 }
 
-// LoadAgentConfig loads agent configuration from a YAML file, environment variables,
-// and applies defaults. Environment variables use the prefix RPINGMESH_ and replace
-// hyphens with underscores (e.g., RPINGMESH_CONTROLLER_ADDR).
-func LoadAgentConfig(configPath string) (*AgentConfig, error) {
+// LoadAgentConfig loads agent configuration from a YAML file, environment
+// variables, CLI flags, and applies defaults. Precedence (highest to
+// lowest) is: CLI flag > environment variable > YAML file > default.
+// Environment variables use the prefix RPINGMESH_ and replace hyphens with
+// underscores (e.g., RPINGMESH_CONTROLLER_ADDR). If flags is non-nil, it is
+// bound to viper so that explicitly-set flags take priority; pass the same
+// FlagSet given to BindAgentFlags.
+func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, error) {
 	v := viper.New()
 
 	// Set defaults
@@ -53,6 +57,14 @@ func LoadAgentConfig(configPath string) (*AgentConfig, error) {
 	v.SetEnvPrefix("RPINGMESH")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
+
+	// Bind CLI flags so that explicitly-set flags take precedence over
+	// environment variables, config file values, and defaults.
+	if flags != nil {
+		if err := bindPFlags(v, flags); err != nil {
+			return nil, err
+		}
+	}
 
 	// Load config file if a path was provided
 	if configPath != "" {
@@ -106,12 +118,28 @@ func LoadAgentConfig(configPath string) (*AgentConfig, error) {
 		TargetProbeRatePerSecond:  v.GetInt("target_probe_rate_per_second"),
 	}
 
-	// Validate GID index is non-negative
-	if config.GIDIndex < 0 {
-		return nil, fmt.Errorf("gid_index must be >= 0, got: %d", config.GIDIndex)
+	if err := config.Validate(); err != nil {
+		return nil, err
 	}
 
 	return config, nil
+}
+
+// Validate checks that the agent configuration is well-formed. It returns
+// an error describing the first invalid field encountered.
+func (c *AgentConfig) Validate() error {
+	// GID index must be non-negative; it indexes into the RNIC's GID table.
+	if c.GIDIndex < 0 {
+		return fmt.Errorf("gid_index must be >= 0, got: %d", c.GIDIndex)
+	}
+
+	// A zero or negative probe interval would make time.NewTicker panic at
+	// runtime, so reject it up front instead of failing deep in the prober.
+	if c.ProbeIntervalMS == 0 {
+		return fmt.Errorf("probe_interval_ms must be > 0, got: %d", c.ProbeIntervalMS)
+	}
+
+	return nil
 }
 
 // BindAgentFlags binds common agent CLI flags to a pflag.FlagSet.

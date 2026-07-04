@@ -118,11 +118,29 @@ pub fn allocateBuffers(dev: *types.RdmaDevice, num_slots: u32) MemoryError!Buffe
 
 /// Deregister the Memory Region and free the buffer memory.
 ///
-/// After calling this function, the BufferSet must not be used again.
-/// Any work requests referencing this buffer's lkey will be invalid.
+/// After calling this function, the BufferSet must not be used again on
+/// success. Any work requests referencing this buffer's lkey will be
+/// invalid.
+///
+/// If ibv_dereg_mr() fails (nonzero return), the underlying pages are
+/// deliberately NOT freed and the function returns early. The kernel/HCA
+/// may still hold a reference to this memory (e.g. an outstanding
+/// completion the driver has not fully drained, or a firmware/driver bug on
+/// real hardware -- ibv_dereg_mr() is documented to fail with EBUSY in
+/// exactly this situation). Freeing pages that hardware can still DMA into
+/// would turn into a use-after-free once those pages are reused by the
+/// allocator, which is a far worse outcome than an intentional, bounded
+/// leak on an already-exceptional error path.
 pub fn freeBuffers(buf_set: *BufferSet) void {
-    // Deregister the Memory Region first (before freeing the underlying memory)
-    _ = c.ibv_dereg_mr(buf_set.mr);
+    const dereg_ret = c.ibv_dereg_mr(buf_set.mr);
+    if (dereg_ret != 0) {
+        std.log.scoped(.rdma_memory).err(
+            "ibv_dereg_mr() failed with errno={d}; leaking {d} bytes to avoid a potential use-after-free",
+            .{ dereg_ret, buf_set.size },
+        );
+        types.setLastError("ibv_dereg_mr() failed; buffer intentionally leaked to avoid use-after-free");
+        return;
+    }
 
     // Free the page-aligned buffer
     const slice = buf_set.buf[0..buf_set.size];

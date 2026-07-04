@@ -348,13 +348,17 @@ func (q *Queue) SendProbe(targetGID [16]byte, targetQPN uint32, seqNum uint64, f
 // of the R-Pingmesh protocol). It echoes T1 from the probe, records T3
 // (receive time), and outputs T4 (the send completion timestamp of this ACK).
 func (q *Queue) SendFirstAck(targetGID [16]byte, targetQPN uint32, flowLabel uint32, recvPacket []byte, recvTimestampNS uint64, timeoutMS uint32) (uint64, error) {
+	// The Zig side unconditionally reads ProbePacketSize bytes from recvPacket,
+	// so a shorter (or nil) slice would cause an out-of-bounds read. Reject it
+	// here rather than passing a too-short buffer across the Cgo boundary.
+	if len(recvPacket) < ProbePacketSize {
+		return 0, fmt.Errorf("recvPacket too short: got %d bytes, need at least %d", len(recvPacket), ProbePacketSize)
+	}
+
 	cGID := goGIDToC(targetGID)
 	var outT4 C.uint64_t
 
-	var pktPtr *C.uint8_t
-	if len(recvPacket) > 0 {
-		pktPtr = (*C.uint8_t)(unsafe.Pointer(&recvPacket[0]))
-	}
+	pktPtr := (*C.uint8_t)(unsafe.Pointer(&recvPacket[0]))
 
 	rc := C.rdma_send_first_ack(
 		q.handle,
@@ -376,12 +380,16 @@ func (q *Queue) SendFirstAck(targetGID [16]byte, targetQPN uint32, flowLabel uin
 // SendSecondAck sends the second ACK containing T3 and T4 so the prober can
 // compute responder processing delay (step 3 of the R-Pingmesh protocol).
 func (q *Queue) SendSecondAck(targetGID [16]byte, targetQPN uint32, flowLabel uint32, recvPacket []byte, t3NS uint64, t4NS uint64, timeoutMS uint32) error {
+	// The Zig side unconditionally reads ProbePacketSize bytes from recvPacket,
+	// so a shorter (or nil) slice would cause an out-of-bounds read. Reject it
+	// here rather than passing a too-short buffer across the Cgo boundary.
+	if len(recvPacket) < ProbePacketSize {
+		return fmt.Errorf("recvPacket too short: got %d bytes, need at least %d", len(recvPacket), ProbePacketSize)
+	}
+
 	cGID := goGIDToC(targetGID)
 
-	var pktPtr *C.uint8_t
-	if len(recvPacket) > 0 {
-		pktPtr = (*C.uint8_t)(unsafe.Pointer(&recvPacket[0]))
-	}
+	pktPtr := (*C.uint8_t)(unsafe.Pointer(&recvPacket[0]))
 
 	rc := C.rdma_send_second_ack(
 		q.handle,

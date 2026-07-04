@@ -1,8 +1,9 @@
 # R-Pingmesh Rebuild - Build System
-# Requires: Go 1.26+, Zig 0.16+, protoc, clang, libibverbs-dev, librdmacm-dev
+# Requires: Go 1.26+, Zig 0.15.2 (the version verified in e2e/CI), protoc,
+# clang, libibverbs-dev, librdmacm-dev
 
 .PHONY: all build build-zig build-go build-controller build-agent \
-        generate generate-proto clean test test-go \
+        generate generate-proto clean test test-go test-all vet \
         test-e2e setup-colima test-e2e-controller clean-e2e-controller help
 
 # Directories
@@ -50,12 +51,31 @@ build-agent:
 	CGO_ENABLED=1 go build -o $(AGENT_BIN) ./cmd/agent/
 	@echo "==> Agent built: $(AGENT_BIN)"
 
-# Run Go tests (probe package is pure Go, no RDMA needed)
+# Run Go tests. NOTE: this only covers internal/probe/... (pure Go, no RDMA
+# hardware needed). Use `make test-all` to run every package's tests (Linux,
+# full CGO/RDMA build env) or `make test-e2e` / `make test-e2e-controller`
+# for the Docker-based end-to-end suites.
 test: test-go
 
 test-go:
 	@echo "==> Running Go tests..."
 	go test -v ./internal/probe/...
+	@echo "==> Tests complete"
+
+# Run `go vet` across the whole module.
+vet:
+	@echo "==> Running go vet..."
+	go vet ./...
+	@echo "==> Vet complete"
+
+# Run all Go tests in the module (excluding ./e2e/..., which requires live
+# infrastructure or RDMA hardware/soft-RoCE and is exercised by
+# test-e2e / test-e2e-controller instead). Requires the full CGO/RDMA build
+# environment (libibverbs-dev, librdmacm-dev, librdmabridge.a already built),
+# so this is intended for Linux, not local macOS development.
+test-all:
+	@echo "==> Running all Go tests (excluding ./e2e/...)..."
+	go test $$(go list ./... | grep -v '/e2e')
 	@echo "==> Tests complete"
 
 # Install rdma_rxe kernel module on the Colima VM (run once before first test-e2e).
@@ -103,7 +123,9 @@ help:
 	@echo "  generate             Generate all code (proto)"
 	@echo "  generate-proto       Generate protobuf Go code"
 	@echo "  test                 Run tests"
-	@echo "  test-go              Run Go tests"
+	@echo "  test-go              Run Go tests (internal/probe only, pure Go)"
+	@echo "  vet                  Run go vet ./..."
+	@echo "  test-all             Run go test on all packages except ./e2e/... (Linux, full build env)"
 	@echo "  setup-colima         Install rdma_rxe kernel module on Colima VM (run once)"
 	@echo "  test-e2e             Run RDMA e2e tests via Docker (requires Colima)"
 	@echo "  test-e2e-controller  Run Agent-to-Controller E2E tests (Docker)"
@@ -111,5 +133,5 @@ help:
 	@echo "  clean                Remove all build artifacts"
 	@echo ""
 	@echo "Requirements:"
-	@echo "  Go 1.26+, Zig 0.16+, protoc, libibverbs-dev, librdmacm-dev"
+	@echo "  Go 1.26+, Zig 0.15.2, protoc, libibverbs-dev, librdmacm-dev"
 	@echo "  For test-e2e: colima running, run 'make setup-colima' first"

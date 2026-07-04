@@ -29,8 +29,11 @@ RUN set -eux; \
     DPKG_ARCH="$(dpkg --print-architecture)"; \
     curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${DPKG_ARCH}.tar.gz" | tar -xz -C /usr/local; \
     /usr/local/go/bin/go version
-ENV PATH="/usr/local/go/bin:${PATH}"
 ENV GOPATH=/go
+# /go/bin must be on PATH for `protoc` to find the protoc-gen-go/
+# protoc-gen-go-grpc plugins installed below via `go install` (which places
+# binaries in $GOPATH/bin, not next to the go tool itself).
+ENV PATH="/usr/local/go/bin:/go/bin:${PATH}"
 
 # Install Zig (URL format: zig-<arch>-linux-<version>.tar.xz)
 RUN set -eux; \
@@ -41,17 +44,23 @@ RUN set -eux; \
     ln -sf "/usr/local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig; \
     zig version
 
-WORKDIR /workspace/rebuild
-
-# Copy rebuild/ source tree
-COPY . .
-
-# Install protoc Go plugins for gRPC code generation
+# Install protoc Go plugins for gRPC code generation. Independent of
+# application source, so this layer stays cached across source-only rebuilds.
 RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest \
     && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 
-# Resolve all Go module dependencies (go.mod starts minimal)
-RUN go mod tidy
+WORKDIR /workspace/rebuild
+
+# Copy module files first and resolve dependencies before copying the rest
+# of the source tree, so `go mod download` is only re-run when go.mod/go.sum
+# change (not on every source edit). go.sum is trusted as-is; it is expected
+# to already be complete and committed (no `go mod tidy` in the container).
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+# Copy rebuild/ source tree
+COPY . .
 
 # Generate protobuf Go bindings (required before compiling packages that import them)
 RUN cd proto/controller_agent && \
@@ -63,7 +72,9 @@ RUN cd proto/controller_agent && \
 RUN make build-zig
 
 # Verify the e2e test package compiles with CGO and the bridge library
-RUN CGO_ENABLED=1 go test -c -o /dev/null ./e2e/
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=1 go test -c -o /dev/null ./e2e/
 
 RUN chmod +x scripts/run-e2e.sh
 

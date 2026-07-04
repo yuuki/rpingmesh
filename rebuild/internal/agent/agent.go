@@ -6,6 +6,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -21,6 +22,25 @@ import (
 const (
 	metricsShutdownTimeout = 5 * time.Second
 	eventRingCapacity      = 1024 // Power of 2 for optimal SPSC ring performance.
+
+	// heartbeatInterval is the period between periodic re-registration
+	// heartbeats sent to the controller. The controller's liveness check
+	// considers an agent dead once last_updated_epoch is older than 300s,
+	// so this must be well under that threshold.
+	heartbeatInterval = 60 * time.Second
+
+	// heartbeatFailureEscalationThreshold is the number of consecutive
+	// heartbeat failures after which log severity is escalated from Warn
+	// to Error, to surface sustained controller unreachability without
+	// being noisy about single transient failures.
+	heartbeatFailureEscalationThreshold = 3
+
+	// Initial registration retry parameters: exponential backoff starting
+	// at registerRetryInitialBackoff, doubling up to registerRetryMaxBackoff,
+	// for up to registerRetryMaxAttempts total attempts.
+	registerRetryInitialBackoff = 1 * time.Second
+	registerRetryMaxBackoff     = 30 * time.Second
+	registerRetryMaxAttempts    = 6
 )
 
 // Agent orchestrates all R-Pingmesh agent components: RDMA context, devices,
@@ -38,6 +58,12 @@ type Agent struct {
 	proberRing *rdmabridge.EventRing
 	respRings  []*rdmabridge.EventRing
 	logger     zerolog.Logger
+
+	// heartbeatStopCh and heartbeatWg control the lifecycle of the
+	// background heartbeat goroutine that periodically re-registers with
+	// the controller to keep the agent's registry entry alive.
+	heartbeatStopCh chan struct{}
+	heartbeatWg     sync.WaitGroup
 }
 
 // NewAgent creates a new Agent instance with the given configuration.
@@ -102,6 +128,12 @@ func (a *Agent) Initialize(ctx context.Context) error {
 		return fmt.Errorf("failed to create prober: %w", err)
 	}
 	a.prober = prober
+	if a.cfg.TargetProbeRatePerSecond > 0 {
+		// Per-target rate cap; the prober scales the aggregate limit with the
+		// pinglist size. Differentiated per-pinglist-type rates are a
+		// documented limitation (see README Limitations).
+		a.prober.SetPerTargetRateLimit(float64(a.cfg.TargetProbeRatePerSecond))
+	}
 
 	// Step 6: Create one responder per device.
 	a.logger.Info().Int("device_count", len(a.devices)).Msg("Creating responders")
@@ -160,9 +192,10 @@ func (a *Agent) Initialize(ctx context.Context) error {
 	return nil
 }
 
-// registerWithController builds a registration request from the agent's
-// configuration and device/responder state, then sends it to the controller.
-func (a *Agent) registerWithController(ctx context.Context) error {
+// buildRegistrationRequest builds a registration request from the agent's
+// configuration and device/responder state. It is used both for the initial
+// registration and for periodic heartbeat re-registrations.
+func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRequest {
 	rnics := make([]*controller_agent.RnicInfo, 0, len(a.responders))
 
 	for i, resp := range a.responders {
@@ -187,23 +220,77 @@ func (a *Agent) registerWithController(ctx context.Context) error {
 			Msg("Prepared RNIC info for registration")
 	}
 
-	req := &controller_agent.AgentRegistrationRequest{
+	return &controller_agent.AgentRegistrationRequest{
 		AgentId:  a.cfg.AgentID,
 		Hostname: a.cfg.HostName,
 		TorId:    a.cfg.TorID,
 		Rnics:    rnics,
 	}
+}
 
-	_, err := a.grpcClient.RegisterAgent(ctx, req)
+// registerAttemptErr builds an error describing why a single registration
+// attempt was considered a failure, checking both the RPC error and the
+// resp.Success field. The controller contract allows it to signal failure
+// via either channel (a gRPC error, e.g. codes.Internal, or a false Success
+// with a populated Message), so both must be checked.
+func registerAttemptErr(resp *controller_agent.AgentRegistrationResponse, err error) error {
 	if err != nil {
 		return fmt.Errorf("RegisterAgent failed: %w", err)
 	}
-
-	a.logger.Info().
-		Str("agent_id", a.cfg.AgentID).
-		Int("rnic_count", len(rnics)).
-		Msg("Agent registered with controller")
+	if !resp.GetSuccess() {
+		return fmt.Errorf("agent registration rejected by controller: %s", resp.GetMessage())
+	}
 	return nil
+}
+
+// registerWithController sends the agent's registration request to the
+// controller, retrying with exponential backoff on failure. A failure is
+// anything that fails either the err or the resp.Success check, since the
+// controller may report a rejected registration via a gRPC error, a
+// Success=false response, or both. It returns an error only if every
+// attempt fails.
+func (a *Agent) registerWithController(ctx context.Context) error {
+	req := a.buildRegistrationRequest()
+
+	backoff := registerRetryInitialBackoff
+	var lastErr error
+
+	for attempt := 1; attempt <= registerRetryMaxAttempts; attempt++ {
+		resp, err := a.grpcClient.RegisterAgent(ctx, req)
+		attemptErr := registerAttemptErr(resp, err)
+		if attemptErr == nil {
+			a.logger.Info().
+				Str("agent_id", a.cfg.AgentID).
+				Int("rnic_count", len(req.GetRnics())).
+				Str("message", resp.GetMessage()).
+				Msg("Agent registered with controller")
+			return nil
+		}
+		lastErr = attemptErr
+
+		if attempt == registerRetryMaxAttempts {
+			break
+		}
+
+		a.logger.Warn().Err(lastErr).
+			Int("attempt", attempt).
+			Int("max_attempts", registerRetryMaxAttempts).
+			Dur("backoff", backoff).
+			Msg("Agent registration attempt failed, retrying")
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("registration cancelled: %w", ctx.Err())
+		case <-time.After(backoff):
+		}
+
+		backoff *= 2
+		if backoff > registerRetryMaxBackoff {
+			backoff = registerRetryMaxBackoff
+		}
+	}
+
+	return fmt.Errorf("agent registration failed after %d attempts: %w", registerRetryMaxAttempts, lastErr)
 }
 
 // Start begins all agent components: responders, prober, cluster monitor,
@@ -227,6 +314,10 @@ func (a *Agent) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start cluster monitor: %w", err)
 	}
 
+	// Start the heartbeat goroutine to periodically re-register with the
+	// controller, keeping the agent's registry entry alive.
+	a.startHeartbeat(ctx)
+
 	// Start the metrics result consumer if metrics are enabled.
 	if a.metrics != nil {
 		a.metrics.StartResultConsumer(ctx, a.prober.Results(), a.cfg.TorID)
@@ -248,6 +339,10 @@ func (a *Agent) Stop(ctx context.Context) {
 	if a.monitor != nil {
 		a.monitor.Stop()
 	}
+
+	// Stop the heartbeat goroutine before closing the gRPC client, since
+	// both it and the cluster monitor depend on grpcClient being open.
+	a.stopHeartbeat()
 
 	// Stop the prober to cease outgoing probes.
 	if a.prober != nil {
@@ -298,6 +393,76 @@ func (a *Agent) Stop(ctx context.Context) {
 	a.respRings = nil
 
 	a.logger.Info().Msg("Agent stopped")
+}
+
+// startHeartbeat launches the background goroutine that periodically
+// re-sends the agent's registration to the controller. This refreshes the
+// controller's last_updated_epoch liveness field, without which the
+// controller's registry considers the agent dead ~5 minutes after startup
+// and drops it from distributed pinglists (and evicts it entirely after
+// ~15 minutes).
+func (a *Agent) startHeartbeat(ctx context.Context) {
+	a.heartbeatStopCh = make(chan struct{})
+	a.heartbeatWg.Add(1)
+	go a.heartbeatLoop(ctx)
+}
+
+// stopHeartbeat signals the heartbeat goroutine to exit and waits for it to
+// finish. It is a no-op if the heartbeat was never started.
+func (a *Agent) stopHeartbeat() {
+	if a.heartbeatStopCh == nil {
+		return
+	}
+	close(a.heartbeatStopCh)
+	a.heartbeatWg.Wait()
+}
+
+// heartbeatLoop periodically re-sends the agent's registration to the
+// controller until the context is cancelled or stopHeartbeat is called.
+// Failures are logged but never terminate the process: a transient
+// controller outage should not bring down an otherwise healthy agent, and
+// the next tick will simply retry.
+func (a *Agent) heartbeatLoop(ctx context.Context) {
+	defer a.heartbeatWg.Done()
+
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	consecutiveFailures := 0
+
+	for {
+		select {
+		case <-a.heartbeatStopCh:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			req := a.buildRegistrationRequest()
+			resp, err := a.grpcClient.RegisterAgent(ctx, req)
+			if attemptErr := registerAttemptErr(resp, err); attemptErr != nil {
+				consecutiveFailures++
+				a.logHeartbeatFailure(consecutiveFailures, attemptErr)
+				continue
+			}
+			consecutiveFailures = 0
+			a.logger.Debug().
+				Str("agent_id", a.cfg.AgentID).
+				Msg("Heartbeat re-registration succeeded")
+		}
+	}
+}
+
+// logHeartbeatFailure logs a heartbeat failure, escalating the log level
+// from Warn to Error once consecutive failures reach the escalation
+// threshold, to surface sustained controller unreachability.
+func (a *Agent) logHeartbeatFailure(consecutiveFailures int, err error) {
+	event := a.logger.Warn()
+	if consecutiveFailures >= heartbeatFailureEscalationThreshold {
+		event = a.logger.Error()
+	}
+	event.Err(err).
+		Int("consecutive_failures", consecutiveFailures).
+		Msg("Heartbeat re-registration failed, agent continues running")
 }
 
 // Run is the main lifecycle method. It initializes the agent, starts all

@@ -35,6 +35,17 @@ type ClusterMonitor struct {
 	stopCh         chan struct{}
 	wg             sync.WaitGroup
 	logger         zerolog.Logger
+
+	// lastTorMeshTargets and lastInterTorTargets cache the most recently
+	// fetched successful pinglist for each type. When a fetch for one
+	// pinglist type fails while the other succeeds, the cached value for
+	// the failed type is reused instead of treating it as empty. This
+	// prevents a transient failure of a single pinglist type from wiping
+	// out the other type's live, healthy targets. These fields are only
+	// ever touched from the single monitor loop goroutine (Start ensures
+	// at most one is running), so no additional synchronization is needed.
+	lastTorMeshTargets  []*controller_agent.PingTarget
+	lastInterTorTargets []*controller_agent.PingTarget
 }
 
 // NewClusterMonitor creates a new ClusterMonitor that will poll the controller
@@ -123,57 +134,55 @@ func (m *ClusterMonitor) monitorLoop(ctx context.Context) {
 	}
 }
 
-// updateTargets fetches the combined pinglist and pushes targets to the prober.
-// If the fetch returns a non-empty list, the prober's targets are replaced.
-// If both fetches fail, the prober keeps its previous targets to avoid
-// clearing healthy targets on a transient controller failure.
+// updateTargets fetches the combined pinglist and pushes targets to the
+// prober. fetchPinglists always returns a usable list (falling back to
+// per-type cached values on failure), so the result is always pushed.
 func (m *ClusterMonitor) updateTargets(ctx context.Context) {
 	targets := m.fetchPinglists(ctx)
-	if targets != nil {
-		m.prober.UpdateTargets(targets)
-	}
+	m.prober.UpdateTargets(targets)
 }
 
 // fetchPinglists requests both TOR_MESH and INTER_TOR pinglists from the
-// controller, merges the results, and returns the combined list.
+// controller and merges the results.
 //
-// If both fetches fail, nil is returned so the caller knows not to update
-// the prober (preserving previous targets). If at least one succeeds, the
-// successfully fetched targets are returned (which may be empty if the
-// controller has no targets for that type).
+// Each pinglist type is handled independently: on success its result
+// replaces the cached value for that type; on failure the previously
+// cached value for that type is reused. This prevents a failure in one
+// pinglist type (e.g. INTER_TOR) from wiping out live, healthy targets of
+// the other type (e.g. TOR_MESH) that were just fetched successfully, and
+// still gracefully degrades to the last known-good targets if a fetch
+// keeps failing repeatedly.
 func (m *ClusterMonitor) fetchPinglists(ctx context.Context) []*controller_agent.PingTarget {
-	var (
-		torMeshTargets  []*controller_agent.PingTarget
-		interTorTargets []*controller_agent.PingTarget
-		torMeshErr      error
-		interTorErr     error
-	)
-
 	// Fetch ToR-mesh pinglist (targets within the same ToR).
-	torMeshTargets, torMeshErr = m.client.GetPinglist(
+	torMeshTargets, torMeshErr := m.client.GetPinglist(
 		ctx, m.agentID, m.torID, m.requesterGID,
 		controller_agent.PinglistType_TOR_MESH,
 	)
 	if torMeshErr != nil {
 		m.logger.Error().Err(torMeshErr).
-			Msg("Failed to fetch TOR_MESH pinglist")
+			Int("cached_count", len(m.lastTorMeshTargets)).
+			Msg("Failed to fetch TOR_MESH pinglist, reusing cached targets")
+		torMeshTargets = m.lastTorMeshTargets
+	} else {
+		m.lastTorMeshTargets = torMeshTargets
 	}
 
 	// Fetch inter-ToR pinglist (targets across different ToRs).
-	interTorTargets, interTorErr = m.client.GetPinglist(
+	interTorTargets, interTorErr := m.client.GetPinglist(
 		ctx, m.agentID, m.torID, m.requesterGID,
 		controller_agent.PinglistType_INTER_TOR,
 	)
 	if interTorErr != nil {
 		m.logger.Error().Err(interTorErr).
-			Msg("Failed to fetch INTER_TOR pinglist")
+			Int("cached_count", len(m.lastInterTorTargets)).
+			Msg("Failed to fetch INTER_TOR pinglist, reusing cached targets")
+		interTorTargets = m.lastInterTorTargets
+	} else {
+		m.lastInterTorTargets = interTorTargets
 	}
 
-	// If both fetches failed, return nil to signal the caller that the
-	// prober should keep its existing targets.
 	if torMeshErr != nil && interTorErr != nil {
-		m.logger.Warn().Msg("Both pinglist fetches failed, keeping previous targets")
-		return nil
+		m.logger.Warn().Msg("Both pinglist fetches failed, falling back to cached targets")
 	}
 
 	// Combine the results from both pinglist types.

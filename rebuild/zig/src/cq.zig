@@ -297,6 +297,16 @@ fn dispatchClassicWc(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
         log.debug("@{x} RECV (classic) status={d}", .{ @intFromPtr(queue), status_int });
         if (wc.status == c.IBV_WC_SUCCESS) {
             processRecvClassic(queue, wc);
+        } else {
+            // A failed recv completion (e.g. IBV_WC_WR_FLUSH_ERR on teardown,
+            // or a transient link error) still owns one of NUM_RECV_SLOTS.
+            // Without reposting it here, that slot is permanently lost --
+            // repeated errors would eventually starve the recv queue.
+            const slot_index: u32 = @intCast(wc.wr_id & 0xFFFFFFFF);
+            log.warn("@{x} RECV (classic) completion error status={d}, reposting slot={d}", .{ @intFromPtr(queue), status_int, slot_index });
+            memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {
+                log.warn("@{x} failed to repost recv slot={d} after completion error", .{ @intFromPtr(queue), slot_index });
+            };
         }
     } else {
         log.debug("@{x} unknown opcode (classic) status={d}", .{ @intFromPtr(queue), status_int });
@@ -404,9 +414,17 @@ fn dispatchCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
         log.debug("@{x} RECV completion status={d}", .{ @intFromPtr(queue), status });
         if (status == c.IBV_WC_SUCCESS) {
             processRecvCompletion(queue, cq);
+        } else {
+            // A failed recv completion still owns one of NUM_RECV_SLOTS.
+            // Repost it (mirroring the classic-path handling above) so a
+            // transient completion error does not permanently leak a slot.
+            const wr_id: u64 = cq.wr_id;
+            const slot_index: u32 = @intCast(wr_id & 0xFFFFFFFF);
+            log.warn("@{x} RECV completion error status={d}, reposting slot={d}", .{ @intFromPtr(queue), status, slot_index });
+            memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {
+                log.warn("@{x} failed to repost recv slot={d} after completion error", .{ @intFromPtr(queue), slot_index });
+            };
         }
-        // Recv errors: buffer slot is effectively lost until queue recreation.
-        // For the test scenario this is acceptable.
     } else {
         log.debug("@{x} unknown opcode, status={d}", .{ @intFromPtr(queue), status });
     }
@@ -626,26 +644,46 @@ test "readBigEndianU64 correctness" {
 }
 
 test "parseProbePayload extracts fields" {
+    // Wire format under test (see the ProbePayload doc comment above, and
+    // packet.zig's serializeProbePacket/deserializeProbePacket, which this
+    // must stay in sync with):
+    //   byte  0:     version
+    //   byte  1:     msg_type (is_ack)
+    //   byte  2:     ack_type
+    //   byte  3:     flags
+    //   bytes 4-11:  sequence_num (u64 BigEndian)
+    //   bytes 12-19: t1 (u64 BigEndian)
+    //   bytes 20-27: t3 (u64 BigEndian)
+    //   bytes 28-35: t4 (u64 BigEndian)
+    //   bytes 36-39: reserved
     var payload: [40]u8 = [_]u8{0} ** 40;
 
-    // sequence_num = 1 (bytes 0-7, big-endian)
-    payload[7] = 0x01;
+    // msg_type (is_ack) = 1 (byte 1)
+    payload[1] = 1;
 
-    // t1 = 1000 (bytes 8-15)
-    payload[14] = 0x03;
-    payload[15] = 0xE8;
+    // ack_type = 2 (byte 2)
+    payload[2] = 2;
 
-    // is_ack = 1 (byte 32)
-    payload[32] = 1;
+    // sequence_num = 1 (bytes 4-11, BigEndian; LSB is the last byte, index 11)
+    payload[11] = 0x01;
 
-    // ack_type = 2 (byte 33)
-    payload[33] = 2;
+    // t1 = 1000 = 0x03E8 (bytes 12-19, BigEndian; LSB is index 19)
+    payload[18] = 0x03;
+    payload[19] = 0xE8;
+
+    // t3 = 2000 = 0x07D0 (bytes 20-27, BigEndian; LSB is index 27)
+    payload[26] = 0x07;
+    payload[27] = 0xD0;
+
+    // t4 = 3000 = 0x0BB8 (bytes 28-35, BigEndian; LSB is index 35)
+    payload[34] = 0x0B;
+    payload[35] = 0xB8;
 
     const parsed = parseProbePayload(&payload);
     try std.testing.expectEqual(@as(u64, 1), parsed.sequence_num);
     try std.testing.expectEqual(@as(u64, 1000), parsed.t1);
-    try std.testing.expectEqual(@as(u64, 0), parsed.t3);
-    try std.testing.expectEqual(@as(u64, 0), parsed.t4);
+    try std.testing.expectEqual(@as(u64, 2000), parsed.t3);
+    try std.testing.expectEqual(@as(u64, 3000), parsed.t4);
     try std.testing.expectEqual(@as(u8, 1), parsed.is_ack);
     try std.testing.expectEqual(@as(u8, 2), parsed.ack_type);
 }

@@ -8,7 +8,7 @@ import (
 	"github.com/yuuki/rpingmesh/rebuild/internal/probe"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 )
 
 // serviceNameOf returns the service.name attribute value from a resource

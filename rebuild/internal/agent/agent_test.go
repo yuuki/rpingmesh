@@ -119,7 +119,7 @@ func TestAgent_CreateResultsFanIn_MergesResultsFromEveryProber(t *testing.T) {
 	}
 }
 
-func TestAgent_CreateResultsFanIn_ClosesSharedChannelAfterAllProbersDestroyed(t *testing.T) {
+func TestAgent_StopResultsFanIn_ClosesSharedChannelAfterAllProbersDestroyed(t *testing.T) {
 	probers := []*Prober{fakeProber(1), fakeProber(1)}
 	a := newTestAgent(nil, probers)
 
@@ -128,9 +128,24 @@ func TestAgent_CreateResultsFanIn_ClosesSharedChannelAfterAllProbersDestroyed(t 
 	// Destroy() is safe on a bare fake Prober: Stop() is a no-op because
 	// running was never set true (no goroutines were started), so
 	// destroyOnce only closes resultChan and skips the nil queue teardown --
-	// mirroring what Agent.Stop does to every real prober.
+	// mirroring what Agent.Stop does to every real prober. Per
+	// stopResultsFanIn's contract, this must happen before calling it so
+	// every fan-in goroutine's range loop can observe the closed source
+	// channel.
 	for _, p := range probers {
 		p.Destroy()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		a.stopResultsFanIn()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stopResultsFanIn did not return within 2s after all probers were destroyed")
 	}
 
 	select {
@@ -138,7 +153,48 @@ func TestAgent_CreateResultsFanIn_ClosesSharedChannelAfterAllProbersDestroyed(t 
 		if ok {
 			t.Fatalf("expected a.results to be closed with no pending data, got result: %+v", result)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for a.results to close after all probers were destroyed")
+	default:
+		t.Fatal("expected a.results to already be closed once stopResultsFanIn returned")
+	}
+}
+
+// TestAgent_StopResultsFanIn_NoConsumer_DoesNotDeadlock reproduces the
+// scenario a review of PR #31 flagged: when metrics are disabled (or
+// MetricsCollector creation failed), Start never drains a.results. If a
+// fan-in goroutine has no way to abandon a blocked send once a.results
+// fills up, stopResultsFanIn (called from Agent.Stop) would hang forever
+// waiting on resultsWg, leaking the goroutine and every buffered result.
+// createResultsFanIn's select on resultsDone must let it return promptly
+// regardless.
+func TestAgent_StopResultsFanIn_NoConsumer_DoesNotDeadlock(t *testing.T) {
+	// More results than a.results' buffer (resultChanSize) can hold, so at
+	// least one forwarded result is guaranteed to overflow it and block the
+	// fan-in goroutine's send with nothing there to drain it.
+	const overflow = resultChanSize + 8
+
+	prober := fakeProber(overflow)
+	a := newTestAgent(nil, []*Prober{prober})
+
+	a.createResultsFanIn()
+
+	for i := 0; i < overflow; i++ {
+		prober.emitResult(&probe.ProbeResult{SequenceNum: uint64(i)})
+	}
+
+	// Nothing ever reads from a.results in this test: no metrics result
+	// consumer, matching the metrics-disabled/unavailable scenario.
+	prober.Destroy()
+
+	done := make(chan struct{})
+	go func() {
+		a.stopResultsFanIn()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stopResultsFanIn deadlocked with no consumer draining a.results: " +
+			"the fan-in goroutine could not abandon a blocked send")
 	}
 }

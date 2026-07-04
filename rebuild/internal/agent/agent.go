@@ -73,6 +73,15 @@ type Agent struct {
 	results   chan *probe.ProbeResult
 	resultsWg sync.WaitGroup
 
+	// resultsDone is closed by stopResultsFanIn (called from Stop) to tell
+	// every fan-in goroutine to stop forwarding immediately, even if it is
+	// currently blocked trying to send on a full results channel. Without
+	// this, a fan-in goroutine has no way to unblock when nothing drains
+	// a.results (e.g. metrics disabled, or MetricsCollector creation
+	// failed), which would leak the goroutine and any buffered results
+	// forever instead of letting Stop complete deterministically.
+	resultsDone chan struct{}
+
 	// agentIP is the host's outbound IP toward the controller, reported in the
 	// registration request's agent_ip field. Best-effort: empty if it cannot be
 	// determined, which never blocks registration.
@@ -447,15 +456,22 @@ func (a *Agent) Stop(ctx context.Context) {
 	a.stopHeartbeat()
 
 	// Stop all probers to cease outgoing probes. Destroy() closes each
-	// prober's own Results() channel; the fan-in goroutines started by
-	// createResultsFanIn notice the close, drain, and exit, and once every
-	// fan-in goroutine has exited the closer goroutine closes a.results,
-	// which in turn lets the metrics result consumer's range loop finish.
+	// prober's own Results() channel, letting each fan-in goroutine's range
+	// loop finish once it has drained any buffered values.
 	for _, prober := range a.probers {
 		if prober != nil {
 			prober.Destroy()
 		}
 	}
+
+	// Deterministically wind down the results fan-in: signal every fan-in
+	// goroutine to stop forwarding, wait for all of them to exit, and close
+	// the shared results channel exactly once. This must happen here in
+	// Stop (not a fire-and-forget background goroutine) so shutdown never
+	// leaves a fan-in goroutine blocked forever on a full a.results with
+	// nothing draining it (e.g. metrics disabled), which in turn lets the
+	// metrics result consumer's range loop finish.
+	a.stopResultsFanIn()
 
 	// Stop all responders.
 	for _, resp := range a.responders {
@@ -688,28 +704,57 @@ func (a *Agent) createEventRings() error {
 // "the" probe result stream as a single channel even though every device now
 // has its own Prober.
 //
-// Shutdown ordering: each fan-in goroutine exits when its prober's Destroy()
-// closes that prober's own resultChan (a range over a closed channel drains
-// then returns). A separate closer goroutine waits for every fan-in
-// goroutine to exit before closing a.results exactly once, so the shared
-// channel is never closed while a producer might still send on it.
+// Each fan-in goroutine selects between sending on a.results and reading
+// from resultsDone, so it can always return promptly once Stop calls
+// stopResultsFanIn -- whether or not anything is (or ever was) draining
+// a.results. Without this, a fan-in goroutine could block forever on a full
+// a.results when metrics are disabled (or MetricsCollector creation
+// failed), leaking the goroutine and every buffered result.
 func (a *Agent) createResultsFanIn() {
 	a.results = make(chan *probe.ProbeResult, resultChanSize)
+	a.resultsDone = make(chan struct{})
 
 	for _, prober := range a.probers {
 		a.resultsWg.Add(1)
 		go func(p *Prober) {
 			defer a.resultsWg.Done()
 			for result := range p.Results() {
-				a.results <- result
+				select {
+				case a.results <- result:
+				case <-a.resultsDone:
+					// Stop is shutting down and nothing is guaranteed to
+					// drain a.results; stop forwarding immediately instead
+					// of risking a permanent block. Any results not yet
+					// forwarded (this one, and anything still buffered in
+					// p.Results()) are dropped.
+					return
+				}
 			}
 		}(prober)
 	}
+}
 
-	go func() {
-		a.resultsWg.Wait()
-		close(a.results)
-	}()
+// stopResultsFanIn signals every fan-in goroutine started by
+// createResultsFanIn to stop forwarding, waits for all of them to exit, and
+// then closes the shared results channel exactly once. It is a no-op if
+// createResultsFanIn was never called (e.g. Initialize failed before
+// reaching it), matching the nil-guard pattern used throughout Stop.
+//
+// Closing resultsDone before waiting is what makes this deterministic: it
+// guarantees every fan-in goroutine can return -- even one currently blocked
+// trying to send on a full a.results -- regardless of whether the metrics
+// result consumer (or anything else) is draining it. Callers must invoke
+// this only after every prober has been destroyed (which closes that
+// prober's own Results() channel), so fan-in goroutines waiting for the
+// *next* value (rather than blocked on the send) also observe closure and
+// exit their range loop.
+func (a *Agent) stopResultsFanIn() {
+	if a.resultsDone == nil {
+		return
+	}
+	close(a.resultsDone)
+	a.resultsWg.Wait()
+	close(a.results)
 }
 
 // proberRingDropCount sums EventRing.DropCount() across every prober ring

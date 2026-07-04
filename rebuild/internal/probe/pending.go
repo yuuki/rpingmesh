@@ -1,9 +1,17 @@
 package probe
 
-// PendingMeasurement tracks the in-flight 6-timestamp state of a single probe
-// as its two ACKs arrive. The two ACKs may arrive out of order (the second ACK
-// can be delivered before the first), so this state machine records whichever
-// arrives first and only reports completion once both have been seen.
+// PendingMeasurement tracks the in-flight 6-timestamp state of a single probe.
+//
+// The three inputs — the send-side timestamps (T1/T2), the first ACK, and the
+// second ACK — can arrive in ANY order relative to one another. In particular
+// an ACK can arrive before the send-side timestamps are known: SendProbe
+// blocks until its own send completion (T2), and on a low-latency RNIC the ACK
+// can reach the ACK-processing loop before the send call has returned and
+// recorded T1/T2. The pending entry is therefore created (and its sequence
+// number registered) BEFORE the send, and the send-side timestamps are applied
+// afterwards via ApplySend. This state machine buffers whichever inputs arrive
+// first and only reports completion once all three are present. The two ACKs
+// may themselves also arrive out of order (second before first).
 //
 // PendingMeasurement is NOT safe for concurrent use; callers must provide their
 // own synchronization (the prober guards it with its pending-map mutex).
@@ -18,14 +26,28 @@ type PendingMeasurement struct {
 	T5 uint64 // Prober first ACK recv timestamp
 	T6 uint64 // Prober second ACK recv time (CLOCK_MONOTONIC, same domain as T1)
 
+	sendApplied      bool
 	firstAckArrived  bool
 	secondAckArrived bool
 }
 
-// NewPendingMeasurement creates a pending measurement seeded with T1 and T2,
-// which are known at probe-send time.
-func NewPendingMeasurement(t1, t2 uint64) *PendingMeasurement {
-	return &PendingMeasurement{T1: t1, T2: t2}
+// NewPendingMeasurement creates an empty pending measurement. It is registered
+// at probe-send time BEFORE the send so that an ACK arriving before the send
+// completes still finds its pending entry; the send-side timestamps (T1/T2)
+// are filled in afterwards via ApplySend.
+func NewPendingMeasurement() *PendingMeasurement {
+	return &PendingMeasurement{}
+}
+
+// ApplySend records the send-side timestamps T1 (prober send time) and T2
+// (send-completion timestamp), which become known only once SendProbe returns.
+// Until this is called the measurement can never be Complete(), so the ACK
+// handlers cannot finalize (and delete) the entry before the send path has
+// recorded T1/T2 — even if both ACKs have already arrived.
+func (m *PendingMeasurement) ApplySend(t1, t2 uint64) {
+	m.T1 = t1
+	m.T2 = t2
+	m.sendApplied = true
 }
 
 // ApplyFirstAck records the timestamps associated with the first ACK: T3 (the
@@ -52,10 +74,13 @@ func (m *PendingMeasurement) ApplySecondAck(t3, t4, t6 uint64) {
 	m.secondAckArrived = true
 }
 
-// Complete reports whether both ACKs have arrived and the measurement is ready
-// to be finalized into a ProbeResult.
+// Complete reports whether all three inputs — the send-side timestamps and
+// both ACKs — have arrived, so the measurement is ready to be finalized into a
+// ProbeResult. Requiring sendApplied guarantees T1/T2 are present in the
+// result and that an ACK-only arrival (before the send completes) cannot
+// finalize the entry prematurely.
 func (m *PendingMeasurement) Complete() bool {
-	return m.firstAckArrived && m.secondAckArrived
+	return m.sendApplied && m.firstAckArrived && m.secondAckArrived
 }
 
 // Result copies the six timestamps into a ProbeResult. Caller-owned fields

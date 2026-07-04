@@ -156,10 +156,10 @@ pub fn createQueue(
         .event_ring = event_ring,
         .cq_thread = null,
         .device = dev,
-        .send_slot_states = [_]types.SlotState{types.SlotState.Free} ** types.NUM_SEND_SLOTS,
+        .send_slot_states = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(types.SlotState.Free))} ** types.NUM_SEND_SLOTS,
         .recv_slot_states = [_]types.SlotState{types.SlotState.Free} ** types.NUM_RECV_SLOTS,
         .running = std.atomic.Value(bool).init(false),
-        .send_completion_ready = std.atomic.Value(bool).init(false),
+        .send_completion_wr_id = std.atomic.Value(u64).init(types.SEND_WR_ID_NONE),
         .send_completion_timestamp = std.atomic.Value(u64).init(0),
         .send_completion_status = std.atomic.Value(i32).init(0),
     };

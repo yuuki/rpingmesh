@@ -73,6 +73,12 @@ type Prober struct {
 	// race with Destroy() setting queue to nil.
 	queueMu sync.RWMutex
 
+	// destroyOnce makes Destroy() idempotent: closing resultChan and tearing
+	// down the queue must happen exactly once even if Destroy is called
+	// multiple times (e.g. Agent.Stop after a partial start), otherwise the
+	// second close(resultChan) panics.
+	destroyOnce sync.Once
+
 	// rateMu guards the send-rate limiter, which SetPerTargetRateLimit may update from
 	// a different goroutine than the probe loop.
 	rateMu       sync.Mutex // guards limiter and perTargetPPS; lock order: targetsMu -> rateMu
@@ -172,14 +178,20 @@ func (p *Prober) Stop() {
 // per-target cadence is preserved as the pinglist grows or shrinks. A
 // non-positive pps disables rate limiting. Safe to call while running.
 func (p *Prober) SetPerTargetRateLimit(pps float64) {
+	// Hold targetsMu across the whole rate update, taking rateMu nested. This
+	// matches UpdateTargets' lock order (targetsMu -> rateMu) and closes a
+	// TOCTOU window: reading len(targets) and recomputing the aggregate rate
+	// must be atomic w.r.t. a concurrent UpdateTargets, otherwise the two could
+	// interleave and leave the limiter with a rate computed from a stale count.
 	p.targetsMu.RLock()
+	defer p.targetsMu.RUnlock()
 	n := len(p.targets)
-	p.targetsMu.RUnlock()
 
 	p.rateMu.Lock()
 	p.perTargetPPS = pps
 	p.limiter.SetRate(pps * float64(n))
 	p.rateMu.Unlock()
+
 	p.logger.Info().
 		Float64("per_target_pps", pps).
 		Int("targets", n).
@@ -316,7 +328,9 @@ func (p *Prober) sendProbes(ctx context.Context) {
 		counter := uint64(p.seqCounter.Add(1))
 		seqNum := (uint64(p.agentEpoch) << 32) | (counter & 0xFFFFFFFF)
 
-		// Parse the target GID string into a [16]byte for the RDMA layer.
+		// Parse the target GID string into a [16]byte for the RDMA layer. Do
+		// this BEFORE registering the pending entry so a malformed target never
+		// leaves an orphaned entry behind.
 		targetGID, err := probe.ParseGID(target.GetTargetGid())
 		if err != nil {
 			p.logger.Error().Err(err).
@@ -325,6 +339,23 @@ func (p *Prober) sendProbes(ctx context.Context) {
 				Msg("Failed to parse target GID, skipping target")
 			continue
 		}
+
+		// Register the pending entry BEFORE sending. SendProbe blocks until the
+		// send completion (T2), and on a low-latency RNIC an ACK can reach
+		// ackProcessLoop before SendProbe returns. Registering first guarantees
+		// the ACK handlers find the entry instead of dropping the ACK as an
+		// "unknown sequence number" and letting the probe falsely time out. The
+		// send-side timestamps are applied after the send via ApplySend, and
+		// Complete() requires them, so the ACK handlers cannot finalize (and
+		// delete) the entry before this send path records T1/T2.
+		pp := &pendingProbe{
+			target:    target,
+			meas:      probe.NewPendingMeasurement(),
+			createdAt: time.Now(),
+		}
+		p.pendingMu.Lock()
+		p.pending[seqNum] = pp
+		p.pendingMu.Unlock()
 
 		// Send the probe packet. SendProbe is synchronous: it posts the
 		// packet and waits for the send completion within the timeout.
@@ -337,24 +368,36 @@ func (p *Prober) sendProbes(ctx context.Context) {
 		)
 
 		if result.Error != nil {
+			// The send failed, so no ACK will ever complete this probe. Remove
+			// the pending entry and emit a failed result so the loss is counted
+			// in probe_failed_total rather than vanishing until the stale sweep.
+			p.pendingMu.Lock()
+			delete(p.pending, seqNum)
+			p.pendingMu.Unlock()
+
 			p.logger.Error().Err(result.Error).
 				Str("target_gid", target.GetTargetGid()).
 				Uint32("target_qpn", target.GetTargetQpn()).
 				Uint64("seq", seqNum).
 				Msg("Failed to send probe packet")
+			p.emitResult(newFailedResult(seqNum, target, fmt.Sprintf("probe send failed: %v", result.Error)))
 			continue
 		}
 
-		// Record the pending probe with T1 and T2 from the send result. The
-		// PendingMeasurement will absorb the two ACKs in whatever order they
-		// arrive.
+		// Apply the send-side timestamps T1/T2 now that the send completed. If
+		// both ACKs already arrived while the send was in progress, this is the
+		// call that finally completes the measurement; finalize it here rather
+		// than losing it.
 		p.pendingMu.Lock()
-		p.pending[seqNum] = &pendingProbe{
-			target:    target,
-			meas:      probe.NewPendingMeasurement(result.T1NS, result.T2NS),
-			createdAt: time.Now(),
+		var finalized *probe.ProbeResult
+		if cur, ok := p.pending[seqNum]; ok {
+			cur.meas.ApplySend(result.T1NS, result.T2NS)
+			finalized = p.finalizeIfCompleteLocked(seqNum, cur)
 		}
 		p.pendingMu.Unlock()
+		if finalized != nil {
+			p.deliverResult(seqNum, target, finalized)
+		}
 
 		p.logger.Debug().
 			Str("target_gid", target.GetTargetGid()).
@@ -571,24 +614,51 @@ func (p *Prober) finalizeIfCompleteLocked(seqNum uint64, pp *pendingProbe) *prob
 		return nil
 	}
 
-	// Build the target GID from the pending probe's target information.
-	var targetGID [16]byte
-	if parsedGID, err := probe.ParseGID(pp.target.GetTargetGid()); err == nil {
-		targetGID = parsedGID
-	}
-
 	result := pp.meas.Result()
-	result.SequenceNum = seqNum
-	result.TargetGID = targetGID
-	result.TargetQPN = pp.target.GetTargetQpn()
-	result.FlowLabel = pp.target.GetFlowLabel()
+	fillTargetMetadata(&result, seqNum, pp.target)
 	result.Success = true
-	result.TargetIP = pp.target.GetTargetIp()
-	result.TargetHostname = pp.target.GetTargetHostname()
-	result.TargetTorID = pp.target.GetTargetTorId()
 
 	delete(p.pending, seqNum)
 	return &result
+}
+
+// fillTargetMetadata copies the sequence number and per-target metadata into a
+// ProbeResult. Shared by the success, send-failure, and stale-timeout paths so
+// they cannot diverge on which fields a result carries.
+func fillTargetMetadata(result *probe.ProbeResult, seqNum uint64, target *controller_agent.PingTarget) {
+	result.SequenceNum = seqNum
+	result.TargetQPN = target.GetTargetQpn()
+	result.FlowLabel = target.GetFlowLabel()
+	result.TargetIP = target.GetTargetIp()
+	result.TargetHostname = target.GetTargetHostname()
+	result.TargetTorID = target.GetTargetTorId()
+	if parsedGID, err := probe.ParseGID(target.GetTargetGid()); err == nil {
+		result.TargetGID = parsedGID
+	}
+}
+
+// newFailedResult builds a Success=false ProbeResult carrying the target
+// metadata and an error message, used when a probe send fails outright.
+func newFailedResult(seqNum uint64, target *controller_agent.PingTarget, errMsg string) *probe.ProbeResult {
+	result := &probe.ProbeResult{}
+	fillTargetMetadata(result, seqNum, target)
+	result.Success = false
+	result.ErrorMessage = errMsg
+	return result
+}
+
+// emitResult delivers a result on resultChan without blocking. A non-blocking
+// send keeps a slow consumer from stalling the probe or ACK loops (which may
+// hold pendingMu at the call site's caller); a full channel drops the result
+// with a warning.
+func (p *Prober) emitResult(result *probe.ProbeResult) {
+	select {
+	case p.resultChan <- result:
+	default:
+		p.logger.Warn().
+			Uint64("seq", result.SequenceNum).
+			Msg("Result channel full, dropping probe result")
+	}
 }
 
 // deliverResult computes RTT metrics for a completed probe and emits it on the
@@ -612,15 +682,7 @@ func (p *Prober) deliverResult(seqNum uint64, target *controller_agent.PingTarge
 		Int64("prober_delay_ns", rtt.ProberDelay).
 		Msg("Probe completed with all 6 timestamps")
 
-	// Send the result to the results channel. Use a non-blocking send
-	// to avoid blocking the ACK processing loop if the consumer is slow.
-	select {
-	case p.resultChan <- result:
-	default:
-		p.logger.Warn().
-			Uint64("seq", seqNum).
-			Msg("Result channel full, dropping probe result")
-	}
+	p.emitResult(result)
 }
 
 // cleanupStalePending removes entries from the pending map that are older
@@ -635,18 +697,12 @@ func (p *Prober) cleanupStalePending() {
 	p.pendingMu.Lock()
 	for seqNum, pp := range p.pending {
 		if now.Sub(pp.createdAt) > stalePendingTimeout {
+			// Preserve any partial timestamps the measurement collected, then
+			// overlay the target metadata and failure state.
 			result := pp.meas.Result()
-			result.SequenceNum = seqNum
-			result.TargetQPN = pp.target.GetTargetQpn()
-			result.FlowLabel = pp.target.GetFlowLabel()
+			fillTargetMetadata(&result, seqNum, pp.target)
 			result.Success = false
 			result.ErrorMessage = "timed out waiting for ACKs"
-			result.TargetIP = pp.target.GetTargetIp()
-			result.TargetHostname = pp.target.GetTargetHostname()
-			result.TargetTorID = pp.target.GetTargetTorId()
-			if parsedGID, err := probe.ParseGID(pp.target.GetTargetGid()); err == nil {
-				result.TargetGID = parsedGID
-			}
 			stale = append(stale, &result)
 			delete(p.pending, seqNum)
 		}
@@ -656,13 +712,7 @@ func (p *Prober) cleanupStalePending() {
 	// Emit outside pendingMu; non-blocking like deliverResult so a slow
 	// consumer cannot stall the probe loop.
 	for _, result := range stale {
-		select {
-		case p.resultChan <- result:
-		default:
-			p.logger.Warn().
-				Uint64("seq", result.SequenceNum).
-				Msg("Result channel full, dropping timed-out probe result")
-		}
+		p.emitResult(result)
 	}
 
 	if len(stale) > 0 {
@@ -693,12 +743,14 @@ func (p *Prober) GetQueueInfo() rdmabridge.QueueInfo {
 // when the channel is closed.
 func (p *Prober) Destroy() {
 	p.Stop()
-	close(p.resultChan)
-	p.queueMu.Lock()
-	if p.queue != nil {
-		p.queue.Destroy()
-		p.queue = nil
-	}
-	p.queueMu.Unlock()
-	p.logger.Info().Msg("Prober destroyed")
+	p.destroyOnce.Do(func() {
+		close(p.resultChan)
+		p.queueMu.Lock()
+		if p.queue != nil {
+			p.queue.Destroy()
+			p.queue = nil
+		}
+		p.queueMu.Unlock()
+		p.logger.Info().Msg("Prober destroyed")
+	})
 }

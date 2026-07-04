@@ -37,6 +37,13 @@ const (
 	// DefaultEcmpMaxFlowLabels caps the computed label count (n) to bound
 	// probe amplification.
 	DefaultEcmpMaxFlowLabels = 64
+
+	// MaxEcmpFlowLabels is the absolute ceiling on ecmp_max_flow_labels: the
+	// IPv6 flow-label field is 20 bits, so at most 2^20 DISTINCT labels can
+	// exist. A larger cap could reach a PingTarget and make the agent's
+	// distinct-label generation unable to ever collect that many, so it is
+	// rejected here.
+	MaxEcmpFlowLabels = 1 << 20
 )
 
 // ControllerConfig holds all configuration for the controller.
@@ -192,6 +199,11 @@ func (c *ControllerConfig) Validate() error {
 	}
 	if c.EcmpMaxFlowLabels < 1 {
 		return fmt.Errorf("ecmp_max_flow_labels must be >= 1, got: %d", c.EcmpMaxFlowLabels)
+	}
+	// The 20-bit flow-label field holds at most 2^20 distinct values; a larger
+	// cap could hang the agent's distinct-label generation.
+	if c.EcmpMaxFlowLabels > MaxEcmpFlowLabels {
+		return fmt.Errorf("ecmp_max_flow_labels must be <= %d (20-bit flow-label space), got: %d", MaxEcmpFlowLabels, c.EcmpMaxFlowLabels)
 	}
 
 	return nil

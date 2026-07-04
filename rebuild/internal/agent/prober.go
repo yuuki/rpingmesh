@@ -57,7 +57,25 @@ const (
 	// flowLabelMask is the 20-bit IPv6 flow-label field width; generated labels
 	// are masked to it before reaching ibv_ah_attr.grh.flow_label.
 	flowLabelMask = 0xFFFFF
+
+	// maxDistinctFlowLabels is the hard upper bound on how many DISTINCT flow
+	// labels can exist: the field is 20 bits, so at most 2^20 distinct values.
+	// generateFlowLabels clamps FlowLabelCount to this so a bad or malicious
+	// controller value can never make the dedup loop spin forever hunting for
+	// more distinct 20-bit labels than the space contains. The controller also
+	// validates ecmp_max_flow_labels against this bound (defense in depth).
+	maxDistinctFlowLabels = 1 << 20
 )
+
+// clampDistinctFlowLabelCount bounds a requested flow-label count to the number
+// of distinct 20-bit labels that can exist (maxDistinctFlowLabels). Extracted
+// so the clamp decision is unit-testable without generating a huge label set.
+func clampDistinctFlowLabelCount(count uint32) uint32 {
+	if count > maxDistinctFlowLabels {
+		return maxDistinctFlowLabels
+	}
+	return count
+}
 
 // flowLabelAt deterministically derives a candidate ECMP flow label for label
 // index within a target's set, from the controller-provided seed and (for the
@@ -113,6 +131,9 @@ func generateFlowLabels(seed, count uint32, rotationEpoch uint64) []uint32 {
 	if count == 0 {
 		count = 1
 	}
+	// Never ask for more distinct labels than the 20-bit space can hold, or the
+	// dedup loop below could never satisfy the request and would spin forever.
+	count = clampDistinctFlowLabelCount(count)
 	labels := make([]uint32, count)
 	used := make(map[uint32]struct{}, count)
 

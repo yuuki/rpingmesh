@@ -93,6 +93,29 @@ func TestGenerateFlowLabels_DistinctUnderCollision(t *testing.T) {
 	}
 }
 
+// TestClampDistinctFlowLabelCount verifies the agent never asks for more
+// distinct labels than the 20-bit space holds, so a bad/malicious controller
+// FlowLabelCount cannot make generateFlowLabels spin forever. The clamp
+// decision is tested directly (not by generating 2^20 labels) to stay fast.
+func TestClampDistinctFlowLabelCount(t *testing.T) {
+	tests := []struct {
+		in   uint32
+		want uint32
+	}{
+		{0, 0},
+		{5, 5},
+		{maxDistinctFlowLabels - 1, maxDistinctFlowLabels - 1},
+		{maxDistinctFlowLabels, maxDistinctFlowLabels},
+		{maxDistinctFlowLabels + 1, maxDistinctFlowLabels},
+		{^uint32(0), maxDistinctFlowLabels}, // 2^32-1, worst case
+	}
+	for _, tc := range tests {
+		if got := clampDistinctFlowLabelCount(tc.in); got != tc.want {
+			t.Errorf("clampDistinctFlowLabelCount(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
 // TestFlowLabelRotation_FractionAcrossEpoch verifies that exactly the rotating
 // subset (~20%, every flowLabelRotateStride-th index) changes across an epoch
 // boundary while the rest stay stable for time-series continuity.

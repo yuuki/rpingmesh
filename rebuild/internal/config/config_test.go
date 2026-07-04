@@ -183,6 +183,26 @@ func TestControllerConfig_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// A cap above the 20-bit flow-label space (2^20) could reach a
+			// PingTarget and hang the agent's distinct-label generation.
+			name: "ecmp max flow labels exceeds 20-bit space",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: MaxEcmpFlowLabels + 1,
+			},
+			wantErr: true,
+		},
+		{
+			name: "ecmp max flow labels at 20-bit boundary",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: MaxEcmpFlowLabels,
+			},
+			wantErr: false,
+		},
+		{
 			name: "invalid listen addr",
 			cfg: ControllerConfig{
 				ListenAddr: "not-a-valid-addr-no-colon", DatabaseURI: "http://localhost:4001", LogLevel: "info",

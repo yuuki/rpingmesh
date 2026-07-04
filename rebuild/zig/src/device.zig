@@ -103,9 +103,9 @@ pub fn getDeviceCount(ctx: *types.RdmaContext) i32 {
 /// This function performs the full device initialization sequence:
 ///   1. Validate the index and open the device context
 ///   2. Allocate a Protection Domain (PD)
-///   3. Find the first active port and query the specified GID
-///   4. Check for hardware timestamp support
-///   5. Populate the DeviceInfo struct with name, GID, and IP
+///   3. Find the first active port and query the specified GID (also
+///      validates the GID's RoCE type via sysfs; see logGidTypeInfo())
+///   4. Populate the DeviceInfo struct with name, GID, and IP
 ///
 /// On failure, all partially allocated resources are cleaned up before
 /// returning the error.
@@ -143,23 +143,23 @@ pub fn openDevice(ctx: *types.RdmaContext, index: i32, gid_index: i32) DeviceErr
     };
     errdefer _ = c.ibv_dealloc_pd(pd);
 
+    // Get device name. This is needed both for the DeviceInfo struct below
+    // and for the sysfs GID-type validation performed inside
+    // findActivePortAndGid(), so it is extracted before that call.
+    const dev_name_ptr = c.ibv_get_device_name(device);
+    var device_name: [64]u8 = [_]u8{0} ** 64;
+    var device_name_len: usize = 0;
+    if (dev_name_ptr != null) {
+        const name_slice = std.mem.sliceTo(dev_name_ptr, 0);
+        device_name_len = @min(name_slice.len, device_name.len - 1);
+        @memcpy(device_name[0..device_name_len], name_slice[0..device_name_len]);
+    }
+
     // Find the first active port and query GID
-    const port_result = findActivePortAndGid(ibv_ctx, gid_index) orelse {
+    const port_result = findActivePortAndGid(ibv_ctx, gid_index, device_name[0..device_name_len]) orelse {
         // Error message already set by findActivePortAndGid
         return DeviceError.NoActivePort;
     };
-
-    // Check hardware timestamp capability
-    const has_hw_timestamps = queryHwTimestampSupport(ibv_ctx);
-
-    // Get device name
-    const dev_name_ptr = c.ibv_get_device_name(device);
-    var device_name: [64]u8 = [_]u8{0} ** 64;
-    if (dev_name_ptr != null) {
-        const name_slice = std.mem.sliceTo(dev_name_ptr, 0);
-        const copy_len = @min(name_slice.len, device_name.len - 1);
-        @memcpy(device_name[0..copy_len], name_slice[0..copy_len]);
-    }
 
     // Format GID and extract IP
     const gid_bytes = types.gidToBytes(port_result.gid);
@@ -185,7 +185,6 @@ pub fn openDevice(ctx: *types.RdmaContext, index: i32, gid_index: i32) DeviceErr
             .active_port = port_result.port_num,
             .active_gid_index = @intCast(gid_index),
         },
-        .has_hw_timestamps = has_hw_timestamps,
     };
 
     return dev;
@@ -226,8 +225,23 @@ pub fn openDeviceByName(ctx: *types.RdmaContext, name: [*:0]const u8, gid_index:
 /// frees the RdmaDevice struct memory. All queues associated with this
 /// device must be destroyed before calling this function.
 pub fn closeDevice(dev: *types.RdmaDevice) void {
-    _ = c.ibv_dealloc_pd(dev.pd);
-    _ = c.ibv_close_device(dev.ctx);
+    const log = std.log.scoped(.rdma_device);
+
+    // Log (rather than silently discard) failures from these teardown
+    // calls. A non-zero return here typically means resources are still
+    // referenced (e.g. a queue/QP was not destroyed first) and is useful
+    // operational signal even though we cannot recover from it at this
+    // point in the shutdown path.
+    const dealloc_ret = c.ibv_dealloc_pd(dev.pd);
+    if (dealloc_ret != 0) {
+        log.err("ibv_dealloc_pd() failed with errno={d}", .{dealloc_ret});
+    }
+
+    const close_ret = c.ibv_close_device(dev.ctx);
+    if (close_ret != 0) {
+        log.err("ibv_close_device() failed with errno={d}", .{close_ret});
+    }
+
     std.heap.page_allocator.destroy(dev);
 }
 
@@ -303,7 +317,14 @@ const PortGidResult = struct {
 ///
 /// Mirrors the Go OpenDevice() logic that iterates ports 1..phys_port_cnt,
 /// queries each port's state, and checks the GID at the given index.
-fn findActivePortAndGid(ibv_ctx: *c.ibv_context, gid_index: i32) ?PortGidResult {
+///
+/// Once a usable GID is found, this also validates its RoCE GID type via
+/// sysfs (see logGidTypeInfo()) and logs a warning if it is not RoCE v2 --
+/// on real Mellanox hardware, gid_index 0 is commonly RoCE v1, which does
+/// not interoperate with a RoCE v2 peer even though the GID itself is
+/// non-zero and otherwise looks valid. This validation is purely
+/// informational: the configured gid_index is still used as-is.
+fn findActivePortAndGid(ibv_ctx: *c.ibv_context, gid_index: i32, dev_name: []const u8) ?PortGidResult {
     // Query device attributes to get the number of physical ports
     var device_attr: c.ibv_device_attr = std.mem.zeroes(c.ibv_device_attr);
     if (c.ibv_query_device(ibv_ctx, &device_attr) != 0) {
@@ -349,6 +370,8 @@ fn findActivePortAndGid(ibv_ctx: *c.ibv_context, gid_index: i32) ?PortGidResult 
             continue;
         }
 
+        logGidTypeInfo(dev_name, port_num, gid_index);
+
         return PortGidResult{
             .port_num = port_num,
             .gid = gid,
@@ -359,17 +382,115 @@ fn findActivePortAndGid(ibv_ctx: *c.ibv_context, gid_index: i32) ?PortGidResult 
     return null;
 }
 
-/// Query whether the device supports hardware completion timestamps.
-///
-/// ibv_query_device_ex() is a static inline wrapper in libibverbs headers and
-/// is not reliably exported as a linkable symbol in all distributions (e.g.,
-/// Debian bookworm libibverbs 44.0). Soft-RoCE (rdma_rxe) does not support
-/// hardware timestamps regardless. The CQ poller in cq.zig automatically falls
-/// back to software timestamps when IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK
-/// is unsupported, so returning false here is safe and correct.
-fn queryHwTimestampSupport(ibv_ctx: *c.ibv_context) bool {
-    _ = ibv_ctx;
-    return false;
+// ---------------------------------------------------------------------------
+// GID type validation (RoCE v1 vs RoCE v2) via sysfs
+// ---------------------------------------------------------------------------
+//
+// libibverbs has no verbs-level API to query whether a given gid_index is
+// RoCE v1, RoCE v1.5, or RoCE v2 -- the kernel exposes this only via sysfs:
+//   /sys/class/infiniband/<dev>/ports/<port>/gid_attrs/types/<index>
+// This matters in practice because production Mellanox NICs frequently
+// populate gid_index 0 with a RoCE v1 entry (for legacy compatibility) and
+// place the RoCE v2 (UDP/IP-routable) entry at a higher index. rdma_rxe
+// (soft-RoCE, used in CI/dev) typically only ever creates RoCE v2 entries,
+// which is why this class of misconfiguration would not be caught by
+// soft-RoCE testing and only surfaces against real hardware.
+
+/// Highest GID table index probed when searching for a RoCE v2 alternative.
+/// 32 comfortably covers the GID table sizes exposed by mlx5 and rdma_rxe.
+const MAX_GID_SEARCH_INDEX: i32 = 32;
+
+/// Coarse classification of a GID table entry's RoCE type, as reported by
+/// the kernel via sysfs gid_attrs/types/<index>.
+const GidType = enum {
+    roce_v1,
+    roce_v1_5,
+    roce_v2,
+    infiniband,
+    unknown,
+};
+
+/// Read and classify the GID type for (dev_name, port_num, gid_index) from
+/// sysfs. Returns null if the sysfs file cannot be opened or read -- this is
+/// expected on older kernels that predate the gid_attrs sysfs interface, or
+/// in restricted containers without /sys mounted, and is not itself an
+/// error.
+fn readGidTypeFromSysfs(dev_name: []const u8, port_num: u8, gid_index: i32) ?GidType {
+    if (dev_name.len == 0) return null;
+
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(
+        &path_buf,
+        "/sys/class/infiniband/{s}/ports/{d}/gid_attrs/types/{d}",
+        .{ dev_name, port_num, gid_index },
+    ) catch return null;
+
+    var file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+
+    var content_buf: [64]u8 = undefined;
+    const n = file.readAll(&content_buf) catch return null;
+    const content = std.mem.trim(u8, content_buf[0..n], " \t\r\n");
+
+    // Order matters: check the more specific "RoCE v2" before the "RoCE v1"
+    // substring match. Known kernel strings: "IB/RoCE v1", "RoCE v2".
+    if (std.mem.indexOf(u8, content, "RoCE v2") != null) return .roce_v2;
+    if (std.mem.indexOf(u8, content, "RoCE v1.5") != null) return .roce_v1_5;
+    if (std.mem.indexOf(u8, content, "RoCE v1") != null) return .roce_v1;
+    if (std.mem.indexOf(u8, content, "IB") != null) return .infiniband;
+    return .unknown;
+}
+
+/// Search gid_index 0..MAX_GID_SEARCH_INDEX on the given port for the first
+/// entry classified as RoCE v2. Returns null if none is found (or if sysfs
+/// is unavailable).
+fn findFirstRoceV2GidIndex(dev_name: []const u8, port_num: u8) ?i32 {
+    var idx: i32 = 0;
+    while (idx < MAX_GID_SEARCH_INDEX) : (idx += 1) {
+        if (readGidTypeFromSysfs(dev_name, port_num, idx)) |gt| {
+            if (gt == .roce_v2) return idx;
+        }
+    }
+    return null;
+}
+
+/// Log the GID type of the configured gid_index and warn if it is not
+/// RoCE v2. This is purely diagnostic: it never changes which gid_index is
+/// actually used, so behavior stays conservative and predictable. If a
+/// RoCE v2 entry is found elsewhere on the same port, its index is logged
+/// as a suggestion for the operator to update their configuration with.
+fn logGidTypeInfo(dev_name: []const u8, port_num: u8, gid_index: i32) void {
+    const log = std.log.scoped(.rdma_device);
+
+    const gid_type = readGidTypeFromSysfs(dev_name, port_num, gid_index) orelse {
+        log.warn(
+            "could not determine RoCE GID type via sysfs for gid_index={d} on {s} port {d} " ++
+                "(older kernel or /sys unavailable); proceeding without RoCE v1/v2 validation",
+            .{ gid_index, dev_name, port_num },
+        );
+        return;
+    };
+
+    log.info("gid_index={d} on {s} port {d} has GID type {s}", .{ gid_index, dev_name, port_num, @tagName(gid_type) });
+
+    if (gid_type != .roce_v2) {
+        log.warn(
+            "configured gid_index={d} on {s} port {d} is {s}, not RoCE v2; this is a common " ++
+                "cause of unreachable peers on production Mellanox NICs, which often place a " ++
+                "RoCE v1 entry at gid_index 0",
+            .{ gid_index, dev_name, port_num, @tagName(gid_type) },
+        );
+        if (findFirstRoceV2GidIndex(dev_name, port_num)) |suggested| {
+            log.warn(
+                "found a RoCE v2 GID at gid_index={d} on {s} port {d}; consider updating the " ++
+                    "gid_index configuration (not switched automatically to preserve explicit " ++
+                    "configuration behavior)",
+                .{ suggested, dev_name, port_num },
+            );
+        } else {
+            log.warn("no RoCE v2 GID found on {s} port {d}", .{ dev_name, port_num });
+        }
+    }
 }
 
 /// Format a u8 value as a decimal string into the output buffer.

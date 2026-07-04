@@ -88,15 +88,20 @@ jobs:
   # RDMA e2e tests using soft-RoCE (rdma_rxe) inside a privileged container.
   # GitHub-hosted runners are real VMs (so privileged Docker containers do
   # work), but the rdma_rxe module is not always present on the host kernel
-  # image (e.g. Azure-based runner kernels ship it in a separate
-  # linux-modules-extra package, or omit it entirely). We install the
-  # matching modules-extra package and modprobe it on the host below, but
-  # this is still best-effort: package availability and module support can
-  # change with the runner image at any time, and there is no guarantee the
-  # attempt succeeds. `continue-on-error: true` so an environment-level
-  # soft-RoCE failure (e.g. "rdma_rxe module not found") does not fail the
-  # whole workflow; a real regression in the probe/ACK path itself should
-  # still be investigated by reading the job logs.
+  # image. We attempt to install the matching linux-modules-extra-$(uname -r)
+  # package and modprobe rdma_rxe on the host below, but this is a confirmed
+  # environment-level limitation on the current runner image, not just a
+  # missing-package issue: as of 2026-07-04, on kernel 6.17.0-1018-azure the
+  # linux-modules-extra-6.17.0-1018-azure package installs successfully, yet
+  # it does not contain rdma_rxe.ko at all ("modprobe: FATAL: Module rdma_rxe
+  # not found in directory /lib/modules/6.17.0-1018-azure") -- the Ubuntu
+  # linux-azure kernel flavor GitHub Actions runners use apparently does not
+  # build the soft-RoCE driver, unlike linux-generic. There is no further
+  # apt-level fix for this; it would require a different runner
+  # image/kernel flavor (e.g. self-hosted or a non-Azure kernel) to resolve.
+  # `continue-on-error: true` so this does not fail the whole workflow; a
+  # real regression in the probe/ACK path itself should still be
+  # investigated by reading the job logs.
   e2e-rdma:
     name: e2e-rdma (soft-RoCE, best-effort)
     runs-on: ubuntu-latest

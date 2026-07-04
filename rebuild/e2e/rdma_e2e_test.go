@@ -271,9 +271,10 @@ func TestRDMAE2ETwoDevices(t *testing.T) {
 // completion, which is only known after the first ACK send WR completes and is
 // therefore only available in the second ACK payload).
 //
-// When usesSWTimestamps is true (soft-RoCE), CQ poll thread scheduling jitter
-// can make T4 appear later than T5, yielding a negative NetworkRTT.  This is
-// expected and logged as a warning instead of a test failure.
+// All SW-fallback timestamps (T1-T5 in Zig, T6 in Go) share the same
+// CLOCK_MONOTONIC domain, so NetworkRTT is expected to be positive even in
+// soft-RoCE (SW timestamp) mode; a non-positive value indicates a real
+// clock-domain or ordering regression, not an environmental fluke.
 func validateRoundTrip(t *testing.T, t1NS, t2NS, t5 uint64, secondAckEv rdmabridge.CompletionEvent, usesSWTimestamps bool) {
 	t.Helper()
 
@@ -302,11 +303,7 @@ func validateRoundTrip(t *testing.T, t1NS, t2NS, t5 uint64, secondAckEv rdmabrid
 		t.Logf("ResponderDelay = %d ns (%.3f ms)", int64(t4-t3), float64(t4-t3)/1e6)
 
 		if networkRTTns <= 0 {
-			if usesSWTimestamps {
-				t.Logf("WARNING: NetworkRTT is non-positive (%d ns); expected with SW timestamps due to CQ poll jitter", networkRTTns)
-			} else {
-				t.Errorf("NetworkRTT should be positive, got %d ns (possible clock skew)", networkRTTns)
-			}
+			t.Errorf("NetworkRTT should be positive, got %d ns (possible clock skew or ordering regression)", networkRTTns)
 		}
 		const maxRTTns = int64(10 * time.Second)
 		if networkRTTns > maxRTTns {

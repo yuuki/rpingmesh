@@ -224,28 +224,27 @@ func TestProbeToOTelMetrics(t *testing.T) {
 			probeTotal, probeSuccess, probeFailed)
 	}
 
-	// Soft assertion: at least some probes should succeed. With soft-RoCE
-	// SW timestamps, CQ poll jitter can cause negative NetworkRTT making
-	// all probes "failed" (invalid RTT). This is a known limitation.
+	// Hard assertion: at least some probes must succeed. All 6 timestamps
+	// (T1-T6) are on the same CLOCK_MONOTONIC domain (SW fallback: Zig
+	// types.monotonicNs(); Go: unix.ClockGettime(CLOCK_MONOTONIC)), so a
+	// valid RTT is expected on every run; probe_success_total==0 indicates
+	// a clock-domain regression, not an environmental fluke.
 	if probeSuccess == 0 {
-		t.Logf("WARNING: probe_success_total=0; all probes had invalid RTT (expected with SW timestamps)")
+		t.Fatal("rpingmesh.probe_success_total must be > 0: all probes had invalid RTT")
 	}
 
-	// If any probes succeeded, verify histogram data exists.
-	if probeSuccess > 0 {
-		assertHistogramHasData(t, rm, "rpingmesh.network_rtt_ns")
-		assertHistogramHasData(t, rm, "rpingmesh.prober_delay_ns")
-		assertHistogramHasData(t, rm, "rpingmesh.responder_delay_ns")
+	assertHistogramHasData(t, rm, "rpingmesh.network_rtt_ns")
+	assertHistogramHasData(t, rm, "rpingmesh.prober_delay_ns")
+	assertHistogramHasData(t, rm, "rpingmesh.responder_delay_ns")
 
-		// Log RTT values from histogram.
-		if h := getHistogramData(rm, "rpingmesh.network_rtt_ns"); h != nil {
-			t.Logf("network_rtt_ns: count=%d sum=%d min=%d max=%d",
-				h.Count, h.Sum, extremaVal(h.Min), extremaVal(h.Max))
-		}
-		if h := getHistogramData(rm, "rpingmesh.responder_delay_ns"); h != nil {
-			t.Logf("responder_delay_ns: count=%d sum=%d min=%d max=%d",
-				h.Count, h.Sum, extremaVal(h.Min), extremaVal(h.Max))
-		}
+	// Log RTT values from histogram.
+	if h := getHistogramData(rm, "rpingmesh.network_rtt_ns"); h != nil {
+		t.Logf("network_rtt_ns: count=%d sum=%d min=%d max=%d",
+			h.Count, h.Sum, extremaVal(h.Min), extremaVal(h.Max))
+	}
+	if h := getHistogramData(rm, "rpingmesh.responder_delay_ns"); h != nil {
+		t.Logf("responder_delay_ns: count=%d sum=%d min=%d max=%d",
+			h.Count, h.Sum, extremaVal(h.Min), extremaVal(h.Max))
 	}
 
 	// Verify ToR attributes are present on probe_total.

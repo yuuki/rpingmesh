@@ -291,10 +291,13 @@ pub fn waitSendCompletion(queue: *types.UdQueue, timeout_ms: u32) PacketError!u6
 // ---------------------------------------------------------------------------
 
 /// Get the current monotonic clock time in nanoseconds.
+///
+/// Delegates to the shared `types.monotonicNs()` helper, which uses true
+/// CLOCK_MONOTONIC (not `std.time.nanoTimestamp()`, which is CLOCK_REALTIME
+/// in Zig 0.15.2) so that T1 stays in the same clock domain as the Go
+/// side's T6.
 fn getMonotonicNs() u64 {
-    const ts = std.time.nanoTimestamp();
-    // nanoTimestamp returns i128; safely convert to u64
-    return @intCast(@as(u128, @bitCast(ts)) & 0xFFFFFFFFFFFFFFFF);
+    return types.monotonicNs();
 }
 
 // ---------------------------------------------------------------------------

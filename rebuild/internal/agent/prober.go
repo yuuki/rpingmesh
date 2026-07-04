@@ -59,15 +59,19 @@ const (
 	flowLabelMask = 0xFFFFF
 )
 
-// flowLabelAt deterministically derives the ECMP flow label for label index
-// within a target's set, from the controller-provided seed and (for the
+// flowLabelAt deterministically derives a candidate ECMP flow label for label
+// index within a target's set, from the controller-provided seed and (for the
 // rotating subset of indices) the current rotationEpoch. It is pure: the same
-// (seed, index, rotationEpoch) always yields the same 20-bit label, which is
-// what makes the set reproducible across agents and testable.
+// (seed, index, rotationEpoch, attempt) always yields the same 20-bit label,
+// which is what makes the set reproducible across agents and testable.
 //
 // Only indices that are multiples of flowLabelRotateStride fold in the epoch;
-// all other indices ignore it and are therefore stable across epochs.
-func flowLabelAt(seed, index uint32, rotationEpoch uint64) uint32 {
+// all other indices ignore it and are therefore stable across epochs. The
+// attempt parameter is a collision-resolution nonce: attempt 0 is the primary
+// candidate (its bytes are omitted so the value is unchanged from a plain
+// hash), and generateFlowLabels advances it only when a candidate collides
+// with an already-chosen label.
+func flowLabelAt(seed, index uint32, rotationEpoch uint64, attempt uint32) uint32 {
 	h := fnv.New32a()
 	var buf [16]byte
 	binary.BigEndian.PutUint32(buf[0:4], seed)
@@ -78,19 +82,62 @@ func flowLabelAt(seed, index uint32, rotationEpoch uint64) uint32 {
 		n = 16
 	}
 	_, _ = h.Write(buf[:n])
+	if attempt > 0 {
+		var a [4]byte
+		binary.BigEndian.PutUint32(a[:], attempt)
+		_, _ = h.Write(a[:])
+	}
 	return h.Sum32() & flowLabelMask
 }
 
-// generateFlowLabels expands a (seed, count) pair into count deterministic
-// 20-bit flow labels for the given rotationEpoch. A count of 0 is treated as 1
-// so every target yields at least one label.
+// generateFlowLabels expands a (seed, count) pair into exactly count DISTINCT
+// deterministic 20-bit flow labels for the given rotationEpoch. A count of 0 is
+// treated as 1 so every target yields at least one label.
+//
+// Distinctness matters: the controller sizes count via Eq.(1) assuming n
+// distinct labels, so a duplicate would silently explore fewer ECMP 5-tuples
+// than the configured coverage probability requires. Masking a 32-bit hash to
+// 20 bits can collide, so each label is chosen by a set-guarded loop that
+// advances a collision nonce (flowLabelAt's attempt) until the candidate is
+// new. Termination is fast and guaranteed: the controller caps count well
+// below the 2^20 label space (default cap 64), so collisions are rare and each
+// slot resolves in ~1 attempt.
+//
+// Slots are resolved in two passes -- stable slots (index % stride != 0)
+// first, then rotating slots -- so a stable slot's dedup never depends on the
+// epoch-varying rotating slots. This keeps the ~80% stable subset byte-for-byte
+// identical across epochs (exact time-series continuity, not merely likely)
+// while the rotating subset still shifts each epoch. Dedup is applied after the
+// epoch is mixed in, so the final set is distinct for every epoch.
 func generateFlowLabels(seed, count uint32, rotationEpoch uint64) []uint32 {
 	if count == 0 {
 		count = 1
 	}
 	labels := make([]uint32, count)
+	used := make(map[uint32]struct{}, count)
+
+	assign := func(i uint32) {
+		for attempt := uint32(0); ; attempt++ {
+			v := flowLabelAt(seed, i, rotationEpoch, attempt)
+			if _, dup := used[v]; !dup {
+				used[v] = struct{}{}
+				labels[i] = v
+				return
+			}
+		}
+	}
+
+	// Pass 1: stable slots (epoch-independent dedup domain).
 	for i := uint32(0); i < count; i++ {
-		labels[i] = flowLabelAt(seed, i, rotationEpoch)
+		if i%flowLabelRotateStride != 0 {
+			assign(i)
+		}
+	}
+	// Pass 2: rotating slots (epoch-mixed, dedup against the full set).
+	for i := uint32(0); i < count; i++ {
+		if i%flowLabelRotateStride == 0 {
+			assign(i)
+		}
 	}
 	return labels
 }

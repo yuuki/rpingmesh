@@ -58,6 +58,41 @@ func TestGenerateFlowLabels_ZeroCount(t *testing.T) {
 	}
 }
 
+// TestGenerateFlowLabels_DistinctUnderCollision verifies that a (seed, count)
+// pair whose raw 20-bit hashes collide still yields exactly count distinct
+// labels. seed=593, count=64, epoch=0 is a known collision (indices 5 and 37
+// both hash to 0xfda4b without dedup); Eq.(1) sizing assumes distinct labels,
+// so the set-guarded loop must resolve the collision. A broad sweep guards the
+// invariant across many seeds at the controller's maximum cap (64).
+func TestGenerateFlowLabels_DistinctUnderCollision(t *testing.T) {
+	got := generateFlowLabels(593, 64, 0)
+	seen := make(map[uint32]struct{}, len(got))
+	for i, v := range got {
+		if v > 0xFFFFF {
+			t.Errorf("label[%d] = %#x exceeds 20-bit width", i, v)
+		}
+		if _, dup := seen[v]; dup {
+			t.Errorf("label[%d] = %#x is a duplicate; collision not resolved", i, v)
+		}
+		seen[v] = struct{}{}
+	}
+	if len(seen) != 64 {
+		t.Fatalf("seed=593 count=64: got %d distinct labels, want 64", len(seen))
+	}
+
+	// The dedup must hold for every seed at the maximum label count.
+	for seed := uint32(0); seed < 4096; seed++ {
+		labels := generateFlowLabels(seed, 64, 0)
+		u := make(map[uint32]struct{}, 64)
+		for _, v := range labels {
+			u[v] = struct{}{}
+		}
+		if len(u) != 64 {
+			t.Fatalf("seed=%d count=64: got %d distinct labels, want 64", seed, len(u))
+		}
+	}
+}
+
 // TestFlowLabelRotation_FractionAcrossEpoch verifies that exactly the rotating
 // subset (~20%, every flowLabelRotateStride-th index) changes across an epoch
 // boundary while the rest stay stable for time-series continuity.

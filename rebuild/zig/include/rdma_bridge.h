@@ -194,14 +194,23 @@ int32_t rdma_get_device_count(rdma_context_t ctx);
  * specified GID index on the first active port, allocates a PD, and
  * populates the device info struct.
  *
- * @param ctx        Context handle
- * @param index      Device index (0-based)
- * @param gid_index  GID table index to use on the active port
- * @param out_dev    Receives the device handle
- * @param out_info   Receives device information (name, GID, IP, port)
- * @return           0 on success, negative error code on failure
+ * @param ctx             Context handle
+ * @param index           Device index (0-based)
+ * @param gid_index       GID table index to use on the active port
+ * @param service_level   Service Level (SL, PFC priority) to store on the
+ *                        device and apply to every Address Handle created
+ *                        for it (0-7; only the low 3 bits are meaningful).
+ * @param traffic_class   IPv6/GRH traffic class octet to store on the device
+ *                        and apply to every Address Handle created for it.
+ *                        RoCEv2 DSCP occupies the upper 6 bits of this
+ *                        octet, so a target DSCP value D maps to
+ *                        traffic_class = D << 2.
+ * @param out_dev         Receives the device handle
+ * @param out_info        Receives device information (name, GID, IP, port)
+ * @return                0 on success, negative error code on failure
  */
 int32_t rdma_open_device(rdma_context_t ctx, int32_t index, int32_t gid_index,
+                         uint8_t service_level, uint8_t traffic_class,
                          rdma_device_t* out_dev, rdma_device_info_t* out_info);
 
 /*
@@ -209,15 +218,18 @@ int32_t rdma_open_device(rdma_context_t ctx, int32_t index, int32_t gid_index,
  *
  * Same as rdma_open_device but looks up the device by name (e.g., "mlx5_0").
  *
- * @param ctx        Context handle
- * @param name       Null-terminated device name string
- * @param gid_index  GID table index to use on the active port
- * @param out_dev    Receives the device handle
- * @param out_info   Receives device information
- * @return           0 on success, negative error code on failure
+ * @param ctx             Context handle
+ * @param name            Null-terminated device name string
+ * @param gid_index       GID table index to use on the active port
+ * @param service_level   Service Level (SL, PFC priority); see rdma_open_device.
+ * @param traffic_class   GRH traffic class octet; see rdma_open_device.
+ * @param out_dev         Receives the device handle
+ * @param out_info        Receives device information
+ * @return                0 on success, negative error code on failure
  */
 int32_t rdma_open_device_by_name(rdma_context_t ctx, const char* name,
-                                 int32_t gid_index, rdma_device_t* out_dev,
+                                 int32_t gid_index, uint8_t service_level,
+                                 uint8_t traffic_class, rdma_device_t* out_dev,
                                  rdma_device_info_t* out_info);
 
 /*

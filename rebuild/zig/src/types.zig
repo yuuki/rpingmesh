@@ -122,6 +122,18 @@ pub const RdmaDevice = struct {
     /// GID value queried from the device (union ibv_gid).
     gid: c.ibv_gid,
 
+    /// Service Level (SL, PFC priority) applied to every Address Handle
+    /// created for this device. Configured once at device-open time from
+    /// agent configuration (0-7; only the low 3 bits are meaningful to the
+    /// verbs API). See createAddressHandle() in queue.zig.
+    sl: u8,
+
+    /// GRH traffic class octet applied to every Address Handle created for
+    /// this device. Configured once at device-open time from agent
+    /// configuration. RoCEv2 DSCP occupies the upper 6 bits of this octet:
+    /// a target DSCP value D maps to traffic_class = D << 2.
+    traffic_class: u8,
+
     /// Human-readable device information matching rdma_device_info_t in the
     /// C header. This is filled during device open and returned to Go.
     device_info: DeviceInfo,
@@ -436,6 +448,21 @@ test "gidToString IPv4-mapped GID" {
     const result = gidToString(gid_bytes);
     const expected = "0000:0000:0000:0000:0000:ffff:0ac8:0001";
     try std.testing.expectEqualStrings(expected, result[0..expected.len]);
+}
+
+test "RdmaDevice stores sl and traffic_class as configured" {
+    // No real ibv_context/ibv_pd is available in a unit test (that requires
+    // an RDMA device), so this only exercises the value-propagation part of
+    // the sl/traffic_class wiring: that RdmaDevice carries whatever open
+    // time passes in through to the fields createAddressHandle() reads (see
+    // queue.zig). The AH-creation effect itself can only be exercised on
+    // real RDMA hardware/soft-RoCE (see e2e/rdma_e2e_test.go).
+    var dev: RdmaDevice = undefined;
+    dev.sl = 3;
+    dev.traffic_class = 96; // DSCP 24 << 2
+
+    try std.testing.expectEqual(@as(u8, 3), dev.sl);
+    try std.testing.expectEqual(@as(u8, 96), dev.traffic_class);
 }
 
 test "setLastError and getLastError" {

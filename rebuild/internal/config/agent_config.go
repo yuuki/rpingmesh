@@ -20,18 +20,26 @@ const DefaultFlowLabelRotationPeriodSec = 3600
 
 // AgentConfig holds all configuration for the agent.
 type AgentConfig struct {
-	AgentID                   string   `mapstructure:"agent_id"`
-	HostName                  string   `mapstructure:"hostname"`
-	TorID                     string   `mapstructure:"tor_id"`
-	ControllerAddr            string   `mapstructure:"controller_addr"`
-	LogLevel                  string   `mapstructure:"log_level"`
-	ProbeIntervalMS           uint32   `mapstructure:"probe_interval_ms"`
-	OtelCollectorAddr         string   `mapstructure:"otel_collector_addr"`
-	MetricsEnabled            bool     `mapstructure:"metrics_enabled"`
-	AllowedDeviceNames        []string `mapstructure:"allowed_device_names"`
-	GIDIndex                  int      `mapstructure:"gid_index"`
-	PinglistUpdateIntervalSec uint32   `mapstructure:"pinglist_update_interval_sec"`
-	TargetProbeRatePerSecond  int      `mapstructure:"target_probe_rate_per_second"`
+	AgentID            string   `mapstructure:"agent_id"`
+	HostName           string   `mapstructure:"hostname"`
+	TorID              string   `mapstructure:"tor_id"`
+	ControllerAddr     string   `mapstructure:"controller_addr"`
+	LogLevel           string   `mapstructure:"log_level"`
+	ProbeIntervalMS    uint32   `mapstructure:"probe_interval_ms"`
+	OtelCollectorAddr  string   `mapstructure:"otel_collector_addr"`
+	MetricsEnabled     bool     `mapstructure:"metrics_enabled"`
+	AllowedDeviceNames []string `mapstructure:"allowed_device_names"`
+	GIDIndex           int      `mapstructure:"gid_index"`
+	// ServiceLevel is the Service Level (SL, PFC priority) applied to every
+	// Address Handle the agent's RDMA devices create (0-7; see Validate()).
+	ServiceLevel int `mapstructure:"service_level"`
+	// TrafficClass is the IPv6/GRH traffic class octet applied to every
+	// Address Handle the agent's RDMA devices create (0-255; see
+	// Validate()). RoCEv2 DSCP occupies the upper 6 bits of this octet: a
+	// target DSCP value D maps to traffic_class = D << 2.
+	TrafficClass              int    `mapstructure:"traffic_class"`
+	PinglistUpdateIntervalSec uint32 `mapstructure:"pinglist_update_interval_sec"`
+	TargetProbeRatePerSecond  int    `mapstructure:"target_probe_rate_per_second"`
 	// FlowLabelRotationPeriodSec is the period over which the rotating subset
 	// of each target's ECMP flow-label set is refreshed (time-based ECMP path
 	// rotation). See DefaultFlowLabelRotationPeriodSec.
@@ -59,6 +67,8 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("metrics_enabled", true)
 	v.SetDefault("allowed_device_names", []string{})
 	v.SetDefault("gid_index", 0)
+	v.SetDefault("service_level", 0)
+	v.SetDefault("traffic_class", 0)
 	v.SetDefault("pinglist_update_interval_sec", 300)
 	v.SetDefault("target_probe_rate_per_second", DefaultTargetProbeRatePerSecond)
 	v.SetDefault("flow_label_rotation_period_sec", DefaultFlowLabelRotationPeriodSec)
@@ -125,6 +135,8 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		MetricsEnabled:             v.GetBool("metrics_enabled"),
 		AllowedDeviceNames:         v.GetStringSlice("allowed_device_names"),
 		GIDIndex:                   v.GetInt("gid_index"),
+		ServiceLevel:               v.GetInt("service_level"),
+		TrafficClass:               v.GetInt("traffic_class"),
 		PinglistUpdateIntervalSec:  v.GetUint32("pinglist_update_interval_sec"),
 		TargetProbeRatePerSecond:   v.GetInt("target_probe_rate_per_second"),
 		FlowLabelRotationPeriodSec: v.GetUint32("flow_label_rotation_period_sec"),
@@ -143,6 +155,18 @@ func (c *AgentConfig) Validate() error {
 	// GID index must be non-negative; it indexes into the RNIC's GID table.
 	if c.GIDIndex < 0 {
 		return fmt.Errorf("gid_index must be >= 0, got: %d", c.GIDIndex)
+	}
+
+	// Service Level maps directly to ibv_ah_attr.sl, a 4-bit verbs field of
+	// which only the low 3 bits (0-7) are meaningful as PFC priority.
+	if c.ServiceLevel < 0 || c.ServiceLevel > 7 {
+		return fmt.Errorf("service_level must be between 0 and 7, got: %d", c.ServiceLevel)
+	}
+
+	// Traffic class maps directly to the one-byte GRH traffic_class field
+	// (ibv_ah_attr.grh.traffic_class).
+	if c.TrafficClass < 0 || c.TrafficClass > 255 {
+		return fmt.Errorf("traffic_class must be between 0 and 255, got: %d", c.TrafficClass)
 	}
 
 	// A zero or negative probe interval would make time.NewTicker panic at
@@ -171,6 +195,8 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.Bool("metrics-enabled", true, "Enable OpenTelemetry metrics export")
 	flags.StringSlice("allowed-device-names", []string{}, "List of allowed RDMA device names (empty = all)")
 	flags.Int("gid-index", 0, "GID index to use for RDMA devices (must be >= 0)")
+	flags.Int("service-level", 0, "Service Level (SL, PFC priority) for Address Handles (0-7)")
+	flags.Int("traffic-class", 0, "GRH traffic class (DSCP << 2) for Address Handles (0-255)")
 	flags.Uint32("pinglist-update-interval-sec", 300, "Pinglist update interval in seconds")
 	flags.Int("target-probe-rate-per-second", DefaultTargetProbeRatePerSecond, "Probe rate per second per target")
 	flags.Uint32("flow-label-rotation-period-sec", DefaultFlowLabelRotationPeriodSec, "Period (seconds) over which the rotating ~20% of each target's ECMP flow-label set is refreshed")

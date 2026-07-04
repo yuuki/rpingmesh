@@ -107,7 +107,7 @@ func TestProbeToOTelMetrics(t *testing.T) {
 	defer rdmaCtx.Destroy()
 
 	// --- Open devices ---
-	proberDev, err := rdmaCtx.OpenDeviceByName(proberDeviceName, gidIndex)
+	proberDev, err := rdmaCtx.OpenDeviceByName(proberDeviceName, gidIndex, testServiceLevel, testTrafficClass)
 	if err != nil {
 		t.Fatalf("open prober device %q: %v", proberDeviceName, err)
 	}
@@ -115,7 +115,7 @@ func TestProbeToOTelMetrics(t *testing.T) {
 	t.Logf("prober device: name=%s GID=%s IP=%s",
 		proberDev.Info.DeviceName, proberDev.Info.GID, proberDev.Info.IPAddr)
 
-	responderDev, err := rdmaCtx.OpenDeviceByName(responderDeviceName, gidIndex)
+	responderDev, err := rdmaCtx.OpenDeviceByName(responderDeviceName, gidIndex, testServiceLevel, testTrafficClass)
 	if err != nil {
 		t.Fatalf("open responder device %q: %v", responderDeviceName, err)
 	}

@@ -271,6 +271,18 @@ func (ring *EventRing) Destroy() {
 	}
 }
 
+// DropCount returns the total number of completion events dropped because
+// the ring was full, i.e. Poll was not called fast enough to keep up with
+// the Zig CQ poller thread. It is monotonically increasing for the
+// lifetime of the ring and safe to call from any goroutine. Returns 0 if
+// the ring has already been destroyed.
+func (ring *EventRing) DropCount() uint64 {
+	if ring.handle == nil {
+		return 0
+	}
+	return uint64(C.rdma_event_ring_drop_count(ring.handle))
+}
+
 // ---------------------------------------------------------------------------
 // Queue Operations
 // ---------------------------------------------------------------------------

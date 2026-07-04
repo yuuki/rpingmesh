@@ -66,8 +66,11 @@ jobs:
       - name: Build (Zig library + CGO agent + controller)
         run: make build
 
+      - name: Run Zig unit tests
+        run: make test-zig
+
       - name: Run Go unit tests (excludes ./e2e/...)
-        run: make test-all
+        run: go test $(go list ./... | grep -v '/e2e')
 
   # Agent-to-Controller e2e tests: pure-Go gRPC path against a real
   # rqlite-backed Controller, no RDMA hardware needed. Runs entirely via

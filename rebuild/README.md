@@ -44,10 +44,11 @@ and computes sub-microsecond network RTT using a 6-timestamp protocol.
 distributes pinglists (probe target assignments). Stores RNIC information in
 rqlite. Pure Go; no RDMA dependency.
 
-**Agent** -- Deployed on each RDMA host. Opens RDMA devices, runs a Responder per
-device (answers incoming probes with ACKs), a single Prober (sends probes to
-assigned targets), a ClusterMonitor (fetches pinglists from the controller), and a
-MetricsCollector (exports OTLP metrics).
+**Agent** -- Deployed on each RDMA host. Opens RDMA devices, and runs one
+Responder, one Prober (sends probes to assigned targets), and one ClusterMonitor
+(fetches pinglists from the controller) per opened device -- so every RNIC on a
+multi-rail host actively probes, not just the first -- plus a single
+MetricsCollector (exports OTLP metrics) shared across all of them.
 
 **Zig RDMA Library** -- Static library (`librdmabridge.a`) that handles all
 libibverbs operations: device enumeration, QP creation, CQ polling, packet
@@ -205,6 +206,7 @@ via Cgo (`CGO_ENABLED=1`).
 | Field | Default | Description |
 |-------|---------|-------------|
 | `agent_id` | hostname | Unique agent identifier |
+| `hostname` | auto-detected | Hostname reported to the controller on registration (falls back to `os.Hostname()` if empty) |
 | `tor_id` | *(required)* | Top-of-Rack switch identifier |
 | `controller_addr` | `localhost:50051` | Controller gRPC address |
 | `probe_interval_ms` | `500` | Milliseconds between probe rounds |
@@ -223,6 +225,8 @@ via Cgo (`CGO_ENABLED=1`).
 |-------|---------|-------------|
 | `listen_addr` | `:50051` | gRPC listen address |
 | `database_uri` | `http://localhost:4001` | rqlite connection URI |
+| `active_threshold_sec` | `300` | Window (seconds) within which an RNIC entry is considered active for pinglist generation |
+| `stale_threshold_sec` | `900` | Window (seconds) after which an inactive RNIC entry is considered stale and removed |
 | `inter_tor_sample_size` | `5` | Distinct ToRs sampled per inter-ToR pinglist |
 | `ecmp_paths_assumed` | `16` | Assumed ECMP fabric width (m) for Eq.(1) flow-label coverage sizing |
 | `ecmp_coverage_probability` | `0.9` | Target probability (p, in (0,1)) that generated flow labels cover all ECMP paths |
@@ -505,10 +509,6 @@ sudo rdma link add rxe0 type rxe netdev eth0
 - **eBPF service tracing not implemented.** The original R-Pingmesh uses eBPF to
   monitor RDMA QP lifecycle events for service-aware monitoring. This rebuild
   focuses on the probing infrastructure.
-
-- **Single prober per agent.** The current design creates one Prober on the first
-  RDMA device. Multi-prober support (one per device) could be added for hosts
-  with multiple RNICs on different fabrics.
 
 - **No TLS on gRPC.** Controller-agent communication uses plaintext gRPC, assuming
   a trusted internal network. mTLS can be added via gRPC transport credentials.

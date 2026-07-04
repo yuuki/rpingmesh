@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/rebuild/internal/agent/controller_client"
 	"github.com/yuuki/rpingmesh/rebuild/internal/config"
+	"github.com/yuuki/rpingmesh/rebuild/internal/probe"
 	"github.com/yuuki/rpingmesh/rebuild/internal/rdmabridge"
 	"github.com/yuuki/rpingmesh/rebuild/internal/telemetry"
 	"github.com/yuuki/rpingmesh/rebuild/proto/controller_agent"
@@ -45,20 +46,32 @@ const (
 )
 
 // Agent orchestrates all R-Pingmesh agent components: RDMA context, devices,
-// responders, prober, cluster monitor, and telemetry. It handles initialization,
-// registration with the controller, and graceful shutdown.
+// responders, probers, cluster monitors, and telemetry. It handles
+// initialization, registration with the controller, and graceful shutdown.
+//
+// One Prober, one ClusterMonitor, and one prober EventRing are created per
+// opened RDMA device so that every RNIC on a multi-rail host actively probes
+// (not just the first device), matching the fact that every device is
+// registered with the controller and can be targeted by other agents'
+// pinglists.
 type Agent struct {
-	cfg        *config.AgentConfig
-	rdmaCtx    *rdmabridge.Context
-	devices    []*rdmabridge.Device
-	responders []*Responder
-	prober     *Prober
-	monitor    *ClusterMonitor
-	grpcClient *controller_client.GRPCControllerClient
-	metrics    *telemetry.MetricsCollector
-	proberRing *rdmabridge.EventRing
-	respRings  []*rdmabridge.EventRing
-	logger     zerolog.Logger
+	cfg         *config.AgentConfig
+	rdmaCtx     *rdmabridge.Context
+	devices     []*rdmabridge.Device
+	responders  []*Responder
+	probers     []*Prober
+	monitors    []*ClusterMonitor
+	grpcClient  *controller_client.GRPCControllerClient
+	metrics     *telemetry.MetricsCollector
+	proberRings []*rdmabridge.EventRing
+	respRings   []*rdmabridge.EventRing
+	logger      zerolog.Logger
+
+	// results is the fan-in destination for every prober's Results()
+	// channel (see createResultsFanIn), consumed by the metrics result
+	// consumer as a single stream.
+	results   chan *probe.ProbeResult
+	resultsWg sync.WaitGroup
 
 	// agentIP is the host's outbound IP toward the controller, reported in the
 	// registration request's agent_ip field. Best-effort: empty if it cannot be
@@ -118,28 +131,40 @@ func (a *Agent) Initialize(ctx context.Context) error {
 	}
 	a.grpcClient = grpcClient
 
-	// Step 4: Create event rings (one for the prober, one per responder).
+	// Step 4: Create event rings (one prober ring and one responder ring per device).
 	a.logger.Info().Msg("Creating event rings")
 	if err := a.createEventRings(); err != nil {
 		return fmt.Errorf("failed to create event rings: %w", err)
 	}
 
-	// Step 5: Create prober using the first device.
-	a.logger.Info().
-		Str("device", a.devices[0].Info.DeviceName).
-		Uint32("probe_interval_ms", a.cfg.ProbeIntervalMS).
-		Msg("Creating prober")
-	prober, err := NewProber(a.devices[0], a.proberRing, a.cfg.ProbeIntervalMS)
-	if err != nil {
-		return fmt.Errorf("failed to create prober: %w", err)
+	// Step 5: Create one prober per device, so every RNIC actively probes
+	// instead of only the first one. This closes the multi-rail monitoring
+	// blind spot where every device is registered and probed BY other agents
+	// but only devices[0] ever probed anyone.
+	a.logger.Info().Int("device_count", len(a.devices)).Msg("Creating probers")
+	for i, dev := range a.devices {
+		prober, err := NewProber(dev, a.proberRings[i], a.cfg.ProbeIntervalMS)
+		if err != nil {
+			return fmt.Errorf("failed to create prober for device %s: %w",
+				dev.Info.DeviceName, err)
+		}
+		if a.cfg.TargetProbeRatePerSecond > 0 {
+			// Per-target rate cap; the prober scales the aggregate limit with the
+			// pinglist size. Differentiated per-pinglist-type rates are a
+			// documented limitation (see README Limitations).
+			prober.SetPerTargetRateLimit(float64(a.cfg.TargetProbeRatePerSecond))
+		}
+		a.probers = append(a.probers, prober)
+		a.logger.Info().
+			Str("device", dev.Info.DeviceName).
+			Uint32("qpn", prober.GetQueueInfo().QPN).
+			Msg("Prober created")
 	}
-	a.prober = prober
-	if a.cfg.TargetProbeRatePerSecond > 0 {
-		// Per-target rate cap; the prober scales the aggregate limit with the
-		// pinglist size. Differentiated per-pinglist-type rates are a
-		// documented limitation (see README Limitations).
-		a.prober.SetPerTargetRateLimit(float64(a.cfg.TargetProbeRatePerSecond))
-	}
+
+	// Fan-in every prober's Results() channel into a single stream so the
+	// rest of Initialize/Start can keep treating "the" probe result stream
+	// as one channel, as before.
+	a.createResultsFanIn()
 
 	// Step 6: Create one responder per device.
 	a.logger.Info().Int("device_count", len(a.devices)).Msg("Creating responders")
@@ -171,8 +196,12 @@ func (a *Agent) Initialize(ctx context.Context) error {
 			// above) as an OTel observable counter. A growing count means the
 			// Go poller goroutine is not draining rdma_event_ring_poll fast
 			// enough and completion events are being silently discarded.
+			// Both readers aggregate across all per-device rings under a
+			// single label ("prober"/"responder") to keep metric cardinality
+			// low (matching the source_tor/target_tor-only convention used
+			// elsewhere), rather than reporting one data point per device.
 			if err := a.metrics.RegisterEventRingDropCallback(map[string]func() uint64{
-				"prober":    a.proberRing.DropCount,
+				"prober":    a.proberRingDropCount,
 				"responder": a.responderRingDropCount,
 			}); err != nil {
 				a.logger.Warn().Err(err).
@@ -201,24 +230,42 @@ func (a *Agent) Initialize(ctx context.Context) error {
 		return fmt.Errorf("failed to register with controller: %w", err)
 	}
 
-	// Step 9: Create cluster monitor for periodic pinglist updates.
-	// Use the first device's GID as the requester GID for pinglist requests.
-	requesterGID := a.devices[0].Info.GID
-	a.logger.Info().
-		Str("requester_gid", requesterGID).
-		Uint32("update_interval_sec", a.cfg.PinglistUpdateIntervalSec).
-		Msg("Creating cluster monitor")
-	a.monitor = NewClusterMonitor(
-		a.grpcClient,
-		a.prober,
-		a.cfg.AgentID,
-		a.cfg.TorID,
-		requesterGID,
-		a.cfg.PinglistUpdateIntervalSec,
-	)
+	// Step 9: Create one cluster monitor per device for periodic pinglist
+	// updates, each requesting its pinglist with that device's own GID as
+	// requester_gid and feeding targets to that device's prober.
+	a.createClusterMonitors()
 
 	a.logger.Info().Msg("Agent initialization complete")
 	return nil
+}
+
+// createClusterMonitors creates one ClusterMonitor per device, each
+// requesting its pinglist with that device's own GID as requester_gid and
+// feeding fetched targets to that device's prober (a.probers[i]). This keeps
+// each RNIC's probe targets scoped to requests made on its own behalf,
+// matching how the controller's registry associates pinglists with GIDs, and
+// closes the multi-rail blind spot where only devices[0] ever requested a
+// pinglist. Requires a.probers to already be populated one-to-one with
+// a.devices.
+func (a *Agent) createClusterMonitors() {
+	a.logger.Info().Int("device_count", len(a.devices)).Msg("Creating cluster monitors")
+	for i, dev := range a.devices {
+		requesterGID := dev.Info.GID
+		a.logger.Info().
+			Str("device", dev.Info.DeviceName).
+			Str("requester_gid", requesterGID).
+			Uint32("update_interval_sec", a.cfg.PinglistUpdateIntervalSec).
+			Msg("Creating cluster monitor")
+		monitor := NewClusterMonitor(
+			a.grpcClient,
+			a.probers[i],
+			a.cfg.AgentID,
+			a.cfg.TorID,
+			requesterGID,
+			a.cfg.PinglistUpdateIntervalSec,
+		)
+		a.monitors = append(a.monitors, monitor)
+	}
 }
 
 // buildRegistrationRequest builds a registration request from the agent's
@@ -340,7 +387,7 @@ func (a *Agent) registerWithController(ctx context.Context) error {
 	return fmt.Errorf("agent registration failed after %d attempts: %w", registerRetryMaxAttempts, lastErr)
 }
 
-// Start begins all agent components: responders, prober, cluster monitor,
+// Start begins all agent components: responders, probers, cluster monitors,
 // and the metrics result consumer. All components must be initialized via
 // Initialize() before calling Start().
 func (a *Agent) Start(ctx context.Context) error {
@@ -351,23 +398,29 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
-	// Start the prober.
-	if err := a.prober.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start prober: %w", err)
+	// Start all probers (one per device).
+	for i, prober := range a.probers {
+		if err := prober.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start prober %d: %w", i, err)
+		}
 	}
 
-	// Start the cluster monitor for periodic pinglist updates.
-	if err := a.monitor.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start cluster monitor: %w", err)
+	// Start all cluster monitors for periodic pinglist updates.
+	for i, monitor := range a.monitors {
+		if err := monitor.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start cluster monitor %d: %w", i, err)
+		}
 	}
 
 	// Start the heartbeat goroutine to periodically re-register with the
 	// controller, keeping the agent's registry entry alive.
 	a.startHeartbeat(ctx)
 
-	// Start the metrics result consumer if metrics are enabled.
+	// Start the metrics result consumer if metrics are enabled. It reads from
+	// the fan-in channel that merges every prober's results (see
+	// createResultsFanIn), so results from every device are recorded.
 	if a.metrics != nil {
-		a.metrics.StartResultConsumer(ctx, a.prober.Results(), a.cfg.TorID)
+		a.metrics.StartResultConsumer(ctx, a.results, a.cfg.TorID)
 		a.logger.Info().Msg("Metrics result consumer started")
 	}
 
@@ -376,24 +429,32 @@ func (a *Agent) Start(ctx context.Context) error {
 }
 
 // Stop gracefully shuts down all agent components in reverse order of startup.
-// It stops the cluster monitor, prober, and responders, then tears down
+// It stops the cluster monitors, probers, and responders, then tears down
 // infrastructure resources (metrics, gRPC, queues, devices, RDMA context,
 // and event rings).
 func (a *Agent) Stop(ctx context.Context) {
 	a.logger.Info().Msg("Stopping agent")
 
-	// Stop cluster monitor first to prevent new pinglist updates.
-	if a.monitor != nil {
-		a.monitor.Stop()
+	// Stop all cluster monitors first to prevent new pinglist updates.
+	for _, monitor := range a.monitors {
+		if monitor != nil {
+			monitor.Stop()
+		}
 	}
 
 	// Stop the heartbeat goroutine before closing the gRPC client, since
-	// both it and the cluster monitor depend on grpcClient being open.
+	// both it and the cluster monitors depend on grpcClient being open.
 	a.stopHeartbeat()
 
-	// Stop the prober to cease outgoing probes.
-	if a.prober != nil {
-		a.prober.Destroy()
+	// Stop all probers to cease outgoing probes. Destroy() closes each
+	// prober's own Results() channel; the fan-in goroutines started by
+	// createResultsFanIn notice the close, drain, and exit, and once every
+	// fan-in goroutine has exited the closer goroutine closes a.results,
+	// which in turn lets the metrics result consumer's range loop finish.
+	for _, prober := range a.probers {
+		if prober != nil {
+			prober.Destroy()
+		}
 	}
 
 	// Stop all responders.
@@ -430,10 +491,10 @@ func (a *Agent) Stop(ctx context.Context) {
 	}
 
 	// Destroy event rings.
-	if a.proberRing != nil {
-		a.proberRing.Destroy()
-		a.proberRing = nil
+	for _, ring := range a.proberRings {
+		ring.Destroy()
 	}
+	a.proberRings = nil
 	for _, ring := range a.respRings {
 		ring.Destroy()
 	}
@@ -594,31 +655,74 @@ func (a *Agent) openDevices() error {
 	return nil
 }
 
-// createEventRings creates one event ring for the prober and one per device
-// (for responders). Each ring is a lock-free SPSC buffer used to deliver
-// CQ completion events from the Zig poller thread to Go.
+// createEventRings creates one prober event ring and one responder event
+// ring per device. Each ring is a lock-free SPSC buffer used to deliver CQ
+// completion events from the Zig poller thread to Go.
 func (a *Agent) createEventRings() error {
-	// Prober ring.
-	proberRing, err := rdmabridge.NewEventRing(eventRingCapacity)
-	if err != nil {
-		return fmt.Errorf("failed to create prober event ring: %w", err)
-	}
-	a.proberRing = proberRing
-
-	// One responder ring per device.
 	for i, dev := range a.devices {
-		ring, err := rdmabridge.NewEventRing(eventRingCapacity)
+		proberRing, err := rdmabridge.NewEventRing(eventRingCapacity)
+		if err != nil {
+			return fmt.Errorf("failed to create prober event ring for device %d (%s): %w",
+				i, dev.Info.DeviceName, err)
+		}
+		a.proberRings = append(a.proberRings, proberRing)
+
+		respRing, err := rdmabridge.NewEventRing(eventRingCapacity)
 		if err != nil {
 			return fmt.Errorf("failed to create responder event ring for device %d (%s): %w",
 				i, dev.Info.DeviceName, err)
 		}
-		a.respRings = append(a.respRings, ring)
+		a.respRings = append(a.respRings, respRing)
 	}
 
 	a.logger.Info().
+		Int("prober_rings", len(a.proberRings)).
 		Int("responder_rings", len(a.respRings)).
 		Msg("Event rings created")
 	return nil
+}
+
+// createResultsFanIn creates the shared results channel and starts one
+// fan-in goroutine per prober that forwards its Results() into the shared
+// channel. This lets Start() and the metrics result consumer keep treating
+// "the" probe result stream as a single channel even though every device now
+// has its own Prober.
+//
+// Shutdown ordering: each fan-in goroutine exits when its prober's Destroy()
+// closes that prober's own resultChan (a range over a closed channel drains
+// then returns). A separate closer goroutine waits for every fan-in
+// goroutine to exit before closing a.results exactly once, so the shared
+// channel is never closed while a producer might still send on it.
+func (a *Agent) createResultsFanIn() {
+	a.results = make(chan *probe.ProbeResult, resultChanSize)
+
+	for _, prober := range a.probers {
+		a.resultsWg.Add(1)
+		go func(p *Prober) {
+			defer a.resultsWg.Done()
+			for result := range p.Results() {
+				a.results <- result
+			}
+		}(prober)
+	}
+
+	go func() {
+		a.resultsWg.Wait()
+		close(a.results)
+	}()
+}
+
+// proberRingDropCount sums EventRing.DropCount() across every prober ring
+// (one per device). Used as the "prober" reader for
+// telemetry.MetricsCollector.RegisterEventRingDropCallback; see
+// responderRingDropCount for why this aggregates rather than reporting per
+// device.
+func (a *Agent) proberRingDropCount() uint64 {
+	var total uint64
+	for _, ring := range a.proberRings {
+		total += ring.DropCount()
+	}
+	return total
 }
 
 // responderRingDropCount sums EventRing.DropCount() across every responder

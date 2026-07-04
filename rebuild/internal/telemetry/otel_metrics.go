@@ -9,6 +9,8 @@ package telemetry
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -40,6 +42,51 @@ var rttBucketBoundaries = []float64{
 // flushes accumulated metrics to the collector.
 const periodicReaderInterval = 10 * time.Second
 
+// Failure reason values attached to the "reason" attribute of
+// rpingmesh.probe_failed_total. Keeping this to a small fixed set avoids
+// metric cardinality blowup while still distinguishing regression classes
+// that require different remediation:
+//
+//   - reasonTimeout: the ACK-matching path never completed (probe.ProbeResult
+//     built by Prober.cleanupStalePending, ErrorMessage "timed out waiting
+//     for ACKs"). This indicates a real protocol/connectivity regression.
+//   - reasonSendError: ibv_post_send (or the Cgo call wrapping it) failed
+//     outright before any ACK could be expected.
+//   - reasonInvalidRTT: all 6 timestamps arrived (result.Success == true) but
+//     probe.CalculateRTT rejected the measurement (rtt.Valid == false), e.g.
+//     a small negative NetworkRTT from SW-timestamp jitter on soft-RoCE. This
+//     is measurement noise, not a protocol failure.
+//   - reasonUnknown: a failed result whose ErrorMessage does not match a
+//     known pattern; kept so new failure paths are still visible instead of
+//     silently falling into one of the above buckets.
+const (
+	reasonTimeout    = "timeout"
+	reasonSendError  = "send_error"
+	reasonInvalidRTT = "invalid_rtt"
+	reasonUnknown    = "unknown"
+)
+
+// probeFailureReason classifies a non-successful probe outcome into one of
+// the fixed reason buckets documented above. It is the single place that
+// derives the "reason" metric attribute so RecordProbeResult and any future
+// callers cannot diverge on the classification logic.
+func probeFailureReason(result *probe.ProbeResult, rtt *probe.RTTResult) string {
+	if !result.Success {
+		switch {
+		case strings.Contains(result.ErrorMessage, "timed out"):
+			return reasonTimeout
+		case strings.Contains(result.ErrorMessage, "send failed"):
+			return reasonSendError
+		default:
+			return reasonUnknown
+		}
+	}
+	// result.Success == true means all 6 timestamps were collected
+	// (see PendingMeasurement.Complete()); a non-success path here means
+	// CalculateRTT rejected the measurement itself.
+	return reasonInvalidRTT
+}
+
 // defaultServiceName is the OTel resource service.name used when
 // NewMetricsCollector is called without a WithServiceName option.
 const defaultServiceName = "rpingmesh-agent"
@@ -65,14 +112,16 @@ func WithServiceName(serviceName string) Option {
 // All recorded metrics use ToR-level attributes (source_tor, target_tor) to
 // maintain low cardinality. GID-level detail is emitted only in debug logs.
 type MetricsCollector struct {
-	meterProvider  *sdkmetric.MeterProvider
-	networkRTT     metric.Int64Histogram // nanoseconds
-	proberDelay    metric.Int64Histogram // nanoseconds
-	responderDelay metric.Int64Histogram // nanoseconds
-	probeSuccess   metric.Int64Counter
-	probeFailed    metric.Int64Counter
-	probeTotal     metric.Int64Counter
-	logger         zerolog.Logger
+	meterProvider    *sdkmetric.MeterProvider
+	meter            metric.Meter
+	networkRTT       metric.Int64Histogram // nanoseconds
+	proberDelay      metric.Int64Histogram // nanoseconds
+	responderDelay   metric.Int64Histogram // nanoseconds
+	probeSuccess     metric.Int64Counter
+	probeFailed      metric.Int64Counter
+	probeTotal       metric.Int64Counter
+	eventRingDropped metric.Int64ObservableCounter
+	logger           zerolog.Logger
 }
 
 // buildResource builds the OTel resource identifying this service, merging
@@ -219,15 +268,30 @@ func registerInstruments(provider *sdkmetric.MeterProvider) (*MetricsCollector, 
 		return nil, err
 	}
 
+	// Registered without a callback here: the EventRing values it reads are
+	// owned by the agent package (internal/agent/agent.go), not telemetry.
+	// RegisterEventRingDropCallback wires the callback in once the agent has
+	// created its rings.
+	eventRingDropped, err := meter.Int64ObservableCounter(
+		"rpingmesh.event_ring_dropped_total",
+		metric.WithDescription("Total number of completion events dropped because an event ring was full"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &MetricsCollector{
-		meterProvider:  provider,
-		networkRTT:     networkRTT,
-		proberDelay:    proberDelay,
-		responderDelay: responderDelay,
-		probeSuccess:   probeSuccess,
-		probeFailed:    probeFailed,
-		probeTotal:     probeTotal,
-		logger:         log.With().Str("component", "telemetry").Logger(),
+		meterProvider:    provider,
+		meter:            meter,
+		networkRTT:       networkRTT,
+		proberDelay:      proberDelay,
+		responderDelay:   responderDelay,
+		probeSuccess:     probeSuccess,
+		probeFailed:      probeFailed,
+		probeTotal:       probeTotal,
+		eventRingDropped: eventRingDropped,
+		logger:           log.With().Str("component", "telemetry").Logger(),
 	}, nil
 }
 
@@ -237,8 +301,10 @@ func registerInstruments(provider *sdkmetric.MeterProvider) (*MetricsCollector, 
 // Debug level for troubleshooting without inflating metric series count.
 //
 // If result.Success is true and rtt.Valid is true, the RTT histograms and
-// success counter are incremented. Otherwise, only the failure counter is
-// incremented. The total counter is always incremented.
+// success counter are incremented. Otherwise, the failure counter is
+// incremented with an additional "reason" attribute (see probeFailureReason)
+// so timeout/send/measurement-noise failures can be distinguished without
+// per-GID cardinality cost. The total counter is always incremented.
 func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *probe.RTTResult, sourceTorID string) {
 	if result == nil {
 		return
@@ -263,7 +329,11 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		mc.responderDelay.Record(ctx, rtt.ResponderDelay, attrs)
 		mc.probeSuccess.Add(ctx, 1, attrs)
 	} else {
-		mc.probeFailed.Add(ctx, 1, attrs)
+		mc.probeFailed.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("source_tor", sourceTorID),
+			attribute.String("target_tor", result.TargetTorID),
+			attribute.String("reason", probeFailureReason(result, rtt)),
+		))
 	}
 
 	// Log GID-level detail at Debug level. This provides per-flow
@@ -284,6 +354,36 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		Bool("success", result.Success).
 		Str("error", result.ErrorMessage).
 		Msg("Probe result recorded")
+}
+
+// RegisterEventRingDropCallback registers an OTel callback that reports the
+// current cumulative drop count for each named event ring (e.g. "prober",
+// "responder") as a "ring" attribute on rpingmesh.event_ring_dropped_total.
+// readers maps a ring label to a function returning that ring's current
+// drop count.
+//
+// MetricsCollector deliberately does not import internal/rdmabridge (the
+// package that owns *EventRing) to avoid coupling telemetry to the RDMA
+// bridge; callers (the Agent, which owns the ring values) supply plain
+// closures instead. The callback is invoked once per collection cycle by
+// the MeterProvider's PeriodicReader/ManualReader, so readers should be
+// cheap (an atomic load, per EventRing.DropCount).
+func (mc *MetricsCollector) RegisterEventRingDropCallback(readers map[string]func() uint64) error {
+	_, err := mc.meter.RegisterCallback(
+		func(_ context.Context, o metric.Observer) error {
+			for label, read := range readers {
+				o.ObserveInt64(mc.eventRingDropped, int64(read()), metric.WithAttributes(
+					attribute.String("ring", label),
+				))
+			}
+			return nil
+		},
+		mc.eventRingDropped,
+	)
+	if err != nil {
+		return fmt.Errorf("register event ring drop callback: %w", err)
+	}
+	return nil
 }
 
 // Shutdown gracefully shuts down the MeterProvider, flushing any buffered

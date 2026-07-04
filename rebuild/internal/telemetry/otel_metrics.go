@@ -19,7 +19,12 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	// Pinned to v1.39.0 to match the schema URL baked into resource.Default()
+	// by go.opentelemetry.io/otel/sdk v1.40.0's process/telemetry-sdk resource
+	// detectors. A mismatched semconv version here (e.g. v1.26.0) makes
+	// resource.Merge fail with "conflicting Schema URL" on every call,
+	// breaking MetricsCollector initialization entirely.
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
 // Histogram bucket boundaries in nanoseconds, covering sub-microsecond to
@@ -35,6 +40,27 @@ var rttBucketBoundaries = []float64{
 // flushes accumulated metrics to the collector.
 const periodicReaderInterval = 10 * time.Second
 
+// defaultServiceName is the OTel resource service.name used when
+// NewMetricsCollector is called without a WithServiceName option.
+const defaultServiceName = "rpingmesh-agent"
+
+// Option configures optional parameters for NewMetricsCollector.
+type Option func(*collectorOptions)
+
+// collectorOptions holds the configurable parameters applied via Option.
+type collectorOptions struct {
+	serviceName string
+}
+
+// WithServiceName overrides the OTel resource service.name reported by the
+// MetricsCollector. If not supplied, NewMetricsCollector uses
+// defaultServiceName ("rpingmesh-agent"), preserving prior behavior.
+func WithServiceName(serviceName string) Option {
+	return func(o *collectorOptions) {
+		o.serviceName = serviceName
+	}
+}
+
 // MetricsCollector collects and exports R-Pingmesh probe metrics via OTLP.
 // All recorded metrics use ToR-level attributes (source_tor, target_tor) to
 // maintain low cardinality. GID-level detail is emitted only in debug logs.
@@ -49,13 +75,37 @@ type MetricsCollector struct {
 	logger         zerolog.Logger
 }
 
+// buildResource builds the OTel resource identifying this service, merging
+// process/host defaults with the given service name and a fixed service
+// version. Extracted as its own function so tests can verify service-name
+// parameterization without dialing a real OTLP collector.
+func buildResource(serviceName string) (*resource.Resource, error) {
+	return resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName(serviceName),
+			semconv.ServiceVersion("0.1.0"),
+		),
+	)
+}
+
 // NewMetricsCollector creates a MetricsCollector that exports OTLP metrics
 // to the given gRPC collector address (e.g., "localhost:4317"). It sets up:
 //   - An OTLP gRPC exporter (insecure) targeting collectorAddr
 //   - A MeterProvider with a periodic reader flushing every 10 seconds
 //   - Histogram instruments for network RTT, prober delay, responder delay
 //   - Counter instruments for probe success, failure, and total counts
-func NewMetricsCollector(ctx context.Context, collectorAddr string) (*MetricsCollector, error) {
+//
+// By default the OTel resource reports service.name="rpingmesh-agent"; pass
+// WithServiceName to override it (e.g. for non-agent processes reusing this
+// collector).
+func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Option) (*MetricsCollector, error) {
+	options := collectorOptions{serviceName: defaultServiceName}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	// Create OTLP gRPC exporter targeting the collector.
 	exporter, err := otlpmetricgrpc.New(
 		ctx,
@@ -67,14 +117,7 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string) (*MetricsCol
 	}
 
 	// Build the OTel resource identifying this service.
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName("rpingmesh-agent"),
-			semconv.ServiceVersion("0.1.0"),
-		),
-	)
+	res, err := buildResource(options.serviceName)
 	if err != nil {
 		return nil, err
 	}

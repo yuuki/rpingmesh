@@ -50,7 +50,7 @@ func main() {
 // lifecycle until a termination signal is received.
 func run(cmd *cobra.Command, args []string) error {
 	// Load configuration from file, environment variables, and CLI flags.
-	cfg, err := config.LoadAgentConfig(configPath)
+	cfg, err := config.LoadAgentConfig(configPath, cmd.Flags())
 	if err != nil {
 		return fmt.Errorf("failed to load agent configuration: %w", err)
 	}

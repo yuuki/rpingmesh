@@ -5,17 +5,25 @@ import (
 	"hash/fnv"
 
 	"github.com/rs/zerolog/log"
-	"github.com/yuuki/rpingmesh/rebuild/internal/controller/registry"
 	"github.com/yuuki/rpingmesh/rebuild/proto/controller_agent"
 )
 
-// PinglistGenerator generates probe target lists for agents.
-type PinglistGenerator struct {
-	registry *registry.RnicRegistry
+// RnicSource is the subset of registry.RnicRegistry's read API required to
+// generate pinglists. It is declared here, at the point of use, so that
+// PinglistGenerator can be unit tested against a fake instead of a real
+// rqlite-backed registry.
+type RnicSource interface {
+	GetRNICsByToR(ctx context.Context, torID string) ([]*controller_agent.RnicInfo, error)
+	GetSampleRNICsFromOtherToRs(ctx context.Context, excludeTorID string) ([]*controller_agent.RnicInfo, error)
 }
 
-// NewPinglistGenerator creates a new PinglistGenerator backed by the given RNIC registry.
-func NewPinglistGenerator(registry *registry.RnicRegistry) *PinglistGenerator {
+// PinglistGenerator generates probe target lists for agents.
+type PinglistGenerator struct {
+	registry RnicSource
+}
+
+// NewPinglistGenerator creates a new PinglistGenerator backed by the given RNIC source.
+func NewPinglistGenerator(registry RnicSource) *PinglistGenerator {
 	return &PinglistGenerator{
 		registry: registry,
 	}

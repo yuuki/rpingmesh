@@ -11,15 +11,56 @@ import (
 	"github.com/yuuki/rpingmesh/rebuild/proto/controller_agent"
 )
 
+// Default thresholds used when the caller does not supply a positive value
+// to NewRnicRegistry. These mirror the values that were previously
+// hardcoded directly into the SQL queries.
+const (
+	// DefaultActiveThresholdSec is the window (in seconds) within which an
+	// RNIC entry's last_updated_epoch must fall to be considered "active"
+	// for pinglist generation and lookups.
+	DefaultActiveThresholdSec = 300
+
+	// DefaultStaleThresholdSec is the window (in seconds) after which an
+	// RNIC entry is considered stale and eligible for removal.
+	DefaultStaleThresholdSec = 900
+
+	// DefaultInterTorSampleSize is the default number of distinct ToRs
+	// sampled for inter-ToR pinglist generation.
+	DefaultInterTorSampleSize = 5
+)
+
 // RnicRegistry manages RNIC information stored in rqlite.
 type RnicRegistry struct {
 	conn *gorqlite.Connection
+
+	// activeThresholdSec is the "active" window (seconds) used by queries
+	// that only consider recently-updated RNIC entries.
+	activeThresholdSec int
+	// staleThresholdSec is the window (seconds) after which entries are
+	// considered stale and removed or excluded.
+	staleThresholdSec int
+	// interTorSampleSize caps the number of distinct ToRs sampled by
+	// GetSampleRNICsFromOtherToRs.
+	interTorSampleSize int
 }
 
-// NewRnicRegistry creates a new RNIC registry connected to the given rqlite URI.
-// It initializes the database schema (table + indexes) before returning.
-func NewRnicRegistry(dbURI string) (*RnicRegistry, error) {
+// NewRnicRegistry creates a new RNIC registry connected to the given rqlite
+// URI. It initializes the database schema (table + indexes) before
+// returning. activeThresholdSec, staleThresholdSec, and interTorSampleSize
+// configure the thresholds described above; a value <= 0 falls back to the
+// corresponding Default* constant.
+func NewRnicRegistry(dbURI string, activeThresholdSec, staleThresholdSec, interTorSampleSize int) (*RnicRegistry, error) {
 	log.Info().Str("dbURI", dbURI).Msg("Initializing RNIC registry with rqlite")
+
+	if activeThresholdSec <= 0 {
+		activeThresholdSec = DefaultActiveThresholdSec
+	}
+	if staleThresholdSec <= 0 {
+		staleThresholdSec = DefaultStaleThresholdSec
+	}
+	if interTorSampleSize <= 0 {
+		interTorSampleSize = DefaultInterTorSampleSize
+	}
 
 	conn, err := gorqlite.Open(dbURI)
 	if err != nil {
@@ -27,7 +68,10 @@ func NewRnicRegistry(dbURI string) (*RnicRegistry, error) {
 	}
 
 	registry := &RnicRegistry{
-		conn: conn,
+		conn:               conn,
+		activeThresholdSec: activeThresholdSec,
+		staleThresholdSec:  staleThresholdSec,
+		interTorSampleSize: interTorSampleSize,
 	}
 
 	if err := registry.initializeSchema(); err != nil {
@@ -48,8 +92,12 @@ func (r *RnicRegistry) Close() error {
 
 // initializeSchema creates the rnics table and associated indexes if they
 // do not already exist. Each index is created in a separate write call
-// because rqlite's WriteOne executes a single statement at a time.
+// because rqlite's WriteOne executes a single statement at a time. This
+// runs once at startup, before any request-scoped context exists, so it
+// uses context.Background().
 func (r *RnicRegistry) initializeSchema() error {
+	ctx := context.Background()
+
 	createTableSQL := `
 	CREATE TABLE IF NOT EXISTS rnics (
 		rnic_gid TEXT PRIMARY KEY,
@@ -63,7 +111,7 @@ func (r *RnicRegistry) initializeSchema() error {
 		last_updated_epoch INTEGER NOT NULL
 	);`
 
-	if _, err := r.conn.WriteOne(createTableSQL); err != nil {
+	if _, err := r.conn.WriteOneContext(ctx, createTableSQL); err != nil {
 		return fmt.Errorf("failed to create rnics table: %w", err)
 	}
 
@@ -76,7 +124,7 @@ func (r *RnicRegistry) initializeSchema() error {
 	}
 
 	for _, idx := range indexes {
-		if _, err := r.conn.WriteOne(idx); err != nil {
+		if _, err := r.conn.WriteOneContext(ctx, idx); err != nil {
 			return fmt.Errorf("failed to create index: %w", err)
 		}
 	}
@@ -84,18 +132,27 @@ func (r *RnicRegistry) initializeSchema() error {
 	return nil
 }
 
-// RegisterRNIC upserts an RNIC entry in the registry. The last_updated_epoch
-// field is set to the current Unix timestamp (seconds).
-func (r *RnicRegistry) RegisterRNIC(
+// RegisterRNICs upserts all of the given RNIC entries for a single agent as
+// one atomic rqlite transaction (WriteParameterizedContext executes all
+// statements as a single transaction). This guarantees that a partial
+// failure (e.g. a constraint violation on one RNIC) never leaves some of the
+// agent's RNICs registered while others are silently dropped. The
+// last_updated_epoch field is set to the current Unix timestamp (seconds)
+// for every row.
+func (r *RnicRegistry) RegisterRNICs(
 	ctx context.Context,
 	agentID string,
 	agentIP string,
-	rnic *controller_agent.RnicInfo,
+	rnics []*controller_agent.RnicInfo,
 ) error {
+	if len(rnics) == 0 {
+		return nil
+	}
+
 	log.Info().
 		Str("agentID", agentID).
-		Str("rnicGID", rnic.GetGid()).
-		Msg("Registering RNIC")
+		Int("rnicCount", len(rnics)).
+		Msg("Registering RNICs")
 
 	upsertSQL := `
 	INSERT OR REPLACE INTO rnics
@@ -104,30 +161,40 @@ func (r *RnicRegistry) RegisterRNIC(
 
 	now := time.Now().Unix()
 
-	stmt := gorqlite.ParameterizedStatement{
-		Query: upsertSQL,
-		Arguments: []interface{}{
-			rnic.GetGid(),
-			rnic.GetQpn(),
-			agentID,
-			agentIP,
-			rnic.GetIpAddress(),
-			rnic.GetTorId(),
-			rnic.GetHostName(),
-			rnic.GetDeviceName(),
-			now,
-		},
+	statements := make([]gorqlite.ParameterizedStatement, 0, len(rnics))
+	for _, rnic := range rnics {
+		statements = append(statements, gorqlite.ParameterizedStatement{
+			Query: upsertSQL,
+			Arguments: []interface{}{
+				rnic.GetGid(),
+				rnic.GetQpn(),
+				agentID,
+				agentIP,
+				rnic.GetIpAddress(),
+				rnic.GetTorId(),
+				rnic.GetHostName(),
+				rnic.GetDeviceName(),
+				now,
+			},
+		})
 	}
 
-	if _, err := r.conn.WriteOneParameterized(stmt); err != nil {
-		return fmt.Errorf("failed to register RNIC: %w", err)
+	results, err := r.conn.WriteParameterizedContext(ctx, statements)
+	if err != nil {
+		return fmt.Errorf("failed to register RNICs: %w", err)
+	}
+
+	for i, res := range results {
+		if res.Err != nil {
+			return fmt.Errorf("failed to register RNIC %s: %w", rnics[i].GetGid(), res.Err)
+		}
 	}
 
 	return nil
 }
 
-// GetRNICsByToR returns all active RNICs (updated within the last 5 minutes)
-// belonging to the specified ToR switch.
+// GetRNICsByToR returns all active RNICs (updated within the configured
+// active-threshold window) belonging to the specified ToR switch.
 func (r *RnicRegistry) GetRNICsByToR(
 	ctx context.Context,
 	torID string,
@@ -138,14 +205,14 @@ func (r *RnicRegistry) GetRNICsByToR(
 	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 	FROM rnics
 	WHERE tor_id = ?
-	AND last_updated_epoch > (strftime('%s','now') - 300);`
+	AND last_updated_epoch > (strftime('%s','now') - ?);`
 
 	stmt := gorqlite.ParameterizedStatement{
 		Query:     querySQL,
-		Arguments: []interface{}{torID},
+		Arguments: []interface{}{torID, r.activeThresholdSec},
 	}
 
-	result, err := r.conn.QueryOneParameterized(stmt)
+	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query RNICs by ToR: %w", err)
 	}
@@ -154,8 +221,13 @@ func (r *RnicRegistry) GetRNICsByToR(
 }
 
 // GetSampleRNICsFromOtherToRs returns one representative RNIC from each ToR
-// other than the excluded one, limited to 5 ToRs. Only active entries
-// (updated within the last 5 minutes) are considered.
+// other than the excluded one, up to interTorSampleSize distinct ToRs. Only
+// active entries (updated within the configured active-threshold window)
+// are considered. Candidate rows are fetched in random order (ORDER BY
+// RANDOM()) so that, across repeated calls, a different representative ToR
+// set and RNIC is chosen each time rather than always sampling the same
+// fixed 5 ToRs and RNICs (as GROUP BY without ORDER BY would, since SQLite
+// does not guarantee which row within a group is returned).
 func (r *RnicRegistry) GetSampleRNICsFromOtherToRs(
 	ctx context.Context,
 	excludeTorID string,
@@ -166,26 +238,46 @@ func (r *RnicRegistry) GetSampleRNICsFromOtherToRs(
 	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 	FROM rnics
 	WHERE tor_id != ?
-	AND last_updated_epoch > (strftime('%s','now') - 300)
-	GROUP BY tor_id
-	LIMIT 5;`
+	AND last_updated_epoch > (strftime('%s','now') - ?)
+	ORDER BY RANDOM();`
 
 	stmt := gorqlite.ParameterizedStatement{
 		Query:     querySQL,
-		Arguments: []interface{}{excludeTorID},
+		Arguments: []interface{}{excludeTorID, r.activeThresholdSec},
 	}
 
-	result, err := r.conn.QueryOneParameterized(stmt)
+	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query sample RNICs from other ToRs: %w", err)
 	}
 
-	return scanRnicInfoRows(result)
+	candidates, err := scanRnicInfoRows(result)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pick at most one RNIC per distinct ToR, up to interTorSampleSize
+	// ToRs. Since candidates arrived in random order, this yields a
+	// randomly chosen representative ToR set and RNIC on each call.
+	seenToRs := make(map[string]bool, r.interTorSampleSize)
+	sampled := make([]*controller_agent.RnicInfo, 0, r.interTorSampleSize)
+	for _, rnic := range candidates {
+		if seenToRs[rnic.GetTorId()] {
+			continue
+		}
+		seenToRs[rnic.GetTorId()] = true
+		sampled = append(sampled, rnic)
+		if len(sampled) >= r.interTorSampleSize {
+			break
+		}
+	}
+
+	return sampled, nil
 }
 
 // GetRNICInfo looks up a single RNIC by GID (primary key) or IP address.
-// Only active entries (updated within the last 5 minutes) are returned.
-// Returns (nil, nil) when no matching entry is found.
+// Only active entries (updated within the configured active-threshold
+// window) are returned. Returns (nil, nil) when no matching entry is found.
 func (r *RnicRegistry) GetRNICInfo(
 	ctx context.Context,
 	targetIP string,
@@ -208,11 +300,11 @@ func (r *RnicRegistry) GetRNICInfo(
 		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 		FROM rnics
 		WHERE rnic_gid = ?
-		AND last_updated_epoch > (strftime('%s','now') - 300)
+		AND last_updated_epoch > (strftime('%s','now') - ?)
 		LIMIT 1;`
 		stmt = gorqlite.ParameterizedStatement{
 			Query:     querySQL,
-			Arguments: []interface{}{targetGID},
+			Arguments: []interface{}{targetGID, r.activeThresholdSec},
 		}
 	} else {
 		// Fallback to IP-based lookup.
@@ -220,15 +312,15 @@ func (r *RnicRegistry) GetRNICInfo(
 		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 		FROM rnics
 		WHERE rnic_ip = ?
-		AND last_updated_epoch > (strftime('%s','now') - 300)
+		AND last_updated_epoch > (strftime('%s','now') - ?)
 		LIMIT 1;`
 		stmt = gorqlite.ParameterizedStatement{
 			Query:     querySQL,
-			Arguments: []interface{}{targetIP},
+			Arguments: []interface{}{targetIP, r.activeThresholdSec},
 		}
 	}
 
-	result, err := r.conn.QueryOneParameterized(stmt)
+	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query RNIC info: %w", err)
 	}
@@ -254,16 +346,21 @@ func (r *RnicRegistry) GetRNICInfo(
 	}, nil
 }
 
-// CleanupStaleEntries removes RNIC entries that have not been updated in
-// the last 15 minutes (900 seconds).
+// CleanupStaleEntries removes RNIC entries that have not been updated
+// within the configured stale-threshold window.
 func (r *RnicRegistry) CleanupStaleEntries(ctx context.Context) error {
 	log.Info().Msg("Cleaning up stale RNIC entries")
 
 	cleanupSQL := `
 	DELETE FROM rnics
-	WHERE last_updated_epoch < (strftime('%s','now') - 900);`
+	WHERE last_updated_epoch < (strftime('%s','now') - ?);`
 
-	result, err := r.conn.WriteOne(cleanupSQL)
+	stmt := gorqlite.ParameterizedStatement{
+		Query:     cleanupSQL,
+		Arguments: []interface{}{r.staleThresholdSec},
+	}
+
+	result, err := r.conn.WriteOneParameterizedContext(ctx, stmt)
 	if err != nil {
 		return fmt.Errorf("failed to cleanup stale entries: %w", err)
 	}
@@ -275,51 +372,28 @@ func (r *RnicRegistry) CleanupStaleEntries(ctx context.Context) error {
 	return nil
 }
 
-// ListAllRNICs returns all active RNICs (updated within the last 15 minutes),
-// ordered by tor_id and hostname.
+// ListAllRNICs returns all active RNICs (updated within the configured
+// stale-threshold window), ordered by tor_id and hostname.
 func (r *RnicRegistry) ListAllRNICs(ctx context.Context) ([]*controller_agent.RnicInfo, error) {
 	log.Debug().Msg("Listing all active RNICs")
 
 	querySQL := `
 	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 	FROM rnics
-	WHERE last_updated_epoch > (strftime('%s','now') - 900)
+	WHERE last_updated_epoch > (strftime('%s','now') - ?)
 	ORDER BY tor_id, hostname;`
 
-	result, err := r.conn.QueryOne(querySQL)
+	stmt := gorqlite.ParameterizedStatement{
+		Query:     querySQL,
+		Arguments: []interface{}{r.staleThresholdSec},
+	}
+
+	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list RNICs: %w", err)
 	}
 
 	return scanRnicInfoRows(result)
-}
-
-// GetTorIDs returns the distinct set of ToR switch IDs that have at least
-// one active RNIC (updated within the last 15 minutes).
-func (r *RnicRegistry) GetTorIDs(ctx context.Context) ([]string, error) {
-	log.Debug().Msg("Getting active ToR IDs")
-
-	querySQL := `
-	SELECT DISTINCT tor_id
-	FROM rnics
-	WHERE last_updated_epoch > (strftime('%s','now') - 900)
-	ORDER BY tor_id;`
-
-	result, err := r.conn.QueryOne(querySQL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get ToR IDs: %w", err)
-	}
-
-	var torIDs []string
-	for result.Next() {
-		var torID string
-		if err := result.Scan(&torID); err != nil {
-			return nil, fmt.Errorf("failed to scan ToR ID row: %w", err)
-		}
-		torIDs = append(torIDs, torID)
-	}
-
-	return torIDs, nil
 }
 
 // scanRnicInfoRows is a helper that iterates over query result rows and

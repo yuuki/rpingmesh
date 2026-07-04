@@ -378,9 +378,13 @@ fn pollCqExtended(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
 }
 
 /// Return the current monotonic clock time in nanoseconds (software fallback).
+///
+/// Delegates to the shared `types.monotonicNs()` helper, which uses true
+/// CLOCK_MONOTONIC (not `std.time.nanoTimestamp()`, which is CLOCK_REALTIME
+/// in Zig 0.15.2) so that SW-fallback T2/T3/T4/T5 stay in the same clock
+/// domain as T1 (`packet.zig`) and the Go side's T6.
 fn swTimestampNs() u64 {
-    const ts = std.time.nanoTimestamp();
-    return @intCast(@as(u128, @bitCast(ts)) & 0xFFFFFFFFFFFFFFFF);
+    return types.monotonicNs();
 }
 
 /// Dispatch a single work completion to the appropriate handler.
@@ -526,14 +530,13 @@ pub fn processSendCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
 /// Get the completion timestamp, using HW or SW source depending on queue config.
 ///
 /// If the queue uses hardware timestamps, reads the wallclock nanosecond
-/// timestamp from the extended CQ. Otherwise falls back to the system
-/// monotonic clock.
+/// timestamp from the extended CQ. Otherwise falls back to the shared
+/// CLOCK_MONOTONIC helper (see `swTimestampNs`).
 fn getCompletionTimestamp(queue: *types.UdQueue, cq: *c.ibv_cq_ex) u64 {
     if (queue.uses_sw_timestamps) {
-        // Software timestamp: use system clock as approximation
-        const ts = std.time.nanoTimestamp();
-        // nanoTimestamp returns i128; truncate to u64
-        return @intCast(@as(u128, @bitCast(ts)) & 0xFFFFFFFFFFFFFFFF);
+        // Software timestamp: use CLOCK_MONOTONIC, same domain as T1 and
+        // the Go side's T6.
+        return swTimestampNs();
     } else {
         // Hardware timestamp: read from extended CQ
         return c.ibv_wc_read_completion_wallclock_ns(cq);

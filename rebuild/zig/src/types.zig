@@ -314,8 +314,45 @@ pub fn getLastError() [*:0]const u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Clock helper
+// ---------------------------------------------------------------------------
+
+/// Get the current CLOCK_MONOTONIC time in nanoseconds.
+///
+/// This is the single shared clock source for every software timestamp
+/// (SW-fallback T1/T2/T3/T4/T5) in the 6-timestamp protocol, so that they
+/// stay in the same clock domain as the Go side's T6, which is read via
+/// `unix.ClockGettime(unix.CLOCK_MONOTONIC, ...)` in
+/// `internal/agent/prober.go`. Do NOT use `std.time.nanoTimestamp()` here:
+/// in Zig 0.15.2 it returns CLOCK_REALTIME (wall-clock) time despite the
+/// name, which would mix an epoch-scale value with the Go side's
+/// boot-scale monotonic value and make every ProberDelay/NetworkRTT
+/// calculation nonsensical.
+pub fn monotonicNs() u64 {
+    const ts = std.posix.clock_gettime(.MONOTONIC) catch std.posix.timespec{ .sec = 0, .nsec = 0 };
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "monotonicNs returns non-zero value" {
+    const ns = monotonicNs();
+    try std.testing.expect(ns > 0);
+}
+
+test "monotonicNs is monotonic" {
+    const t1 = monotonicNs();
+    // Small busy loop to ensure time advances
+    var sum: u64 = 0;
+    for (0..1000) |i| {
+        sum += i;
+    }
+    if (sum == 0) unreachable; // prevent optimizer from eliminating the loop
+    const t2 = monotonicNs();
+    try std.testing.expect(t2 >= t1);
+}
 
 test "gidToBytes and bytesToGid roundtrip" {
     const original = [16]u8{ 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };

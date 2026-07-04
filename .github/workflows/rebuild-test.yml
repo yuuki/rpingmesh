@@ -1,0 +1,108 @@
+name: Rebuild Tests
+
+# Validates rebuild/ (the active codebase). The legacy top-level
+# implementation is covered separately by go-test.yml.
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'rebuild/**'
+      - '.github/workflows/rebuild-test.yml'
+  push:
+    branches: [ main ]
+    paths:
+      - 'rebuild/**'
+      - '.github/workflows/rebuild-test.yml'
+
+# Prevent concurrent runs of the same workflow on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: rebuild
+
+jobs:
+  # Full build (Zig static lib + CGO agent + pure-Go controller) and the
+  # Go unit test suite. Excludes ./e2e/..., which requires either live
+  # Docker infrastructure (see e2e-controller) or RDMA hardware/soft-RoCE
+  # (see e2e-rdma) and is not runnable as a plain `go test`.
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.0'
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install system dependencies (protoc, libibverbs, librdmacm)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler libibverbs-dev librdmacm-dev
+
+      - name: Install protoc Go plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Generate protobuf bindings
+        run: make generate-proto
+
+      - name: go vet
+        run: make vet
+
+      - name: Build (Zig library + CGO agent + controller)
+        run: make build
+
+      - name: Run Go unit tests (excludes ./e2e/...)
+        run: make test-all
+
+  # Agent-to-Controller e2e tests: pure-Go gRPC path against a real
+  # rqlite-backed Controller, no RDMA hardware needed. Runs entirely via
+  # docker compose (see docker-compose.e2e-controller.yml).
+  e2e-controller:
+    name: e2e-controller
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run Agent-to-Controller e2e tests
+        run: make test-e2e-controller
+
+  # RDMA e2e tests using soft-RoCE (rdma_rxe) inside a privileged container.
+  # GitHub-hosted runners are real VMs (so privileged Docker containers do
+  # work), but whether the underlying host kernel ships/allows loading the
+  # rdma_rxe module is outside our control and can change with the runner
+  # image at any time. `continue-on-error: true` so an environment-level
+  # soft-RoCE failure (e.g. "rdma_rxe module not found") does not fail the
+  # whole workflow; a real regression in the probe/ACK path itself should
+  # still be investigated by reading the job logs.
+  e2e-rdma:
+    name: e2e-rdma (soft-RoCE, best-effort)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run RDMA e2e tests (soft-RoCE)
+        run: make test-e2e

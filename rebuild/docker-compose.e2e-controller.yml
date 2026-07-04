@@ -45,6 +45,8 @@ services:
       go test -v -count=1 -timeout 120s ./e2e/controller/...
     restart: "no"
 
-volumes:
-  go_mod_cache:
-  go_build_cache:
+# NOTE: no top-level `volumes:` for a Go module/build cache here. Dependency
+# resolution happens at image-build time via BuildKit cache mounts in
+# Dockerfile.e2e-controller (`--mount=type=cache,target=/go/pkg/mod`), not at
+# container-run time, so a named volume mounted into this service would
+# never be populated or read.

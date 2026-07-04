@@ -87,9 +87,13 @@ jobs:
 
   # RDMA e2e tests using soft-RoCE (rdma_rxe) inside a privileged container.
   # GitHub-hosted runners are real VMs (so privileged Docker containers do
-  # work), but whether the underlying host kernel ships/allows loading the
-  # rdma_rxe module is outside our control and can change with the runner
-  # image at any time. `continue-on-error: true` so an environment-level
+  # work), but the rdma_rxe module is not always present on the host kernel
+  # image (e.g. Azure-based runner kernels ship it in a separate
+  # linux-modules-extra package, or omit it entirely). We install the
+  # matching modules-extra package and modprobe it on the host below, but
+  # this is still best-effort: package availability and module support can
+  # change with the runner image at any time, and there is no guarantee the
+  # attempt succeeds. `continue-on-error: true` so an environment-level
   # soft-RoCE failure (e.g. "rdma_rxe module not found") does not fail the
   # whole workflow; a real regression in the probe/ACK path itself should
   # still be investigated by reading the job logs.
@@ -103,6 +107,25 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Install and load rdma_rxe kernel module (best-effort)
+        run: |
+          set +e
+          echo "Installing linux-modules-extra-$(uname -r) (provides rdma_rxe)..."
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          if [ $? -ne 0 ]; then
+            echo "::warning::Failed to install linux-modules-extra-$(uname -r); rdma_rxe may be unavailable on this runner kernel"
+          fi
+
+          echo "Loading rdma_rxe module on host..."
+          sudo modprobe rdma_rxe
+          if [ $? -eq 0 ]; then
+            echo "rdma_rxe module loaded successfully"
+          else
+            echo "::warning::modprobe rdma_rxe failed; soft-RoCE e2e test below is expected to fail on this runner"
+          fi
+          exit 0
 
       - name: Run RDMA e2e tests (soft-RoCE)
         run: make test-e2e

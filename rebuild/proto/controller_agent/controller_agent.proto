@@ -62,9 +62,23 @@ message PingTarget {
     string target_device_name = 6;
     // source_port is metadata only (not enforced at the RDMA layer).
     uint32 source_port = 7;
-    // flow_label is used for ECMP path diversity via ibv_ah_attr.grh.flow_label.
+    // flow_label is the base (legacy) ECMP flow label applied via
+    // ibv_ah_attr.grh.flow_label. It remains populated for backward
+    // compatibility and is the sole label the agent uses when
+    // flow_label_count <= 1.
     uint32 flow_label = 8;
     uint32 priority = 9;
+    // flow_label_count is the number of distinct ECMP flow labels the agent
+    // rotates through when probing this target. The controller sizes it via
+    // R-Pingmesh Eq.(1) (coupon-collector coverage) so the target's ECMP paths
+    // are covered with a configured probability. 0 or 1 selects legacy
+    // single-label behavior (use flow_label as-is).
+    uint32 flow_label_count = 10;
+    // flow_label_seed deterministically seeds agent-side generation of the
+    // flow-label set, so the controller need not enumerate every label in the
+    // message (seed + count is far smaller than a repeated list). The agent
+    // derives label i from a hash of (seed, i, rotation_epoch).
+    fixed32 flow_label_seed = 11;
 }
 
 // PinglistResponse contains the list of targets to probe.

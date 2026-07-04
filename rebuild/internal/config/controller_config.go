@@ -26,6 +26,17 @@ const (
 	// DefaultInterTorSampleSize is the default number of distinct ToRs
 	// sampled for inter-ToR pinglist generation.
 	DefaultInterTorSampleSize = 5
+
+	// DefaultEcmpPathsAssumed is the assumed ECMP fabric width (m) used by
+	// Eq.(1) to size the per-target flow-label set. It cannot be measured
+	// from the agent, so it is an operator assumption.
+	DefaultEcmpPathsAssumed = 16
+	// DefaultEcmpCoverageProbability is the target probability (p) that the
+	// generated flow-label set exercises all m ECMP paths.
+	DefaultEcmpCoverageProbability = 0.9
+	// DefaultEcmpMaxFlowLabels caps the computed label count (n) to bound
+	// probe amplification.
+	DefaultEcmpMaxFlowLabels = 64
 )
 
 // ControllerConfig holds all configuration for the controller.
@@ -36,6 +47,12 @@ type ControllerConfig struct {
 	ActiveThresholdSec int    `mapstructure:"active_threshold_sec"`
 	StaleThresholdSec  int    `mapstructure:"stale_threshold_sec"`
 	InterTorSampleSize int    `mapstructure:"inter_tor_sample_size"`
+	// EcmpPathsAssumed (m), EcmpCoverageProbability (p), and EcmpMaxFlowLabels
+	// (cap on n) drive R-Pingmesh Eq.(1) sizing of the per-target flow-label
+	// set for probabilistic ECMP path coverage.
+	EcmpPathsAssumed        int     `mapstructure:"ecmp_paths_assumed"`
+	EcmpCoverageProbability float64 `mapstructure:"ecmp_coverage_probability"`
+	EcmpMaxFlowLabels       int     `mapstructure:"ecmp_max_flow_labels"`
 }
 
 // LoadControllerConfig loads controller configuration from a YAML file,
@@ -55,6 +72,9 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 	v.SetDefault("active_threshold_sec", DefaultActiveThresholdSec)
 	v.SetDefault("stale_threshold_sec", DefaultStaleThresholdSec)
 	v.SetDefault("inter_tor_sample_size", DefaultInterTorSampleSize)
+	v.SetDefault("ecmp_paths_assumed", DefaultEcmpPathsAssumed)
+	v.SetDefault("ecmp_coverage_probability", DefaultEcmpCoverageProbability)
+	v.SetDefault("ecmp_max_flow_labels", DefaultEcmpMaxFlowLabels)
 
 	// Enable environment variable override with RPINGMESH_ prefix
 	v.SetEnvPrefix("RPINGMESH")
@@ -91,12 +111,15 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 	}
 
 	config := &ControllerConfig{
-		ListenAddr:         v.GetString("listen_addr"),
-		DatabaseURI:        v.GetString("database_uri"),
-		LogLevel:           v.GetString("log_level"),
-		ActiveThresholdSec: v.GetInt("active_threshold_sec"),
-		StaleThresholdSec:  v.GetInt("stale_threshold_sec"),
-		InterTorSampleSize: v.GetInt("inter_tor_sample_size"),
+		ListenAddr:              v.GetString("listen_addr"),
+		DatabaseURI:             v.GetString("database_uri"),
+		LogLevel:                v.GetString("log_level"),
+		ActiveThresholdSec:      v.GetInt("active_threshold_sec"),
+		StaleThresholdSec:       v.GetInt("stale_threshold_sec"),
+		InterTorSampleSize:      v.GetInt("inter_tor_sample_size"),
+		EcmpPathsAssumed:        v.GetInt("ecmp_paths_assumed"),
+		EcmpCoverageProbability: v.GetFloat64("ecmp_coverage_probability"),
+		EcmpMaxFlowLabels:       v.GetInt("ecmp_max_flow_labels"),
 	}
 
 	if err := config.Validate(); err != nil {
@@ -159,6 +182,18 @@ func (c *ControllerConfig) Validate() error {
 		return fmt.Errorf("inter_tor_sample_size must be > 0, got: %d", c.InterTorSampleSize)
 	}
 
+	if c.EcmpPathsAssumed < 1 {
+		return fmt.Errorf("ecmp_paths_assumed must be >= 1, got: %d", c.EcmpPathsAssumed)
+	}
+	// p must be a strict probability: 0 and 1 are degenerate for Eq.(1)
+	// (0 needs no coverage; 1 is unreachable by random sampling).
+	if c.EcmpCoverageProbability <= 0 || c.EcmpCoverageProbability >= 1 {
+		return fmt.Errorf("ecmp_coverage_probability must be in (0, 1), got: %v", c.EcmpCoverageProbability)
+	}
+	if c.EcmpMaxFlowLabels < 1 {
+		return fmt.Errorf("ecmp_max_flow_labels must be >= 1, got: %d", c.EcmpMaxFlowLabels)
+	}
+
 	return nil
 }
 
@@ -171,4 +206,7 @@ func BindControllerFlags(flags *pflag.FlagSet) {
 	flags.Int("active-threshold-sec", DefaultActiveThresholdSec, "Window (seconds) within which an RNIC is considered active")
 	flags.Int("stale-threshold-sec", DefaultStaleThresholdSec, "Window (seconds) after which an inactive RNIC is removed")
 	flags.Int("inter-tor-sample-size", DefaultInterTorSampleSize, "Number of distinct ToRs sampled for inter-ToR pinglists")
+	flags.Int("ecmp-paths-assumed", DefaultEcmpPathsAssumed, "Assumed ECMP fabric width (m) for Eq.(1) flow-label coverage sizing")
+	flags.Float64("ecmp-coverage-probability", DefaultEcmpCoverageProbability, "Target probability (p, in (0,1)) that generated flow labels cover all ECMP paths")
+	flags.Int("ecmp-max-flow-labels", DefaultEcmpMaxFlowLabels, "Hard cap on the number of flow labels per target (bounds probe amplification)")
 }

@@ -20,12 +20,24 @@ type RnicSource interface {
 // PinglistGenerator generates probe target lists for agents.
 type PinglistGenerator struct {
 	registry RnicSource
+	// flowLabelCount is the number of distinct ECMP flow labels each target
+	// should be probed with, computed once from the ECMP config via
+	// ComputeFlowLabelCount (R-Pingmesh Eq.(1)). It is stamped into every
+	// PingTarget; the agent expands seed+count into the concrete label set.
+	flowLabelCount uint32
 }
 
-// NewPinglistGenerator creates a new PinglistGenerator backed by the given RNIC source.
-func NewPinglistGenerator(registry RnicSource) *PinglistGenerator {
+// NewPinglistGenerator creates a new PinglistGenerator backed by the given
+// RNIC source. The ECMP config sizes how many distinct flow labels each
+// target is probed with (Eq.(1) coverage), computed once here.
+func NewPinglistGenerator(registry RnicSource, ecmp ECMPConfig) *PinglistGenerator {
 	return &PinglistGenerator{
 		registry: registry,
+		flowLabelCount: ComputeFlowLabelCount(
+			ecmp.PathsAssumed,
+			ecmp.CoverageProbability,
+			ecmp.MaxFlowLabels,
+		),
 	}
 }
 
@@ -48,7 +60,7 @@ func (g *PinglistGenerator) GenerateTorMeshPinglist(
 			continue
 		}
 
-		targets = append(targets, buildPingTarget(requesterGID, rnic))
+		targets = append(targets, g.buildPingTarget(requesterGID, rnic))
 	}
 
 	log.Info().
@@ -73,7 +85,7 @@ func (g *PinglistGenerator) GenerateInterTorPinglist(
 
 	targets := make([]*controller_agent.PingTarget, 0, len(rnics))
 	for _, rnic := range rnics {
-		targets = append(targets, buildPingTarget(requesterGID, rnic))
+		targets = append(targets, g.buildPingTarget(requesterGID, rnic))
 	}
 
 	log.Info().
@@ -86,9 +98,11 @@ func (g *PinglistGenerator) GenerateInterTorPinglist(
 }
 
 // buildPingTarget creates a PingTarget from an RnicInfo with deterministic
-// 5-tuple values based on the requester-target GID pair.
-func buildPingTarget(requesterGID string, rnic *controller_agent.RnicInfo) *controller_agent.PingTarget {
+// 5-tuple values based on the requester-target GID pair, plus the ECMP
+// flow-label set sizing (seed + count) the agent expands into concrete labels.
+func (g *PinglistGenerator) buildPingTarget(requesterGID string, rnic *controller_agent.RnicInfo) *controller_agent.PingTarget {
 	targetGID := rnic.GetGid()
+	seed := flowLabelSeed(requesterGID, targetGID)
 	return &controller_agent.PingTarget{
 		TargetGid:        targetGID,
 		TargetQpn:        rnic.GetQpn(),
@@ -96,19 +110,33 @@ func buildPingTarget(requesterGID string, rnic *controller_agent.RnicInfo) *cont
 		TargetHostname:   rnic.GetHostName(),
 		TargetTorId:      rnic.GetTorId(),
 		TargetDeviceName: rnic.GetDeviceName(),
-		FlowLabel:        deterministicFlowLabel(requesterGID, targetGID),
-		SourcePort:       deterministicSourcePort(requesterGID, targetGID),
-		Priority:         deterministicPriority(requesterGID, targetGID),
+		// FlowLabel is the legacy base label (low 20 bits of the seed), kept
+		// for backward compatibility and used verbatim when FlowLabelCount<=1.
+		FlowLabel: seed & 0xFFFFF,
+		// FlowLabelSeed/FlowLabelCount let the agent derive FlowLabelCount
+		// distinct 20-bit labels without the controller enumerating them.
+		FlowLabelSeed:  seed,
+		FlowLabelCount: g.flowLabelCount,
+		SourcePort:     deterministicSourcePort(requesterGID, targetGID),
+		Priority:       deterministicPriority(requesterGID, targetGID),
 	}
 }
 
-// deterministicFlowLabel generates a deterministic flow label for ECMP path diversity.
-// Uses FNV-1a 32-bit hash of requesterGID + targetGID, masked to 20 bits (0-0xFFFFF).
-func deterministicFlowLabel(requesterGID, targetGID string) uint32 {
+// flowLabelSeed is the full 32-bit FNV-1a hash of requesterGID+targetGID. It
+// seeds agent-side flow-label expansion; its low 20 bits double as the legacy
+// single flow label (see deterministicFlowLabel).
+func flowLabelSeed(requesterGID, targetGID string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(requesterGID))
 	h.Write([]byte(targetGID))
-	return h.Sum32() & 0xFFFFF // 20-bit mask
+	return h.Sum32()
+}
+
+// deterministicFlowLabel generates a deterministic flow label for ECMP path
+// diversity: the low 20 bits (0-0xFFFFF) of flowLabelSeed. Retained so the
+// legacy single-label semantics and its tests are preserved unchanged.
+func deterministicFlowLabel(requesterGID, targetGID string) uint32 {
+	return flowLabelSeed(requesterGID, targetGID) & 0xFFFFF // 20-bit mask
 }
 
 // deterministicSourcePort generates a deterministic source port (metadata only).

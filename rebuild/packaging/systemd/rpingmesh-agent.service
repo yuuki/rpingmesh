@@ -36,8 +36,15 @@
 #     if present): this is a device-file permission, not a capability. On
 #     most distributions the rdma-core package ships a udev rule that grants
 #     the "rdma" group access to these nodes -- hence SupplementaryGroups=rdma
-#     below. If your distribution uses a different group (or ACLs) for
-#     /dev/infiniband, adjust SupplementaryGroups accordingly.
+#     below. systemd refuses to even *start* a unit whose SupplementaryGroups
+#     name doesn't resolve, so the nfpm package's postinstall script
+#     (packaging/nfpm/scripts/postinstall-agent.sh) unconditionally creates
+#     the "rdma" group if rdma-core hasn't already, rather than only joining
+#     it when present. If installing manually (not via the .deb/.rpm) or if
+#     your distribution uses a different group (or ACLs) for
+#     /dev/infiniband, create/adjust that group yourself and update
+#     SupplementaryGroups accordingly -- see the "Deployment (systemd)"
+#     section of rebuild/README.md.
 #
 # What this unit deliberately does NOT grant, and why:
 #   - CAP_NET_RAW: not needed (see above). If a future change makes the

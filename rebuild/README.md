@@ -349,8 +349,12 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
 # Agent hosts only: grant access to /dev/infiniband/* (see the capability
 # note at the top of rpingmesh-agent.service for why CAP_NET_RAW is
 # deliberately *not* granted, and why CAP_IPC_LOCK + LimitMEMLOCK=infinity
-# are).
-sudo usermod -a -G rdma rpingmesh    # if your distro's rdma-core created an "rdma" group
+# are). The unit declares SupplementaryGroups=rdma unconditionally, so the
+# group must exist even if your distro's rdma-core hasn't created it yet
+# (systemd refuses to start a unit whose SupplementaryGroups name doesn't
+# resolve) -- the nfpm packages' postinstall script does this automatically.
+sudo groupadd --system rdma 2>/dev/null || true   # no-op if rdma-core already created it
+sudo usermod -a -G rdma rpingmesh
 
 # 4. Enable and start.
 sudo systemctl daemon-reload
@@ -366,11 +370,14 @@ go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
 # From the rebuild/ directory:
 make package              # builds both agent and controller .deb + .rpm into dist/
 make package-agent         # agent only (Linux/CGO_ENABLED=1 build host required)
-make package-controller    # controller only (any platform, CGO_ENABLED=0)
+make package-controller    # controller only (cross-compiles to GOOS=linux automatically -- safe to run from macOS)
 
-# Override the package version (default: `git describe --tags --always --dirty`):
+# Override the package version (default: "0.0.0+git.<short sha>", or the
+# exact tag if HEAD is tagged):
 make package VERSION=1.2.3
 ```
+
+Both `package-agent`/`package-controller` build with `GOOS=linux GOARCH=$(NFPM_ARCH)` explicitly (see the `package-build-*` targets in the Makefile), regardless of the host `make` runs on, so the packaged binary's platform always matches what the `.deb`/`.rpm` declares. The controller is pure Go (`CGO_ENABLED=0`) and cross-compiles cleanly from any host; the agent is `CGO_ENABLED=1` and links libibverbs/librdmacm via Cgo, so it still requires a matching Linux host to actually produce a working binary.
 
 Each package installs the binary to `/usr/bin/`, the unit file to
 `/usr/lib/systemd/system/`, and a sample config to

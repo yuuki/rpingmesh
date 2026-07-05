@@ -5,7 +5,8 @@
 .PHONY: all build build-zig build-go build-controller build-agent \
         generate generate-proto clean test test-go test-zig test-all vet \
         test-e2e setup-colima test-e2e-controller clean-e2e-controller \
-        check-nfpm package package-agent package-controller help
+        check-nfpm package package-agent package-controller \
+        package-build-agent package-build-controller help
 
 # Directories
 ZIG_DIR := zig
@@ -143,16 +144,44 @@ check-nfpm:
 # (systemd)" section of README.md for the full install/enable workflow.
 package: package-agent package-controller
 
+# Packaging-only build steps: unlike build-agent/build-controller (which
+# target the host running `make`), these force GOOS=linux and
+# GOARCH=$(NFPM_ARCH) so the resulting binary always matches what the nfpm
+# packages below declare (platform: linux, arch: ${NFPM_ARCH}) -- regardless
+# of what host `make package` is invoked from. Without this, `go build` on a
+# macOS host would silently produce a Darwin binary and nfpm would happily
+# wrap it in a package labelled "linux".
+#
+# The controller is CGO_ENABLED=0 (pure Go), so this cross-compiles cleanly
+# from any host, including macOS. The agent is CGO_ENABLED=1 and links
+# libibverbs/librdmacm via Cgo, which cannot cross-compile against a foreign
+# C toolchain/sysroot -- GOOS=linux GOARCH=$(NFPM_ARCH) here only produces a
+# working binary when `make` is actually run on a matching Linux host (see
+# README.md "Building"); on any other host this step fails, same as
+# build-agent does today.
+package-build-controller:
+	@echo "==> Building controller for packaging (GOOS=linux GOARCH=$(NFPM_ARCH))..."
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(NFPM_ARCH) go build -o $(CONTROLLER_BIN) ./cmd/controller/
+	@echo "==> Controller built for packaging: $(CONTROLLER_BIN)"
+
+package-build-agent:
+	@echo "==> Building agent for packaging (GOOS=linux GOARCH=$(NFPM_ARCH))..."
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=1 GOOS=linux GOARCH=$(NFPM_ARCH) go build -o $(AGENT_BIN) ./cmd/agent/
+	@echo "==> Agent built for packaging: $(AGENT_BIN)"
+
 # Requires a Linux/CGO_ENABLED=1 build host with libibverbs-dev/librdmacm-dev
-# (same requirement as build-agent; see README.md "Building").
-package-agent: build-agent check-nfpm
+# whose GOARCH matches $(NFPM_ARCH) (same requirement as build-agent; see
+# README.md "Building").
+package-agent: package-build-agent check-nfpm
 	@echo "==> Packaging rpingmesh-agent $(NFPM_VERSION) ($(NFPM_ARCH))..."
 	@mkdir -p $(DIST_DIR)
 	nfpm package --config packaging/nfpm/nfpm-agent.yaml --packager deb --target $(DIST_DIR)/
 	nfpm package --config packaging/nfpm/nfpm-agent.yaml --packager rpm --target $(DIST_DIR)/
 	@echo "==> Agent packages written to $(DIST_DIR)/"
 
-package-controller: build-controller check-nfpm
+package-controller: package-build-controller check-nfpm
 	@echo "==> Packaging rpingmesh-controller $(NFPM_VERSION) ($(NFPM_ARCH))..."
 	@mkdir -p $(DIST_DIR)
 	nfpm package --config packaging/nfpm/nfpm-controller.yaml --packager deb --target $(DIST_DIR)/

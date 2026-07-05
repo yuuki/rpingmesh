@@ -19,13 +19,17 @@ if ! getent passwd rpingmesh >/dev/null 2>&1; then
 fi
 
 # /dev/infiniband/* device nodes are typically owned by a distro-provided
-# "rdma" group (created by the rdma-core package's udev rules), not by
-# rpingmesh. Join it if present; if this host's rdma-core hasn't created it
-# yet (or uses ACLs instead), this is a no-op -- see the AmbientCapabilities
-# / SupplementaryGroups comment in packaging/systemd/rpingmesh-agent.service.
-if getent group rdma >/dev/null 2>&1; then
-    usermod -a -G rdma rpingmesh || true
+# "rdma" group (created by the rdma-core package's udev rules). The unit
+# file (packaging/systemd/rpingmesh-agent.service) statically declares
+# SupplementaryGroups=rdma, and systemd refuses to even *start* a unit whose
+# SupplementaryGroups name doesn't resolve to an existing group -- so this
+# group must exist unconditionally after this package is installed. Create
+# it if rdma-core hasn't already (harmless if it races with rdma-core's own
+# udev-triggered group creation; getent re-checks right before use).
+if ! getent group rdma >/dev/null 2>&1; then
+    groupadd --system rdma || true
 fi
+usermod -a -G rdma rpingmesh || true
 
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true

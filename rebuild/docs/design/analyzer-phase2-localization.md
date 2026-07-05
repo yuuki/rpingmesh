@@ -84,12 +84,55 @@ advanced pass that is correct only once a fabric model is added.
 
 ### Overview
 
-Phase 2 adds a **localizer** that runs after each window is complete, reads the
-retained window buckets, aggregates per-path summaries up to **ToR-pair**
-granularity, applies a fault-localization pass, and emits ranked suspect ToRs
-(and, when topology permits, suspect links) as findings + OTLP gauges. It is a
-new file `internal/controller/analyzer/localizer.go` in the existing package;
-`Analyzer` gains a post-window hook that invokes it.
+Phase 2 adds a **localizer** that runs once a window is **closed** (see the
+grace-period policy below), reads the retained window buckets, aggregates
+per-path summaries up to **ToR-pair** granularity, applies a fault-localization
+pass, and emits ranked suspect ToRs (and, when topology permits, suspect links)
+as findings + OTLP gauges. It is a new file
+`internal/controller/analyzer/localizer.go` in the existing package.
+
+**Localize on closed windows, not per report (the arrival-race fix).** A window's
+summaries arrive **asynchronously from many agents** — each agent reports on its
+own schedule after its window elapses, and network/retry jitter spreads those
+reports out. If the localizer ran as a naive `Analyzer.Ingest` post-hook (fire
+on every report), the first report for window W would trigger localization while
+almost no agents had reported yet: `agentsReporting`, breadth fractions, and
+`EdgeStat` totals would all be **under-counted**, producing spurious suspects and
+corrupting the finding hysteresis state machine. The localizer must therefore
+operate on a window only once it is considered **complete enough**, governed by a
+watermark:
+
+- A window with aligned start `Ws` (duration `D = windowNs`) has nominal end
+  `We = Ws + D`. It is declared **closed** at `We + grace`, where
+  `grace = expectedReportLag + margin`. `expectedReportLag` is bounded by the
+  agent report cadence — agents report at each window boundary
+  (`AnalysisReporter` ticks every `windowDur`), so a report for W is expected
+  within roughly one window plus RPC latency; a safe default is
+  `grace = windowNs + fixedMargin` (e.g. one extra window + a few seconds).
+- The `Analyzer` advances a monotonic **watermark** = `maxObservedWindowStart`
+  seen across all ingested reports (windows are wall-clock aligned and shared, so
+  this is well-defined). A window `Ws` is eligible for localization once
+  `now >= We + grace` **or** the watermark has advanced by ≥2 windows past `Ws`
+  (whichever comes first) — the latter lets a busy cluster close windows promptly
+  without waiting on wall-clock when later windows are already flowing in.
+- A **sweeper** (a ticker on the analyzer, period ≈ `windowNs`) picks the oldest
+  not-yet-localized closed window from the retained ring, runs `Localize(W)`
+  exactly once, and marks it localized. `Ingest` stays a pure ingest/retain/SLA
+  path; it no longer triggers localization directly. This keeps ingest cheap and
+  decouples localization cadence from report arrival.
+- **Late arrivals** (a report for an already-localized window) are **not**
+  re-localized — the window's finding contribution is fixed once evaluated, so a
+  straggler cannot flip a decision after the fact. Such a summary is still
+  retained/counted for SLA logging and metrics, but it is dropped from
+  localization with a counter (`rpingmesh.analyzer.late_summaries_total`) so
+  chronic lateness is observable and `grace` can be tuned. (Re-opening a window
+  for late data is rejected as it would make hysteresis non-deterministic and
+  reorder-sensitive.)
+
+Retention interaction: `WindowRetention` (default 20) must comfortably exceed the
+number of windows spanned by `grace` so a window is never evicted from the ring
+before it is localized; the sweeper asserts this and logs if retention is too
+small for the configured grace.
 
 ```
 per-agent PathSummary (window W)
@@ -395,7 +438,8 @@ granularity only):
 |--------|------|-----------|---------|
 | `rpingmesh.analyzer.suspect_tor` | ObservableGauge (0/1) or Gauge | `tor`, `kind` (downside/upside) | 1 while a ToR has an open suspicion finding |
 | `rpingmesh.analyzer.suspect_tor_score` | Gauge | `tor`, `kind` | current suspicion score (0..1) for a suspected ToR |
-| `rpingmesh.analyzer.localization_runs_total` | Counter | — | windows processed by the localizer |
+| `rpingmesh.analyzer.localization_runs_total` | Counter | — | closed windows processed by the localizer |
+| `rpingmesh.analyzer.late_summaries_total` | Counter | — | summaries arriving for an already-localized window (grace-tuning signal) |
 | `rpingmesh.analyzer.inter_tor_path_suspect` | Gauge (0/1) | `source_tor`, `target_tor` | spine-path suspicion that is not attributable to one ToR |
 
 No GID attribute ever appears on a metric; GID-level evidence goes to findings
@@ -429,6 +473,8 @@ Additive keys, defaults chosen conservatively:
 
 ```yaml
 analyzer_localization_enabled: true
+analyzer_loc_grace_sec: 40            # window-close grace = expectedReportLag + margin
+                                      # (>= agent analysis_window_sec + a few sec)
 analyzer_loc_breadth_frac: 0.6        # fraction of edges degraded to call a side "broad"
 analyzer_loc_open_score: 0.6          # score to open a suspicion
 analyzer_loc_close_score: 0.3         # score to clear (hysteresis)
@@ -488,6 +534,13 @@ matching the Phase 1 analyzer tests.
 - **Cross-agent aggregation**: two agents reporting summaries for the same
   aligned window and same ToR-pair must fold into one `EdgeStat` with summed
   totals; assert exact loss ratio and (with histogram field) exact merged p99.
+- **Window-close / late arrival** (injected clock via a `nowFn` seam, mirroring
+  `AnalysisReporter.nowFn`): a window is localized exactly once, only after
+  `We + grace`; asserting that reports trickling in before close do **not**
+  trigger localization and that the eventual single run sees the full
+  `agentsReporting`. A report arriving after the window is localized increments
+  `late_summaries_total` and does **not** re-run localization or alter the
+  already-emitted finding.
 - **Findings lifecycle**: drive K windows above `openThresh` → assert OPEN
   finding + gauge=1; then M windows below `closeThresh` → assert CLEARED +
   gauge=0; assert a single dip below threshold does not close (hysteresis).
@@ -517,7 +570,12 @@ and keeps the schema-free work first.
    must land within this PR before the localizer can use it. Then
    `internal/controller/analyzer/localizer.go`: `EdgeStat`, edge folding from the
    retained window buckets, the common-element heuristic, ranking. `Analyzer`
-   gains a post-window hook (invoked when a window completes) that calls it.
+   gains a **window-close sweeper** (a ticker + monotonic watermark) that runs
+   `Localize(W)` exactly once per window after `We + grace`, instead of a
+   per-report hook — this is what prevents localizing on a partially-reported
+   window (under-counted `agentsReporting`/breadth). Late summaries for an
+   already-localized window are counted (`late_summaries_total`) but not
+   re-localized. `analyzer_loc_grace_sec` config + a retention-vs-grace assertion.
    Registry gains a read-only `TopologySnapshot()` (GID→ToR, ToR→GIDs) built
    from `ListAllRNICs`. Findings logged only (no metrics yet). Fixtures +
    Scenarios A–E as unit tests (Scenario E specifically exercises the

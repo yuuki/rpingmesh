@@ -183,13 +183,43 @@ reinit lock:
    freed inside those; then `proberRings[i].Destroy()`, `respRings[i].Destroy()`,
    `rdma_async_watch_stop(asyncRing[i])`, and finally `devices[i].Close()`.
    Order matches the header rule (queues before device; rings after queues).
-4. **Re-open the device** with the *same* parameters the agent used originally —
+4. **Refresh the device list, then re-open the device.**
+   **Stale-device-list hazard (must fix first).** The shared bridge context
+   caches the device list at startup: Zig `RdmaContext` (`types.zig`) stores
+   `device_list` and `num_devices` populated once by `ibv_get_device_list()`
+   inside `rdma_init()`, and both `rdma_get_device_count` and the open-by-
+   index/name paths read that cached array. After `rdma link delete` +
+   re-add (or a real hot-unplug/replug) the re-added device is a **new** entry
+   the cached list does not contain — so a naive re-open would fail to find it,
+   or worse, index into a freed/renamed slot. The reinit sequence must
+   re-enumerate before re-opening.
+
+   Two ways to re-enumerate, and why the surgical one is chosen:
+   - **Recreate the whole bridge context** (`rdma_destroy` + `rdma_init`):
+     rejected for per-device reinit. The header contract requires *all* devices
+     and queues be destroyed before `rdma_destroy`, so recreating the shared
+     context would force quiescing every *healthy* RNIC too — defeating the
+     per-device isolation this whole design is built on.
+   - **Add a device-list refresh C-ABI** (chosen): a new
+     `int32_t rdma_refresh_devices(rdma_context_t ctx)` that calls
+     `ibv_free_device_list()` on the cached array and re-runs
+     `ibv_get_device_list()`, updating `RdmaContext.device_list` /
+     `num_devices` in place. `ibv_free_device_list()` frees only the *list
+     array*, not the `ibv_context` of already-opened devices, so healthy RNICs
+     are untouched. Exposed to Go as `Context.RefreshDevices()`. Refresh must be
+     serialized with respect to any open/count call (the reinit already holds the
+     per-device reinit lock; document that device open/count/refresh on the
+     shared context are mutually exclusive).
+
+   Then **re-open** with the *same* parameters the agent used originally —
    by name if `AllowedDeviceNames` is set, else by index — passing the same
    `gidIndex`, `sl`, `tc` (already threaded through `openDevices` →
-   `OpenDevice(index, gidIndex, sl, tc)`). A removed-then-readded rxe device may
-   reappear at a different index; **prefer re-open by name** during reinit even
-   when the initial open was by index, keyed on `devices[i].Info.DeviceName`, to
-   survive index reshuffling.
+   `OpenDevice(index, gidIndex, sl, tc)`). Because a removed-then-readded device
+   commonly reappears at a **different index**, **prefer re-open by name** during
+   reinit even when the initial open was by index, keyed on
+   `devices[i].Info.DeviceName`, to survive index reshuffling. (After a refresh
+   the by-name lookup scans the freshly enumerated list, so the new device is
+   found regardless of its new index.)
 5. **Rebuild in creation order**: new `EventRing`s → new async watcher → new
    `Prober` (new QPN) → new `Responder` (new QPN) → new `ClusterMonitor` bound to
    the new prober. Re-apply per-target rate limit and flow-label rotation period
@@ -343,21 +373,32 @@ outcome may adjust the event→action table above.
    ring + stop-unblock. No agent behavior change yet (watcher can be started and
    its events logged only). **Includes the investigation** of rxe delete
    behavior.
-2. **P3-I.2 — Fan-in single-prober replace.** Refactor `createResultsFanIn` /
+2. **P3-I.2 — Device-list refresh C-ABI.** Add
+   `int32_t rdma_refresh_devices(rdma_context_t ctx)` in `zig/src/device.zig`
+   (`ibv_free_device_list` + re-run `ibv_get_device_list`, updating
+   `RdmaContext.device_list`/`num_devices` in place) and its `main.zig` export +
+   header entry; Go wrapper `Context.RefreshDevices()`. Zig unit test that a
+   refresh re-reads the count and does not disturb an already-open device's
+   handle. Independent of the async watcher; lands before reinit uses it, since
+   without it re-open cannot find a re-added device.
+3. **P3-I.3 — Fan-in single-prober replace.** Refactor `createResultsFanIn` /
    `stopResultsFanIn` to per-goroutine stop channels and a helper to
    detach/attach one prober's fan-in without closing the shared channels. Pure
    Go, unit-tested with fake probers. Lands and is proven **before** reinit uses
    it.
-3. **P3-I.3 — Supervisor + per-device reinit orchestration.**
+4. **P3-I.4 — Supervisor + per-device reinit orchestration.**
    `internal/agent/rnic_supervisor.go`: the state machine, quiesce/pause,
-   destroy→reopen(by name)→rebuild→re-register→resume, backoff, DOWN handling.
-   `Prober.Pause/Resume`. Go unit tests with injected fake async events and fake
-   bridge; assert the exact call sequence and fan-in re-wire. Metrics.
-4. **P3-I.4 — soft-RoCE e2e.** New Docker e2e that deletes/re-adds rxe0 mid-run
-   (or netdev down/up fallback) and asserts reinit + resumed probing shape.
-5. **P3-I.5 (optional) — QP_FATAL / GID_CHANGE fine-grained handling.**
+   destroy→**refresh-device-list**→reopen(by name)→rebuild→re-register→resume,
+   backoff, DOWN handling. `Prober.Pause/Resume`. Go unit tests with injected
+   fake async events and fake bridge; assert the exact call sequence (including
+   the `RefreshDevices()` call before re-open) and fan-in re-wire. Metrics.
+5. **P3-I.5 — soft-RoCE e2e.** New Docker e2e that deletes/re-adds rxe0 mid-run
+   (or netdev down/up fallback) and asserts reinit + resumed probing shape,
+   exercising the device-list refresh (the re-added rxe device is found only
+   after refresh).
+6. **P3-I.6 (optional) — QP_FATAL / GID_CHANGE fine-grained handling.**
    Queue-scoped rebuild without device close, and GID re-query + re-register.
-   Smaller, layered on the machinery from I.3.
+   Smaller, layered on the machinery from I.4.
 
 ## Open Questions
 

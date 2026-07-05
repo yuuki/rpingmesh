@@ -82,12 +82,23 @@ the QP create/modify/destroy path, an eBPF program captures, per QP:
   *remote RNIC*, and thus to a ToR-pair that probes also traverse;
 - **lifecycle**: create timestamp, destroy timestamp → QP liveness.
 
-The agent maintains an in-memory **QP→service table** keyed by local QPN,
-enriched with the remote GID/QPN. That table is the join key back to probe
-results: a probe path `(source_gid, target_gid)` shares fabric with an
-application QP whose `(local device gid, dgid)` matches the same ToR-pair. Note
-UD (rpingmesh's own QPs) never modify to a single remote, so rpingmesh's probe
-QPs are naturally excluded/ignorable; the workloads' RC/UC QPs carry a remote.
+The agent maintains an in-memory **QP→service table**. **The key must be the
+composite `(device, LocalQPN)`, not `LocalQPN` alone.** A QPN is only unique
+*within one RDMA device's* QP-number namespace; on a multi-RNIC host (the norm
+for this system — the agent already opens one Prober/Responder per device) two
+different RNICs can legitimately hand out the **same** QPN to different
+applications. Keying on the bare QPN would collide those two QPs into one table
+entry and mis-attribute a service to the wrong RNIC (and thus the wrong ToR-pair,
+corrupting the probe join). The eBPF program therefore captures a device
+discriminator alongside the QPN — the kernel `ib_device`/uverbs file identity, or
+its port — and userspace resolves it to the local RNIC's `DeviceGID`; the map key
+is `(DeviceGID, LocalQPN)` (or `(device_id, port, LocalQPN)` before GID
+resolution). Entries are enriched with the remote GID/QPN. That table is the join
+key back to probe results: a probe path `(source_gid, target_gid)` shares fabric
+with an application QP whose `(local device gid, dgid)` matches the same ToR-pair.
+Note UD (rpingmesh's own QPs) never modify to a single remote, so rpingmesh's
+probe QPs are naturally excluded/ignorable; the workloads' RC/UC QPs carry a
+remote.
 
 ### Technology choice: cilium/ebpf (recommended) vs libbpf-go
 
@@ -171,9 +182,17 @@ service tracing is simply disabled (graceful degradation), agent unaffected.
 
 ```go
 // Linux-only. One row per observed application QP.
+// Table key is the composite QPKey below, NOT LocalQPN alone: QPNs are unique
+// only within a single device's namespace, so a multi-RNIC host can reuse the
+// same QPN on two RNICs.
+type QPKey struct {
+    DeviceGID string   // local RNIC identity (resolved from device/port)
+    LocalQPN  uint32
+}
+
 type QPRecord struct {
     LocalQPN    uint32
-    DeviceGID   string   // local RNIC GID (mapped from device/port)
+    DeviceGID   string   // local RNIC GID (mapped from device/port); part of the key
     RemoteQPN   uint32   // 0 until RTR modify observed
     RemoteGID   string   // "" until RTR modify observed (UD stays empty)
     PID         uint32
@@ -185,8 +204,11 @@ type QPRecord struct {
 ```
 
 The kernel program emits compact fixed-layout events into the ring buffer
-(create / modify-RTR / destroy); the Go reader folds them into the table and
-resolves `DeviceGID` from the device/port index. Aggregation for reporting rolls
+(create / modify-RTR / destroy), **each carrying the device discriminator**
+(uverbs file / `ib_device` identity, and port) alongside the QPN so the userspace
+reader can build the composite key. The Go reader resolves that discriminator to
+the local RNIC's `DeviceGID` and folds events into the `map[QPKey]*QPRecord`
+table. Aggregation for reporting rolls
 QPs up to **service (cgroup) × remote ToR**, so nothing GID-level or PID-level
 reaches a metric.
 
@@ -295,6 +317,10 @@ the plan is staged with most logic testable without loading a program.
   by synthetic event structs; the graceful-degradation decision logic (kernel
   too old / no BTF / no cap → disabled) with injected feature-probe results. The
   `!linux` stub compiles and is a no-op.
+- **Composite-key collision guard**: feed two synthetic create events with the
+  **same `LocalQPN` on two different devices** (distinct `DeviceGID`) and assert
+  they produce two distinct `QPKey` entries mapped to their respective services —
+  a regression test that the key is `(DeviceGID, LocalQPN)`, not the bare QPN.
 - **Loader/verifier test (Linux CI)**: assert the embedded CO-RE object **loads
   and verifies** against the CI kernel's BTF (`cilium/ebpf` can load without
   attaching). This catches verifier regressions without needing to generate real

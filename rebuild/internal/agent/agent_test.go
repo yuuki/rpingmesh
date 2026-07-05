@@ -119,6 +119,81 @@ func TestAgent_CreateResultsFanIn_MergesResultsFromEveryProber(t *testing.T) {
 	}
 }
 
+// TestAgent_CreateResultsFanIn_TeesToAnalysis verifies that, with analysis
+// reporting enabled, every fan-in result is delivered to BOTH the metrics
+// channel and the analysis branch (the tee), so the analyzer sees the same
+// stream the metrics consumer does.
+func TestAgent_CreateResultsFanIn_TeesToAnalysis(t *testing.T) {
+	probers := []*Prober{fakeProber(4)}
+	a := newTestAgent(nil, probers)
+	a.cfg.AnalysisReportEnabled = true
+
+	a.createResultsFanIn()
+
+	if a.analysisResults == nil {
+		t.Fatal("analysisResults channel not created when analysis enabled")
+	}
+
+	probers[0].emitResult(&probe.ProbeResult{SequenceNum: 7})
+
+	// Metrics branch.
+	select {
+	case r := <-a.results:
+		if r.SequenceNum != 7 {
+			t.Errorf("metrics branch seq = %d, want 7", r.SequenceNum)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for result on metrics branch")
+	}
+
+	// Analysis branch (the tee).
+	select {
+	case r := <-a.analysisResults:
+		if r.SequenceNum != 7 {
+			t.Errorf("analysis branch seq = %d, want 7", r.SequenceNum)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for result on analysis branch")
+	}
+}
+
+// TestAgent_CreateResultsFanIn_SlowAnalysisDoesNotStallMetrics verifies the
+// key non-blocking contract: when the analysis branch backs up (nothing drains
+// a.analysisResults, its buffer fills), the metrics path must still receive
+// every result. The tee's analysis send is non-blocking (drops on a full
+// buffer) precisely so a slow aggregator cannot stall metrics.
+func TestAgent_CreateResultsFanIn_SlowAnalysisDoesNotStallMetrics(t *testing.T) {
+	// More than the analysis branch buffer (resultChanSize) so it overflows.
+	const total = resultChanSize + 100
+
+	prober := fakeProber(total) // hold all emitted results without dropping
+	a := newTestAgent(nil, []*Prober{prober})
+	a.cfg.AnalysisReportEnabled = true
+
+	a.createResultsFanIn()
+
+	// Nothing ever drains a.analysisResults: the aggregator is "stuck".
+	for i := 0; i < total; i++ {
+		prober.emitResult(&probe.ProbeResult{SequenceNum: uint64(i)})
+	}
+	prober.Destroy() // close Results() so the fan-in drains and eventually exits
+
+	// The metrics branch must still receive all `total` results.
+	got := 0
+	timeout := time.After(5 * time.Second)
+	for got < total {
+		select {
+		case _, ok := <-a.results:
+			if !ok {
+				t.Fatalf("metrics channel closed after %d results, want %d", got, total)
+			}
+			got++
+		case <-timeout:
+			t.Fatalf("slow analysis branch stalled metrics: only %d/%d results delivered", got, total)
+		}
+	}
+}
+
 func TestAgent_StopResultsFanIn_ClosesSharedChannelAfterAllProbersDestroyed(t *testing.T) {
 	probers := []*Prober{fakeProber(1), fakeProber(1)}
 	a := newTestAgent(nil, probers)
@@ -155,6 +230,30 @@ func TestAgent_StopResultsFanIn_ClosesSharedChannelAfterAllProbersDestroyed(t *t
 		}
 	default:
 		t.Fatal("expected a.results to already be closed once stopResultsFanIn returned")
+	}
+}
+
+// TestAgent_StopResultsFanIn_ClosesAnalysisBranch verifies that shutting down
+// the fan-in also closes the analysis branch (after every fan-in goroutine has
+// exited), which is what ends the AnalysisReporter's run loop.
+func TestAgent_StopResultsFanIn_ClosesAnalysisBranch(t *testing.T) {
+	probers := []*Prober{fakeProber(1)}
+	a := newTestAgent(nil, probers)
+	a.cfg.AnalysisReportEnabled = true
+
+	a.createResultsFanIn()
+	for _, p := range probers {
+		p.Destroy()
+	}
+	a.stopResultsFanIn()
+
+	select {
+	case _, ok := <-a.analysisResults:
+		if ok {
+			t.Fatal("expected analysisResults closed with no pending data")
+		}
+	default:
+		t.Fatal("expected analysisResults to be closed after stopResultsFanIn")
 	}
 }
 

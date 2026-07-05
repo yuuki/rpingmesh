@@ -45,6 +45,20 @@ const (
 	// target carry a ~1M-entry label set/map and stall or OOM the agent. The
 	// agent enforces the same 4096 clamp as defense in depth.
 	MaxEcmpFlowLabels = 4096
+
+	// DefaultAnalyzerSLALossRatio is the default per-path loss ratio
+	// (probe_failed / probe_total) above which the analyzer flags a window as
+	// a loss SLA violation.
+	DefaultAnalyzerSLALossRatio = 0.02
+	// DefaultAnalyzerSLANetworkRTTP99Ns is the default per-path p99 network-RTT
+	// threshold (ns) above which the analyzer flags an RTT SLA violation.
+	DefaultAnalyzerSLANetworkRTTP99Ns = 500_000
+	// DefaultAnalyzerWindowRetention is the default number of distinct windows
+	// the analyzer retains in its in-memory ring.
+	DefaultAnalyzerWindowRetention = 20
+	// DefaultControllerOtelCollectorAddr is the default OTLP gRPC collector
+	// endpoint the analyzer exports its metrics to.
+	DefaultControllerOtelCollectorAddr = "localhost:4317"
 )
 
 // ControllerConfig holds all configuration for the controller.
@@ -61,6 +75,17 @@ type ControllerConfig struct {
 	EcmpPathsAssumed        int     `mapstructure:"ecmp_paths_assumed"`
 	EcmpCoverageProbability float64 `mapstructure:"ecmp_coverage_probability"`
 	EcmpMaxFlowLabels       int     `mapstructure:"ecmp_max_flow_labels"`
+
+	// Analyzer (Phase 1) settings. AnalyzerEnabled turns on ingestion of
+	// agent-reported per-path summaries and SLA-violation detection.
+	AnalyzerEnabled            bool    `mapstructure:"analyzer_enabled"`
+	AnalyzerSLALossRatio       float64 `mapstructure:"analyzer_sla_loss_ratio"`
+	AnalyzerSLANetworkRTTP99Ns uint64  `mapstructure:"analyzer_sla_network_rtt_p99_ns"`
+	AnalyzerWindowRetention    int     `mapstructure:"analyzer_window_retention"`
+	// OtelCollectorAddr is the OTLP gRPC endpoint the analyzer exports its
+	// metrics to (service.name=rpingmesh-analyzer). Only used when the analyzer
+	// is enabled; export is best-effort.
+	OtelCollectorAddr string `mapstructure:"otel_collector_addr"`
 }
 
 // LoadControllerConfig loads controller configuration from a YAML file,
@@ -83,6 +108,11 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 	v.SetDefault("ecmp_paths_assumed", DefaultEcmpPathsAssumed)
 	v.SetDefault("ecmp_coverage_probability", DefaultEcmpCoverageProbability)
 	v.SetDefault("ecmp_max_flow_labels", DefaultEcmpMaxFlowLabels)
+	v.SetDefault("analyzer_enabled", true)
+	v.SetDefault("analyzer_sla_loss_ratio", DefaultAnalyzerSLALossRatio)
+	v.SetDefault("analyzer_sla_network_rtt_p99_ns", DefaultAnalyzerSLANetworkRTTP99Ns)
+	v.SetDefault("analyzer_window_retention", DefaultAnalyzerWindowRetention)
+	v.SetDefault("otel_collector_addr", DefaultControllerOtelCollectorAddr)
 
 	// Enable environment variable override with RPINGMESH_ prefix
 	v.SetEnvPrefix("RPINGMESH")
@@ -128,6 +158,12 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		EcmpPathsAssumed:        v.GetInt("ecmp_paths_assumed"),
 		EcmpCoverageProbability: v.GetFloat64("ecmp_coverage_probability"),
 		EcmpMaxFlowLabels:       v.GetInt("ecmp_max_flow_labels"),
+
+		AnalyzerEnabled:            v.GetBool("analyzer_enabled"),
+		AnalyzerSLALossRatio:       v.GetFloat64("analyzer_sla_loss_ratio"),
+		AnalyzerSLANetworkRTTP99Ns: v.GetUint64("analyzer_sla_network_rtt_p99_ns"),
+		AnalyzerWindowRetention:    v.GetInt("analyzer_window_retention"),
+		OtelCollectorAddr:          v.GetString("otel_collector_addr"),
 	}
 
 	if err := config.Validate(); err != nil {
@@ -207,6 +243,20 @@ func (c *ControllerConfig) Validate() error {
 		return fmt.Errorf("ecmp_max_flow_labels must be <= %d, got: %d", MaxEcmpFlowLabels, c.EcmpMaxFlowLabels)
 	}
 
+	// Analyzer settings are only enforced when the analyzer is enabled.
+	if c.AnalyzerEnabled {
+		// A loss ratio is a probability in [0, 1]; outside that range the
+		// threshold is meaningless (a negative ratio flags everything, > 1
+		// flags nothing).
+		if c.AnalyzerSLALossRatio < 0 || c.AnalyzerSLALossRatio > 1 {
+			return fmt.Errorf("analyzer_sla_loss_ratio must be in [0, 1], got: %v", c.AnalyzerSLALossRatio)
+		}
+		// The window ring must retain at least one window.
+		if c.AnalyzerWindowRetention < 1 {
+			return fmt.Errorf("analyzer_window_retention must be >= 1, got: %d", c.AnalyzerWindowRetention)
+		}
+	}
+
 	return nil
 }
 
@@ -222,4 +272,9 @@ func BindControllerFlags(flags *pflag.FlagSet) {
 	flags.Int("ecmp-paths-assumed", DefaultEcmpPathsAssumed, "Assumed ECMP fabric width (m) for Eq.(1) flow-label coverage sizing")
 	flags.Float64("ecmp-coverage-probability", DefaultEcmpCoverageProbability, "Target probability (p, in (0,1)) that generated flow labels cover all ECMP paths")
 	flags.Int("ecmp-max-flow-labels", DefaultEcmpMaxFlowLabels, "Hard cap on the number of flow labels per target (bounds probe amplification)")
+	flags.Bool("analyzer-enabled", true, "Enable the Phase 1 analyzer (ingest agent summaries, detect SLA violations)")
+	flags.Float64("analyzer-sla-loss-ratio", DefaultAnalyzerSLALossRatio, "Per-path loss ratio (0..1) above which a window is an SLA violation")
+	flags.Uint64("analyzer-sla-network-rtt-p99-ns", DefaultAnalyzerSLANetworkRTTP99Ns, "Per-path p99 network-RTT threshold (ns) above which a window is an SLA violation (0 disables)")
+	flags.Int("analyzer-window-retention", DefaultAnalyzerWindowRetention, "Number of recent windows the analyzer retains in memory")
+	flags.String("otel-collector-addr", DefaultControllerOtelCollectorAddr, "OTLP gRPC collector endpoint for analyzer metrics")
 }

@@ -82,6 +82,19 @@ type Agent struct {
 	// forever instead of letting Stop complete deterministically.
 	resultsDone chan struct{}
 
+	// analysisResults is the secondary fan-out branch of the results fan-in,
+	// feeding the AnalysisReporter (per-path window aggregation). It is nil
+	// when analysis reporting is disabled. The fan-in tees onto it with a
+	// non-blocking send so a backed-up aggregator can never stall the primary
+	// metrics path; it is closed by stopResultsFanIn after every fan-in
+	// goroutine has exited (so no send races the close).
+	analysisResults chan *probe.ProbeResult
+
+	// analysisReporter drives the PathAggregator and ships completed window
+	// summaries to the controller via ReportProbeAnalysis. nil when analysis
+	// reporting is disabled.
+	analysisReporter *AnalysisReporter
+
 	// agentIP is the host's outbound IP toward the controller, reported in the
 	// registration request's agent_ip field. Best-effort: empty if it cannot be
 	// determined, which never blocks registration.
@@ -177,8 +190,25 @@ func (a *Agent) Initialize(ctx context.Context) error {
 
 	// Fan-in every prober's Results() channel into a single stream so the
 	// rest of Initialize/Start can keep treating "the" probe result stream
-	// as one channel, as before.
+	// as one channel, as before. When analysis reporting is enabled this also
+	// creates the secondary analysis branch that the fan-in tees onto.
 	a.createResultsFanIn()
+
+	// Create the analysis reporter (per-path window aggregation + SLA
+	// reporting to the controller) if enabled. It consumes the analysis branch
+	// created by createResultsFanIn and reports on this agent's behalf.
+	if a.cfg.AnalysisReportEnabled {
+		a.analysisReporter = NewAnalysisReporter(
+			a.grpcClient,
+			a.cfg.AgentID,
+			a.cfg.TorID,
+			a.cfg.AnalysisWindowSec,
+			a.analysisResults,
+		)
+		a.logger.Info().
+			Uint32("window_sec", a.cfg.AnalysisWindowSec).
+			Msg("Analysis reporter created")
+	}
 
 	// Step 6: Create one responder per device.
 	a.logger.Info().Int("device_count", len(a.devices)).Msg("Creating responders")
@@ -438,6 +468,12 @@ func (a *Agent) Start(ctx context.Context) error {
 		a.logger.Info().Msg("Metrics result consumer started")
 	}
 
+	// Start the analysis reporter if enabled. It consumes the secondary
+	// analysis branch of the fan-in independently of the metrics consumer.
+	if a.analysisReporter != nil {
+		a.analysisReporter.Start(ctx)
+	}
+
 	a.logger.Info().Msg("Agent started")
 	return nil
 }
@@ -477,6 +513,13 @@ func (a *Agent) Stop(ctx context.Context) {
 	// nothing draining it (e.g. metrics disabled), which in turn lets the
 	// metrics result consumer's range loop finish.
 	a.stopResultsFanIn()
+
+	// Wait for the analysis reporter to drain the now-closed analysis branch
+	// and ship its final window summary. This must happen before the gRPC
+	// client is closed below, since the final flush is sent over it.
+	if a.analysisReporter != nil {
+		a.analysisReporter.Wait()
+	}
 
 	// Stop all responders.
 	for _, resp := range a.responders {
@@ -718,12 +761,27 @@ func (a *Agent) createEventRings() error {
 func (a *Agent) createResultsFanIn() {
 	a.results = make(chan *probe.ProbeResult, resultChanSize)
 	a.resultsDone = make(chan struct{})
+	if a.cfg.AnalysisReportEnabled {
+		a.analysisResults = make(chan *probe.ProbeResult, resultChanSize)
+	}
 
 	for _, prober := range a.probers {
 		a.resultsWg.Add(1)
 		go func(p *Prober) {
 			defer a.resultsWg.Done()
 			for result := range p.Results() {
+				// Secondary, best-effort tee to the analysis path. The send is
+				// non-blocking (dropped if the analysis buffer is full) so a
+				// slow or backed-up aggregator/reporter can never stall the
+				// primary metrics path below. Done first so a full a.results
+				// (e.g. metrics slow) does not also starve analysis of this
+				// result.
+				if a.analysisResults != nil {
+					select {
+					case a.analysisResults <- result:
+					default:
+					}
+				}
 				select {
 				case a.results <- result:
 				case <-a.resultsDone:
@@ -760,6 +818,12 @@ func (a *Agent) stopResultsFanIn() {
 	close(a.resultsDone)
 	a.resultsWg.Wait()
 	close(a.results)
+	// Close the analysis branch too (only after every fan-in goroutine has
+	// exited, so no tee send can race this close). This is what ends the
+	// AnalysisReporter's run loop and triggers its final-window flush.
+	if a.analysisResults != nil {
+		close(a.analysisResults)
+	}
 }
 
 // proberRingDropCount sums EventRing.DropCount() across every prober ring

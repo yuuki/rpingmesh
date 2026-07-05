@@ -22,6 +22,14 @@ type registryClient interface {
 	RegisterRNICs(ctx context.Context, agentID, agentIP string, rnics []*controller_agent.RnicInfo) error
 }
 
+// probeAnalyzer is the subset of the analyzer used by ReportProbeAnalysis,
+// declared at the point of use so the service can be unit tested against a
+// fake and so the controller package does not hard-depend on the analyzer's
+// concrete type. Ingest returns the number of SLA-violating summaries.
+type probeAnalyzer interface {
+	Ingest(ctx context.Context, report *controller_agent.ProbeAnalysisReport) int
+}
+
 // ControllerService implements the gRPC ControllerService defined in
 // controller_agent.proto. It handles agent registration and pinglist
 // distribution.
@@ -29,6 +37,10 @@ type ControllerService struct {
 	controller_agent.UnimplementedControllerServiceServer
 	registry registryClient
 	pinglist *pinglist.PinglistGenerator
+	// analyzer ingests reported per-path summaries and detects SLA violations.
+	// nil when the analyzer is disabled, in which case ReportProbeAnalysis
+	// accepts-and-drops.
+	analyzer probeAnalyzer
 }
 
 // NewControllerService creates a new ControllerService backed by the given
@@ -40,6 +52,13 @@ func NewControllerService(reg registryClient, ecmp pinglist.ECMPConfig) *Control
 		registry: reg,
 		pinglist: pinglist.NewPinglistGenerator(reg, ecmp),
 	}
+}
+
+// SetAnalyzer wires an analyzer into the service so ReportProbeAnalysis ingests
+// reported summaries. It is optional: with no analyzer set, ReportProbeAnalysis
+// accepts-and-drops. Call before serving.
+func (s *ControllerService) SetAnalyzer(a probeAnalyzer) {
+	s.analyzer = a
 }
 
 // RegisterAgent registers an agent and all of its RNICs with the controller.
@@ -146,5 +165,40 @@ func (s *ControllerService) GetPinglist(
 	return &controller_agent.PinglistResponse{
 		Targets: targets,
 		Type:    req.GetType(),
+	}, nil
+}
+
+// ReportProbeAnalysis ingests a batch of per-path window summaries reported by
+// an agent and returns an ack carrying the number of SLA-violating summaries
+// the analyzer detected. When no analyzer is configured, it accepts-and-drops
+// (Accepted=false) so agents (which treat reporting as best-effort) are not
+// forced to error.
+func (s *ControllerService) ReportProbeAnalysis(
+	ctx context.Context,
+	req *controller_agent.ProbeAnalysisReport,
+) (*controller_agent.ProbeAnalysisAck, error) {
+	if req.GetAgentId() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "agent_id is required")
+	}
+
+	if s.analyzer == nil {
+		log.Debug().
+			Str("agentID", req.GetAgentId()).
+			Int("summaryCount", len(req.GetSummaries())).
+			Msg("ReportProbeAnalysis received but analyzer is disabled; dropping")
+		return &controller_agent.ProbeAnalysisAck{Accepted: false}, nil
+	}
+
+	violations := s.analyzer.Ingest(ctx, req)
+
+	log.Debug().
+		Str("agentID", req.GetAgentId()).
+		Int("summaryCount", len(req.GetSummaries())).
+		Int("slaViolations", violations).
+		Msg("Ingested probe analysis report")
+
+	return &controller_agent.ProbeAnalysisAck{
+		Accepted:      true,
+		SlaViolations: uint32(violations),
 	}, nil
 }

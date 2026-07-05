@@ -20,6 +20,13 @@ pinglist_update_interval_sec: 300 # Pinglist refresh interval
 # controller (see controller.yaml ecmp_* settings).
 flow_label_rotation_period_sec: 3600
 
+# Analyzer reporting (Phase 1)
+# When enabled, the agent aggregates probe results per path over fixed windows
+# and reports PathSummary batches to the controller's analyzer via
+# ReportProbeAnalysis. Reporting is best-effort and never blocks probing.
+analysis_report_enabled: true
+analysis_window_sec: 30          # per-path aggregation window length
+
 # RDMA settings
 gid_index: 0                     # GID table index to use
 allowed_device_names: []         # Empty = all devices

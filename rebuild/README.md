@@ -54,8 +54,12 @@ MetricsCollector (exports OTLP metrics) shared across all of them.
 libibverbs operations: device enumeration, QP creation, CQ polling, packet
 serialization, and send/receive. Exposes a C-ABI that Go calls via Cgo.
 
-> **Note:** The Analyzer component and eBPF service tracing from the original
-> implementation are out of scope for this rebuild.
+> **Note:** A Phase 1 Analyzer is implemented: agents aggregate probe results
+> per path over fixed windows and report `PathSummary` batches to the controller
+> via `ReportProbeAnalysis`, where an in-process analyzer detects per-path SLA
+> violations (loss ratio and p99 network-RTT thresholds). Topology-aware
+> switch/link fault localization (Phase 2) and eBPF service tracing remain out
+> of scope for this rebuild.
 
 ## 6-Timestamp Probing Protocol
 
@@ -217,6 +221,8 @@ via Cgo (`CGO_ENABLED=1`).
 | `allowed_device_names` | `[]` | Device filter (empty = all devices) |
 | `metrics_enabled` | `true` | Enable OpenTelemetry export |
 | `otel_collector_addr` | `localhost:4317` | OTLP gRPC collector endpoint |
+| `analysis_report_enabled` | `true` | Aggregate probe results per path and report `PathSummary` batches to the controller's analyzer (best-effort; never blocks probing) |
+| `analysis_window_sec` | `30` | Per-path aggregation window length in seconds |
 | `log_level` | `info` | Log level: debug, info, warn, error |
 
 ### Controller (`configs/controller.yaml`)
@@ -231,6 +237,11 @@ via Cgo (`CGO_ENABLED=1`).
 | `ecmp_paths_assumed` | `16` | Assumed ECMP fabric width (m) for Eq.(1) flow-label coverage sizing |
 | `ecmp_coverage_probability` | `0.9` | Target probability (p, in (0,1)) that generated flow labels cover all ECMP paths |
 | `ecmp_max_flow_labels` | `64` | Hard cap on flow labels per target (bounds probe amplification) |
+| `analyzer_enabled` | `true` | Enable the Phase 1 analyzer: ingest agent-reported summaries and detect SLA violations |
+| `analyzer_sla_loss_ratio` | `0.02` | Per-path loss ratio (0..1) above which a window is flagged as a loss SLA violation |
+| `analyzer_sla_network_rtt_p99_ns` | `500000` | Per-path p99 network-RTT (ns) above which a window is flagged as an RTT SLA violation (0 disables the check) |
+| `analyzer_window_retention` | `20` | Number of recent windows the analyzer retains in memory |
+| `otel_collector_addr` | `localhost:4317` | OTLP gRPC endpoint for analyzer metrics (`service.name=rpingmesh-analyzer`) |
 | `log_level` | `info` | Log level |
 
 ### Environment Variable Overrides
@@ -422,6 +433,17 @@ The agent exports the following OTLP metrics:
 
 All metrics carry two attributes: `source_tor` and `target_tor`.
 
+The controller-side analyzer (Phase 1) exports the following OTLP metrics under
+`service.name=rpingmesh-analyzer`:
+
+| Metric | Type | Attributes | Description |
+|--------|------|-----------|-------------|
+| `rpingmesh.analyzer.path_summaries_total` | Counter | — | Per-path window summaries ingested |
+| `rpingmesh.analyzer.sla_violations_total` | Counter | `source_tor`, `target_tor`, `kind` (`loss`/`rtt`) | SLA violations detected |
+
+Analyzer metric attributes are ToR-level only, matching the agent convention;
+per-path GID detail appears only in findings logs, never as a metric attribute.
+
 Histogram bucket boundaries (nanoseconds):
 ```
 100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000, 10000000
@@ -502,9 +524,14 @@ sudo rdma link add rxe0 type rxe netdev eth0
 
 ## Limitations and Future Work
 
-- **Analyzer not implemented.** The data aggregation and analysis component from
-  the original design is out of scope. Probe results are exported as OTLP metrics
-  for external analysis.
+- **Analyzer is Phase 1 only (SLA detection, no fault localization).** Agents
+  aggregate probe results per path over fixed windows and report `PathSummary`
+  batches to the controller, where an in-process analyzer flags per-path SLA
+  violations (loss ratio and p99 network-RTT thresholds) to logs and OTLP
+  metrics. Topology-aware cross-agent switch/link fault *localization* (Phase 2)
+  is future work: it needs a topology join and cross-agent quantile synthesis
+  built on the summaries this phase already collects. Summaries are held
+  in-memory (a bounded recent-window ring); durable storage is not yet wired up.
 
 - **eBPF service tracing not implemented.** The original R-Pingmesh uses eBPF to
   monitor RDMA QP lifecycle events for service-aware monitoring. This rebuild
@@ -526,10 +553,11 @@ sudo rdma link add rxe0 type rxe netdev eth0
   pinglist is still a fixed, configurable random sample of `inter_tor_sample_size`
   ToRs, not itself derived from a coverage-probability target.
 
-- **Analyzer and Service Tracing remain out of scope.** As noted above, the
-  data-aggregation/anomaly-detection Analyzer (switch/link fault
-  localization, priority ranking) and eBPF-based service tracing from the
-  original design are not part of this rebuild.
+- **Analyzer fault localization and Service Tracing remain out of scope.** As
+  noted above, the analyzer detects SLA violations (Phase 1) but does not yet
+  perform topology-aware switch/link fault localization or priority ranking
+  (Phase 2); eBPF-based service tracing from the original design is also not
+  part of this rebuild.
 
 - **No agent self-protection.** There is no hard CPU/memory cap on the
   agent process and no fail-closed behavior (e.g. backing off or shutting

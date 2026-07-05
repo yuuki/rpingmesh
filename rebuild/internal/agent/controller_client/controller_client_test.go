@@ -41,6 +41,13 @@ type fakeControllerServer struct {
 	pinglistDelay time.Duration
 	pinglistResp  *controller_agent.PinglistResponse
 	pinglistErr   error
+
+	// reportFunc, if set, handles ReportProbeAnalysis; otherwise a default
+	// accepted=true ack is returned. reportCalls counts invocations and
+	// lastReport captures the most recent request for assertions.
+	reportFunc  func(req *controller_agent.ProbeAnalysisReport) (*controller_agent.ProbeAnalysisAck, error)
+	reportCalls int
+	lastReport  *controller_agent.ProbeAnalysisReport
 }
 
 func (s *fakeControllerServer) RegisterAgent(
@@ -74,6 +81,20 @@ func (s *fakeControllerServer) GetPinglist(
 		return s.pinglistResp, nil
 	}
 	return &controller_agent.PinglistResponse{}, nil
+}
+
+func (s *fakeControllerServer) ReportProbeAnalysis(
+	_ context.Context, req *controller_agent.ProbeAnalysisReport,
+) (*controller_agent.ProbeAnalysisAck, error) {
+	s.mu.Lock()
+	s.reportCalls++
+	s.lastReport = req
+	s.mu.Unlock()
+
+	if s.reportFunc != nil {
+		return s.reportFunc(req)
+	}
+	return &controller_agent.ProbeAnalysisAck{Accepted: true}, nil
 }
 
 // newTestClient starts srv on an in-process bufconn listener and returns a
@@ -242,6 +263,60 @@ func TestGetPinglist_Success(t *testing.T) {
 	}
 	if len(targets) != 2 {
 		t.Fatalf("got %d targets, want 2", len(targets))
+	}
+}
+
+// TestReportProbeAnalysis_Success verifies the happy path: the report is
+// delivered unchanged and the analyzer's ack (accepted + violation count) is
+// returned to the caller.
+func TestReportProbeAnalysis_Success(t *testing.T) {
+	srv := &fakeControllerServer{
+		reportFunc: func(_ *controller_agent.ProbeAnalysisReport) (*controller_agent.ProbeAnalysisAck, error) {
+			return &controller_agent.ProbeAnalysisAck{Accepted: true, SlaViolations: 2}, nil
+		},
+	}
+	c := newTestClient(t, srv)
+
+	report := &controller_agent.ProbeAnalysisReport{
+		AgentId: "agent-1",
+		Summaries: []*controller_agent.PathSummary{
+			{SourceGid: "fe80::1", TargetGid: "fe80::2", ProbeTotal: 100, ProbeFailed: 50},
+		},
+	}
+	ack, err := c.ReportProbeAnalysis(context.Background(), report)
+	if err != nil {
+		t.Fatalf("ReportProbeAnalysis: %v", err)
+	}
+	if !ack.GetAccepted() {
+		t.Errorf("ack.Accepted = false, want true")
+	}
+	if ack.GetSlaViolations() != 2 {
+		t.Errorf("ack.SlaViolations = %d, want 2", ack.GetSlaViolations())
+	}
+	if srv.reportCalls != 1 {
+		t.Errorf("server saw %d ReportProbeAnalysis calls, want 1", srv.reportCalls)
+	}
+	if got := len(srv.lastReport.GetSummaries()); got != 1 {
+		t.Errorf("server received %d summaries, want 1", got)
+	}
+}
+
+// TestReportProbeAnalysis_RPCError verifies that a transport-level error is
+// wrapped and returned with a nil ack, so the reporter can drop the batch.
+func TestReportProbeAnalysis_RPCError(t *testing.T) {
+	srv := &fakeControllerServer{
+		reportFunc: func(_ *controller_agent.ProbeAnalysisReport) (*controller_agent.ProbeAnalysisAck, error) {
+			return nil, status.Error(codes.Unavailable, "controller busy")
+		},
+	}
+	c := newTestClient(t, srv)
+
+	ack, err := c.ReportProbeAnalysis(context.Background(), &controller_agent.ProbeAnalysisReport{AgentId: "agent-1"})
+	if err == nil {
+		t.Fatal("ReportProbeAnalysis: want error, got nil")
+	}
+	if ack != nil {
+		t.Errorf("ack = %+v, want nil on RPC error", ack)
 	}
 }
 

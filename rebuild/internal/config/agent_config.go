@@ -18,6 +18,12 @@ const DefaultTargetProbeRatePerSecond = 10
 // for time-series continuity. 3600s (1h) matches the R-Pingmesh paper.
 const DefaultFlowLabelRotationPeriodSec = 3600
 
+// DefaultAnalysisWindowSec is the default aggregation window (seconds) over
+// which the agent's PathAggregator groups per-path probe results before
+// reporting a summary to the controller's analyzer. 30s balances reporting
+// volume against detection latency.
+const DefaultAnalysisWindowSec = 30
+
 // AgentConfig holds all configuration for the agent.
 type AgentConfig struct {
 	AgentID                   string   `mapstructure:"agent_id"`
@@ -36,6 +42,14 @@ type AgentConfig struct {
 	// of each target's ECMP flow-label set is refreshed (time-based ECMP path
 	// rotation). See DefaultFlowLabelRotationPeriodSec.
 	FlowLabelRotationPeriodSec uint32 `mapstructure:"flow_label_rotation_period_sec"`
+
+	// AnalysisReportEnabled turns on per-path window aggregation and reporting
+	// of PathSummary batches to the controller's analyzer via
+	// ReportProbeAnalysis. Reporting is best-effort and never blocks probing.
+	AnalysisReportEnabled bool `mapstructure:"analysis_report_enabled"`
+	// AnalysisWindowSec is the aggregation window length in seconds. See
+	// DefaultAnalysisWindowSec.
+	AnalysisWindowSec uint32 `mapstructure:"analysis_window_sec"`
 }
 
 // LoadAgentConfig loads agent configuration from a YAML file, environment
@@ -62,6 +76,8 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("pinglist_update_interval_sec", 300)
 	v.SetDefault("target_probe_rate_per_second", DefaultTargetProbeRatePerSecond)
 	v.SetDefault("flow_label_rotation_period_sec", DefaultFlowLabelRotationPeriodSec)
+	v.SetDefault("analysis_report_enabled", true)
+	v.SetDefault("analysis_window_sec", DefaultAnalysisWindowSec)
 
 	// Enable environment variable override with RPINGMESH_ prefix.
 	// Underscores in env var names map to underscores in config keys.
@@ -128,6 +144,8 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		PinglistUpdateIntervalSec:  v.GetUint32("pinglist_update_interval_sec"),
 		TargetProbeRatePerSecond:   v.GetInt("target_probe_rate_per_second"),
 		FlowLabelRotationPeriodSec: v.GetUint32("flow_label_rotation_period_sec"),
+		AnalysisReportEnabled:      v.GetBool("analysis_report_enabled"),
+		AnalysisWindowSec:          v.GetUint32("analysis_window_sec"),
 	}
 
 	if err := config.Validate(); err != nil {
@@ -156,6 +174,12 @@ func (c *AgentConfig) Validate() error {
 		return fmt.Errorf("flow_label_rotation_period_sec must be > 0, got: %d", c.FlowLabelRotationPeriodSec)
 	}
 
+	// When analysis reporting is on, the window drives a time.Ticker and the
+	// aggregator's window alignment, both of which require a positive length.
+	if c.AnalysisReportEnabled && c.AnalysisWindowSec == 0 {
+		return fmt.Errorf("analysis_window_sec must be > 0 when analysis_report_enabled, got: %d", c.AnalysisWindowSec)
+	}
+
 	return nil
 }
 
@@ -174,4 +198,6 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.Uint32("pinglist-update-interval-sec", 300, "Pinglist update interval in seconds")
 	flags.Int("target-probe-rate-per-second", DefaultTargetProbeRatePerSecond, "Probe rate per second per target")
 	flags.Uint32("flow-label-rotation-period-sec", DefaultFlowLabelRotationPeriodSec, "Period (seconds) over which the rotating ~20% of each target's ECMP flow-label set is refreshed")
+	flags.Bool("analysis-report-enabled", true, "Enable per-path window aggregation and SLA reporting to the controller")
+	flags.Uint32("analysis-window-sec", DefaultAnalysisWindowSec, "Per-path aggregation window length in seconds")
 }

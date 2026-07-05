@@ -14,5 +14,16 @@ ecmp_paths_assumed: 16            # Assumed ECMP fabric width (m)
 ecmp_coverage_probability: 0.9    # Target coverage probability (p, in (0,1))
 ecmp_max_flow_labels: 64          # Hard cap on labels per target (bounds amplification)
 
+# Analyzer (Phase 1)
+# Ingests agent-reported per-path window summaries and flags SLA violations
+# (per-path loss ratio and p99 network-RTT threshold breaches). Findings go to
+# logs (with GID detail) and OTLP metrics (rpingmesh.analyzer.*, ToR-level
+# attributes only).
+analyzer_enabled: true
+analyzer_sla_loss_ratio: 0.02            # per-path loss ratio (0..1) that is a violation
+analyzer_sla_network_rtt_p99_ns: 500000  # per-path p99 network-RTT (ns) that is a violation (0 disables)
+analyzer_window_retention: 20            # recent windows retained in memory
+otel_collector_addr: "localhost:4317"    # OTLP endpoint for analyzer metrics
+
 # Logging
 log_level: "info"                       # debug, info, warn, error

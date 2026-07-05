@@ -11,6 +11,10 @@ service ControllerService {
     rpc RegisterAgent(AgentRegistrationRequest) returns (AgentRegistrationResponse);
     // GetPinglist returns the list of targets for an agent to probe.
     rpc GetPinglist(PinglistRequest) returns (PinglistResponse);
+    // ReportProbeAnalysis reports per-path, window-aggregated probe summaries
+    // from an agent so the controller-side analyzer can detect SLA violations
+    // (and, in a future phase, localize switch/link faults across agents).
+    rpc ReportProbeAnalysis(ProbeAnalysisReport) returns (ProbeAnalysisAck);
 }
 
 // RnicInfo describes an RDMA NIC.
@@ -85,4 +89,50 @@ message PingTarget {
 message PinglistResponse {
     repeated PingTarget targets = 1;
     PinglistType type = 2;
+}
+
+// PathSummary is a window-aggregated summary of one probe path
+// (source RNIC -> target RNIC), produced by the agent-side PathAggregator.
+// Reporting summaries instead of raw per-probe results cuts the controller's
+// ingest volume by roughly three orders of magnitude (see analyzer design).
+//
+// RTT statistics are summary statistics only (min/max plus p50/p99 estimated
+// from fixed histogram buckets); no full histogram is carried, to keep the
+// message small. All RTT fields are network RTT in nanoseconds.
+message PathSummary {
+    string source_gid           = 1;   // source RNIC GID (this agent)
+    string source_tor_id        = 2;   // source RNIC ToR (this agent)
+    string target_gid           = 3;   // target RNIC GID
+    string target_tor_id        = 4;   // target RNIC ToR
+    uint32 target_qpn           = 5;
+    uint64 window_start_unix_ns = 6;   // wall-clock start of the aggregation window
+    uint32 window_duration_ms   = 7;
+    uint32 probe_total          = 8;   // = probe_success + probe_failed + invalid_rtt_count
+    uint32 probe_success        = 9;   // completed with a valid RTT (feeds the RTT stats)
+    uint32 probe_failed         = 10;  // send failure or ACK timeout (counts as loss)
+    uint64 network_rtt_min_ns   = 11;
+    uint64 network_rtt_max_ns   = 12;
+    uint64 network_rtt_p50_ns   = 13;
+    uint64 network_rtt_p99_ns   = 14;
+    // invalid_rtt_count: probes that completed all 6 timestamps (Success) but
+    // whose RTT failed validation (e.g. clock-skew/SW-timestamp noise). Not
+    // counted as loss.
+    uint32 invalid_rtt_count    = 15;
+}
+
+// ProbeAnalysisReport is a batch of window summaries reported by one agent.
+message ProbeAnalysisReport {
+    string agent_id = 1;
+    repeated PathSummary summaries = 2;
+}
+
+// ProbeAnalysisAck acknowledges a ProbeAnalysisReport.
+message ProbeAnalysisAck {
+    bool accepted = 1;
+    // sla_violations is the number of summaries in the acked report that the
+    // controller-side analyzer flagged as SLA violations (loss and/or p99 RTT
+    // threshold breaches). It gives the reporting agent operational feedback
+    // and makes the ingest+detection path observable end-to-end without an
+    // OTLP collector. 0 when the analyzer is disabled.
+    uint32 sla_violations = 2;
 }

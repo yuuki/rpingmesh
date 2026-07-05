@@ -40,7 +40,14 @@ const (
 // ProbeResult contains the complete 6-timestamp probe measurement.
 // Timestamps are in nanoseconds (CLOCK_MONOTONIC or HW timestamps).
 type ProbeResult struct {
-	SequenceNum    uint64
+	SequenceNum uint64
+	// SourceGID is the GID of the local RNIC that sent this probe. It is set
+	// by the Prober from its bound device so that downstream consumers (in
+	// particular the per-path PathAggregator) can key results by
+	// (source, target) even after every device's results are merged into one
+	// fan-in stream. Zero when the emitting Prober has no bound device (test
+	// fakes), which is harmless: such results are never aggregated.
+	SourceGID      [16]byte
 	TargetGID      [16]byte
 	TargetQPN      uint32
 	FlowLabel      uint32

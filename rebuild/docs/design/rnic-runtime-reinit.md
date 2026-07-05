@@ -176,13 +176,25 @@ reinit lock:
    `probers[i]` (a new `Prober.Pause()` / `Resume()` or a cheap "suspend sends"
    flag — sends short-circuit while paused). This prevents new sends against a
    dead queue.
-2. **Detach fan-in for prober *i*.** Signal the single fan-in goroutine bound to
-   `probers[i]` to exit and wait for just that one (see "Fan-in re-wiring").
-3. **Destroy the affected components** using the existing idempotent teardown:
-   `probers[i].Destroy()`, `responders[i].Destroy()`, then their queues are
-   freed inside those; then `proberRings[i].Destroy()`, `respRings[i].Destroy()`,
+2. **Signal fan-in stop for prober *i* (do NOT wait yet).** Close the single
+   fan-in goroutine's per-goroutine `stop` channel. This alone is *not* enough to
+   unblock it: a fan-in goroutine parked in `range probers[i].Results()` waiting
+   for the next value (the common case once sends are paused and nothing is
+   flowing) only observes `stop` from inside its `select` on a send, not while
+   blocked in `range`. So do not wait here — waiting now would deadlock, because
+   `Results()` has not been closed yet. The `stop` signal is issued first only so
+   a goroutine that *is* mid-send on a full channel can unblock promptly.
+3. **Destroy the affected components, THEN wait for the fan-in goroutine.** Using
+   the existing idempotent teardown: `probers[i].Destroy()` (this closes
+   `probers[i].Results()`, which ends the fan-in goroutine's `range` and lets it
+   exit) — **now** wait for that one goroutine to finish (its size-1
+   `sync.WaitGroup`); then `responders[i].Destroy()`, whose queues are freed
+   inside those Destroys; then `proberRings[i].Destroy()`, `respRings[i].Destroy()`,
    `rdma_async_watch_stop(asyncRing[i])`, and finally `devices[i].Close()`.
-   Order matches the header rule (queues before device; rings after queues).
+   The **signal → Destroy() → wait** order is mandatory (it matches the canonical
+   ordering in "Fan-in re-wiring" below and the reasoning in the existing
+   `stopResultsFanIn`); the queue/device/ring teardown order matches the header
+   rule (queues before device; rings after queues).
 4. **Refresh the device list, then re-open the device.**
    **Stale-device-list hazard (must fix first).** The shared bridge context
    caches the device list at startup: Zig `RdmaContext` (`types.zig`) stores
@@ -206,10 +218,27 @@ reinit lock:
      `ibv_get_device_list()`, updating `RdmaContext.device_list` /
      `num_devices` in place. `ibv_free_device_list()` frees only the *list
      array*, not the `ibv_context` of already-opened devices, so healthy RNICs
-     are untouched. Exposed to Go as `Context.RefreshDevices()`. Refresh must be
-     serialized with respect to any open/count call (the reinit already holds the
-     per-device reinit lock; document that device open/count/refresh on the
-     shared context are mutually exclusive).
+     are untouched. Exposed to Go as `Context.RefreshDevices()`.
+
+     **Concurrency: this needs a shared-context mutex, not the per-device reinit
+     lock.** `rdma_refresh_devices` *frees and replaces* the shared
+     `RdmaContext.device_list` array that every open-by-index, open-by-name, and
+     `rdma_get_device_count` call reads. The per-device reinit lock does **not**
+     serialize these: when two RNICs fail at once, each reinit holds its *own*
+     device lock and they run concurrently, so one goroutine can be walking the
+     old `device_list` inside an open/count while the other's refresh frees and
+     swaps it — a use-after-free / stale-open race on shared state. The fix is a
+     dedicated **context-level mutex** (a `sync.Mutex` on the Go `Context`, or an
+     equivalent lock inside the Zig `RdmaContext`) that makes
+     `RefreshDevices` / `OpenDevice` / `OpenDeviceByName` / `GetDeviceCount`
+     mutually exclusive across *all* devices. Each of those bridge calls takes
+     the context mutex for its whole duration (enumeration + open). The per-device
+     reinit lock still serializes a single device's own reinit steps; the
+     context mutex additionally serializes the shared-list operations across
+     concurrent multi-RNIC reinits. Hold ordering: acquire the per-device reinit
+     lock first, then the context mutex only around the refresh+reopen span, and
+     release it before the (device-local) rebuild/re-register steps so a slow
+     re-registration never blocks another device's enumeration.
 
    Then **re-open** with the *same* parameters the agent used originally —
    by name if `AllowedDeviceNames` is set, else by index — passing the same
@@ -283,10 +312,16 @@ largest and riskiest code change and should be its own PR, landed and tested
   continues with its remaining RNICs. Recovery from `DOWN` is a process restart
   (systemd), matching the Non-Goal boundary.
 - **Partial failure (multi-RNIC, one bad card).** This is the common case and is
-  handled by construction: everything is per-device, the supervisor touches only
-  device *i*, and the re-registration sends the full current set (healthy RNICs
-  unchanged, rebuilt RNIC with its new QPN, `DOWN` RNIC omitted so the controller
-  stops distributing it in pinglists via set-replacement).
+  mostly handled by construction: state is per-device, the supervisor touches
+  only device *i*, and the re-registration sends the full current set (healthy
+  RNICs unchanged, rebuilt RNIC with its new QPN, `DOWN` RNIC omitted so the
+  controller stops distributing it in pinglists via set-replacement). The one
+  piece that is **not** per-device is the shared bridge context's device list:
+  two RNICs failing at once run their reinits concurrently and both touch that
+  shared list during refresh+reopen, so those operations must be serialized by
+  the **context-level mutex** described in step 4 — the per-device isolation
+  holds for everything except the shared enumeration, which the context mutex
+  covers.
 - **Event storms / flapping.** Debounce: a `PORT_ERR`/`PORT_ACTIVE` flap only
   pauses/resumes (cheap). Repeated `DEVICE_FATAL` within a short window escalates
   straight to `DOWN` rather than churning QPNs.
@@ -373,14 +408,19 @@ outcome may adjust the event→action table above.
    ring + stop-unblock. No agent behavior change yet (watcher can be started and
    its events logged only). **Includes the investigation** of rxe delete
    behavior.
-2. **P3-I.2 — Device-list refresh C-ABI.** Add
+2. **P3-I.2 — Device-list refresh C-ABI + context mutex.** Add
    `int32_t rdma_refresh_devices(rdma_context_t ctx)` in `zig/src/device.zig`
    (`ibv_free_device_list` + re-run `ibv_get_device_list`, updating
    `RdmaContext.device_list`/`num_devices` in place) and its `main.zig` export +
-   header entry; Go wrapper `Context.RefreshDevices()`. Zig unit test that a
-   refresh re-reads the count and does not disturb an already-open device's
-   handle. Independent of the async watcher; lands before reinit uses it, since
-   without it re-open cannot find a re-added device.
+   header entry; Go wrapper `Context.RefreshDevices()`. **Add the context-level
+   mutex** that makes `RefreshDevices`/`OpenDevice`/`OpenDeviceByName`/
+   `GetDeviceCount` mutually exclusive across all devices (see the concurrency
+   note in the reinit sequence), so concurrent multi-RNIC reinits cannot race the
+   shared device list. Zig/Go unit tests: a refresh re-reads the count and does
+   not disturb an already-open device's handle; a concurrency test (race
+   detector) that interleaves refresh with open/count and asserts no
+   use-after-free/stale read. Independent of the async watcher; lands before
+   reinit uses it, since without it re-open cannot find a re-added device.
 3. **P3-I.3 — Fan-in single-prober replace.** Refactor `createResultsFanIn` /
    `stopResultsFanIn` to per-goroutine stop channels and a helper to
    detach/attach one prober's fan-in without closing the shared channels. Pure

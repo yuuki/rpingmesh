@@ -124,11 +124,30 @@ void     rdma_async_watch_stop(rdma_async_ring_t ring);   /* unblocks + joins wa
 blocks in the watcher thread; `rdma_async_watch_stop` must unblock it
 deterministically. Two workable mechanisms, to be chosen during implementation:
 
-1. **Non-blocking async fd + `poll()`**: dup the device's `async_fd`
-   (`ibv_context.async_fd`), set `O_NONBLOCK`, and have the watcher `poll()` on
-   `{async_fd, shutdown_eventfd}`. `rdma_async_watch_stop` writes the eventfd →
-   `poll` returns → thread drains any pending event and exits. This is the clean
-   approach and is the recommended one.
+1. **`poll()` on `{async_fd, eventfd}`, without changing any fd flags
+   (recommended)**: this is the idiomatic libibverbs pattern for readiness-driven
+   async events. The watcher blocks in `poll(2)` on two descriptors — the device's
+   `ibv_context.async_fd` and a `shutdown_eventfd` — and calls
+   `ibv_get_async_event` **only after** `poll` reports `async_fd` readable, at
+   which point the call returns immediately without blocking (an event is already
+   queued). `rdma_async_watch_stop` `write(2)`s the eventfd → `poll` returns with
+   the eventfd readable → the thread exits. Crucially, **the fd's file status
+   flags are never modified**: `async_fd` stays in its default (blocking) mode and
+   is only ever read after `poll` says data is ready.
+
+   > POSIX note (why we do NOT set `O_NONBLOCK`, and why not via `dup`): file
+   > status flags such as `O_NONBLOCK` live on the **open file description**, not
+   > the file descriptor. `dup(2)` creates a new descriptor referring to the
+   > **same** open file description, so setting `O_NONBLOCK` on a `dup`-ed
+   > `async_fd` would also make the **original** `ibv_context.async_fd`
+   > non-blocking — corrupting any other consumer of it (e.g. a drain path or a
+   > future async-event user), which could then spin on `EAGAIN`. The
+   > "`dup` isolates the original fd" assumption is therefore wrong. The `poll`
+   > approach sidesteps this entirely by never touching the flags: readiness is
+   > established by `poll`, not by non-blocking reads. (In today's rebuild the
+   > watcher would be the sole `ibv_get_async_event` consumer, but relying on that
+   > to justify flipping a shared flag is fragile; the flag-free `poll` design is
+   > correct regardless.)
 2. **Close-to-unblock**: rely on device close to error the blocking call. This
    races the very reinit we are performing and is harder to reason about;
    avoid.
@@ -403,7 +422,9 @@ outcome may adjust the event→action table above.
 
 1. **P3-I.1 — Zig async watcher + C-ABI.** `zig/src/async.zig`, the
    `rdma_async_*` exports, the `rdma_async_event_t` struct, and the
-   non-blocking-fd + eventfd stop mechanism. `internal/rdmabridge` wrappers
+   flag-free `poll({async_fd, eventfd})` stop mechanism (never mutating the
+   `async_fd` file status flags — see the POSIX note above).
+   `internal/rdmabridge` wrappers
    (`AsyncRing`, `Device.WatchAsync`, `AsyncRing.Poll/Stop`). Zig unit tests for
    ring + stop-unblock. No agent behavior change yet (watcher can be started and
    its events logged only). **Includes the investigation** of rxe delete

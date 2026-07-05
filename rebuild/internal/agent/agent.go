@@ -95,6 +95,16 @@ type Agent struct {
 	// reporting is disabled.
 	analysisReporter *AnalysisReporter
 
+	// metricsResultsActive records whether a metrics result consumer will drain
+	// a.results (i.e. a.metrics != nil). It is decided before createResultsFanIn
+	// and read by each fan-in goroutine: when false, the fan-in does NOT send on
+	// a.results at all. Otherwise a full a.results (which nobody drains when
+	// metrics are disabled or MetricsCollector creation failed) would block the
+	// fan-in, stopping it reading from the probers and starving the independent
+	// analysis tee. Analysis reporting can be enabled without metrics, so the
+	// two branches must not be coupled.
+	metricsResultsActive bool
+
 	// agentIP is the host's outbound IP toward the controller, reported in the
 	// registration request's agent_ip field. Best-effort: empty if it cannot be
 	// determined, which never blocks registration.
@@ -194,6 +204,15 @@ func (a *Agent) Initialize(ctx context.Context) error {
 			Msg("Prober created")
 	}
 
+	// Create the metrics collector (if enabled) BEFORE the results fan-in, so
+	// the fan-in knows whether a metrics result consumer will actually drain
+	// a.results. If none will (metrics disabled, or MetricsCollector creation
+	// failed), the fan-in must not send on a.results -- once its buffer filled,
+	// the fan-in would block, stop reading from the probers, and starve the
+	// independent analysis tee too.
+	a.createMetricsCollector(ctx)
+	a.metricsResultsActive = a.metrics != nil
+
 	// Fan-in every prober's Results() channel into a single stream so the
 	// rest of Initialize/Start can keep treating "the" probe result stream
 	// as one channel, as before. When analysis reporting is enabled this also
@@ -231,36 +250,8 @@ func (a *Agent) Initialize(ctx context.Context) error {
 			Msg("Responder created")
 	}
 
-	// Step 7: Create metrics collector if enabled.
-	if a.cfg.MetricsEnabled {
-		a.logger.Info().
-			Str("collector_addr", a.cfg.OtelCollectorAddr).
-			Msg("Creating metrics collector")
-		mc, err := telemetry.NewMetricsCollector(ctx, a.cfg.OtelCollectorAddr)
-		if err != nil {
-			a.logger.Warn().Err(err).
-				Msg("Failed to create metrics collector, continuing without metrics")
-		} else {
-			a.metrics = mc
-			// Surface event-ring drop counts (rings were created in step 4,
-			// above) as an OTel observable counter. A growing count means the
-			// Go poller goroutine is not draining rdma_event_ring_poll fast
-			// enough and completion events are being silently discarded.
-			// Both readers aggregate across all per-device rings under a
-			// single label ("prober"/"responder") to keep metric cardinality
-			// low (matching the source_tor/target_tor-only convention used
-			// elsewhere), rather than reporting one data point per device.
-			if err := a.metrics.RegisterEventRingDropCallback(map[string]func() uint64{
-				"prober":    a.proberRingDropCount,
-				"responder": a.responderRingDropCount,
-			}); err != nil {
-				a.logger.Warn().Err(err).
-					Msg("Failed to register event ring drop count callback")
-			}
-		}
-	} else {
-		a.logger.Info().Msg("Metrics collection is disabled")
-	}
+	// (The metrics collector is created earlier, before the results fan-in; see
+	// createMetricsCollector above.)
 
 	// Determine the host's outbound IP toward the controller so it can be
 	// reported in the registration. Best-effort: on failure agentIP stays
@@ -756,18 +747,58 @@ func (a *Agent) createEventRings() error {
 	return nil
 }
 
+// createMetricsCollector creates the OTel MetricsCollector when metrics are
+// enabled, leaving a.metrics nil (and logging) if metrics are disabled or if
+// creation fails. It is called before createResultsFanIn so the fan-in can
+// tell, via a.metrics != nil, whether a metrics result consumer will run.
+func (a *Agent) createMetricsCollector(ctx context.Context) {
+	if !a.cfg.MetricsEnabled {
+		a.logger.Info().Msg("Metrics collection is disabled")
+		return
+	}
+
+	a.logger.Info().
+		Str("collector_addr", a.cfg.OtelCollectorAddr).
+		Msg("Creating metrics collector")
+	mc, err := telemetry.NewMetricsCollector(ctx, a.cfg.OtelCollectorAddr)
+	if err != nil {
+		a.logger.Warn().Err(err).
+			Msg("Failed to create metrics collector, continuing without metrics")
+		return
+	}
+	a.metrics = mc
+
+	// Surface event-ring drop counts (rings were created earlier) as an OTel
+	// observable counter. A growing count means the Go poller goroutine is not
+	// draining rdma_event_ring_poll fast enough and completion events are being
+	// silently discarded. Both readers aggregate across all per-device rings
+	// under a single label ("prober"/"responder") to keep metric cardinality
+	// low (matching the source_tor/target_tor-only convention used elsewhere),
+	// rather than reporting one data point per device.
+	if err := a.metrics.RegisterEventRingDropCallback(map[string]func() uint64{
+		"prober":    a.proberRingDropCount,
+		"responder": a.responderRingDropCount,
+	}); err != nil {
+		a.logger.Warn().Err(err).
+			Msg("Failed to register event ring drop count callback")
+	}
+}
+
 // createResultsFanIn creates the shared results channel and starts one
 // fan-in goroutine per prober that forwards its Results() into the shared
 // channel. This lets Start() and the metrics result consumer keep treating
 // "the" probe result stream as a single channel even though every device now
 // has its own Prober.
 //
-// Each fan-in goroutine selects between sending on a.results and reading
-// from resultsDone, so it can always return promptly once Stop calls
-// stopResultsFanIn -- whether or not anything is (or ever was) draining
-// a.results. Without this, a fan-in goroutine could block forever on a full
-// a.results when metrics are disabled (or MetricsCollector creation
-// failed), leaking the goroutine and every buffered result.
+// When a.metricsResultsActive is true, each fan-in goroutine selects between
+// sending on a.results and reading from resultsDone, so it can always return
+// promptly once Stop calls stopResultsFanIn -- whether or not anything is (or
+// ever was) draining a.results (e.g. metrics active but the consumer has
+// already stopped during shutdown). When it is false (no metrics consumer will
+// run), the fan-in skips the a.results send entirely: sending on a channel
+// nobody drains would, once full, block the goroutine, stop it reading from the
+// prober, and starve the independent analysis tee. Analysis can be enabled
+// without metrics, so the two branches must stay decoupled.
 func (a *Agent) createResultsFanIn() {
 	a.results = make(chan *probe.ProbeResult, resultChanSize)
 	a.resultsDone = make(chan struct{})
@@ -791,6 +822,12 @@ func (a *Agent) createResultsFanIn() {
 					case a.analysisResults <- result:
 					default:
 					}
+				}
+				// Primary metrics path. Skipped entirely when no metrics
+				// consumer will drain a.results, so a slow/absent metrics
+				// consumer cannot stall the fan-in (and thus the analysis tee).
+				if !a.metricsResultsActive {
+					continue
 				}
 				select {
 				case a.results <- result:

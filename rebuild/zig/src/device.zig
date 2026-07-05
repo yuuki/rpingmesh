@@ -320,6 +320,38 @@ const PortGidResult = struct {
     gid: c.ibv_gid,
 };
 
+/// Formats the diagnostic emitted when at least one active port was found
+/// but the configured `gid_index` did not resolve to a usable GID on it
+/// (either `ibv_query_gid()` failed -- e.g. the index is past the end of
+/// the port's GID table -- or the entry it returned was all zeros).
+///
+/// This is deliberately distinct from the "no active port" case (see
+/// findActivePortAndGid()): a caller reading "no usable GID found on any
+/// active port" when a port *is* up but `gid_index` is simply wrong would
+/// reasonably conclude the link itself is down, sending them down the wrong
+/// debugging path. Naming the device, port, and GID table size lets an
+/// operator immediately see that gid_index is out of range or unpopulated,
+/// without needing to reproduce the failure with ibv_devinfo.
+///
+/// `gid_tbl_len` is the value ibv_query_port() reported for the port
+/// (0 if the port attributes could not be queried at all, which should not
+/// normally happen for a port already found to be active).
+///
+/// Returns the formatted message as a slice into `buf`. If `buf` is too
+/// small to hold the formatted message, returns an empty slice as a safe
+/// fallback (setLastError() also gracefully handles a slice longer than its
+/// internal capacity, but bufPrint itself errors on overflow rather than
+/// truncating).
+fn formatInvalidGidIndexError(buf: []u8, dev_name: []const u8, port_num: u8, gid_index: i32, gid_tbl_len: i32) []const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "gid_index={d} is invalid or not present on device {s} port {d} (GID table size {d}): " ++
+            "active port found, but ibv_query_gid() failed or the entry is empty -- check " ++
+            "gid_index is within [0, {d})",
+        .{ gid_index, dev_name, port_num, gid_tbl_len, gid_tbl_len },
+    ) catch buf[0..0];
+}
+
 /// Iterate over all physical ports to find the first active port with a
 /// non-zero GID at the specified GID index.
 ///
@@ -332,6 +364,12 @@ const PortGidResult = struct {
 /// not interoperate with a RoCE v2 peer even though the GID itself is
 /// non-zero and otherwise looks valid. This validation is purely
 /// informational: the configured gid_index is still used as-is.
+///
+/// On failure, the error set via setLastError() distinguishes two distinct
+/// root causes so operators are not misled into debugging the wrong layer:
+///   1. No port on the device is active at all (link/cabling/switch issue).
+///   2. An active port exists, but gid_index does not resolve to a usable
+///      GID on it (misconfiguration -- see formatInvalidGidIndexError()).
 fn findActivePortAndGid(ibv_ctx: *c.ibv_context, gid_index: i32, dev_name: []const u8) ?PortGidResult {
     // Query device attributes to get the number of physical ports
     var device_attr: c.ibv_device_attr = std.mem.zeroes(c.ibv_device_attr);
@@ -346,6 +384,13 @@ fn findActivePortAndGid(ibv_ctx: *c.ibv_context, gid_index: i32, dev_name: []con
         return null;
     }
 
+    // Remember the first active port encountered (and its GID table size)
+    // so that, if no port yields a usable GID at gid_index, the failure
+    // message can name a specific port instead of implying no port was
+    // ever active.
+    var first_active_port: ?u8 = null;
+    var first_active_gid_tbl_len: i32 = 0;
+
     // Iterate ports 1..phys_port_cnt (verbs API uses 1-based port numbers)
     var port_num: u8 = 1;
     while (port_num <= phys_port_cnt) : (port_num += 1) {
@@ -357,6 +402,11 @@ fn findActivePortAndGid(ibv_ctx: *c.ibv_context, gid_index: i32, dev_name: []con
         // Skip non-active ports
         if (port_attr.state != c.IBV_PORT_ACTIVE) {
             continue;
+        }
+
+        if (first_active_port == null) {
+            first_active_port = port_num;
+            first_active_gid_tbl_len = @intCast(port_attr.gid_tbl_len);
         }
 
         // Query the GID at the specified index on this active port
@@ -386,7 +436,16 @@ fn findActivePortAndGid(ibv_ctx: *c.ibv_context, gid_index: i32, dev_name: []con
         };
     }
 
-    types.setLastError("no usable GID found on any active port");
+    if (first_active_port) |p| {
+        // Sized to comfortably fit the formatted message even in the
+        // (unrealistic) worst case of a 63-byte device name and i32-max
+        // gid_index/gid_tbl_len values -- see formatInvalidGidIndexError().
+        var err_buf: [384]u8 = undefined;
+        const msg = formatInvalidGidIndexError(&err_buf, dev_name, p, gid_index, first_active_gid_tbl_len);
+        types.setLastError(msg);
+    } else {
+        types.setLastError("no active port found on any physical port (link down, cabling, or switch issue)");
+    }
     return null;
 }
 
@@ -699,4 +758,28 @@ test "formatU8Decimal formats zero" {
     const len = formatU8Decimal(&buf, 0);
     try std.testing.expectEqual(@as(usize, 1), len);
     try std.testing.expectEqual(@as(u8, '0'), buf[0]);
+}
+
+test "formatInvalidGidIndexError names the device, port, and gid_index" {
+    var buf: [256]u8 = undefined;
+    const msg = formatInvalidGidIndexError(&buf, "mlx5_0", 1, 100, 3);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "gid_index=100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "mlx5_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "port 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "table size 3") != null);
+}
+
+test "formatInvalidGidIndexError does not claim no port is active" {
+    var buf: [256]u8 = undefined;
+    const msg = formatInvalidGidIndexError(&buf, "rxe0", 1, 5, 2);
+    // The whole point of this message is to distinguish "gid_index is
+    // wrong" from "no active port" -- it must never resemble the latter.
+    try std.testing.expect(std.mem.indexOf(u8, msg, "no usable GID found on any active port") == null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "no active port") == null);
+}
+
+test "formatInvalidGidIndexError with a small buffer returns empty slice" {
+    var buf: [8]u8 = undefined;
+    const msg = formatInvalidGidIndexError(&buf, "mlx5_0", 1, 100, 3);
+    try std.testing.expectEqual(@as(usize, 0), msg.len);
 }

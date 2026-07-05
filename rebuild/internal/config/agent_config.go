@@ -9,8 +9,23 @@ import (
 	"github.com/spf13/viper"
 )
 
-// DefaultTargetProbeRatePerSecond is the default number of probes per second per target.
+// DefaultTargetProbeRatePerSecond is the default number of probes per second
+// per target. It is the backward-compatible uniform rate: when neither
+// tor_mesh_probe_rate_per_second nor inter_tor_probe_rate_per_second is set
+// (both 0), this rate applies to targets of both pinglist types, reproducing
+// the pre-differentiation single-rate behavior.
 const DefaultTargetProbeRatePerSecond = 10
+
+// DefaultTorMeshProbeRatePerSecond and DefaultInterTorProbeRatePerSecond are
+// the defaults for the per-pinglist-type probe rates. They are 0, meaning
+// "inherit target_probe_rate_per_second" so that a deployment which only ever
+// set the legacy single rate keeps its uniform behavior after upgrading. Set
+// them to positive values (see the recommended configs/agent.yaml: ToR-mesh
+// 10pps, inter-ToR 1pps) to get the paper's differentiated per-type rates.
+const (
+	DefaultTorMeshProbeRatePerSecond  = 0
+	DefaultInterTorProbeRatePerSecond = 0
+)
 
 // DefaultFlowLabelRotationPeriodSec is the default period (seconds) over which
 // the rotating subset (~20%) of a target's ECMP flow-label set is refreshed,
@@ -55,7 +70,17 @@ type AgentConfig struct {
 	// target DSCP value D maps to traffic_class = D << 2.
 	TrafficClass              int    `mapstructure:"traffic_class"`
 	PinglistUpdateIntervalSec uint32 `mapstructure:"pinglist_update_interval_sec"`
-	TargetProbeRatePerSecond  int    `mapstructure:"target_probe_rate_per_second"`
+	// TargetProbeRatePerSecond is the legacy uniform per-target probe rate. It
+	// is the fallback for whichever per-pinglist-type rate below is left unset
+	// (0). See EffectiveTorMeshProbeRate / EffectiveInterTorProbeRate.
+	TargetProbeRatePerSecond int `mapstructure:"target_probe_rate_per_second"`
+	// TorMeshProbeRatePerSecond and InterTorProbeRatePerSecond are the
+	// differentiated per-target probe rates for ToR-mesh and inter-ToR targets
+	// respectively (R-Pingmesh probes ToR-mesh more aggressively than inter-ToR).
+	// A value of 0 means "inherit TargetProbeRatePerSecond" for backward
+	// compatibility; a positive value overrides it for that pinglist type.
+	TorMeshProbeRatePerSecond  int `mapstructure:"tor_mesh_probe_rate_per_second"`
+	InterTorProbeRatePerSecond int `mapstructure:"inter_tor_probe_rate_per_second"`
 	// FlowLabelRotationPeriodSec is the period over which the rotating subset
 	// of each target's ECMP flow-label set is refreshed (time-based ECMP path
 	// rotation). See DefaultFlowLabelRotationPeriodSec.
@@ -106,6 +131,8 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("traffic_class", 0)
 	v.SetDefault("pinglist_update_interval_sec", 300)
 	v.SetDefault("target_probe_rate_per_second", DefaultTargetProbeRatePerSecond)
+	v.SetDefault("tor_mesh_probe_rate_per_second", DefaultTorMeshProbeRatePerSecond)
+	v.SetDefault("inter_tor_probe_rate_per_second", DefaultInterTorProbeRatePerSecond)
 	v.SetDefault("flow_label_rotation_period_sec", DefaultFlowLabelRotationPeriodSec)
 	v.SetDefault("analysis_report_enabled", true)
 	v.SetDefault("analysis_window_sec", DefaultAnalysisWindowSec)
@@ -181,6 +208,8 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		TrafficClass:               v.GetInt("traffic_class"),
 		PinglistUpdateIntervalSec:  v.GetUint32("pinglist_update_interval_sec"),
 		TargetProbeRatePerSecond:   v.GetInt("target_probe_rate_per_second"),
+		TorMeshProbeRatePerSecond:  v.GetInt("tor_mesh_probe_rate_per_second"),
+		InterTorProbeRatePerSecond: v.GetInt("inter_tor_probe_rate_per_second"),
 		FlowLabelRotationPeriodSec: v.GetUint32("flow_label_rotation_period_sec"),
 		AnalysisReportEnabled:      v.GetBool("analysis_report_enabled"),
 		AnalysisWindowSec:          v.GetUint32("analysis_window_sec"),
@@ -233,6 +262,17 @@ func (c *AgentConfig) Validate() error {
 		return fmt.Errorf("flow_label_rotation_period_sec must be > 0, got: %d", c.FlowLabelRotationPeriodSec)
 	}
 
+	// Per-pinglist-type probe rates must be non-negative; 0 selects the
+	// backward-compatible fallback to target_probe_rate_per_second. A negative
+	// value is meaningless (the limiter treats <=0 as "disabled", which would
+	// silently defeat the intended cap), so reject it up front.
+	if c.TorMeshProbeRatePerSecond < 0 {
+		return fmt.Errorf("tor_mesh_probe_rate_per_second must be >= 0, got: %d", c.TorMeshProbeRatePerSecond)
+	}
+	if c.InterTorProbeRatePerSecond < 0 {
+		return fmt.Errorf("inter_tor_probe_rate_per_second must be >= 0, got: %d", c.InterTorProbeRatePerSecond)
+	}
+
 	// When analysis reporting is on, the window drives a time.Ticker and the
 	// aggregator's window alignment, both of which require a positive length.
 	if c.AnalysisReportEnabled && c.AnalysisWindowSec == 0 {
@@ -247,6 +287,27 @@ func (c *AgentConfig) Validate() error {
 	}
 
 	return nil
+}
+
+// EffectiveTorMeshProbeRate returns the per-target probe rate (probes/sec) to
+// apply to ToR-mesh targets. TorMeshProbeRatePerSecond takes effect when it is
+// positive; otherwise it falls back to TargetProbeRatePerSecond so a deployment
+// that only set the legacy uniform rate keeps its behavior unchanged.
+func (c *AgentConfig) EffectiveTorMeshProbeRate() int {
+	if c.TorMeshProbeRatePerSecond > 0 {
+		return c.TorMeshProbeRatePerSecond
+	}
+	return c.TargetProbeRatePerSecond
+}
+
+// EffectiveInterTorProbeRate returns the per-target probe rate (probes/sec) to
+// apply to inter-ToR targets, using the same fallback rule as
+// EffectiveTorMeshProbeRate.
+func (c *AgentConfig) EffectiveInterTorProbeRate() int {
+	if c.InterTorProbeRatePerSecond > 0 {
+		return c.InterTorProbeRatePerSecond
+	}
+	return c.TargetProbeRatePerSecond
 }
 
 // BindAgentFlags binds common agent CLI flags to a pflag.FlagSet.
@@ -264,7 +325,9 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.Int("service-level", 0, "Service Level (SL, PFC priority) for Address Handles (0-7)")
 	flags.Int("traffic-class", 0, "GRH traffic class (DSCP << 2) for Address Handles (0-255)")
 	flags.Uint32("pinglist-update-interval-sec", 300, "Pinglist update interval in seconds")
-	flags.Int("target-probe-rate-per-second", DefaultTargetProbeRatePerSecond, "Probe rate per second per target")
+	flags.Int("target-probe-rate-per-second", DefaultTargetProbeRatePerSecond, "Legacy uniform probe rate per second per target (fallback for the per-type rates below when they are 0)")
+	flags.Int("tor-mesh-probe-rate-per-second", DefaultTorMeshProbeRatePerSecond, "Probe rate per second per ToR-mesh target (0 = inherit target-probe-rate-per-second)")
+	flags.Int("inter-tor-probe-rate-per-second", DefaultInterTorProbeRatePerSecond, "Probe rate per second per inter-ToR target (0 = inherit target-probe-rate-per-second)")
 	flags.Uint32("flow-label-rotation-period-sec", DefaultFlowLabelRotationPeriodSec, "Period (seconds) over which the rotating ~20% of each target's ECMP flow-label set is refreshed")
 	flags.Bool("analysis-report-enabled", true, "Enable per-path window aggregation and SLA reporting to the controller")
 	flags.Uint32("analysis-window-sec", DefaultAnalysisWindowSec, "Per-path aggregation window length in seconds")

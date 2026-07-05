@@ -186,13 +186,16 @@ func (a *Agent) Initialize(ctx context.Context) error {
 			return fmt.Errorf("failed to create prober for device %s: %w",
 				dev.Info.DeviceName, err)
 		}
-		if a.cfg.TargetProbeRatePerSecond > 0 {
-			// Per-target rate cap; the prober scales the aggregate limit with the
-			// pinglist size. Differentiated per-pinglist-type rates are a
-			// documented limitation (see README Limitations). Note the cap is
-			// per TARGET, not per flow label: a target's ECMP label set shares
-			// this budget, bounding probe amplification.
-			prober.SetPerTargetRateLimit(float64(a.cfg.TargetProbeRatePerSecond))
+		torMeshRate := a.cfg.EffectiveTorMeshProbeRate()
+		interTorRate := a.cfg.EffectiveInterTorProbeRate()
+		if torMeshRate > 0 || interTorRate > 0 {
+			// Per-target rate caps, differentiated by pinglist type (the prober
+			// scales each type's aggregate limit with that type's target count).
+			// When both per-type keys are unset they inherit the legacy
+			// target_probe_rate_per_second, reproducing a single uniform cap.
+			// Note the cap is per TARGET, not per flow label: a target's ECMP
+			// label set shares this budget, bounding probe amplification.
+			prober.SetPerTypeRateLimit(float64(torMeshRate), float64(interTorRate))
 		}
 		// Configure the ECMP flow-label rotation period (time-based rotation of
 		// the rotating ~20% of each target's label set).

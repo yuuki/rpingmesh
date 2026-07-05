@@ -214,7 +214,9 @@ via Cgo (`CGO_ENABLED=1`).
 | `tor_id` | *(required)* | Top-of-Rack switch identifier |
 | `controller_addr` | `localhost:50051` | Controller gRPC address |
 | `probe_interval_ms` | `500` | Milliseconds between probe rounds |
-| `target_probe_rate_per_second` | `10` | Max probes per second **per target** (a target's ECMP flow labels share this budget) |
+| `target_probe_rate_per_second` | `10` | Legacy **uniform** per-target probe-rate cap. Used as the fallback for whichever per-type cap below is `0`, so a config that only sets this keeps a single uniform rate (a target's ECMP flow labels share this budget) |
+| `tor_mesh_probe_rate_per_second` | `0`† | Per-target probe-rate cap for **ToR-mesh** targets (`0` = inherit `target_probe_rate_per_second`) |
+| `inter_tor_probe_rate_per_second` | `0`† | Per-target probe-rate cap for **inter-ToR** targets (`0` = inherit `target_probe_rate_per_second`) |
 | `pinglist_update_interval_sec` | `300` | Seconds between pinglist refreshes |
 | `flow_label_rotation_period_sec` | `3600` | Period over which the rotating ~20% of each target's ECMP flow-label set is refreshed |
 | `gid_index` | `0` | GID table index on RDMA devices (0-255; see note below) |
@@ -231,6 +233,11 @@ via Cgo (`CGO_ENABLED=1`).
 | `tls_key_file` | `""` | Client private key file (required when `tls_mode=mtls`) |
 | `tls_ca_file` | `""` | CA file used to verify the controller's certificate (required when `tls_mode` is `tls` or `mtls`) |
 | `tls_server_name` | `""` | Overrides the name used for TLS SNI/verification; needed when `controller_addr` is an IP literal that doesn't match the server certificate's subject |
+
+† The built-in default for both per-type rates is `0`, which inherits
+`target_probe_rate_per_second` (effectively `10`) so an upgrade preserves the
+prior uniform behavior. The shipped `configs/agent.yaml` overrides them with the
+paper-style differentiated caps (ToR-mesh `10`, inter-ToR `1`).
 
 `gid_index` selects which entry of the RNIC's GID table to use for RDMA
 traffic; the correct value depends on the device and is not portable across
@@ -452,6 +459,31 @@ debug logs, but deliberately **not** as an OTel metric attribute — per-label
 cardinality would explode the metric space, so aggregate metrics stay
 ToR-level.
 
+### Differentiated per-pinglist-type probe rates
+
+R-Pingmesh probes the ToR-mesh more aggressively than inter-ToR. The controller
+knows which pinglist a target belongs to, so it stamps `pinglist_type` into
+every `PingTarget` (`GenerateTorMeshPinglist` / `GenerateInterTorPinglist`). The
+agent merges the two lists into one target list but keeps the stamp, and the
+Prober holds **one rate limiter per type**: each limiter's aggregate rate is
+`rate_type × (number of targets of that type)`, recomputed on every pinglist
+update so the per-target cadence survives churn. `sendProbes` selects the
+limiter matching each target's `pinglist_type`.
+
+The rates are configured with `tor_mesh_probe_rate_per_second` and
+`inter_tor_probe_rate_per_second`; either left at `0` inherits the legacy
+uniform `target_probe_rate_per_second`, so existing single-rate deployments are
+unaffected on upgrade.
+
+The two limiters cap their types independently. Note that probes are still sent
+from a single per-round loop, so in the (uncommon) regime where the caps
+actually bind — i.e. `probe_interval_ms` is short enough that a round would
+otherwise exceed the caps — the per-round pacing of the two types is sequential
+rather than concurrent. At the default `probe_interval_ms: 500` the caps do not
+bind (the interval, not the cap, sets the cadence), so this coupling is not
+observable; fully decoupling it would require a separate send loop per type and
+is deferred.
+
 ### ToR-Level Metric Cardinality
 
 OpenTelemetry histogram attributes use ToR IDs (`source_tor`, `target_tor`)
@@ -593,12 +625,6 @@ sudo rdma link add rxe0 type rxe netdev eth0
   default `tls_mode: disabled` still uses plaintext gRPC for backward compatibility.
   Production deployments should set `tls_mode: mtls` on both sides. Certificate
   loading is static (no hot-reload) and rotation is not a goal of this implementation.
-
-- **Only a single, uniform probe rate cap.** The Prober enforces
-  `target_probe_rate_per_second` as a per-target cap (the aggregate limit
-  scales with the pinglist size). The paper's per-probe-type differentiated
-  rates (e.g. ToR-mesh probes at 10pps, with a separate rate for inter-ToR
-  probes) are not implemented.
 
 - **Inter-ToR *ToR selection* is a fixed-size random sample.** ECMP *path*
   coverage per target is now sized probabilistically via Eq.(1) (see

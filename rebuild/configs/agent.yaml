@@ -10,7 +10,15 @@ controller_addr: "localhost:50051"
 
 # Probing settings
 probe_interval_ms: 500           # Probe interval in milliseconds
-target_probe_rate_per_second: 10 # Max probes per second PER TARGET (shared across a target's flow labels)
+# Per-target probe-rate caps (probes/sec PER TARGET; a target's ECMP flow labels
+# share this budget, they do not multiply it). R-Pingmesh probes the ToR-mesh
+# more aggressively than inter-ToR, so the two pinglist types have separate caps.
+# target_probe_rate_per_second is the legacy uniform cap: it is used as the
+# fallback for whichever per-type cap below is left at 0, so an existing config
+# that only sets it keeps a single uniform rate.
+target_probe_rate_per_second: 10   # Fallback cap for any per-type rate left at 0
+tor_mesh_probe_rate_per_second: 10 # ToR-mesh targets (0 = inherit target_probe_rate_per_second)
+inter_tor_probe_rate_per_second: 1 # Inter-ToR targets (0 = inherit target_probe_rate_per_second)
 pinglist_update_interval_sec: 300 # Pinglist refresh interval
 
 # ECMP flow-label rotation

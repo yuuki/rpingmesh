@@ -226,11 +226,21 @@ type Prober struct {
 	// second close(resultChan) panics.
 	destroyOnce sync.Once
 
-	// rateMu guards the send-rate limiter, which SetPerTargetRateLimit may update from
-	// a different goroutine than the probe loop.
-	rateMu       sync.Mutex // guards limiter and perTargetPPS; lock order: targetsMu -> rateMu
-	limiter      probe.RateLimiter
-	perTargetPPS float64
+	// rateMu guards the per-pinglist-type send-rate limiters, which
+	// SetPerTypeRateLimit / SetPerTargetRateLimit may update from a different
+	// goroutine than the probe loop. Lock order: targetsMu -> rateMu.
+	//
+	// There is one limiter per pinglist type (ToR-mesh, inter-ToR) so the two
+	// types can be capped at independent per-target rates (R-Pingmesh probes
+	// ToR-mesh more aggressively than inter-ToR). Each limiter's aggregate rate
+	// is pps * (number of targets of that type), recomputed on every
+	// UpdateTargets so the configured per-target cadence survives pinglist
+	// churn -- exactly as the single aggregate limiter did before, but scoped
+	// per type. sendProbes selects the limiter matching each target's
+	// PinglistType.
+	rateMu       sync.Mutex
+	torMeshRate  perTypeRate
+	interTorRate perTypeRate
 
 	// flowLabelRotationPeriodSec is the period over which the rotating subset
 	// of each target's flow-label set is refreshed. Read only by the probe-loop
@@ -250,6 +260,17 @@ type Prober struct {
 	labelCache map[string]*labelSet
 
 	logger zerolog.Logger
+}
+
+// perTypeRate couples the configured per-target probe rate (pps) for one
+// pinglist type with the aggregate RateLimiter that enforces it. The limiter's
+// rate is pps * (number of targets of that type); pps is retained so
+// UpdateTargets can recompute the aggregate rate when the pinglist size
+// changes. The zero value is a disabled limiter (pps 0), which is what a
+// struct-literal Prober in tests starts with.
+type perTypeRate struct {
+	pps     float64
+	limiter probe.RateLimiter
 }
 
 // labelSet is a cached flow-label set plus the inputs that produced it, so the
@@ -359,29 +380,74 @@ func (p *Prober) Stop() {
 }
 
 // SetPerTargetRateLimit caps the probe send rate to at most pps packets per
-// second per target. The aggregate limiter rate is recomputed as
-// pps * len(targets) here and on every UpdateTargets call, so the configured
-// per-target cadence is preserved as the pinglist grows or shrinks. A
-// non-positive pps disables rate limiting. Safe to call while running.
+// second per target, applying the SAME cap to both pinglist types. It is the
+// backward-compatible single-rate entry point (differentiated rates go through
+// SetPerTypeRateLimit). Each type's aggregate limiter rate is recomputed as
+// pps * (targets of that type) here and on every UpdateTargets call, so the
+// configured per-target cadence is preserved as the pinglist grows or shrinks.
+// A non-positive pps disables rate limiting. Safe to call while running.
 func (p *Prober) SetPerTargetRateLimit(pps float64) {
+	p.SetPerTypeRateLimit(pps, pps)
+}
+
+// SetPerTypeRateLimit caps the probe send rate per target at torMeshPPS for
+// ToR-mesh targets and interTorPPS for inter-ToR targets, independently. Each
+// type's aggregate limiter is set to pps * (number of targets of that type) so
+// the per-target cadence is preserved as the pinglist changes; a non-positive
+// pps disables limiting for that type. Safe to call while running.
+func (p *Prober) SetPerTypeRateLimit(torMeshPPS, interTorPPS float64) {
 	// Hold targetsMu across the whole rate update, taking rateMu nested. This
 	// matches UpdateTargets' lock order (targetsMu -> rateMu) and closes a
-	// TOCTOU window: reading len(targets) and recomputing the aggregate rate
-	// must be atomic w.r.t. a concurrent UpdateTargets, otherwise the two could
-	// interleave and leave the limiter with a rate computed from a stale count.
+	// TOCTOU window: reading the per-type target counts and recomputing the
+	// aggregate rates must be atomic w.r.t. a concurrent UpdateTargets,
+	// otherwise the two could interleave and leave a limiter with a rate
+	// computed from a stale count.
 	p.targetsMu.RLock()
 	defer p.targetsMu.RUnlock()
-	n := len(p.targets)
+	nTorMesh, nInterTor := countTargetsByType(p.targets)
 
 	p.rateMu.Lock()
-	p.perTargetPPS = pps
-	p.limiter.SetRate(pps * float64(n))
+	p.torMeshRate.pps = torMeshPPS
+	p.torMeshRate.limiter.SetRate(torMeshPPS * float64(nTorMesh))
+	p.interTorRate.pps = interTorPPS
+	p.interTorRate.limiter.SetRate(interTorPPS * float64(nInterTor))
 	p.rateMu.Unlock()
 
 	p.logger.Info().
-		Float64("per_target_pps", pps).
-		Int("targets", n).
-		Msg("Probe send rate limit updated")
+		Float64("tor_mesh_pps", torMeshPPS).
+		Int("tor_mesh_targets", nTorMesh).
+		Float64("inter_tor_pps", interTorPPS).
+		Int("inter_tor_targets", nInterTor).
+		Msg("Probe send rate limits updated")
+}
+
+// countTargetsByType counts how many targets belong to each pinglist type. A
+// nil target and any type other than INTER_TOR count as ToR-mesh, which also
+// makes the (proto3-default) zero PinglistType read as TOR_MESH -- the
+// backward-compatible reading of targets from a controller that never stamped
+// the field.
+func countTargetsByType(targets []*controller_agent.PingTarget) (nTorMesh, nInterTor int) {
+	for _, t := range targets {
+		if t == nil {
+			continue
+		}
+		if t.GetPinglistType() == controller_agent.PinglistType_INTER_TOR {
+			nInterTor++
+		} else {
+			nTorMesh++
+		}
+	}
+	return nTorMesh, nInterTor
+}
+
+// rateForType returns the limiter state governing the given pinglist type.
+// INTER_TOR maps to the inter-ToR limiter; everything else (TOR_MESH and the
+// proto3 default) maps to the ToR-mesh limiter. Callers must hold rateMu.
+func (p *Prober) rateForType(ptype controller_agent.PinglistType) *perTypeRate {
+	if ptype == controller_agent.PinglistType_INTER_TOR {
+		return &p.interTorRate
+	}
+	return &p.torMeshRate
 }
 
 // SetFlowLabelRotationPeriod sets the period over which the rotating subset of
@@ -441,17 +507,24 @@ func (p *Prober) UpdateTargets(targets []*controller_agent.PingTarget) {
 	defer p.targetsMu.Unlock()
 	p.targets = targets
 
-	// Keep the aggregate limiter in sync with the per-target rate so the
-	// per-target cadence survives pinglist size changes. Lock order is
-	// always targetsMu -> rateMu.
+	// Keep each type's aggregate limiter in sync with its per-target rate so the
+	// per-target cadence survives pinglist size changes (a type whose count
+	// shrinks must slow its aggregate, and vice versa). Lock order is always
+	// targetsMu -> rateMu.
+	nTorMesh, nInterTor := countTargetsByType(targets)
 	p.rateMu.Lock()
-	if p.perTargetPPS > 0 {
-		p.limiter.SetRate(p.perTargetPPS * float64(len(targets)))
+	if p.torMeshRate.pps > 0 {
+		p.torMeshRate.limiter.SetRate(p.torMeshRate.pps * float64(nTorMesh))
+	}
+	if p.interTorRate.pps > 0 {
+		p.interTorRate.limiter.SetRate(p.interTorRate.pps * float64(nInterTor))
 	}
 	p.rateMu.Unlock()
 
 	p.logger.Info().
 		Int("count", len(targets)).
+		Int("tor_mesh_count", nTorMesh).
+		Int("inter_tor_count", nInterTor).
 		Msg("Probe targets updated")
 }
 
@@ -536,9 +609,10 @@ func (p *Prober) sendProbes(ctx context.Context) {
 			continue
 		}
 
-		// Apply the optional send-rate limit, spacing sends across targets.
-		// The wait is interruptible so Stop() is not delayed by the limiter.
-		if !p.rateLimitWait(ctx) {
+		// Apply the optional send-rate limit for this target's pinglist type,
+		// spacing sends across targets of the same type. The wait is
+		// interruptible so Stop() is not delayed by the limiter.
+		if !p.rateLimitWait(ctx, target.GetPinglistType()) {
 			return
 		}
 
@@ -710,13 +784,13 @@ func (p *Prober) pruneLabelRotation(targets []*controller_agent.PingTarget) {
 }
 
 // rateLimitWait blocks for the duration required by the configured send-rate
-// limit before the next probe may be sent. It returns false if the wait was
-// interrupted by ctx cancellation or Stop(), in which case the caller should
-// abandon the current send batch. When rate limiting is disabled it returns
-// true immediately.
-func (p *Prober) rateLimitWait(ctx context.Context) bool {
+// limit for the given pinglist type before the next probe of that type may be
+// sent. It returns false if the wait was interrupted by ctx cancellation or
+// Stop(), in which case the caller should abandon the current send batch. When
+// rate limiting is disabled for the type it returns true immediately.
+func (p *Prober) rateLimitWait(ctx context.Context, ptype controller_agent.PinglistType) bool {
 	p.rateMu.Lock()
-	wait := p.limiter.Reserve(time.Now())
+	wait := p.rateForType(ptype).limiter.Reserve(time.Now())
 	p.rateMu.Unlock()
 
 	if wait <= 0 {

@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"math"
 	"sort"
 	"sync"
 )
@@ -102,8 +103,14 @@ func (a *pathAccumulator) quantile(q float64) uint64 {
 	if !a.hasRTT || a.success == 0 {
 		return 0
 	}
-	// rank is 1-based: the smallest index whose cumulative count reaches it.
-	rank := uint64(float64(a.success)*q + 0.5)
+	// Nearest-rank method (1-indexed): rank = ceil(q * n). Round-half-up
+	// (q*n + 0.5) is wrong -- it can pick a rank one below ceil(q*n) and so
+	// miss a rare slow tail. E.g. n=151, q=0.99: ceil(0.99*151)=ceil(149.49)=150,
+	// but round-half-up gives round(149.99)=149, landing one rank too low (in
+	// the fast bucket) and hiding a 2-of-151 p99 breach. The small epsilon
+	// absorbs float error so an integer-valued q*n (e.g. from q=0.9) is not
+	// nudged up a whole rank by a representation like 9.0000000000000002.
+	rank := uint64(math.Ceil(q*float64(a.success) - 1e-9))
 	if rank < 1 {
 		rank = 1
 	}

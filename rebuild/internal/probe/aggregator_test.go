@@ -170,6 +170,75 @@ func TestPathAggregator_P99CapturesTail(t *testing.T) {
 	}
 }
 
+// TestPathAggregator_P99NearestRankCapturesRareTail is the Codex counterexample
+// for the off-by-one in the old round-half-up rank: 151 valid samples with only
+// 2 slow ones. Nearest-rank p99 = ceil(0.99*151) = ceil(149.49) = 150, which
+// lands on a slow sample; round-half-up gives round(149.99) = 149 (the fast
+// bucket) and would hide the SLA breach.
+func TestPathAggregator_P99NearestRankCapturesRareTail(t *testing.T) {
+	src, tgt := gid(1), gid(2)
+	agg := NewPathAggregator(testWindowNs)
+
+	for i := 0; i < 149; i++ {
+		agg.AddResult(validResult(src, tgt, "tor-b", 1, 1000), win0Recv) // fast (1us)
+	}
+	for i := 0; i < 2; i++ {
+		agg.AddResult(validResult(src, tgt, "tor-b", 1, 5_000_000), win0Recv) // slow (5ms)
+	}
+
+	s := agg.Collect(win1Recv)[0]
+	if s.ProbeSuccess != 151 {
+		t.Fatalf("ProbeSuccess = %d, want 151", s.ProbeSuccess)
+	}
+	if s.NetworkRTTP99Ns < 5_000_000 {
+		t.Errorf("p99 = %d, want >= 5000000: nearest-rank must capture the 2-of-151 slow tail",
+			s.NetworkRTTP99Ns)
+	}
+	// The median stays firmly in the fast bucket.
+	if s.NetworkRTTP50Ns != 1000 {
+		t.Errorf("p50 = %d, want 1000", s.NetworkRTTP50Ns)
+	}
+}
+
+// TestPathAggregator_P50NearestRank pins p50 (q=0.5) nearest-rank behavior for
+// odd and even sample counts: rank = ceil(n/2). p50 is unchanged by the fix
+// (round-half-up equals ceil at q=0.5), so these must stay consistent with the
+// other percentile tests.
+func TestPathAggregator_P50NearestRank(t *testing.T) {
+	const (
+		fastNs = uint64(1000)      // 1us -> "fast" bucket
+		slowNs = uint64(5_000_000) // 5ms -> "slow" bucket
+	)
+	cases := []struct {
+		name       string
+		fast, slow int
+		wantP50    uint64
+	}{
+		// even n=4: rank ceil(2)=2, among the 2 fast -> fast bucket.
+		{"even_n4_rank2_fast", 2, 2, fastNs},
+		// odd n=3: rank ceil(1.5)=2, 2nd smallest of [fast, slow, slow] -> slow.
+		{"odd_n3_rank2_slow", 1, 2, slowNs},
+		// odd n=5: rank ceil(2.5)=3, 3rd smallest of [fast x3, slow x2] -> fast.
+		{"odd_n5_rank3_fast", 3, 2, fastNs},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src, tgt := gid(1), gid(2)
+			agg := NewPathAggregator(testWindowNs)
+			for i := 0; i < tc.fast; i++ {
+				agg.AddResult(validResult(src, tgt, "tor-b", 1, fastNs), win0Recv)
+			}
+			for i := 0; i < tc.slow; i++ {
+				agg.AddResult(validResult(src, tgt, "tor-b", 1, slowNs), win0Recv)
+			}
+			s := agg.Collect(win1Recv)[0]
+			if s.NetworkRTTP50Ns != tc.wantP50 {
+				t.Errorf("p50 = %d, want %d", s.NetworkRTTP50Ns, tc.wantP50)
+			}
+		})
+	}
+}
+
 func TestPathAggregator_WindowBoundary(t *testing.T) {
 	src, tgt := gid(1), gid(2)
 	agg := NewPathAggregator(testWindowNs)

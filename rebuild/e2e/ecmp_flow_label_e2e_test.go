@@ -50,13 +50,13 @@ func TestECMPMultiFlowLabel(t *testing.T) {
 	}
 	defer rdmaCtx.Destroy()
 
-	proberDev, err := rdmaCtx.OpenDeviceByName(proberDeviceName, gidIndex)
+	proberDev, err := rdmaCtx.OpenDeviceByName(proberDeviceName, gidIndex, testServiceLevel, testTrafficClass)
 	if err != nil {
 		t.Fatalf("open prober device %q: %v", proberDeviceName, err)
 	}
 	defer proberDev.Close()
 
-	responderDev, err := rdmaCtx.OpenDeviceByName(responderDeviceName, gidIndex)
+	responderDev, err := rdmaCtx.OpenDeviceByName(responderDeviceName, gidIndex, testServiceLevel, testTrafficClass)
 	if err != nil {
 		t.Fatalf("open responder device %q: %v", responderDeviceName, err)
 	}

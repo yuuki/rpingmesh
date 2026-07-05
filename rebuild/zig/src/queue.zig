@@ -246,6 +246,9 @@ pub fn destroyQueue(queue: *types.UdQueue) void {
 ///   - Flow label for ECMP path pinning
 ///   - Source GID index from the device configuration
 ///   - Maximum hop limit (255)
+///   - Service Level (sl) and traffic class (DSCP) from the device
+///     configuration (static per-agent values; see RdmaDevice.sl /
+///     RdmaDevice.traffic_class)
 ///
 /// Uses ibv_create_ah() (not rdma_create_ah()) to match the Go implementation.
 pub fn createAddressHandle(
@@ -258,23 +261,19 @@ pub fn createAddressHandle(
     // Global routing is required for RoCE
     ah_attr.is_global = 1;
     ah_attr.port_num = dev.port_num;
-    // Known limitation: sl and traffic_class are fixed at 0 rather than
-    // being configurable. On a production lossless fabric that relies on
-    // PFC/ECN and DSCP-to-TC mappings (RoCEv2 congestion control), probe
-    // traffic sharing traffic_class=0 with best-effort/background traffic
-    // may land in an unintended priority queue, skewing latency
-    // measurements relative to the application traffic the probes are
-    // meant to represent. Left as-is here (no behavior change); a future
-    // fix would thread a configurable DSCP/traffic_class value through
-    // from the agent configuration.
-    ah_attr.sl = 0; // Service Level
+    // Service Level (PFC priority) and traffic class (DSCP) are static,
+    // agent-configured values stored on the device at open time (see
+    // device.zig openDevice()) rather than per-send arguments, since every
+    // send on this device shares the same lossless-class intent and the AH
+    // is already rebuilt per send for flow_label (ECMP) rotation.
+    ah_attr.sl = dev.sl;
 
     // GRH settings
     ah_attr.grh.dgid = types.bytesToGid(target_gid);
     ah_attr.grh.flow_label = flow_label;
     ah_attr.grh.sgid_index = dev.gid_index;
     ah_attr.grh.hop_limit = 255;
-    ah_attr.grh.traffic_class = 0;
+    ah_attr.grh.traffic_class = dev.traffic_class;
 
     const ah = c.ibv_create_ah(dev.pd, &ah_attr) orelse {
         types.setLastError("ibv_create_ah() failed");

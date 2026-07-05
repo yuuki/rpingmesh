@@ -159,7 +159,9 @@ func (ctx *Context) GetDeviceCount() int {
 
 // OpenDevice opens an RDMA device by its index in the device list.
 // The gidIndex specifies which GID table entry to use on the active port.
-func (ctx *Context) OpenDevice(index int, gidIndex int) (*Device, error) {
+// sl and tc are the Service Level (PFC priority, 0-7) and GRH traffic class
+// (DSCP << 2) applied to every Address Handle created for this device.
+func (ctx *Context) OpenDevice(index int, gidIndex int, sl uint8, tc uint8) (*Device, error) {
 	var devHandle C.rdma_device_t
 	var cInfo C.rdma_device_info_t
 
@@ -167,6 +169,8 @@ func (ctx *Context) OpenDevice(index int, gidIndex int) (*Device, error) {
 		ctx.handle,
 		C.int32_t(index),
 		C.int32_t(gidIndex),
+		C.uint8_t(sl),
+		C.uint8_t(tc),
 		&devHandle,
 		&cInfo,
 	)
@@ -185,7 +189,9 @@ func (ctx *Context) OpenDevice(index int, gidIndex int) (*Device, error) {
 
 // OpenDeviceByName opens an RDMA device by its name (e.g., "mlx5_0", "rxe0").
 // The gidIndex specifies which GID table entry to use on the active port.
-func (ctx *Context) OpenDeviceByName(name string, gidIndex int) (*Device, error) {
+// sl and tc are the Service Level (PFC priority, 0-7) and GRH traffic class
+// (DSCP << 2) applied to every Address Handle created for this device.
+func (ctx *Context) OpenDeviceByName(name string, gidIndex int, sl uint8, tc uint8) (*Device, error) {
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
 
@@ -196,6 +202,8 @@ func (ctx *Context) OpenDeviceByName(name string, gidIndex int) (*Device, error)
 		ctx.handle,
 		cName,
 		C.int32_t(gidIndex),
+		C.uint8_t(sl),
+		C.uint8_t(tc),
 		&devHandle,
 		&cInfo,
 	)

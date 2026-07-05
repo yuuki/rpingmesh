@@ -29,7 +29,16 @@ const (
 	responderDeviceName = "rxe1"
 	// gidIndex 1 selects the IPv4-mapped RoCEv2 GID for soft-RoCE devices.
 	// Adjust if ibv_devinfo shows a different valid index for your environment.
-	gidIndex          = 1
+	gidIndex = 1
+	// testServiceLevel and testTrafficClass are deliberately non-zero across
+	// every e2e test in this package to regression-test the sl/traffic_class
+	// wiring (config -> bridge -> Zig RdmaDevice -> Address Handle): AH
+	// creation must still succeed and probes must still round-trip with a
+	// non-default SL/DSCP. rdma_rxe (soft-RoCE) does not implement PFC/DSCP
+	// queuing, so this cannot verify the actual priority-queue *effect* --
+	// only that the values flow through without breaking the data path.
+	testServiceLevel  = uint8(3)
+	testTrafficClass  = uint8(96) // DSCP 24 << 2
 	eventRingCapacity = 256
 	probeTimeoutMS    = uint32(1000)
 	testTimeout       = 30 * time.Second
@@ -58,7 +67,7 @@ func TestRDMAE2ETwoDevices(t *testing.T) {
 	defer rdmaCtx.Destroy()
 
 	// --- Devices ---
-	proberDev, err := rdmaCtx.OpenDeviceByName(proberDeviceName, gidIndex)
+	proberDev, err := rdmaCtx.OpenDeviceByName(proberDeviceName, gidIndex, testServiceLevel, testTrafficClass)
 	if err != nil {
 		t.Fatalf("open prober device %q (gidIndex=%d): %v", proberDeviceName, gidIndex, err)
 	}
@@ -66,7 +75,7 @@ func TestRDMAE2ETwoDevices(t *testing.T) {
 	t.Logf("prober  device: name=%s GID=%s IP=%s",
 		proberDev.Info.DeviceName, proberDev.Info.GID, proberDev.Info.IPAddr)
 
-	responderDev, err := rdmaCtx.OpenDeviceByName(responderDeviceName, gidIndex)
+	responderDev, err := rdmaCtx.OpenDeviceByName(responderDeviceName, gidIndex, testServiceLevel, testTrafficClass)
 	if err != nil {
 		t.Fatalf("open responder device %q (gidIndex=%d): %v", responderDeviceName, gidIndex, err)
 	}

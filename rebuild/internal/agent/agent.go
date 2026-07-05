@@ -673,11 +673,15 @@ func (a *Agent) Run(ctx context.Context) error {
 // devices are opened by index.
 func (a *Agent) openDevices() error {
 	gidIndex := a.cfg.GIDIndex
+	// Config.Validate() guarantees ServiceLevel is in [0,7] and TrafficClass
+	// is in [0,255], so both narrow to uint8 without loss.
+	sl := uint8(a.cfg.ServiceLevel)
+	tc := uint8(a.cfg.TrafficClass)
 
 	if len(a.cfg.AllowedDeviceNames) > 0 {
 		// Open only the explicitly allowed devices by name.
 		for _, name := range a.cfg.AllowedDeviceNames {
-			dev, err := a.rdmaCtx.OpenDeviceByName(name, gidIndex)
+			dev, err := a.rdmaCtx.OpenDeviceByName(name, gidIndex, sl, tc)
 			if err != nil {
 				a.logger.Warn().Err(err).
 					Str("device_name", name).
@@ -699,7 +703,7 @@ func (a *Agent) openDevices() error {
 		}
 
 		for i := 0; i < count; i++ {
-			dev, err := a.rdmaCtx.OpenDevice(i, gidIndex)
+			dev, err := a.rdmaCtx.OpenDevice(i, gidIndex, sl, tc)
 			if err != nil {
 				a.logger.Warn().Err(err).
 					Int("index", i).

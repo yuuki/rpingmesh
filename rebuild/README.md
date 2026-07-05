@@ -218,6 +218,8 @@ via Cgo (`CGO_ENABLED=1`).
 | `pinglist_update_interval_sec` | `300` | Seconds between pinglist refreshes |
 | `flow_label_rotation_period_sec` | `3600` | Period over which the rotating ~20% of each target's ECMP flow-label set is refreshed |
 | `gid_index` | `0` | GID table index on RDMA devices |
+| `service_level` | `0` | Service Level (SL, PFC priority) applied to every Address Handle (0-7) |
+| `traffic_class` | `0` | GRH traffic class octet applied to every Address Handle (0-255). RoCEv2 DSCP occupies the upper 6 bits of this octet: to use DSCP value `N`, set `traffic_class = N << 2` |
 | `allowed_device_names` | `[]` | Device filter (empty = all devices) |
 | `metrics_enabled` | `true` | Enable OpenTelemetry export |
 | `otel_collector_addr` | `localhost:4317` | OTLP gRPC collector endpoint |
@@ -563,10 +565,17 @@ sudo rdma link add rxe0 type rxe netdev eth0
   agent process and no fail-closed behavior (e.g. backing off or shutting
   down probing) when local resource usage or error rates spike.
 
-- **Address Handle `sl` / `traffic_class` are always 0.** `ibv_ah_attr`
-  fields used for PFC priority (service level) and DSCP (traffic class) are
-  not configurable. Deployments relying on PFC/DSCP-based QoS should be
-  aware probes do not carry the expected markings.
+- **Address Handle `sl` / `traffic_class` are a single agent-wide value, not
+  per-target.** `service_level` and `traffic_class` (see Configuration
+  above) are applied to every Address Handle the agent creates, on every
+  device it opens. There is no way to give individual `PingTarget`s (e.g.
+  by `priority`) a different SL/DSCP; that would require per-send AH
+  parameterization, which is left for future work. Also note: on rxe
+  (soft-RoCE, used by the e2e test suite) the kernel driver does not
+  implement PFC or DSCP-based queuing, so the `sl`/`traffic_class` values
+  are carried on the wire but their real-world effect (priority-queue
+  placement) cannot be verified in that environment — only on real RDMA
+  hardware with a PFC/DSCP-aware fabric.
 
 - **No automatic recovery from RDMA device runtime failures.** If an RDMA
   device fails or is removed after the agent has started, there is no

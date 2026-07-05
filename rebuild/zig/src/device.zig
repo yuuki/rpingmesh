@@ -107,9 +107,14 @@ pub fn getDeviceCount(ctx: *types.RdmaContext) i32 {
 ///      validates the GID's RoCE type via sysfs; see logGidTypeInfo())
 ///   4. Populate the DeviceInfo struct with name, GID, and IP
 ///
+/// `sl` and `traffic_class` are static, agent-configured values stored on
+/// the returned device and later applied to every Address Handle created
+/// for it (see createAddressHandle() in queue.zig); they do not affect
+/// device discovery or GID selection.
+///
 /// On failure, all partially allocated resources are cleaned up before
 /// returning the error.
-pub fn openDevice(ctx: *types.RdmaContext, index: i32, gid_index: i32) DeviceError!*types.RdmaDevice {
+pub fn openDevice(ctx: *types.RdmaContext, index: i32, gid_index: i32, sl: u8, traffic_class: u8) DeviceError!*types.RdmaDevice {
     // Validate index bounds
     if (index < 0 or index >= ctx.device_count) {
         types.setLastError("device index out of range");
@@ -178,6 +183,8 @@ pub fn openDevice(ctx: *types.RdmaContext, index: i32, gid_index: i32) DeviceErr
         .port_num = port_result.port_num,
         .gid_index = @intCast(gid_index),
         .gid = port_result.gid,
+        .sl = sl,
+        .traffic_class = traffic_class,
         .device_info = types.DeviceInfo{
             .device_name = device_name,
             .gid = gid_str,
@@ -193,8 +200,9 @@ pub fn openDevice(ctx: *types.RdmaContext, index: i32, gid_index: i32) DeviceErr
 /// Open an RDMA device by name (e.g., "mlx5_0", "rxe0").
 ///
 /// Iterates through the device list and finds the device with the matching
-/// name, then delegates to the openDevice logic.
-pub fn openDeviceByName(ctx: *types.RdmaContext, name: [*:0]const u8, gid_index: i32) DeviceError!*types.RdmaDevice {
+/// name, then delegates to the openDevice logic. `sl` and `traffic_class`
+/// are forwarded unchanged; see openDevice() for their meaning.
+pub fn openDeviceByName(ctx: *types.RdmaContext, name: [*:0]const u8, gid_index: i32, sl: u8, traffic_class: u8) DeviceError!*types.RdmaDevice {
     const device_list = ctx.device_list orelse {
         types.setLastError("device list is null");
         return DeviceError.GetDeviceListFailed;
@@ -211,7 +219,7 @@ pub fn openDeviceByName(ctx: *types.RdmaContext, name: [*:0]const u8, gid_index:
 
         const dev_name = std.mem.sliceTo(dev_name_ptr, 0);
         if (std.mem.eql(u8, dev_name, target_name)) {
-            return openDevice(ctx, i, gid_index);
+            return openDevice(ctx, i, gid_index, sl, traffic_class);
         }
     }
 
@@ -551,6 +559,8 @@ export fn rdma_open_device(
     ctx_ptr: ?*types.RdmaContext,
     index: i32,
     gid_index: i32,
+    service_level: u8,
+    traffic_class: u8,
     out_dev: *?*types.RdmaDevice,
     out_info: *types.DeviceInfo,
 ) i32 {
@@ -559,7 +569,7 @@ export fn rdma_open_device(
         return -1;
     };
 
-    const dev = openDevice(ctx, index, gid_index) catch return -1;
+    const dev = openDevice(ctx, index, gid_index, service_level, traffic_class) catch return -1;
     out_dev.* = dev;
     out_info.* = dev.device_info;
     return 0;
@@ -573,6 +583,8 @@ export fn rdma_open_device_by_name(
     ctx_ptr: ?*types.RdmaContext,
     name: ?[*:0]const u8,
     gid_index: i32,
+    service_level: u8,
+    traffic_class: u8,
     out_dev: *?*types.RdmaDevice,
     out_info: *types.DeviceInfo,
 ) i32 {
@@ -585,7 +597,7 @@ export fn rdma_open_device_by_name(
         return -1;
     };
 
-    const dev = openDeviceByName(ctx, name_ptr, gid_index) catch return -1;
+    const dev = openDeviceByName(ctx, name_ptr, gid_index, service_level, traffic_class) catch return -1;
     out_dev.* = dev;
     out_info.* = dev.device_info;
     return 0;

@@ -134,7 +134,13 @@ func (a *Agent) Initialize(ctx context.Context) error {
 	a.logger.Info().
 		Str("controller_addr", a.cfg.ControllerAddr).
 		Msg("Creating gRPC controller client")
-	grpcClient, err := controller_client.NewGRPCControllerClient(a.cfg.ControllerAddr)
+	grpcClient, err := controller_client.NewGRPCControllerClient(a.cfg.ControllerAddr, &config.TLSClientConfig{
+		Mode:       a.cfg.TLSMode,
+		CertFile:   a.cfg.TLSCertFile,
+		KeyFile:    a.cfg.TLSKeyFile,
+		CAFile:     a.cfg.TLSCAFile,
+		ServerName: a.cfg.TLSServerName,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create gRPC controller client: %w", err)
 	}

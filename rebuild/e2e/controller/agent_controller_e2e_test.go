@@ -76,7 +76,9 @@ func newClient(t *testing.T) *controller_client.GRPCControllerClient {
 	addr := controllerAddr()
 	waitForController(t, addr, 30*time.Second)
 
-	client, err := controller_client.NewGRPCControllerClient(addr)
+	// nil tlsCfg: this suite exercises the plaintext default path, matching
+	// docker-compose.e2e-controller.yml's tls_mode=disabled controller.
+	client, err := controller_client.NewGRPCControllerClient(addr, nil)
 	if err != nil {
 		t.Fatalf("failed to create gRPC client: %v", err)
 	}

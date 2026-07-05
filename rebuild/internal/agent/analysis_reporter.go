@@ -128,13 +128,26 @@ func (r *AnalysisReporter) run(ctx context.Context) {
 			}
 			r.agg.AddResult(res, uint64(r.nowFn().UnixNano()))
 		case <-ticker.C:
-			// Periodic window flush. Uses the run context so an in-flight
-			// periodic send is abandoned promptly once the agent starts
-			// shutting down (ctx cancelled); any window still open at that
-			// point is picked up by flushFinal instead.
-			r.report(ctx, r.agg.Collect(uint64(r.nowFn().UnixNano())))
+			r.collectAndReport(ctx)
 		}
 	}
+}
+
+// collectAndReport performs one periodic window collection: it harvests the
+// completed windows and sends them.
+//
+// It is a no-op once ctx is cancelled (shutdown has begun). This is important:
+// Collect removes the completed windows from the aggregator, so if the
+// subsequent send failed on the cancelled ctx those summaries would be lost and
+// never retried -- even for a reachable controller. Skipping the collection
+// leaves the windows in the aggregator, where flushFinal (which sends on an
+// independent context after the input closes) picks them up. In-flight periodic
+// sends still abort promptly on ctx cancellation, keeping shutdown fast.
+func (r *AnalysisReporter) collectAndReport(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	r.report(ctx, r.agg.Collect(uint64(r.nowFn().UnixNano())))
 }
 
 // flushFinal emits any remaining (including in-progress) window summaries on a

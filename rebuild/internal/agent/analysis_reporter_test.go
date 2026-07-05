@@ -200,6 +200,67 @@ func TestAnalysisReporter_ReportBestEffortOnError(t *testing.T) {
 	}
 }
 
+// TestAnalysisReporter_PeriodicSkippedAfterCancelRecoveredByFinalFlush verifies
+// the fix for the periodic-send-after-cancel data loss: once ctx is cancelled,
+// a periodic collection is skipped entirely, so its completed windows are NOT
+// removed from the aggregator by a Collect whose send would then fail on the
+// cancelled ctx. The windows survive in the aggregator and are delivered by the
+// final flush (independent context) instead.
+func TestAnalysisReporter_PeriodicSkippedAfterCancelRecoveredByFinalFlush(t *testing.T) {
+	fake := &fakeSender{}
+	r := NewAnalysisReporter(fake, "agent-1", "tor-a", 1, nil) // 1s windows
+
+	// Aggregate two results into window [0, 1e9); pin nowFn past that window so
+	// a periodic Collect would consider it complete (and would remove it).
+	src, tgt := srcGID(1), srcGID(2)
+	r.agg.AddResult(validProbeResult(src, tgt, "tor-b", 42), 0)
+	r.agg.AddResult(validProbeResult(src, tgt, "tor-b", 42), 0)
+	r.nowFn = func() time.Time { return time.Unix(2, 0) } // 2s: window [0,1s) is complete
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // shutdown has begun
+
+	// Periodic collection under a cancelled ctx must be a no-op: nothing sent,
+	// and the completed window must remain in the aggregator (not consumed by a
+	// Collect that would then fail to send).
+	r.collectAndReport(ctx)
+	if fake.reportCount() != 0 {
+		t.Fatalf("periodic report ran under cancelled ctx (reportCount=%d, want 0): "+
+			"its Collected window would be lost", fake.reportCount())
+	}
+
+	// The final flush (independent context) must recover and send the window.
+	r.flushFinal()
+	summaries := fake.allSummaries()
+	if len(summaries) != 1 {
+		t.Fatalf("final flush did not recover the window: got %d summaries, want 1", len(summaries))
+	}
+	if got := summaries[0].GetProbeTotal(); got != 2 {
+		t.Errorf("recovered summary ProbeTotal=%d, want 2", got)
+	}
+}
+
+// TestAnalysisReporter_PeriodicCollectsWhenLive is the positive control for the
+// test above: with a live (non-cancelled) ctx, a periodic collection DOES
+// harvest and send the completed window, confirming the skip is specifically
+// gated on ctx cancellation.
+func TestAnalysisReporter_PeriodicCollectsWhenLive(t *testing.T) {
+	fake := &fakeSender{}
+	r := NewAnalysisReporter(fake, "agent-1", "tor-a", 1, nil)
+
+	src, tgt := srcGID(1), srcGID(2)
+	r.agg.AddResult(validProbeResult(src, tgt, "tor-b", 42), 0)
+	r.nowFn = func() time.Time { return time.Unix(2, 0) } // window [0,1s) complete
+
+	r.collectAndReport(context.Background()) // live ctx: must collect + send
+	if fake.reportCount() != 1 {
+		t.Fatalf("live periodic report did not send: reportCount=%d, want 1", fake.reportCount())
+	}
+	if summaries := fake.allSummaries(); len(summaries) != 1 || summaries[0].GetProbeTotal() != 1 {
+		t.Fatalf("live periodic report sent wrong data: %+v", summaries)
+	}
+}
+
 // TestAnalysisReporter_BatchSplitting verifies that more than
 // maxSummariesPerReport summaries are split across multiple bounded reports.
 func TestAnalysisReporter_BatchSplitting(t *testing.T) {

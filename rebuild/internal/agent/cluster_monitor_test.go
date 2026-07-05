@@ -161,6 +161,43 @@ func TestClusterMonitor_FetchPinglists_BothFail_ReusesCache(t *testing.T) {
 	}
 }
 
+// TestClusterMonitor_FetchPinglists_BackfillsInterTorType verifies that when an
+// older controller returns inter-ToR targets without stamping pinglist_type
+// (proto3 default TOR_MESH), the monitor backfills INTER_TOR -- which the agent
+// knows from having issued an INTER_TOR request -- while leaving ToR-mesh
+// targets and any explicitly-stamped value untouched. Without this, the prober
+// would rate-limit those targets as ToR-mesh and ignore the inter-ToR rate.
+func TestClusterMonitor_FetchPinglists_BackfillsInterTorType(t *testing.T) {
+	client := newMockControllerClient()
+	// ToR-mesh target: unstamped (default TOR_MESH), must stay TOR_MESH.
+	client.enqueue(controller_agent.PinglistType_TOR_MESH,
+		[]*controller_agent.PingTarget{targetWithGID("tor-a")}, nil)
+	// Inter-ToR list as an OLD controller would send it: one unstamped target
+	// (default TOR_MESH) plus one a newer controller stamped INTER_TOR.
+	explicit := targetWithGID("inter-explicit")
+	explicit.PinglistType = controller_agent.PinglistType_INTER_TOR
+	client.enqueue(controller_agent.PinglistType_INTER_TOR,
+		[]*controller_agent.PingTarget{targetWithGID("inter-unstamped"), explicit}, nil)
+
+	monitor := newTestClusterMonitor(client, newTestProber())
+	combined := monitor.fetchPinglists(context.Background())
+
+	byGID := make(map[string]controller_agent.PinglistType, len(combined))
+	for _, tgt := range combined {
+		byGID[tgt.GetTargetGid()] = tgt.GetPinglistType()
+	}
+
+	if got := byGID["tor-a"]; got != controller_agent.PinglistType_TOR_MESH {
+		t.Errorf("ToR-mesh target type = %v, want TOR_MESH (unchanged)", got)
+	}
+	if got := byGID["inter-unstamped"]; got != controller_agent.PinglistType_INTER_TOR {
+		t.Errorf("unstamped inter-ToR target type = %v, want INTER_TOR (backfilled)", got)
+	}
+	if got := byGID["inter-explicit"]; got != controller_agent.PinglistType_INTER_TOR {
+		t.Errorf("explicitly-stamped inter-ToR target type = %v, want INTER_TOR (preserved)", got)
+	}
+}
+
 func TestClusterMonitor_UpdateTargets_PushesToProber(t *testing.T) {
 	client := newMockControllerClient()
 	client.enqueue(controller_agent.PinglistType_TOR_MESH, []*controller_agent.PingTarget{targetWithGID("tor-a")}, nil)

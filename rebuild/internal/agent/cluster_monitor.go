@@ -190,6 +190,15 @@ func (m *ClusterMonitor) fetchPinglists(ctx context.Context) []*controller_agent
 			Msg("Failed to fetch INTER_TOR pinglist, reusing cached targets")
 		interTorTargets = m.lastInterTorTargets
 	} else {
+		// Backward compatibility: an older controller does not set
+		// PingTarget.pinglist_type, so inter-ToR targets arrive with the
+		// proto3-default TOR_MESH and the prober would rate-limit them as
+		// ToR-mesh, ignoring inter_tor_probe_rate_per_second. The agent knows
+		// these came from an INTER_TOR request, so stamp the type where it is
+		// unset. A newer controller's explicit INTER_TOR value is left as-is.
+		// ToR-mesh targets need no correction: their correct type equals the
+		// proto3 default, so an unstamped ToR-mesh target is already right.
+		stampUnsetPinglistType(interTorTargets, controller_agent.PinglistType_INTER_TOR)
 		m.lastInterTorTargets = interTorTargets
 	}
 
@@ -209,4 +218,25 @@ func (m *ClusterMonitor) fetchPinglists(ctx context.Context) []*controller_agent
 		Msg("Fetched pinglists from controller")
 
 	return combined
+}
+
+// stampUnsetPinglistType sets ptype on every target whose pinglist_type is
+// still the proto3 default (TOR_MESH / 0), leaving already-stamped targets
+// untouched. It backfills the type for targets returned by an older controller
+// that predates the pinglist_type field, using the request type the agent knows
+// it asked for. It mutates the targets in place, which is safe because they are
+// freshly deserialized and owned by this agent.
+func stampUnsetPinglistType(targets []*controller_agent.PingTarget, ptype controller_agent.PinglistType) {
+	for _, t := range targets {
+		if t == nil {
+			continue
+		}
+		// TOR_MESH is the zero value, so this matches both "explicitly TOR_MESH"
+		// and "unset". That is exactly what we want: only unset (or already-
+		// ToR-mesh) targets are (re)stamped; a controller that explicitly set
+		// INTER_TOR leaves t.GetPinglistType() != TOR_MESH and is preserved.
+		if t.GetPinglistType() == controller_agent.PinglistType_TOR_MESH {
+			t.PinglistType = ptype
+		}
+	}
 }

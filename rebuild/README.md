@@ -213,7 +213,7 @@ via Cgo (`CGO_ENABLED=1`).
 | `target_probe_rate_per_second` | `10` | Max probes per second **per target** (a target's ECMP flow labels share this budget) |
 | `pinglist_update_interval_sec` | `300` | Seconds between pinglist refreshes |
 | `flow_label_rotation_period_sec` | `3600` | Period over which the rotating ~20% of each target's ECMP flow-label set is refreshed |
-| `gid_index` | `0` | GID table index on RDMA devices |
+| `gid_index` | `0` | GID table index on RDMA devices (0-255; see note below) |
 | `service_level` | `0` | Service Level (SL, PFC priority) applied to every Address Handle (0-7) |
 | `traffic_class` | `0` | GRH traffic class octet applied to every Address Handle (0-255). RoCEv2 DSCP occupies the upper 6 bits of this octet: to use DSCP value `N`, set `traffic_class = N << 2` |
 | `allowed_device_names` | `[]` | Device filter (empty = all devices) |
@@ -225,6 +225,19 @@ via Cgo (`CGO_ENABLED=1`).
 | `tls_key_file` | `""` | Client private key file (required when `tls_mode=mtls`) |
 | `tls_ca_file` | `""` | CA file used to verify the controller's certificate (required when `tls_mode` is `tls` or `mtls`) |
 | `tls_server_name` | `""` | Overrides the name used for TLS SNI/verification; needed when `controller_addr` is an IP literal that doesn't match the server certificate's subject |
+
+`gid_index` selects which entry of the RNIC's GID table to use for RDMA
+traffic; the correct value depends on the device and is not portable across
+machines (e.g. real Mellanox NICs commonly place a RoCE v1 entry at index 0
+and the interoperable RoCE v2 entry at a higher index — check with
+`ibv_devinfo -d <dev> -v`). `Validate()` only rejects an obviously-bogus
+value (negative or > 255) at config-load time; the actual per-device
+range/existence check happens when the agent opens the RDMA device. If
+`gid_index` does not resolve to a usable GID, the agent fails to start with
+a specific error identifying the device, port, and GID table size (e.g.
+`gid_index=100 is invalid or not present on device mlx5_0 port 1 (GID table
+size 3)`), rather than a generic "no usable GID found" message that could be
+mistaken for the port itself being down.
 
 ### Controller (`configs/controller.yaml`)
 

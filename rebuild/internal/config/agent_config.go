@@ -18,6 +18,16 @@ const DefaultTargetProbeRatePerSecond = 10
 // for time-series continuity. 3600s (1h) matches the R-Pingmesh paper.
 const DefaultFlowLabelRotationPeriodSec = 3600
 
+// MaxGIDIndex is a coarse sanity upper bound for gid_index. Real ibv GID
+// tables are small (rdma_rxe typically exposes a handful of entries; mlx5
+// rarely exceeds a few dozen), so a huge value can never be valid on any
+// device and is rejected at config-validation time rather than surfacing
+// only as a device-open failure later. Exact per-device range/existence
+// validation still happens in the Zig bridge at device-open time (see
+// findActivePortAndGid() in zig/src/device.zig), since that is the only
+// place the real GID table size is known.
+const MaxGIDIndex = 255
+
 // AgentConfig holds all configuration for the agent.
 type AgentConfig struct {
 	AgentID            string   `mapstructure:"agent_id"`
@@ -175,8 +185,12 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 // an error describing the first invalid field encountered.
 func (c *AgentConfig) Validate() error {
 	// GID index must be non-negative; it indexes into the RNIC's GID table.
-	if c.GIDIndex < 0 {
-		return fmt.Errorf("gid_index must be >= 0, got: %d", c.GIDIndex)
+	// The upper bound is a coarse sanity check, not the real device limit
+	// (which is only known at device-open time): it exists purely to reject
+	// obviously-bogus values (e.g. a typo like 100000) before they reach the
+	// RDMA bridge. See MaxGIDIndex.
+	if c.GIDIndex < 0 || c.GIDIndex > MaxGIDIndex {
+		return fmt.Errorf("gid_index must be between 0 and %d, got: %d", MaxGIDIndex, c.GIDIndex)
 	}
 
 	// Service Level maps directly to ibv_ah_attr.sl, a 4-bit verbs field of
@@ -223,7 +237,7 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.String("otel-collector-addr", "grpc://localhost:4317", "OpenTelemetry collector address")
 	flags.Bool("metrics-enabled", true, "Enable OpenTelemetry metrics export")
 	flags.StringSlice("allowed-device-names", []string{}, "List of allowed RDMA device names (empty = all)")
-	flags.Int("gid-index", 0, "GID index to use for RDMA devices (must be >= 0)")
+	flags.Int("gid-index", 0, "GID index to use for RDMA devices (0-255)")
 	flags.Int("service-level", 0, "Service Level (SL, PFC priority) for Address Handles (0-7)")
 	flags.Int("traffic-class", 0, "GRH traffic class (DSCP << 2) for Address Handles (0-255)")
 	flags.Uint32("pinglist-update-interval-sec", 300, "Pinglist update interval in seconds")

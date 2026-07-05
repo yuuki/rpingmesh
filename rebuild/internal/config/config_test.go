@@ -364,6 +364,22 @@ func TestLoadAgentConfig_NegativeGIDIndex(t *testing.T) {
 	}
 }
 
+func TestLoadAgentConfig_GIDIndexExceedsMax(t *testing.T) {
+	t.Setenv("RPINGMESH_GID_INDEX", "256")
+
+	if _, err := LoadAgentConfig("", nil); err == nil {
+		t.Fatal("expected an error for gid_index=256 (max is 255), got nil")
+	}
+}
+
+func TestLoadAgentConfig_GIDIndexAtMax(t *testing.T) {
+	t.Setenv("RPINGMESH_GID_INDEX", "255")
+
+	if _, err := LoadAgentConfig("", nil); err != nil {
+		t.Fatalf("unexpected error for gid_index=255 (max allowed): %v", err)
+	}
+}
+
 func TestLoadAgentConfig_ServiceLevelAndTrafficClassDefaults(t *testing.T) {
 	cfg, err := LoadAgentConfig("", nil)
 	if err != nil {
@@ -447,6 +463,16 @@ func TestAgentConfig_Validate(t *testing.T) {
 		{
 			name:    "negative gid index",
 			cfg:     AgentConfig{GIDIndex: -1, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600},
+			wantErr: true,
+		},
+		{
+			name:    "gid index at max is valid",
+			cfg:     AgentConfig{GIDIndex: MaxGIDIndex, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600},
+			wantErr: false,
+		},
+		{
+			name:    "gid index exceeds max",
+			cfg:     AgentConfig{GIDIndex: MaxGIDIndex + 1, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600},
 			wantErr: true,
 		},
 		{

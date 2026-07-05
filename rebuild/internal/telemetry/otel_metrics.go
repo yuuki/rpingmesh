@@ -156,6 +156,32 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 		opt(&options)
 	}
 
+	provider, err := NewMeterProvider(ctx, collectorAddr, options.serviceName)
+	if err != nil {
+		return nil, err
+	}
+
+	mc, err := registerInstruments(provider)
+	if err != nil {
+		return nil, err
+	}
+
+	mc.logger.Info().
+		Str("collector_addr", collectorAddr).
+		Dur("flush_interval", periodicReaderInterval).
+		Msg("MetricsCollector initialized")
+
+	return mc, nil
+}
+
+// NewMeterProvider builds an OTLP-exporting MeterProvider tagged with the
+// given service.name and a periodic reader flushing every periodicReaderInterval.
+// It centralizes the OTLP exporter + resource + reader wiring so that any
+// in-process metric producer can reuse it: the agent's MetricsCollector, and
+// the controller-side analyzer (service.name="rpingmesh-analyzer"), which
+// registers its own instruments on the returned provider. The caller owns the
+// provider's lifecycle (Shutdown).
+func NewMeterProvider(ctx context.Context, collectorAddr, serviceName string) (*sdkmetric.MeterProvider, error) {
 	// Create OTLP gRPC exporter targeting the collector.
 	exporter, err := otlpmetricgrpc.New(
 		ctx,
@@ -167,7 +193,7 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 	}
 
 	// Build the OTel resource identifying this service.
-	res, err := buildResource(options.serviceName)
+	res, err := buildResource(serviceName)
 	if err != nil {
 		return nil, err
 	}
@@ -183,18 +209,7 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 			),
 		),
 	)
-
-	mc, err := registerInstruments(provider)
-	if err != nil {
-		return nil, err
-	}
-
-	mc.logger.Info().
-		Str("collector_addr", collectorAddr).
-		Dur("flush_interval", periodicReaderInterval).
-		Msg("MetricsCollector initialized")
-
-	return mc, nil
+	return provider, nil
 }
 
 // NewMetricsCollectorWithProvider creates a MetricsCollector using the given

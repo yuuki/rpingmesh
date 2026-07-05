@@ -176,3 +176,34 @@ func (c *GRPCControllerClient) GetPinglist(
 
 	return resp.GetTargets(), nil
 }
+
+// ReportProbeAnalysis sends a batch of window-aggregated per-path summaries to
+// the controller's analyzer. It is best-effort: the caller (the agent's
+// analysis reporter) drops the batch on any error rather than retrying, so a
+// slow or unreachable controller never stalls active probing. The RPC is
+// bounded by rpcTimeout like the other calls.
+func (c *GRPCControllerClient) ReportProbeAnalysis(
+	ctx context.Context,
+	report *controller_agent.ProbeAnalysisReport,
+) (*controller_agent.ProbeAnalysisAck, error) {
+	c.logger.Debug().
+		Str("agent_id", report.GetAgentId()).
+		Int("summary_count", len(report.GetSummaries())).
+		Msg("Reporting probe analysis to controller")
+
+	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
+	resp, err := c.client.ReportProbeAnalysis(rpcCtx, report)
+	if err != nil {
+		return nil, fmt.Errorf("ReportProbeAnalysis RPC failed: %w", err)
+	}
+
+	c.logger.Debug().
+		Str("agent_id", report.GetAgentId()).
+		Bool("accepted", resp.GetAccepted()).
+		Uint32("sla_violations", resp.GetSlaViolations()).
+		Msg("Probe analysis reported")
+
+	return resp, nil
+}

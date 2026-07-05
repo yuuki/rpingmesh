@@ -194,9 +194,14 @@ type pendingProbe struct {
 // processes first and second ACK responses via its event ring, and
 // produces ProbeResult values on a buffered channel.
 type Prober struct {
-	queue         *rdmabridge.Queue
-	ring          *rdmabridge.EventRing
-	device        *rdmabridge.Device
+	queue  *rdmabridge.Queue
+	ring   *rdmabridge.EventRing
+	device *rdmabridge.Device
+	// sourceGID is the parsed 16-byte GID of the bound device, stamped onto
+	// every emitted ProbeResult so the per-path aggregator can key results by
+	// (source, target). Parsed once at construction; zero if the device GID is
+	// unparseable or the Prober was built without a device (test fakes).
+	sourceGID     [16]byte
 	targets       []*controller_agent.PingTarget
 	targetsMu     sync.RWMutex
 	pending       map[uint64]*pendingProbe // sequence_num -> pending probe info
@@ -277,10 +282,19 @@ func NewProber(device *rdmabridge.Device, ring *rdmabridge.EventRing, probeInter
 		return nil, err
 	}
 
+	// Parse the device GID once so every emitted result can carry its source
+	// without re-parsing. Best-effort: a parse failure leaves sourceGID zero,
+	// which only means such results are not path-aggregated.
+	var sourceGID [16]byte
+	if gid, err := probe.ParseGID(device.Info.GID); err == nil {
+		sourceGID = gid
+	}
+
 	p := &Prober{
 		queue:                      queue,
 		ring:                       ring,
 		device:                     device,
+		sourceGID:                  sourceGID,
 		pending:                    make(map[uint64]*pendingProbe),
 		agentEpoch:                 rand.Uint32(),
 		resultChan:                 make(chan *probe.ProbeResult, resultChanSize),
@@ -942,6 +956,10 @@ func newFailedResult(seqNum uint64, target *controller_agent.PingTarget, flowLab
 // hold pendingMu at the call site's caller); a full channel drops the result
 // with a warning.
 func (p *Prober) emitResult(result *probe.ProbeResult) {
+	// Stamp the source RNIC GID so downstream per-path aggregation can key by
+	// (source, target). Single-writer point: the result is still owned by the
+	// prober here, before any consumer sees it.
+	result.SourceGID = p.sourceGID
 	select {
 	case p.resultChan <- result:
 	default:

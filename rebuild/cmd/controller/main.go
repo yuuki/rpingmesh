@@ -12,15 +12,22 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
 	"github.com/yuuki/rpingmesh/rebuild/internal/config"
 	"github.com/yuuki/rpingmesh/rebuild/internal/controller"
+	"github.com/yuuki/rpingmesh/rebuild/internal/controller/analyzer"
 	"github.com/yuuki/rpingmesh/rebuild/internal/controller/pinglist"
 	"github.com/yuuki/rpingmesh/rebuild/internal/controller/registry"
+	"github.com/yuuki/rpingmesh/rebuild/internal/telemetry"
 	"github.com/yuuki/rpingmesh/rebuild/proto/controller_agent"
 )
+
+// analyzerServiceName is the OTel service.name reported by the controller-side
+// analyzer's metrics, distinguishing them from agent metrics in the collector.
+const analyzerServiceName = "rpingmesh-analyzer"
 
 var configPath string
 
@@ -98,6 +105,22 @@ func run(cmd *cobra.Command, args []string) error {
 		MaxFlowLabels:       cfg.EcmpMaxFlowLabels,
 	})
 
+	// Set up the Phase 1 analyzer if enabled: it ingests agent-reported
+	// per-path summaries and flags SLA violations. Its OTLP metrics are
+	// best-effort (service.name=rpingmesh-analyzer); a failure to build the
+	// meter provider degrades to log-only findings rather than failing startup.
+	// The provider is returned so it can be flushed on shutdown.
+	analyzerProvider := setupAnalyzer(cfg, svc)
+	if analyzerProvider != nil {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := analyzerProvider.Shutdown(shutdownCtx); err != nil {
+				log.Error().Err(err).Msg("Failed to shut down analyzer metrics provider")
+			}
+		}()
+	}
+
 	// Configure gRPC server transport security from tls_mode. disabled (the
 	// default) preserves the original plaintext behavior for backward
 	// compatibility.
@@ -172,4 +195,50 @@ func run(cmd *cobra.Command, args []string) error {
 
 	log.Info().Msg("Controller stopped")
 	return nil
+}
+
+// setupAnalyzer builds the Phase 1 analyzer (when enabled) and wires it into
+// svc. It attempts to create an OTLP meter provider tagged
+// service.name=rpingmesh-analyzer for the analyzer's metrics; if that fails,
+// the analyzer still runs with log-only findings. It returns the meter provider
+// (or nil) so the caller can flush it on shutdown.
+func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerService) *sdkmetric.MeterProvider {
+	if !cfg.AnalyzerEnabled {
+		log.Info().Msg("Analyzer disabled")
+		return nil
+	}
+
+	var provider *sdkmetric.MeterProvider
+	var metrics *analyzer.Metrics
+	if cfg.OtelCollectorAddr != "" {
+		p, err := telemetry.NewMeterProvider(context.Background(), cfg.OtelCollectorAddr, analyzerServiceName)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to create analyzer meter provider; continuing with log-only findings")
+		} else {
+			m, err := analyzer.NewMetrics(p.Meter("rpingmesh.analyzer"))
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to register analyzer metrics; continuing with log-only findings")
+				_ = p.Shutdown(context.Background())
+			} else {
+				provider = p
+				metrics = m
+			}
+		}
+	}
+
+	az := analyzer.New(analyzer.Config{
+		SLALossRatio:       cfg.AnalyzerSLALossRatio,
+		SLANetworkRTTP99Ns: cfg.AnalyzerSLANetworkRTTP99Ns,
+		WindowRetention:    cfg.AnalyzerWindowRetention,
+	}, metrics)
+	svc.SetAnalyzer(az)
+
+	log.Info().
+		Float64("slaLossRatio", cfg.AnalyzerSLALossRatio).
+		Uint64("slaNetworkRttP99Ns", cfg.AnalyzerSLANetworkRTTP99Ns).
+		Int("windowRetention", cfg.AnalyzerWindowRetention).
+		Bool("metricsEnabled", metrics != nil).
+		Msg("Analyzer enabled")
+
+	return provider
 }

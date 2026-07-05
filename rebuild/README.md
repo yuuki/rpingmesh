@@ -319,6 +319,69 @@ The agent will:
 3. Fetch ToR-mesh and inter-ToR pinglists
 4. Begin probing targets and exporting metrics
 
+## Deployment (systemd)
+
+For long-running deployments, both binaries ship with systemd unit files
+(`packaging/systemd/`) and nfpm packaging definitions
+(`packaging/nfpm/`) that build `.deb`/`.rpm` packages.
+
+### Manual install (no package manager)
+
+```sh
+# 1. Build the binaries (see "Building" above).
+make build-controller   # on the controller host (any platform, CGO_ENABLED=0)
+make build-agent        # on each RDMA agent host (Linux, CGO_ENABLED=1)
+
+# 2. Install the binary, unit file, and a starting config on the target host.
+sudo install -m 0755 bin/rpingmesh-controller /usr/bin/rpingmesh-controller
+sudo install -m 0644 packaging/systemd/rpingmesh-controller.service \
+    /usr/lib/systemd/system/rpingmesh-controller.service
+sudo mkdir -p /etc/rpingmesh
+sudo install -m 0644 configs/controller.yaml /etc/rpingmesh/controller.yaml
+# (repeat with rpingmesh-agent / agent.yaml / rpingmesh-agent.service on agent hosts)
+
+# 3. Edit /etc/rpingmesh/*.yaml for the host (tor_id, controller_addr, etc.),
+#    then create the system user/group and RDMA group membership expected by
+#    the unit files (the nfpm packages below do this automatically).
+sudo groupadd --system rpingmesh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
+    --gid rpingmesh rpingmesh
+# Agent hosts only: grant access to /dev/infiniband/* (see the capability
+# note at the top of rpingmesh-agent.service for why CAP_NET_RAW is
+# deliberately *not* granted, and why CAP_IPC_LOCK + LimitMEMLOCK=infinity
+# are).
+sudo usermod -a -G rdma rpingmesh    # if your distro's rdma-core created an "rdma" group
+
+# 4. Enable and start.
+sudo systemctl daemon-reload
+sudo systemctl enable --now rpingmesh-controller.service   # or rpingmesh-agent.service
+```
+
+### Building `.deb`/`.rpm` packages with nfpm
+
+```sh
+# Install nfpm (https://nfpm.goreleaser.com/install/), e.g.:
+go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+# From the rebuild/ directory:
+make package              # builds both agent and controller .deb + .rpm into dist/
+make package-agent         # agent only (Linux/CGO_ENABLED=1 build host required)
+make package-controller    # controller only (any platform, CGO_ENABLED=0)
+
+# Override the package version (default: `git describe --tags --always --dirty`):
+make package VERSION=1.2.3
+```
+
+Each package installs the binary to `/usr/bin/`, the unit file to
+`/usr/lib/systemd/system/`, and a sample config to
+`/etc/rpingmesh/{agent,controller}.yaml.example` (not the live config --
+copy and edit it to `agent.yaml`/`controller.yaml` before starting, since
+required fields like `tor_id` have no default). The package's postinstall
+script creates the `rpingmesh` system user/group and reloads systemd, but
+deliberately does not enable or start the service. Install with
+`dpkg -i dist/rpingmesh-agent_*.deb` / `rpm -i dist/rpingmesh-agent-*.rpm` (or
+your distro's equivalents), then follow step 3-4 above.
+
 ## Wire Format
 
 Probe packets use a 40-byte explicit big-endian serialization format. Packed

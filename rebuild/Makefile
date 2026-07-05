@@ -4,17 +4,33 @@
 
 .PHONY: all build build-zig build-go build-controller build-agent \
         generate generate-proto clean test test-go test-zig test-all vet \
-        test-e2e setup-colima test-e2e-controller clean-e2e-controller help
+        test-e2e setup-colima test-e2e-controller clean-e2e-controller \
+        check-nfpm package package-agent package-controller help
 
 # Directories
 ZIG_DIR := zig
 ZIG_OUT := $(ZIG_DIR)/zig-out
 BIN_DIR := bin
 PROTO_DIR := proto/controller_agent
+DIST_DIR := dist
 
 # Output binaries
 CONTROLLER_BIN := $(BIN_DIR)/rpingmesh-controller
 AGENT_BIN := $(BIN_DIR)/rpingmesh-agent
+
+# Package version/arch, consumed by packaging/nfpm/*.yaml via ${NFPM_VERSION}
+# / ${NFPM_ARCH}. Override on the command line for a release build, e.g.:
+#   make package VERSION=1.2.3
+# deb/rpm both require the version to start with a digit, so the untagged
+# fallback below is "0.0.0+git.<short sha>" rather than raw `git describe`
+# output (which starts with the commit hash, not a digit, when there is no
+# tag on HEAD -- true for this repo today).
+NFPM_VERSION ?= $(shell v=$$(git describe --tags --exact-match 2>/dev/null); if [ -n "$$v" ]; then printf '%s' "$$v" | sed 's/^v//'; else printf '0.0.0+git.%s' "$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; fi)
+NFPM_ARCH ?= $(shell go env GOARCH 2>/dev/null || echo amd64)
+ifdef VERSION
+NFPM_VERSION := $(VERSION)
+endif
+export NFPM_VERSION NFPM_ARCH
 
 # Default target
 all: build
@@ -112,10 +128,41 @@ test-e2e-controller:
 clean-e2e-controller:
 	COMPOSE_FILE=docker-compose.e2e-controller.yml docker compose down -v
 
+# Fail fast with an actionable message if nfpm isn't installed, rather than
+# letting `nfpm package` below fail with "command not found".
+check-nfpm:
+	@command -v nfpm >/dev/null 2>&1 || { \
+		echo "ERROR: nfpm not found on PATH."; \
+		echo "Install it (e.g. 'go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest'"; \
+		echo "or see https://nfpm.goreleaser.com/install/), then re-run 'make package'."; \
+		exit 1; \
+	}
+
+# Build .deb/.rpm packages for both the agent and the controller. See
+# packaging/nfpm/*.yaml and packaging/systemd/*.service, and the "Deployment
+# (systemd)" section of README.md for the full install/enable workflow.
+package: package-agent package-controller
+
+# Requires a Linux/CGO_ENABLED=1 build host with libibverbs-dev/librdmacm-dev
+# (same requirement as build-agent; see README.md "Building").
+package-agent: build-agent check-nfpm
+	@echo "==> Packaging rpingmesh-agent $(NFPM_VERSION) ($(NFPM_ARCH))..."
+	@mkdir -p $(DIST_DIR)
+	nfpm package --config packaging/nfpm/nfpm-agent.yaml --packager deb --target $(DIST_DIR)/
+	nfpm package --config packaging/nfpm/nfpm-agent.yaml --packager rpm --target $(DIST_DIR)/
+	@echo "==> Agent packages written to $(DIST_DIR)/"
+
+package-controller: build-controller check-nfpm
+	@echo "==> Packaging rpingmesh-controller $(NFPM_VERSION) ($(NFPM_ARCH))..."
+	@mkdir -p $(DIST_DIR)
+	nfpm package --config packaging/nfpm/nfpm-controller.yaml --packager deb --target $(DIST_DIR)/
+	nfpm package --config packaging/nfpm/nfpm-controller.yaml --packager rpm --target $(DIST_DIR)/
+	@echo "==> Controller packages written to $(DIST_DIR)/"
+
 # Clean build artifacts
 clean:
 	@echo "==> Cleaning build artifacts..."
-	rm -rf $(BIN_DIR)
+	rm -rf $(BIN_DIR) $(DIST_DIR)
 	cd $(ZIG_DIR) && rm -rf zig-out .zig-cache
 	@echo "==> Clean complete"
 
@@ -141,8 +188,12 @@ help:
 	@echo "  test-e2e             Run RDMA e2e tests via Docker (requires Colima)"
 	@echo "  test-e2e-controller  Run Agent-to-Controller E2E tests (Docker)"
 	@echo "  clean-e2e-controller Clean up Agent-to-Controller E2E Docker resources"
+	@echo "  package              Build .deb/.rpm packages for agent and controller (requires nfpm)"
+	@echo "  package-agent        Build .deb/.rpm packages for the agent only"
+	@echo "  package-controller   Build .deb/.rpm packages for the controller only"
 	@echo "  clean                Remove all build artifacts"
 	@echo ""
 	@echo "Requirements:"
 	@echo "  Go 1.26+, Zig 0.15.2, protoc, libibverbs-dev, librdmacm-dev"
 	@echo "  For test-e2e: colima running, run 'make setup-colima' first"
+	@echo "  For package: nfpm (https://nfpm.goreleaser.com/install/)"

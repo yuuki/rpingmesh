@@ -1,0 +1,74 @@
+# yaml-language-server: $schema=https://nfpm.goreleaser.com/schema.json
+#
+# nfpm packaging definition for rpingmesh-agent (.deb/.rpm).
+#
+# Run from the rebuild/ directory (contents `src` paths below are relative
+# to the current working directory, not to this file):
+#
+#   make package-agent
+#
+# or directly:
+#
+#   nfpm package --config packaging/nfpm/nfpm-agent.yaml --packager deb --target dist/
+#   nfpm package --config packaging/nfpm/nfpm-agent.yaml --packager rpm --target dist/
+#
+# Requires bin/rpingmesh-agent to already be built (`make build-agent`,
+# Linux/CGO_ENABLED=1 host only -- see rebuild/README.md "Building").
+
+name: "rpingmesh-agent"
+arch: "${NFPM_ARCH}"
+platform: "linux"
+version: "${NFPM_VERSION}"
+section: "net"
+priority: "optional"
+maintainer: "R-Pingmesh rebuild maintainers"
+description: |
+  R-Pingmesh RDMA network monitoring agent.
+  Opens RDMA (RoCEv2) devices, runs the 6-timestamp probing protocol against
+  controller-assigned targets, and exports RTT/loss metrics via OpenTelemetry.
+  Requires RDMA-capable hardware or a soft-RoCE (rxe) device.
+homepage: "https://github.com/yuuki/rpingmesh"
+license: "MIT"
+
+# libibverbs/librdmacm are dynamically linked (see rebuild/README.md
+# "Building"); package names differ across distros, hence the per-packager
+# overrides below instead of a single top-level `depends`.
+overrides:
+  deb:
+    depends:
+      - libibverbs1
+      - librdmacm1
+  rpm:
+    depends:
+      - libibverbs
+      - librdmacm
+
+contents:
+  - src: bin/rpingmesh-agent
+    dst: /usr/bin/rpingmesh-agent
+    file_info:
+      mode: 0755
+
+  - src: packaging/systemd/rpingmesh-agent.service
+    dst: /usr/lib/systemd/system/rpingmesh-agent.service
+    file_info:
+      mode: 0644
+
+  - dst: /etc/rpingmesh
+    type: dir
+    file_info:
+      mode: 0755
+
+  # Shipped as a sample, not the live config: agent.yaml has no default for
+  # the required `tor_id` field, so auto-installing it as a "config" file
+  # that systemd reads directly would leave the service crash-looping.
+  # Operators copy this to agent.yaml and edit it (see the "Deployment
+  # (systemd)" section of rebuild/README.md).
+  - src: configs/agent.yaml
+    dst: /etc/rpingmesh/agent.yaml.example
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: packaging/nfpm/scripts/postinstall-agent.sh
+  preremove: packaging/nfpm/scripts/preremove-agent.sh

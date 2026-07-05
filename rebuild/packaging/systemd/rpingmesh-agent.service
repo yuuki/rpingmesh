@@ -1,0 +1,116 @@
+# rpingmesh-agent.service - R-Pingmesh agent (Go + Cgo, links libibverbs via
+# the Zig rdma_bridge static library; see rebuild/README.md "Architecture").
+#
+# Install layout assumed by this unit (see the nfpm packaging definitions in
+# rebuild/packaging/nfpm/ and the "Deployment (systemd)" section of
+# rebuild/README.md):
+#   /usr/bin/rpingmesh-agent            - binary
+#   /etc/rpingmesh/agent.yaml           - config (edit before enabling)
+#   /etc/rpingmesh/agent.env            - optional environment overrides
+#                                          (RPINGMESH_* vars), sourced only if
+#                                          present (see the "-" prefix below)
+#
+# --- RDMA capability requirements (why AmbientCapabilities is set the way it
+# is) -------------------------------------------------------------------
+# The agent opens RDMA devices and posts sends/receives purely through
+# libibverbs (ibv_open_device/ibv_reg_mr/ibv_create_qp/ibv_create_ah -- see
+# zig/src/device.zig, zig/src/memory.zig, zig/src/queue.zig). It does not use
+# rdma_cm/rsocket-style path resolution and never opens an AF_PACKET/SOCK_RAW
+# socket itself (createAddressHandle() in zig/src/queue.zig builds the AH
+# directly from a GID already known via controller registration, using
+# ibv_create_ah(), not rdma_create_ah()). That rules out CAP_NET_RAW: nothing
+# in this process performs raw-socket-based route/neighbor resolution --
+# GID/MAC resolution for RoCEv2 is handled by the kernel/HCA, not userspace.
+#
+# What *is* required:
+#   - CAP_IPC_LOCK: zig/src/memory.zig registers probe/ACK buffers with
+#     ibv_reg_mr(), which pins ("locks") those pages. Without CAP_IPC_LOCK,
+#     the kernel enforces RLIMIT_MEMLOCK against the calling process; a
+#     non-root, capability-less process would fail memory registration once
+#     it exceeds the (typically tiny, 64KiB) default locked-memory limit.
+#   - LimitMEMLOCK=infinity: belt-and-suspenders alongside CAP_IPC_LOCK --
+#     some environments (e.g. containers, or future changes to this unit
+#     that drop CAP_IPC_LOCK) rely on the rlimit alone, since a rlimit of
+#     RLIM_INFINITY bypasses the locked-page check regardless of capability.
+#   - Read/write access to /dev/infiniband/uverbsN (and /dev/infiniband/rdma_cm
+#     if present): this is a device-file permission, not a capability. On
+#     most distributions the rdma-core package ships a udev rule that grants
+#     the "rdma" group access to these nodes -- hence SupplementaryGroups=rdma
+#     below. If your distribution uses a different group (or ACLs) for
+#     /dev/infiniband, adjust SupplementaryGroups accordingly.
+#
+# What this unit deliberately does NOT grant, and why:
+#   - CAP_NET_RAW: not needed (see above). If a future change makes the
+#     agent perform its own raw-socket-based resolution, this must be
+#     revisited.
+#   - CAP_NET_ADMIN / CAP_SYS_ADMIN: only needed to *create* a soft-RoCE
+#     (rxe) device (`rdma link add`, loading the rdma_rxe kernel module --
+#     see docker-compose.e2e.yml's cap_add list, which is a one-time e2e-test
+#     provisioning step, not something the running agent process needs).
+#     Device provisioning happens before this service starts and is out of
+#     scope for this unit.
+#   - PrivateDevices=yes / DevicePolicy=closed: would hide /dev/infiniband/*
+#     from the process, so this unit intentionally leaves device access at
+#     its default (unrestricted) policy.
+
+[Unit]
+Description=R-Pingmesh Agent (RDMA probing + metrics export)
+Documentation=https://github.com/yuuki/rpingmesh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rpingmesh-agent --config /etc/rpingmesh/agent.yaml
+Restart=on-failure
+RestartSec=5s
+
+# "-" prefix: the unit still starts if this file doesn't exist. Use it for
+# host-specific overrides (e.g. RPINGMESH_TOR_ID, RPINGMESH_CONTROLLER_ADDR)
+# instead of editing agent.yaml directly.
+EnvironmentFile=-/etc/rpingmesh/agent.env
+
+# Run as an unprivileged, dedicated system user (created by the nfpm
+# package's postinstall script; see packaging/nfpm/nfpm-agent.yaml), plus
+# supplementary membership in the group that owns /dev/infiniband/* device
+# nodes on this distribution (see the RDMA capability note above).
+User=rpingmesh
+Group=rpingmesh
+SupplementaryGroups=rdma
+
+# RDMA memory registration requirement -- see the block comment above.
+LimitMEMLOCK=infinity
+CapabilityBoundingSet=CAP_IPC_LOCK
+AmbientCapabilities=CAP_IPC_LOCK
+
+# --- Hardening -------------------------------------------------------------
+# Intentionally weaker than rpingmesh-controller.service in the ways that
+# would break RDMA device access (no PrivateDevices, no
+# RestrictAddressFamilies limited to AF_UNIX/AF_INET/AF_INET6 since the
+# verbs/rdma_cm kernel interfaces are reached via ioctl/netlink on existing
+# fds set up by libibverbs, not by this unit restricting socket() calls --
+# but AF_NETLINK is still allowed below for that reason).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+# gRPC client to the controller (TCP/IP) plus netlink used internally by
+# libibverbs/rdma-core for device/GID table queries.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

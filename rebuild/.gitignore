@@ -5,3 +5,6 @@ proto/controller_agent/*.pb.go
 bin/
 zig/zig-out/
 zig/.zig-cache/
+
+# Packaged .deb/.rpm output (`make package`)
+dist/

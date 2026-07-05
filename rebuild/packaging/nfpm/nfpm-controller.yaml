@@ -1,0 +1,60 @@
+# yaml-language-server: $schema=https://nfpm.goreleaser.com/schema.json
+#
+# nfpm packaging definition for rpingmesh-controller (.deb/.rpm).
+#
+# Run from the rebuild/ directory (contents `src` paths below are relative
+# to the current working directory, not to this file):
+#
+#   make package-controller
+#
+# or directly:
+#
+#   nfpm package --config packaging/nfpm/nfpm-controller.yaml --packager deb --target dist/
+#   nfpm package --config packaging/nfpm/nfpm-controller.yaml --packager rpm --target dist/
+#
+# Requires bin/rpingmesh-controller to already be built (`make
+# build-controller`; pure Go, CGO_ENABLED=0, builds on any platform/arch --
+# see rebuild/README.md "Building").
+
+name: "rpingmesh-controller"
+arch: "${NFPM_ARCH}"
+platform: "linux"
+version: "${NFPM_VERSION}"
+section: "net"
+priority: "optional"
+maintainer: "R-Pingmesh rebuild maintainers"
+description: |
+  R-Pingmesh controller service.
+  Manages agent registration and RNIC registry (backed by rqlite) and
+  distributes ToR-mesh/inter-ToR pinglists to agents over gRPC. Pure Go,
+  no RDMA dependency.
+homepage: "https://github.com/yuuki/rpingmesh"
+license: "MIT"
+
+contents:
+  - src: bin/rpingmesh-controller
+    dst: /usr/bin/rpingmesh-controller
+    file_info:
+      mode: 0755
+
+  - src: packaging/systemd/rpingmesh-controller.service
+    dst: /usr/lib/systemd/system/rpingmesh-controller.service
+    file_info:
+      mode: 0644
+
+  - dst: /etc/rpingmesh
+    type: dir
+    file_info:
+      mode: 0755
+
+  # Shipped as a sample, not the live config -- see the equivalent note in
+  # nfpm-agent.yaml. controller.yaml's defaults assume a local rqlite at
+  # http://localhost:4001, which won't be true in most deployments.
+  - src: configs/controller.yaml
+    dst: /etc/rpingmesh/controller.yaml.example
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: packaging/nfpm/scripts/postinstall-controller.sh
+  preremove: packaging/nfpm/scripts/preremove-controller.sh

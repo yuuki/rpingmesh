@@ -1,0 +1,72 @@
+# rpingmesh-controller.service - R-Pingmesh controller (pure Go, CGO_ENABLED=0).
+#
+# The controller has no RDMA/CGO dependency (see rebuild/README.md
+# "Prerequisites"/"Building"), so this unit is hardened much more tightly
+# than rpingmesh-agent.service: no device access, no elevated capabilities,
+# no writable filesystem paths are needed at runtime (config and, if
+# tls_mode != disabled, TLS certificate/key/CA files are only ever read).
+#
+# Install layout assumed by this unit (see the nfpm packaging definitions in
+# rebuild/packaging/nfpm/ and the "Deployment (systemd)" section of
+# rebuild/README.md):
+#   /usr/bin/rpingmesh-controller       - binary
+#   /etc/rpingmesh/controller.yaml      - config (edit before enabling)
+#   /etc/rpingmesh/controller.env       - optional environment overrides
+#                                          (RPINGMESH_* vars), sourced only if
+#                                          present (see the "-" prefix below)
+
+[Unit]
+Description=R-Pingmesh Controller (agent registry + pinglist distribution)
+Documentation=https://github.com/yuuki/rpingmesh
+# The controller talks to rqlite over HTTP (database_uri); if rqlite is
+# managed as a systemd unit on the same host, order after it, but don't hard
+# -require it here since database_uri may point at a remote/clustered rqlite.
+After=network-online.target rqlite.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rpingmesh-controller --config /etc/rpingmesh/controller.yaml
+Restart=on-failure
+RestartSec=5s
+
+# "-" prefix: the unit still starts if this file doesn't exist. Use it for
+# host-specific overrides (e.g. RPINGMESH_DATABASE_URI, RPINGMESH_TLS_MODE)
+# instead of editing controller.yaml directly.
+EnvironmentFile=-/etc/rpingmesh/controller.env
+
+# Run as an unprivileged, dedicated system user/group (created by the nfpm
+# package's postinstall script; see packaging/nfpm/nfpm-controller.yaml).
+User=rpingmesh
+Group=rpingmesh
+
+# --- Hardening -------------------------------------------------------------
+# The controller is pure Go with no RDMA/device requirements, so it can be
+# locked down fully (contrast with rpingmesh-agent.service, which needs
+# /dev/infiniband access and CAP_IPC_LOCK).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+# gRPC server + rqlite HTTP client need TCP/IP; no raw/packet sockets.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

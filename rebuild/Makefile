@@ -165,7 +165,16 @@ package-build-controller:
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(NFPM_ARCH) go build -o $(CONTROLLER_BIN) ./cmd/controller/
 	@echo "==> Controller built for packaging: $(CONTROLLER_BIN)"
 
-package-build-agent:
+# Depends on build-zig: the agent's Cgo build links zig/zig-out/lib/librdmabridge.a
+# (see internal/rdmabridge/bridge.go's cgo LDFLAGS), which plain `go build`
+# does not produce. build-agent has this same requirement, but today only
+# the top-level `build` target sequences build-zig before it (see CLAUDE.md,
+# "After modifying Zig source ... run `make build-zig` before `make
+# build-agent`"). package-build-agent is meant to be runnable standalone
+# (e.g. straight after `make clean`, as `package-agent`'s prerequisite), so
+# it declares the dependency explicitly rather than relying on the caller to
+# remember the ordering.
+package-build-agent: build-zig
 	@echo "==> Building agent for packaging (GOOS=linux GOARCH=$(NFPM_ARCH))..."
 	@mkdir -p $(BIN_DIR)
 	CGO_ENABLED=1 GOOS=linux GOARCH=$(NFPM_ARCH) go build -o $(AGENT_BIN) ./cmd/agent/

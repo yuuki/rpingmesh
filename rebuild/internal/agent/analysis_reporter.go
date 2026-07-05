@@ -80,9 +80,15 @@ func NewAnalysisReporter(
 }
 
 // Start launches the reporter goroutine. It returns immediately; the goroutine
-// runs until input is closed or ctx is cancelled, then flushes a final partial
-// window (best-effort) before exiting. Call Wait to block until it has exited
-// (do so before closing the gRPC client so the final flush can still be sent).
+// runs until its input channel is closed (by Agent.stopResultsFanIn at
+// shutdown), then flushes and sends the final window before exiting. It does
+// NOT stop on ctx cancellation: on a signal stop the ctx is cancelled before
+// the fan-in is torn down, so exiting on ctx would drop the last results still
+// draining out of the fan-in. ctx only bounds in-flight periodic sends; the
+// final flush uses an independent context so it is delivered regardless. Call
+// Wait to block until it has exited -- do so after stopResultsFanIn (which
+// closes the input) and before closing the gRPC client (so the final flush can
+// still be sent).
 func (r *AnalysisReporter) Start(ctx context.Context) {
 	r.wg.Add(1)
 	go r.run(ctx)
@@ -104,19 +110,29 @@ func (r *AnalysisReporter) run(ctx context.Context) {
 
 	for {
 		select {
-		case <-ctx.Done():
-			r.flushFinal()
-			return
 		case res, ok := <-r.input:
 			if !ok {
-				// The fan-in closed the branch: agent is shutting down.
+				// The input branch was closed by Agent.stopResultsFanIn, which
+				// runs only after every prober was destroyed and every fan-in
+				// goroutine drained. That close is the SOLE shutdown trigger:
+				// draining off it (rather than ctx cancellation) guarantees the
+				// last results still flowing out of the fan-in during prober
+				// teardown are aggregated into the final window instead of
+				// being dropped. On a signal stop the ctx passed to Start is
+				// cancelled first, but we deliberately keep reading here until
+				// the channel closes. flushFinal sends on an independent
+				// context so the final window is delivered even though ctx is
+				// already cancelled.
 				r.flushFinal()
 				return
 			}
 			r.agg.AddResult(res, uint64(r.nowFn().UnixNano()))
 		case <-ticker.C:
-			summaries := r.agg.Collect(uint64(r.nowFn().UnixNano()))
-			r.report(ctx, summaries)
+			// Periodic window flush. Uses the run context so an in-flight
+			// periodic send is abandoned promptly once the agent starts
+			// shutting down (ctx cancelled); any window still open at that
+			// point is picked up by flushFinal instead.
+			r.report(ctx, r.agg.Collect(uint64(r.nowFn().UnixNano())))
 		}
 	}
 }
@@ -176,11 +192,11 @@ func (r *AnalysisReporter) report(ctx context.Context, summaries []probe.PathSum
 // GIDs as canonical strings.
 func (r *AnalysisReporter) toProto(s *probe.PathSummary) *controller_agent.PathSummary {
 	return &controller_agent.PathSummary{
-		SourceGid:        probe.FormatGID(s.SourceGID),
-		SourceTorId:      r.sourceTorID,
-		TargetGid:        probe.FormatGID(s.TargetGID),
-		TargetTorId:      s.TargetTorID,
-		TargetQpn:        s.TargetQPN,
+		SourceGid:         probe.FormatGID(s.SourceGID),
+		SourceTorId:       r.sourceTorID,
+		TargetGid:         probe.FormatGID(s.TargetGID),
+		TargetTorId:       s.TargetTorID,
+		TargetQpn:         s.TargetQPN,
 		WindowStartUnixNs: s.WindowStartUnixNs,
 		WindowDurationMs:  s.WindowDurationMs,
 		ProbeTotal:        s.ProbeTotal,

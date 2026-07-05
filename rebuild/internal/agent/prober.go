@@ -194,8 +194,8 @@ type pendingProbe struct {
 // processes first and second ACK responses via its event ring, and
 // produces ProbeResult values on a buffered channel.
 type Prober struct {
-	queue *rdmabridge.Queue
-	ring  *rdmabridge.EventRing
+	queue  *rdmabridge.Queue
+	ring   *rdmabridge.EventRing
 	device *rdmabridge.Device
 	// sourceGID is the parsed 16-byte GID of the bound device, stamped onto
 	// every emitted ProbeResult so the per-path aggregator can key results by

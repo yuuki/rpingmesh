@@ -108,9 +108,12 @@ func TestAnalysisReporter_FinalFlushOnInputClose(t *testing.T) {
 	}
 }
 
-// TestAnalysisReporter_CtxCancelStops verifies the reporter also exits promptly
-// on context cancellation (not only input close).
-func TestAnalysisReporter_CtxCancelStops(t *testing.T) {
+// TestAnalysisReporter_CtxCancelAloneDoesNotStop verifies the shutdown
+// contract: the reporter does NOT exit on ctx cancellation; it exits only when
+// its input channel is closed. On a signal stop the ctx is cancelled before the
+// fan-in is torn down, so exiting on ctx would drop the last results still
+// draining out of the fan-in.
+func TestAnalysisReporter_CtxCancelAloneDoesNotStop(t *testing.T) {
 	fake := &fakeSender{}
 	input := make(chan *probe.ProbeResult, 4)
 	r := NewAnalysisReporter(fake, "agent-1", "tor-a", 3600, input)
@@ -119,12 +122,64 @@ func TestAnalysisReporter_CtxCancelStops(t *testing.T) {
 	r.Start(ctx)
 	cancel()
 
+	// The reporter must still be running: Wait must not return on ctx cancel.
 	done := make(chan struct{})
 	go func() { r.Wait(); close(done) }()
 	select {
 	case <-done:
+		t.Fatal("reporter exited on ctx cancellation; it must exit only when input closes")
+	case <-time.After(200 * time.Millisecond):
+		// Expected: still running.
+	}
+
+	// Closing the input is the only thing that stops it.
+	close(input)
+	select {
+	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("reporter did not stop on context cancellation")
+		t.Fatal("reporter did not stop after input closed")
+	}
+}
+
+// TestAnalysisReporter_SignalStopFlushesResultsAfterCtxCancel reproduces the
+// signal-stop ordering the reporter must survive: cmd/agent cancels the Start
+// context first, and only afterward does Agent.Stop tear down the probers and
+// fan-in, pushing the last results and finally closing the input. Those
+// post-cancel results must be aggregated into the final window AND actually
+// sent, even though ctx is already cancelled.
+func TestAnalysisReporter_SignalStopFlushesResultsAfterCtxCancel(t *testing.T) {
+	fake := &fakeSender{}
+	input := make(chan *probe.ProbeResult, 8)
+	// Long window so the periodic ticker never fires: the only send is the
+	// final flush, making the assertion unambiguous.
+	r := NewAnalysisReporter(fake, "agent-1", "tor-a", 3600, input)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+
+	// Signal stop: context is cancelled FIRST...
+	cancel()
+
+	// ...then the fan-in's final results arrive (as probers are stopped), and
+	// only then is the input closed by stopResultsFanIn.
+	src, tgt := srcGID(1), srcGID(2)
+	input <- validProbeResult(src, tgt, "tor-b", 42)
+	input <- validProbeResult(src, tgt, "tor-b", 42)
+	input <- validProbeResult(src, tgt, "tor-b", 42)
+	close(input)
+
+	r.Wait()
+
+	// All three post-cancel results must be in the final window and delivered.
+	summaries := fake.allSummaries()
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 final summary, got %d (post-cancel results were dropped)", len(summaries))
+	}
+	if got := summaries[0].GetProbeTotal(); got != 3 {
+		t.Errorf("final summary ProbeTotal = %d, want 3 (all post-cancel results aggregated)", got)
+	}
+	if fake.reportCount() != 1 {
+		t.Errorf("final flush was not sent despite cancelled ctx: reportCount = %d, want 1", fake.reportCount())
 	}
 }
 

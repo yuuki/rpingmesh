@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +43,11 @@ const (
 	eventRingCapacity = 256
 	probeTimeoutMS    = uint32(1000)
 	testTimeout       = 30 * time.Second
+	// invalidGidIndex is well past rdma_rxe's small GID table (a handful of
+	// entries) but still within the config-level sanity bound
+	// (config.MaxGIDIndex = 255), so it exercises the Zig device-open
+	// diagnostic rather than being rejected earlier by config validation.
+	invalidGidIndex = 100
 )
 
 // TestRDMAE2ETwoDevices verifies a full probe/ACK round-trip between two
@@ -270,6 +276,54 @@ func TestRDMAE2ETwoDevices(t *testing.T) {
 		t.Fatalf("responder goroutine error (waiting for second ACK): %v", err)
 	case <-testCtx.Done():
 		t.Fatal("timeout: second ACK not received within test timeout")
+	}
+}
+
+// TestInvalidGidIndexFailsFast verifies that opening a device with a
+// gid_index that does not resolve to a usable GID on the (active) rxe0
+// port fails immediately with a specific, actionable error -- naming the
+// device, port, and GID table size -- rather than a generic message that
+// could be mistaken for "no active port found" (see P2-E in the rebuild
+// design notes / zig/src/device.zig's findActivePortAndGid()).
+func TestInvalidGidIndexFailsFast(t *testing.T) {
+	if os.Getenv("RDMA_E2E_ENABLED") != "1" {
+		t.Skip("RDMA_E2E_ENABLED not set; run via 'make test-e2e' or set RDMA_E2E_ENABLED=1")
+	}
+
+	rdmaCtx, err := rdmabridge.Init()
+	if err != nil {
+		t.Fatalf("rdmabridge.Init: %v", err)
+	}
+	defer rdmaCtx.Destroy()
+
+	_, err = rdmaCtx.OpenDeviceByName(proberDeviceName, invalidGidIndex, testServiceLevel, testTrafficClass)
+	if err == nil {
+		t.Fatalf("expected OpenDeviceByName(%q, gidIndex=%d) to fail, but it succeeded",
+			proberDeviceName, invalidGidIndex)
+	}
+	t.Logf("OpenDeviceByName failed as expected: %v", err)
+
+	msg := err.Error()
+
+	// The error must identify gid_index by value and name the device/port,
+	// not just report "no usable GID" / "no active port" -- rxe0's port IS
+	// active, so a message implying otherwise would misdirect debugging.
+	wantSubstrings := []string{fmt.Sprintf("gid_index=%d", invalidGidIndex), proberDeviceName}
+	for _, want := range wantSubstrings {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message %q does not contain expected substring %q", msg, want)
+		}
+	}
+
+	dontWantSubstrings := []string{
+		"no usable GID found on any active port",
+		"no active port found",
+	}
+	for _, dontWant := range dontWantSubstrings {
+		if strings.Contains(msg, dontWant) {
+			t.Errorf("error message %q incorrectly implies no active port was found (contains %q); "+
+				"gid_index=%d is simply out of range on an active port", msg, dontWant, invalidGidIndex)
+		}
 	}
 }
 

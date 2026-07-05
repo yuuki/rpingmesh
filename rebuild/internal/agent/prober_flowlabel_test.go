@@ -261,13 +261,15 @@ func TestPerTargetRateLimit_IndependentOfFlowLabelCount(t *testing.T) {
 	// per-target flow-label count, i.e. a 50ms minimum spacing.
 	wantInterval := time.Duration(float64(time.Second) / (pps * float64(len(targets))))
 
+	// Both targets carry the proto3-default PinglistType (TOR_MESH), so their
+	// aggregate rate lands on the ToR-mesh limiter.
 	base := time.Now()
-	if w := p.limiter.Reserve(base); w != 0 {
+	if w := p.torMeshRate.limiter.Reserve(base); w != 0 {
 		t.Fatalf("first Reserve wait = %v, want 0", w)
 	}
 	// The next send, requested at the same instant, must wait exactly one
 	// aggregate interval -- proving n (=64) did not inflate the rate.
-	if w := p.limiter.Reserve(base); w != wantInterval {
+	if w := p.torMeshRate.limiter.Reserve(base); w != wantInterval {
 		t.Fatalf("second Reserve wait = %v, want %v (rate independent of flow_label_count)", w, wantInterval)
 	}
 }

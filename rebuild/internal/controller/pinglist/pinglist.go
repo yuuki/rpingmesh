@@ -60,7 +60,7 @@ func (g *PinglistGenerator) GenerateTorMeshPinglist(
 			continue
 		}
 
-		targets = append(targets, g.buildPingTarget(requesterGID, rnic))
+		targets = append(targets, g.buildPingTarget(requesterGID, rnic, controller_agent.PinglistType_TOR_MESH))
 	}
 
 	log.Info().
@@ -85,7 +85,7 @@ func (g *PinglistGenerator) GenerateInterTorPinglist(
 
 	targets := make([]*controller_agent.PingTarget, 0, len(rnics))
 	for _, rnic := range rnics {
-		targets = append(targets, g.buildPingTarget(requesterGID, rnic))
+		targets = append(targets, g.buildPingTarget(requesterGID, rnic, controller_agent.PinglistType_INTER_TOR))
 	}
 
 	log.Info().
@@ -100,7 +100,9 @@ func (g *PinglistGenerator) GenerateInterTorPinglist(
 // buildPingTarget creates a PingTarget from an RnicInfo with deterministic
 // 5-tuple values based on the requester-target GID pair, plus the ECMP
 // flow-label set sizing (seed + count) the agent expands into concrete labels.
-func (g *PinglistGenerator) buildPingTarget(requesterGID string, rnic *controller_agent.RnicInfo) *controller_agent.PingTarget {
+// ptype records which pinglist the target came from so the agent can apply a
+// differentiated, per-pinglist-type probe rate.
+func (g *PinglistGenerator) buildPingTarget(requesterGID string, rnic *controller_agent.RnicInfo, ptype controller_agent.PinglistType) *controller_agent.PingTarget {
 	targetGID := rnic.GetGid()
 	seed := flowLabelSeed(requesterGID, targetGID)
 	return &controller_agent.PingTarget{
@@ -110,6 +112,7 @@ func (g *PinglistGenerator) buildPingTarget(requesterGID string, rnic *controlle
 		TargetHostname:   rnic.GetHostName(),
 		TargetTorId:      rnic.GetTorId(),
 		TargetDeviceName: rnic.GetDeviceName(),
+		PinglistType:     ptype,
 		// FlowLabel is the legacy base label (low 20 bits of the seed), kept
 		// for backward compatibility and used verbatim when FlowLabelCount<=1.
 		FlowLabel: seed & 0xFFFFF,

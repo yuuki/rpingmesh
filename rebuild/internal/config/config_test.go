@@ -324,6 +324,101 @@ func TestLoadAgentConfig_Defaults(t *testing.T) {
 	}
 }
 
+// TestEffectiveProbeRates verifies the per-pinglist-type rate resolution,
+// including the backward-compatible fallback: when a type-specific rate is 0
+// (unset) it inherits the legacy target_probe_rate_per_second.
+func TestEffectiveProbeRates(t *testing.T) {
+	cases := []struct {
+		name         string
+		target       int
+		torMesh      int
+		interTor     int
+		wantTorMesh  int
+		wantInterTor int
+	}{
+		{
+			name:         "both_unset_falls_back_to_target",
+			target:       10,
+			torMesh:      0,
+			interTor:     0,
+			wantTorMesh:  10,
+			wantInterTor: 10,
+		},
+		{
+			name:         "differentiated_paper_rates",
+			target:       10,
+			torMesh:      10,
+			interTor:     1,
+			wantTorMesh:  10,
+			wantInterTor: 1,
+		},
+		{
+			name:         "only_inter_tor_set_tor_mesh_inherits",
+			target:       8,
+			torMesh:      0,
+			interTor:     5,
+			wantTorMesh:  8,
+			wantInterTor: 5,
+		},
+		{
+			name:         "only_tor_mesh_set_inter_tor_inherits",
+			target:       7,
+			torMesh:      12,
+			interTor:     0,
+			wantTorMesh:  12,
+			wantInterTor: 7,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &AgentConfig{
+				TargetProbeRatePerSecond:   tc.target,
+				TorMeshProbeRatePerSecond:  tc.torMesh,
+				InterTorProbeRatePerSecond: tc.interTor,
+			}
+			if got := cfg.EffectiveTorMeshProbeRate(); got != tc.wantTorMesh {
+				t.Errorf("EffectiveTorMeshProbeRate() = %d, want %d", got, tc.wantTorMesh)
+			}
+			if got := cfg.EffectiveInterTorProbeRate(); got != tc.wantInterTor {
+				t.Errorf("EffectiveInterTorProbeRate() = %d, want %d", got, tc.wantInterTor)
+			}
+		})
+	}
+}
+
+// TestValidate_RejectsNegativePerTypeProbeRates verifies that a negative
+// per-type probe rate is rejected (a negative rate would be silently read as
+// "disabled" by the limiter, defeating the intended cap).
+func TestValidate_RejectsNegativePerTypeProbeRates(t *testing.T) {
+	base := func() *AgentConfig {
+		return &AgentConfig{
+			ProbeIntervalMS:            500,
+			FlowLabelRotationPeriodSec: 3600,
+			TLSMode:                    TLSModeDisabled,
+		}
+	}
+
+	neg := base()
+	neg.TorMeshProbeRatePerSecond = -1
+	if err := neg.Validate(); err == nil {
+		t.Error("Validate() accepted negative tor_mesh_probe_rate_per_second, want error")
+	}
+
+	neg = base()
+	neg.InterTorProbeRatePerSecond = -1
+	if err := neg.Validate(); err == nil {
+		t.Error("Validate() accepted negative inter_tor_probe_rate_per_second, want error")
+	}
+
+	ok := base()
+	ok.TorMeshProbeRatePerSecond = 10
+	ok.InterTorProbeRatePerSecond = 1
+	if err := ok.Validate(); err != nil {
+		t.Errorf("Validate() rejected valid per-type rates: %v", err)
+	}
+}
+
 func TestLoadAgentConfig_FlagOverridesEnvAndFile(t *testing.T) {
 	path := writeYAML(t, "agent.yaml", "controller_addr: \"file-addr:1\"\n")
 	t.Setenv("RPINGMESH_CONTROLLER_ADDR", "env-addr:2")

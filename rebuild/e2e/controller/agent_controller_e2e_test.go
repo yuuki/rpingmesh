@@ -251,6 +251,12 @@ func TestPinglistTorMesh(t *testing.T) {
 		if tgt.GetFlowLabelSeed() == 0 {
 			t.Errorf("PingTarget %s has zero flow_label_seed", tgt.GetTargetGid())
 		}
+		// The controller must stamp the pinglist type so the agent can apply a
+		// differentiated per-type probe rate after merging the two lists.
+		if tgt.GetPinglistType() != controller_agent.PinglistType_TOR_MESH {
+			t.Errorf("PingTarget %s: PinglistType = %v, want TOR_MESH",
+				tgt.GetTargetGid(), tgt.GetPinglistType())
+		}
 	}
 }
 
@@ -288,6 +294,14 @@ func TestPinglistInterTor(t *testing.T) {
 	}
 	if !containsTorID(targets, "tor-C") {
 		t.Errorf("expected tor-C in INTER_TOR results")
+	}
+	// The controller must stamp INTER_TOR so the agent applies the inter-ToR
+	// probe rate to these targets.
+	for _, tgt := range targets {
+		if tgt.GetPinglistType() != controller_agent.PinglistType_INTER_TOR {
+			t.Errorf("PingTarget %s: PinglistType = %v, want INTER_TOR",
+				tgt.GetTargetGid(), tgt.GetPinglistType())
+		}
 	}
 }
 

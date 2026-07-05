@@ -83,6 +83,15 @@ message PingTarget {
     // message (seed + count is far smaller than a repeated list). The agent
     // derives label i from a hash of (seed, i, rotation_epoch).
     fixed32 flow_label_seed = 11;
+    // pinglist_type records which pinglist this target belongs to (ToR-mesh vs
+    // inter-ToR). The controller stamps it in GenerateTorMeshPinglist /
+    // GenerateInterTorPinglist -- the only place the classification is known --
+    // so the agent can apply a differentiated, per-pinglist-type probe rate
+    // (e.g. ToR-mesh at 10pps, inter-ToR at 1pps) without re-deriving the type
+    // after the two lists are merged into a single target list. It defaults to
+    // TOR_MESH (0), which is also the backward-compatible reading of targets
+    // from an older controller that did not stamp the field.
+    PinglistType pinglist_type = 12;
 }
 
 // PinglistResponse contains the list of targets to probe.

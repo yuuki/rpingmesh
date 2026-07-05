@@ -108,6 +108,50 @@ func TestGenerateInterTorPinglist_Success(t *testing.T) {
 	}
 }
 
+// TestGeneratePinglist_StampsPinglistType verifies that the generator stamps
+// each PingTarget with the pinglist type it was generated for, so the agent can
+// apply a differentiated per-type probe rate after merging the two lists.
+func TestGeneratePinglist_StampsPinglistType(t *testing.T) {
+	src := &fakeRnicSource{
+		torMesh: []*controller_agent.RnicInfo{
+			{Gid: "fe80::11", Qpn: 100, TorId: "tor-1"},
+			{Gid: "fe80::12", Qpn: 101, TorId: "tor-1"},
+		},
+		interTor: []*controller_agent.RnicInfo{
+			{Gid: "fe80::21", Qpn: 200, TorId: "tor-2"},
+		},
+	}
+	gen := newTestGenerator(src)
+
+	torMesh, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1")
+	if err != nil {
+		t.Fatalf("GenerateTorMeshPinglist: %v", err)
+	}
+	if len(torMesh) == 0 {
+		t.Fatal("expected ToR-mesh targets")
+	}
+	for _, tgt := range torMesh {
+		if tgt.GetPinglistType() != controller_agent.PinglistType_TOR_MESH {
+			t.Errorf("ToR-mesh target %s: PinglistType = %v, want TOR_MESH",
+				tgt.GetTargetGid(), tgt.GetPinglistType())
+		}
+	}
+
+	interTor, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1")
+	if err != nil {
+		t.Fatalf("GenerateInterTorPinglist: %v", err)
+	}
+	if len(interTor) == 0 {
+		t.Fatal("expected inter-ToR targets")
+	}
+	for _, tgt := range interTor {
+		if tgt.GetPinglistType() != controller_agent.PinglistType_INTER_TOR {
+			t.Errorf("inter-ToR target %s: PinglistType = %v, want INTER_TOR",
+				tgt.GetTargetGid(), tgt.GetPinglistType())
+		}
+	}
+}
+
 // TestGenerateInterTorPinglist_Empty verifies that no sampled RNICs (e.g. a
 // single-ToR cluster where every other ToR is empty) yields an empty,
 // non-nil target slice.

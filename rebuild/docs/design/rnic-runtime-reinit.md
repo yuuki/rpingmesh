@@ -108,6 +108,12 @@ typedef struct {
     uint8_t  _pad[3];
 } rdma_async_event_t;
 
+/* New opaque handle, alongside the existing rdma_context_t/rdma_device_t/
+ * rdma_queue_t/rdma_event_ring_t in rdma_bridge.h. Kept distinct from
+ * rdma_event_ring_t so the async control ring cannot be mistakenly passed to a
+ * completion-ring API (they carry different event structs). */
+typedef void* rdma_async_ring_t;
+
 /* One watcher per device. The watcher owns a small SPSC ring Go polls. */
 int32_t  rdma_async_watch_start(rdma_device_t dev, rdma_async_ring_t* out_ring);
 int32_t  rdma_async_ring_poll(rdma_async_ring_t ring, rdma_async_event_t* out, int32_t max);

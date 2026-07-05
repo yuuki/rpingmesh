@@ -40,10 +40,16 @@ analyzer merged in PR #36.
 - **Phase 1 analyzer** (`internal/controller/analyzer/analyzer.go`): ingests
   `ProbeAnalysisReport` batches via `Analyzer.Ingest`, retains the most recent
   `WindowRetention` (default 20, `DefaultAnalyzerWindowRetention`) windows in an
-  in-memory ring of `windowBucket{windowStartUnixNs, summaries}`, and flags
-  per-summary SLA violations in `evaluate` (loss ratio and p99 RTT). It already
-  keeps every summary of the retained windows around — the comment on
-  `windowBucket` explicitly calls this "the substrate a future Phase 2
+  in-memory ring of `windowBucket{windowStartUnixNs, summaries}` where
+  `summaries` is `[]*controller_agent.PathSummary`, and flags per-summary SLA
+  violations in `evaluate` (loss ratio and p99 RTT). **Important gap for Phase
+  2**: `agent_id` lives only on the `ProbeAnalysisReport` envelope and is passed
+  to `evaluate` transiently — it is **not** a field of `PathSummary` and is
+  **not** stored in the ring. So the retained ring, as-is, cannot answer "how
+  many distinct agents reported this edge" (the cross-agent confidence signal).
+  Closing this needs a controller-internal retention change (below), not a proto
+  change. It already keeps every summary of the retained windows around — the
+  comment on `windowBucket` explicitly calls this "the substrate a future Phase 2
   cross-agent localization pass would read." Phase 2 is that pass.
 - **Retention ring** is keyed and sorted by `windowStartUnixNs`. Because agent
   windows are wall-clock aligned (`PathAggregator.windowStart` floors to
@@ -119,6 +125,32 @@ EdgeStat {
 `S == T` is the **intra-ToR** edge (ToR-mesh probes stay inside one ToR).
 `S != T` is an **inter-ToR** edge whose physical path traverses S's uplinks, one
 or more spine/agg switches, and T's downlinks.
+
+**Required Phase 1 retention change (controller-internal, no proto change).**
+`agentsReporting` / `distinctAgents(...)` — the cross-agent confidence signal —
+cannot be computed from the ring as it exists today, because the ring stores
+bare `[]*controller_agent.PathSummary` and `PathSummary` carries no `agent_id`
+(it lives only on the `ProbeAnalysisReport` envelope; see Current State). The fix
+is entirely inside the analyzer package: change what the ring retains from
+`*PathSummary` to a small wrapper that pairs each summary with the reporting
+agent id, e.g.
+
+```go
+// controller-internal; NOT a proto message.
+type retainedSummary struct {
+    AgentID string
+    Summary *controller_agent.PathSummary
+}
+```
+
+`windowBucket.summaries` becomes `[]*retainedSummary`, and `Analyzer.Ingest`
+(which already receives `report.GetAgentId()`) stamps the id when it calls
+`retainLocked`. This is a backward-compatible **internal** structural change: the
+wire `PathSummary` and `ProbeAnalysisReport` are untouched, so "no proto/schema
+change" still holds. `buildEdgeStats` then reads `AgentID` off each retained
+record to count distinct agents per edge. (It also generalizes cleanly if a
+future need arises to distinguish two agents reporting the same GID pair, though
+today `(source_gid, target_gid)` is effectively agent-unique.)
 
 Degradation reuses the Phase 1 thresholds (`Config.SLALossRatio`,
 `Config.SLANetworkRTTP99Ns`) so a window "degraded" at the edge level is
@@ -477,14 +509,20 @@ matching the Phase 1 analyzer tests.
 Each PR is independently reviewable/mergeable. Ordering maximizes value-per-risk
 and keeps the schema-free work first.
 
-1. **P3-H.1 — Edge model + minimal localizer (no proto/schema change).**
-   `internal/controller/analyzer/localizer.go`: `EdgeStat`, edge folding from
+1. **P3-H.1 — Retained-record change + edge model + minimal localizer (no
+   proto/schema change).** First, the controller-internal retention change: swap
+   `windowBucket.summaries` from `[]*controller_agent.PathSummary` to
+   `[]*retainedSummary` (agent id + summary), stamped in `Analyzer.Ingest` — this
+   is the prerequisite that makes cross-agent `agentsReporting` computable and
+   must land within this PR before the localizer can use it. Then
+   `internal/controller/analyzer/localizer.go`: `EdgeStat`, edge folding from the
    retained window buckets, the common-element heuristic, ranking. `Analyzer`
    gains a post-window hook (invoked when a window completes) that calls it.
    Registry gains a read-only `TopologySnapshot()` (GID→ToR, ToR→GIDs) built
    from `ListAllRNICs`. Findings logged only (no metrics yet). Fixtures +
-   Scenarios A–E as unit tests. This PR delivers working ToR-granularity
-   localization with zero migration.
+   Scenarios A–E as unit tests (Scenario E specifically exercises the
+   distinct-agent count off the new retained record). This PR delivers working
+   ToR-granularity localization with zero wire/schema migration.
 2. **P3-H.2 — Findings lifecycle + OTLP.** Add the hysteresis state machine and
    the `suspect_tor` / `suspect_tor_score` / `inter_tor_path_suspect` /
    `localization_runs_total` instruments on the existing analyzer meter. Config

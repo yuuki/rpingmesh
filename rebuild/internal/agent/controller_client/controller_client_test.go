@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"net"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/yuuki/rpingmesh/rebuild/internal/config"
 	"github.com/yuuki/rpingmesh/rebuild/proto/controller_agent"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -136,12 +138,41 @@ func newTestClient(t *testing.T, srv *fakeControllerServer) *GRPCControllerClien
 // dials lazily (no I/O happens until the first RPC), so this needs no
 // network access.
 func TestNewGRPCControllerClient_Construct(t *testing.T) {
-	c, err := NewGRPCControllerClient("127.0.0.1:1")
+	c, err := NewGRPCControllerClient("127.0.0.1:1", nil)
 	if err != nil {
 		t.Fatalf("NewGRPCControllerClient: %v", err)
 	}
 	if err := c.Close(); err != nil {
 		t.Errorf("Close: %v", err)
+	}
+}
+
+// TestNewGRPCControllerClient_ExplicitDisabled verifies that an explicit
+// &config.TLSClientConfig{Mode: config.TLSModeDisabled} behaves identically
+// to a nil tlsCfg: insecure credentials, no certificate files required.
+func TestNewGRPCControllerClient_ExplicitDisabled(t *testing.T) {
+	c, err := NewGRPCControllerClient("127.0.0.1:1", &config.TLSClientConfig{Mode: config.TLSModeDisabled})
+	if err != nil {
+		t.Fatalf("NewGRPCControllerClient: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+// TestNewGRPCControllerClient_TLSConfigError verifies that a tlsCfg
+// requesting mtls with a nonexistent certificate file fails fast at
+// construction time (building the *tls.Config), rather than at the first
+// RPC's handshake.
+func TestNewGRPCControllerClient_TLSConfigError(t *testing.T) {
+	tlsCfg := &config.TLSClientConfig{
+		Mode:     config.TLSModeMTLS,
+		CertFile: filepath.Join(t.TempDir(), "missing-cert.pem"),
+		KeyFile:  filepath.Join(t.TempDir(), "missing-key.pem"),
+		CAFile:   filepath.Join(t.TempDir(), "missing-ca.pem"),
+	}
+	if _, err := NewGRPCControllerClient("127.0.0.1:1", tlsCfg); err == nil {
+		t.Fatal("expected an error for missing mtls certificate files, got nil")
 	}
 }
 

@@ -11,8 +11,10 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/yuuki/rpingmesh/rebuild/internal/config"
 	"github.com/yuuki/rpingmesh/rebuild/proto/controller_agent"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -36,14 +38,35 @@ type GRPCControllerClient struct {
 	logger zerolog.Logger
 }
 
-// NewGRPCControllerClient creates a new gRPC client connected to the controller
-// at the given address. The address should be in "host:port" format. The
-// connection uses insecure credentials, which is acceptable for internal
-// network communication.
-func NewGRPCControllerClient(controllerAddr string) (*GRPCControllerClient, error) {
+// NewGRPCControllerClient creates a new gRPC client connected to the
+// controller at the given address. The address should be in "host:port"
+// format. tlsCfg selects the transport credentials: a nil tlsCfg, or one
+// with Mode == config.TLSModeDisabled (or the empty string), uses insecure
+// credentials, preserving the original plaintext behavior for backward
+// compatibility; a non-nil tlsCfg with Mode == tls or mtls builds TLS
+// transport credentials instead.
+func NewGRPCControllerClient(controllerAddr string, tlsCfg *config.TLSClientConfig) (*GRPCControllerClient, error) {
+	mode := config.TLSModeDisabled
+	if tlsCfg != nil && tlsCfg.Mode != "" {
+		mode = tlsCfg.Mode
+	}
+
+	var transportCreds credentials.TransportCredentials
+	if mode == config.TLSModeDisabled {
+		log.Warn().Str("controller_addr", controllerAddr).
+			Msg("gRPC controller client using tls_mode=disabled: controller-agent traffic is plaintext and unauthenticated; set tls_mode to tls or mtls for production deployments")
+		transportCreds = insecure.NewCredentials()
+	} else {
+		tlsConfig, err := config.ClientTLSConfig(tlsCfg.Mode, tlsCfg.CertFile, tlsCfg.KeyFile, tlsCfg.CAFile, tlsCfg.ServerName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build client TLS configuration for controller at %s: %w", controllerAddr, err)
+		}
+		transportCreds = credentials.NewTLS(tlsConfig)
+	}
+
 	conn, err := grpc.NewClient(
 		controllerAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(transportCreds),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gRPC client for controller at %s: %w", controllerAddr, err)

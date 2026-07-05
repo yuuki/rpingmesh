@@ -226,6 +226,11 @@ via Cgo (`CGO_ENABLED=1`).
 | `analysis_report_enabled` | `true` | Aggregate probe results per path and report `PathSummary` batches to the controller's analyzer (best-effort; never blocks probing) |
 | `analysis_window_sec` | `30` | Per-path aggregation window length in seconds |
 | `log_level` | `info` | Log level: debug, info, warn, error |
+| `tls_mode` | `disabled` | gRPC transport security for the controller connection: `disabled` \| `tls` \| `mtls` (see [TLS/mTLS for controller-agent gRPC](#tlsmtls-for-controller-agent-grpc)) |
+| `tls_cert_file` | `""` | Client certificate file (required when `tls_mode=mtls`) |
+| `tls_key_file` | `""` | Client private key file (required when `tls_mode=mtls`) |
+| `tls_ca_file` | `""` | CA file used to verify the controller's certificate (required when `tls_mode` is `tls` or `mtls`) |
+| `tls_server_name` | `""` | Overrides the name used for TLS SNI/verification; needed when `controller_addr` is an IP literal that doesn't match the server certificate's subject |
 
 ### Controller (`configs/controller.yaml`)
 
@@ -245,6 +250,36 @@ via Cgo (`CGO_ENABLED=1`).
 | `analyzer_window_retention` | `20` | Number of recent windows the analyzer retains in memory |
 | `otel_collector_addr` | `localhost:4317` | OTLP gRPC endpoint for analyzer metrics (`service.name=rpingmesh-analyzer`) |
 | `log_level` | `info` | Log level |
+| `tls_mode` | `disabled` | gRPC transport security for the listener: `disabled` \| `tls` \| `mtls` (see [TLS/mTLS for controller-agent gRPC](#tlsmtls-for-controller-agent-grpc)) |
+| `tls_cert_file` | `""` | Server certificate file (required when `tls_mode` is `tls` or `mtls`) |
+| `tls_key_file` | `""` | Server private key file (required when `tls_mode` is `tls` or `mtls`) |
+| `tls_ca_file` | `""` | CA file used to verify client certificates (required when `tls_mode=mtls`) |
+| `tls_server_name` | `""` | Present for config-key symmetry with the agent; unused by the controller (server) role |
+
+### TLS/mTLS for controller-agent gRPC
+
+By default (`tls_mode: disabled`), controller-agent gRPC is plaintext, matching the
+original behavior; the controller and every `GRPCControllerClient` log a warning once
+at startup when running in this mode. Two opt-in modes are available, selected
+symmetrically via the `tls_mode` key on both sides:
+
+- `tls`: the agent verifies the controller's certificate; the controller does not
+  authenticate the agent. Controller needs `tls_cert_file`/`tls_key_file`; agent needs
+  `tls_ca_file`.
+- `mtls`: mutual authentication. Both sides need `tls_cert_file`, `tls_key_file`, and
+  `tls_ca_file` (the controller's `tls_ca_file` is the CA that signs agent client
+  certificates; the agent's is the CA that signs the controller's server certificate;
+  a single CA can serve both roles). This is the recommended mode for production
+  deployments.
+
+`tls_server_name` on the agent overrides the name used for TLS server-name
+verification, which is required when `controller_addr` is an IP literal rather than a
+DNS name matching the controller certificate's subject. `Validate()` fails fast at
+config-load time if a mode's required certificate files are missing or unreadable,
+rather than deferring the failure to the first gRPC handshake. `InsecureSkipVerify` is
+never used; there is deliberately no way to disable server certificate verification
+other than falling back to `tls_mode: disabled`. Certificate loading is static (no
+hot-reload): rotating certificates requires a restart.
 
 ### Environment Variable Overrides
 
@@ -539,8 +574,12 @@ sudo rdma link add rxe0 type rxe netdev eth0
   monitor RDMA QP lifecycle events for service-aware monitoring. This rebuild
   focuses on the probing infrastructure.
 
-- **No TLS on gRPC.** Controller-agent communication uses plaintext gRPC, assuming
-  a trusted internal network. mTLS can be added via gRPC transport credentials.
+- **TLS/mTLS on gRPC is opt-in, not default.** Controller-agent communication
+  supports `tls`/`mtls` transport security (see
+  [TLS/mTLS for controller-agent gRPC](#tlsmtls-for-controller-agent-grpc)), but the
+  default `tls_mode: disabled` still uses plaintext gRPC for backward compatibility.
+  Production deployments should set `tls_mode: mtls` on both sides. Certificate
+  loading is static (no hot-reload) and rotation is not a goal of this implementation.
 
 - **Only a single, uniform probe rate cap.** The Prober enforces
   `target_probe_rate_per_second` as a per-target cap (the aggregate limit

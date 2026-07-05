@@ -86,6 +86,16 @@ type ControllerConfig struct {
 	// metrics to (service.name=rpingmesh-analyzer). Only used when the analyzer
 	// is enabled; export is best-effort.
 	OtelCollectorAddr string `mapstructure:"otel_collector_addr"`
+	// TLS settings for the gRPC server. See internal/config/tls.go for mode
+	// semantics. TLSMode defaults to TLSModeDisabled, preserving plaintext
+	// gRPC for backward compatibility. These keys are symmetric with
+	// AgentConfig's; TLSServerName is not used by the controller (server)
+	// role but is kept for config-key symmetry across agent.yaml/controller.yaml.
+	TLSMode       string `mapstructure:"tls_mode"`
+	TLSCertFile   string `mapstructure:"tls_cert_file"`
+	TLSKeyFile    string `mapstructure:"tls_key_file"`
+	TLSCAFile     string `mapstructure:"tls_ca_file"`
+	TLSServerName string `mapstructure:"tls_server_name"`
 }
 
 // LoadControllerConfig loads controller configuration from a YAML file,
@@ -113,6 +123,11 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 	v.SetDefault("analyzer_sla_network_rtt_p99_ns", DefaultAnalyzerSLANetworkRTTP99Ns)
 	v.SetDefault("analyzer_window_retention", DefaultAnalyzerWindowRetention)
 	v.SetDefault("otel_collector_addr", DefaultControllerOtelCollectorAddr)
+	v.SetDefault("tls_mode", TLSModeDisabled)
+	v.SetDefault("tls_cert_file", "")
+	v.SetDefault("tls_key_file", "")
+	v.SetDefault("tls_ca_file", "")
+	v.SetDefault("tls_server_name", "")
 
 	// Enable environment variable override with RPINGMESH_ prefix
 	v.SetEnvPrefix("RPINGMESH")
@@ -164,6 +179,11 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		AnalyzerSLANetworkRTTP99Ns: v.GetUint64("analyzer_sla_network_rtt_p99_ns"),
 		AnalyzerWindowRetention:    v.GetInt("analyzer_window_retention"),
 		OtelCollectorAddr:          v.GetString("otel_collector_addr"),
+		TLSMode:                    v.GetString("tls_mode"),
+		TLSCertFile:                v.GetString("tls_cert_file"),
+		TLSKeyFile:                 v.GetString("tls_key_file"),
+		TLSCAFile:                  v.GetString("tls_ca_file"),
+		TLSServerName:              v.GetString("tls_server_name"),
 	}
 
 	if err := config.Validate(); err != nil {
@@ -257,6 +277,13 @@ func (c *ControllerConfig) Validate() error {
 		}
 	}
 
+	// The controller is the gRPC server of the controller-agent connection:
+	// fail fast if the certificate files required by tls_mode are missing,
+	// rather than at the first client handshake.
+	if err := validateTLSFiles(tlsRoleServer, c.TLSMode, c.TLSCertFile, c.TLSKeyFile, c.TLSCAFile); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -277,4 +304,9 @@ func BindControllerFlags(flags *pflag.FlagSet) {
 	flags.Uint64("analyzer-sla-network-rtt-p99-ns", DefaultAnalyzerSLANetworkRTTP99Ns, "Per-path p99 network-RTT threshold (ns) above which a window is an SLA violation (0 disables)")
 	flags.Int("analyzer-window-retention", DefaultAnalyzerWindowRetention, "Number of recent windows the analyzer retains in memory")
 	flags.String("otel-collector-addr", DefaultControllerOtelCollectorAddr, "OTLP gRPC collector endpoint for analyzer metrics")
+	flags.String("tls-mode", TLSModeDisabled, "gRPC transport security mode (disabled|tls|mtls)")
+	flags.String("tls-cert-file", "", "Server certificate file (required when tls-mode is tls or mtls)")
+	flags.String("tls-key-file", "", "Server private key file (required when tls-mode is tls or mtls)")
+	flags.String("tls-ca-file", "", "CA file used to verify client certificates (required when tls-mode=mtls)")
+	flags.String("tls-server-name", "", "Reserved for config-key symmetry with the agent; unused by the controller (server) role")
 }

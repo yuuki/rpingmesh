@@ -58,6 +58,17 @@ type AgentConfig struct {
 	// AnalysisWindowSec is the aggregation window length in seconds. See
 	// DefaultAnalysisWindowSec.
 	AnalysisWindowSec uint32 `mapstructure:"analysis_window_sec"`
+	// TLS settings for the gRPC connection to the controller. See
+	// internal/config/tls.go for mode semantics. TLSMode defaults to
+	// TLSModeDisabled, preserving plaintext gRPC for backward compatibility.
+	TLSMode     string `mapstructure:"tls_mode"`
+	TLSCertFile string `mapstructure:"tls_cert_file"`
+	TLSKeyFile  string `mapstructure:"tls_key_file"`
+	TLSCAFile   string `mapstructure:"tls_ca_file"`
+	// TLSServerName overrides the name used for TLS SNI/verification against
+	// the controller; useful when controller_addr is an IP literal that
+	// doesn't match the server certificate's subject.
+	TLSServerName string `mapstructure:"tls_server_name"`
 }
 
 // LoadAgentConfig loads agent configuration from a YAML file, environment
@@ -88,6 +99,11 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("flow_label_rotation_period_sec", DefaultFlowLabelRotationPeriodSec)
 	v.SetDefault("analysis_report_enabled", true)
 	v.SetDefault("analysis_window_sec", DefaultAnalysisWindowSec)
+	v.SetDefault("tls_mode", TLSModeDisabled)
+	v.SetDefault("tls_cert_file", "")
+	v.SetDefault("tls_key_file", "")
+	v.SetDefault("tls_ca_file", "")
+	v.SetDefault("tls_server_name", "")
 
 	// Enable environment variable override with RPINGMESH_ prefix.
 	// Underscores in env var names map to underscores in config keys.
@@ -158,6 +174,11 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		FlowLabelRotationPeriodSec: v.GetUint32("flow_label_rotation_period_sec"),
 		AnalysisReportEnabled:      v.GetBool("analysis_report_enabled"),
 		AnalysisWindowSec:          v.GetUint32("analysis_window_sec"),
+		TLSMode:                    v.GetString("tls_mode"),
+		TLSCertFile:                v.GetString("tls_cert_file"),
+		TLSKeyFile:                 v.GetString("tls_key_file"),
+		TLSCAFile:                  v.GetString("tls_ca_file"),
+		TLSServerName:              v.GetString("tls_server_name"),
 	}
 
 	if err := config.Validate(); err != nil {
@@ -204,6 +225,13 @@ func (c *AgentConfig) Validate() error {
 		return fmt.Errorf("analysis_window_sec must be > 0 when analysis_report_enabled, got: %d", c.AnalysisWindowSec)
 	}
 
+	// The agent is the gRPC client of the controller connection: fail fast
+	// if the certificate files required by tls_mode are missing, rather
+	// than at the first dial attempt.
+	if err := validateTLSFiles(tlsRoleClient, c.TLSMode, c.TLSCertFile, c.TLSKeyFile, c.TLSCAFile); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -226,4 +254,9 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.Uint32("flow-label-rotation-period-sec", DefaultFlowLabelRotationPeriodSec, "Period (seconds) over which the rotating ~20% of each target's ECMP flow-label set is refreshed")
 	flags.Bool("analysis-report-enabled", true, "Enable per-path window aggregation and SLA reporting to the controller")
 	flags.Uint32("analysis-window-sec", DefaultAnalysisWindowSec, "Per-path aggregation window length in seconds")
+	flags.String("tls-mode", TLSModeDisabled, "gRPC transport security mode for the controller connection (disabled|tls|mtls)")
+	flags.String("tls-cert-file", "", "Client certificate file (required when tls-mode=mtls)")
+	flags.String("tls-key-file", "", "Client private key file (required when tls-mode=mtls)")
+	flags.String("tls-ca-file", "", "CA file used to verify the controller's certificate (required when tls-mode is tls or mtls)")
+	flags.String("tls-server-name", "", "Server name for TLS SNI/verification (optional; defaults to the name derived from controller-addr)")
 }

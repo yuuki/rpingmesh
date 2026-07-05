@@ -328,9 +328,16 @@ For long-running deployments, both binaries ship with systemd unit files
 ### Manual install (no package manager)
 
 ```sh
-# 1. Build the binaries (see "Building" above).
-make build-controller   # on the controller host (any platform, CGO_ENABLED=0)
-make build-agent        # on each RDMA agent host (Linux, CGO_ENABLED=1)
+# 1. Build the binaries. Use the package-build-* targets (not plain
+#    build-controller/build-agent) even for a manual install: they force
+#    GOOS=linux GOARCH=$(NFPM_ARCH) explicitly, so the result is always a
+#    Linux binary for the target host's architecture -- plain `go build` (as
+#    build-controller/build-agent use) targets whatever OS/arch you run
+#    `make` on, which silently produces a binary that fails with "exec
+#    format error" on the target host if you build on e.g. macOS and copy it
+#    over.
+make package-build-controller   # controller: cross-compiles cleanly from any host (CGO_ENABLED=0)
+make package-build-agent        # agent: must be run ON the target Linux/RDMA host itself (CGO_ENABLED=1, Cgo can't cross-compile against libibverbs)
 
 # 2. Install the binary, unit file, and a starting config on the target host.
 sudo install -m 0755 bin/rpingmesh-controller /usr/bin/rpingmesh-controller

@@ -316,6 +316,45 @@ func TestRegisterEventRingDropCallback(t *testing.T) {
 	}
 }
 
+// TestRegisterSelfThrottleCallback verifies that the self_throttle gauge reports
+// the current rate multiplier returned by the registered reader, as a single
+// attribute-free data point.
+func TestRegisterSelfThrottleCallback(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer provider.Shutdown(context.Background())
+
+	mc, err := NewMetricsCollectorWithProvider(provider)
+	if err != nil {
+		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
+	}
+
+	multiplier := 0.25
+	if err := mc.RegisterSelfThrottleCallback(func() float64 { return multiplier }); err != nil {
+		t.Fatalf("RegisterSelfThrottleCallback: %v", err)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("ManualReader.Collect: %v", err)
+	}
+
+	m := findMetric(&rm, "rpingmesh.agent.self_throttle")
+	if m == nil {
+		t.Fatal("rpingmesh.agent.self_throttle metric not found")
+	}
+	gauge, ok := m.Data.(metricdata.Gauge[float64])
+	if !ok || len(gauge.DataPoints) != 1 {
+		t.Fatalf("rpingmesh.agent.self_throttle = %+v, want 1 gauge data point", m.Data)
+	}
+	if got := gauge.DataPoints[0].Value; got != multiplier {
+		t.Errorf("self_throttle = %g, want %g", got, multiplier)
+	}
+	if n := gauge.DataPoints[0].Attributes.Len(); n != 0 {
+		t.Errorf("self_throttle carries %d attributes, want 0 (low cardinality)", n)
+	}
+}
+
 // TestStartResultConsumer verifies that StartResultConsumer reads
 // ProbeResults from the channel, computes RTT via probe.CalculateRTT, and
 // records them, and that it exits cleanly when the channel is closed.

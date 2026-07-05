@@ -227,6 +227,12 @@ via Cgo (`CGO_ENABLED=1`).
 | `otel_collector_addr` | `localhost:4317` | OTLP gRPC collector endpoint |
 | `analysis_report_enabled` | `true` | Aggregate probe results per path and report `PathSummary` batches to the controller's analyzer (best-effort; never blocks probing) |
 | `analysis_window_sec` | `30` | Per-path aggregation window length in seconds |
+| `self_protection_enabled` | `false` | Opt-in resource watchdog: throttles the probe send rate (fail-slow) under local CPU/memory pressure (see [Self-protection](#self-protection)) |
+| `watchdog_interval_sec` | `5` | How often the watchdog samples resource usage (seconds) |
+| `max_memory_mb` | `0` | Soft runtime memory limit in MiB (`GOMEMLIMIT` via `debug.SetMemoryLimit`; `0` = disabled). Also the reference budget for memory throttling. Applied whenever `> 0`, independent of `self_protection_enabled` |
+| `max_procs` | `0` | Cap `runtime.GOMAXPROCS` to this many cores (`0` = Go default: all cores). Applied whenever `> 0`, independent of `self_protection_enabled` |
+| `throttle_memory_ratio` | `0.9` | Fraction of `max_memory_mb` at which memory throttling engages (`0`-`1`). Only active when `max_memory_mb > 0` |
+| `throttle_cpu_percent` | `90` | Percentage of available CPU capacity (`GOMAXPROCS` cores) at which CPU throttling engages (`0`-`100`) |
 | `log_level` | `info` | Log level: debug, info, warn, error |
 | `tls_mode` | `disabled` | gRPC transport security for the controller connection: `disabled` \| `tls` \| `mtls` (see [TLS/mTLS for controller-agent gRPC](#tlsmtls-for-controller-agent-grpc)) |
 | `tls_cert_file` | `""` | Client certificate file (required when `tls_mode=mtls`) |
@@ -300,6 +306,38 @@ rather than deferring the failure to the first gRPC handshake. `InsecureSkipVeri
 never used; there is deliberately no way to disable server certificate verification
 other than falling back to `tls_mode: disabled`. Certificate loading is static (no
 hot-reload): rotating certificates requires a restart.
+
+### Self-protection
+
+The agent can guard its own host footprint with an opt-in watchdog
+(`self_protection_enabled: true`). Every `watchdog_interval_sec` it samples this
+process's memory (via `runtime/metrics`, the same accounting as `GOMEMLIMIT`) and
+CPU time (via `getrusage`), and applies a **fail-slow** throttle: when either
+resource crosses its threshold it steps a probe-rate multiplier down the ladder
+`1.0 → 0.5 → 0.25 → 0.1` (one step per interval), and steps it back up as usage
+recovers. The multiplier scales every prober's per-target send rate on top of the
+configured per-type caps. It is deliberately floored at `0.1` and **never reaches
+`0`**: self-protection slows probing but never stops it, since a silent agent is a
+monitoring blind spot (fail-slow, not fail-closed).
+
+- **Memory throttling** engages at `throttle_memory_ratio × max_memory_mb` and is
+  active only when `max_memory_mb > 0`. Setting `max_memory_mb` also installs a
+  soft `GOMEMLIMIT` (via `debug.SetMemoryLimit`) so the Go runtime GCs harder to
+  stay under the budget while the watchdog sheds probe load before it is reached.
+- **CPU throttling** engages at `throttle_cpu_percent` of the process's available
+  CPU capacity (its `GOMAXPROCS` cores), so `90` means the agent is saturating
+  nearly all the cores it is allowed to use.
+- A **hysteresis band** (recovery requires usage to fall to 75% of the engage
+  threshold) plus the one-step-per-interval ramp keeps the multiplier from
+  flapping when usage hovers at a threshold.
+- `max_procs` and `max_memory_mb` are honored as plain runtime caps whenever set,
+  independent of `self_protection_enabled`.
+
+Engaging and fully releasing the throttle are logged at `warn`; the live
+multiplier is exported as the `rpingmesh.agent.self_throttle` OTLP gauge
+(`1.0` = unthrottled). CPU utilization is measured via `getrusage` rather than the
+`runtime/metrics` `/cpu/classes` counters because the latter only advance during a
+GC cycle, which would leave a low-allocation agent's CPU reading stale.
 
 ### Environment Variable Overrides
 
@@ -589,8 +627,10 @@ The agent exports the following OTLP metrics:
 | `rpingmesh.probe_success_total` | Counter | | Successful probe count |
 | `rpingmesh.probe_failed_total` | Counter | | Failed probe count |
 | `rpingmesh.probe_total` | Counter | | Total probe attempts |
+| `rpingmesh.agent.self_throttle` | Gauge | | Self-protection rate multiplier (`1.0` = unthrottled, down to `0.1`); emitted only when `self_protection_enabled` |
 
-All metrics carry two attributes: `source_tor` and `target_tor`.
+The probe metrics carry two attributes: `source_tor` and `target_tor`. The
+`self_throttle` gauge is attribute-free (a single process-wide value).
 
 The controller-side analyzer (Phase 1) exports the following OTLP metrics under
 `service.name=rpingmesh-analyzer`:
@@ -716,9 +756,13 @@ sudo rdma link add rxe0 type rxe netdev eth0
   (Phase 2); eBPF-based service tracing from the original design is also not
   part of this rebuild.
 
-- **No agent self-protection.** There is no hard CPU/memory cap on the
-  agent process and no fail-closed behavior (e.g. backing off or shutting
-  down probing) when local resource usage or error rates spike.
+- **Agent self-protection is fail-slow and CPU/memory only (opt-in).** The
+  watchdog (`self_protection_enabled`, see [Self-protection](#self-protection))
+  throttles the probe send rate under local CPU/memory pressure and can install a
+  soft `GOMEMLIMIT`/`GOMAXPROCS` cap, but it deliberately never stops probing
+  (no fail-closed) and does not react to error rates or downstream backpressure.
+  Throttling is coarse (a four-step multiplier) and thresholds are static; there
+  is no adaptive control loop.
 
 - **Address Handle `sl` / `traffic_class` are a single agent-wide value, not
   per-target.** `service_level` and `traffic_class` (see Configuration

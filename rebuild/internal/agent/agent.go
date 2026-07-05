@@ -7,6 +7,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -95,6 +97,11 @@ type Agent struct {
 	// reporting is disabled.
 	analysisReporter *AnalysisReporter
 
+	// watchdog samples this process's CPU/memory and throttles every prober's
+	// send rate (fail-slow) under pressure. nil when self-protection is
+	// disabled (the default).
+	watchdog *Watchdog
+
 	// metricsResultsActive records whether a metrics result consumer will drain
 	// a.results (i.e. a.metrics != nil). It is decided before createResultsFanIn
 	// and read by each fan-in goroutine: when false, the fan-in does NOT send on
@@ -124,10 +131,39 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 		return nil, fmt.Errorf("agent config must not be nil")
 	}
 
-	return &Agent{
+	a := &Agent{
 		cfg:    cfg,
 		logger: log.With().Str("component", "agent").Logger(),
-	}, nil
+	}
+
+	// Apply optional hard runtime caps as early as possible (before any heavy
+	// allocation) so a soft memory limit governs the whole process lifetime.
+	applyRuntimeLimits(cfg, a.logger)
+
+	return a, nil
+}
+
+// applyRuntimeLimits applies the optional hard runtime caps from config: a soft
+// memory limit (GOMEMLIMIT, via debug.SetMemoryLimit) and a GOMAXPROCS cap.
+// Both are opt-in (0 leaves the Go default) and applied independently of
+// self_protection_enabled, so they can serve as plain runtime tuning knobs. The
+// memory limit also acts as the reference budget the watchdog throttles against.
+func applyRuntimeLimits(cfg *config.AgentConfig, logger zerolog.Logger) {
+	if cfg.MaxMemoryMB > 0 {
+		limit := int64(cfg.MaxMemoryMB) * bytesPerMiB
+		debug.SetMemoryLimit(limit)
+		logger.Info().
+			Int("max_memory_mb", cfg.MaxMemoryMB).
+			Int64("gomemlimit_bytes", limit).
+			Msg("Applied soft memory limit (GOMEMLIMIT)")
+	}
+	if cfg.MaxProcs > 0 {
+		prev := runtime.GOMAXPROCS(cfg.MaxProcs)
+		logger.Info().
+			Int("max_procs", cfg.MaxProcs).
+			Int("previous_gomaxprocs", prev).
+			Msg("Capped GOMAXPROCS")
+	}
 }
 
 // Initialize performs all setup steps required before the agent can be started.
@@ -236,6 +272,28 @@ func (a *Agent) Initialize(ctx context.Context) error {
 		a.logger.Info().
 			Uint32("window_sec", a.cfg.AnalysisWindowSec).
 			Msg("Analysis reporter created")
+	}
+
+	// Create the resource watchdog (self-protection) if enabled. It throttles
+	// every prober's send rate (fail-slow) when this process's CPU/memory
+	// crosses the configured thresholds. Created after the probers (which it
+	// drives) and the metrics collector (whose self_throttle gauge reads its
+	// live multiplier).
+	if a.cfg.SelfProtectionEnabled {
+		throttlers := make([]rateThrottler, 0, len(a.probers))
+		for _, p := range a.probers {
+			throttlers = append(throttlers, p)
+		}
+		a.watchdog = NewWatchdog(a.cfg, throttlers)
+		if a.metrics != nil {
+			if err := a.metrics.RegisterSelfThrottleCallback(a.watchdog.CurrentMultiplier); err != nil {
+				a.logger.Warn().Err(err).
+					Msg("Failed to register self-throttle metric callback")
+			}
+		}
+		a.logger.Info().
+			Int("prober_count", len(a.probers)).
+			Msg("Self-protection watchdog created")
 	}
 
 	// Step 6: Create one responder per device.
@@ -474,6 +532,12 @@ func (a *Agent) Start(ctx context.Context) error {
 		a.analysisReporter.Start(ctx)
 	}
 
+	// Start the resource watchdog if enabled. It runs independently, sampling
+	// on its own interval and throttling the probers under load.
+	if a.watchdog != nil {
+		a.watchdog.Start(ctx)
+	}
+
 	a.logger.Info().Msg("Agent started")
 	return nil
 }
@@ -495,6 +559,12 @@ func (a *Agent) Stop(ctx context.Context) {
 	// Stop the heartbeat goroutine before closing the gRPC client, since
 	// both it and the cluster monitors depend on grpcClient being open.
 	a.stopHeartbeat()
+
+	// Stop the resource watchdog before tearing down the probers, since it
+	// calls SetRateMultiplier on them.
+	if a.watchdog != nil {
+		a.watchdog.Stop()
+	}
 
 	// Stop all probers to cease outgoing probes. Destroy() closes each
 	// prober's own Results() channel, letting each fan-in goroutine's range

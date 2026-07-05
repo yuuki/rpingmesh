@@ -242,6 +242,18 @@ type Prober struct {
 	torMeshRate  perTypeRate
 	interTorRate perTypeRate
 
+	// rateMultiplier is the self-protection throttle factor in (0, 1] applied
+	// on top of both per-type aggregate rates: the effective limiter rate is
+	// pps * (targets of that type) * rateMultiplier. It is guarded by rateMu
+	// and set by the Watchdog via SetRateMultiplier when local CPU/memory
+	// pressure warrants slowing probing (fail-slow), and restored toward 1.0 on
+	// recovery. A non-positive value (the zero value of a struct-literal Prober,
+	// or an unset throttle) is treated as 1.0 by scaledRate, so throttling is
+	// strictly opt-in and can never silently disable a limiter. It never reaches
+	// 0: the Watchdog floors it at minThrottleMultiplier so probing degrades but
+	// never stops (no fail-closed monitoring hole).
+	rateMultiplier float64
+
 	// flowLabelRotationPeriodSec is the period over which the rotating subset
 	// of each target's flow-label set is refreshed. Read only by the probe-loop
 	// goroutine via flowLabelRotationEpoch; set once at construction and
@@ -320,6 +332,7 @@ func NewProber(device *rdmabridge.Device, ring *rdmabridge.EventRing, probeInter
 		agentEpoch:                 rand.Uint32(),
 		resultChan:                 make(chan *probe.ProbeResult, resultChanSize),
 		stopCh:                     make(chan struct{}),
+		rateMultiplier:             1.0, // unthrottled until the Watchdog engages
 		probeInterval:              time.Duration(probeIntervalMS) * time.Millisecond,
 		probeTimeout:               probeSendTimeoutMS,
 		flowLabelRotationPeriodSec: defaultFlowLabelRotationPeriodSec,
@@ -408,9 +421,9 @@ func (p *Prober) SetPerTypeRateLimit(torMeshPPS, interTorPPS float64) {
 
 	p.rateMu.Lock()
 	p.torMeshRate.pps = torMeshPPS
-	p.torMeshRate.limiter.SetRate(torMeshPPS * float64(nTorMesh))
+	p.torMeshRate.limiter.SetRate(scaledRate(torMeshPPS, nTorMesh, p.rateMultiplier))
 	p.interTorRate.pps = interTorPPS
-	p.interTorRate.limiter.SetRate(interTorPPS * float64(nInterTor))
+	p.interTorRate.limiter.SetRate(scaledRate(interTorPPS, nInterTor, p.rateMultiplier))
 	p.rateMu.Unlock()
 
 	p.logger.Info().
@@ -419,6 +432,64 @@ func (p *Prober) SetPerTypeRateLimit(torMeshPPS, interTorPPS float64) {
 		Float64("inter_tor_pps", interTorPPS).
 		Int("inter_tor_targets", nInterTor).
 		Msg("Probe send rate limits updated")
+}
+
+// SetRateMultiplier scales BOTH per-type aggregate send rates by mult, the
+// self-protection throttle factor. It is the single integration point between
+// the Watchdog and the send path: the Watchdog calls it to slow probing when
+// local CPU/memory pressure rises (fail-slow) and to restore it on recovery.
+// mult is clamped to (0, 1] (out-of-range values map to 1.0 = unthrottled), so
+// the multiplier can only reduce, never amplify, the configured per-target
+// cadence, and can never fully stop probing.
+//
+// It intentionally reuses the SetPerTypeRateLimit lock order (targetsMu ->
+// rateMu): the per-type target counts are read under targetsMu and the limiter
+// rates recomputed under rateMu, so a concurrent UpdateTargets or
+// SetPerTypeRateLimit can neither race the read nor leave a limiter scaled from
+// a stale count. Because the stored multiplier is applied by every subsequent
+// UpdateTargets/SetPerTypeRateLimit too, a pinglist change while throttled
+// preserves the throttle. Safe to call while running.
+func (p *Prober) SetRateMultiplier(mult float64) {
+	mult = clampRateMultiplier(mult)
+
+	p.targetsMu.RLock()
+	defer p.targetsMu.RUnlock()
+	nTorMesh, nInterTor := countTargetsByType(p.targets)
+
+	p.rateMu.Lock()
+	p.rateMultiplier = mult
+	p.torMeshRate.limiter.SetRate(scaledRate(p.torMeshRate.pps, nTorMesh, mult))
+	p.interTorRate.limiter.SetRate(scaledRate(p.interTorRate.pps, nInterTor, mult))
+	p.rateMu.Unlock()
+
+	p.logger.Debug().
+		Float64("rate_multiplier", mult).
+		Msg("Probe send rate multiplier updated")
+}
+
+// clampRateMultiplier bounds a throttle multiplier to (0, 1]. Any value <= 0 or
+// > 1 is nonsensical for a factor that may only slow probing, so it maps to 1.0
+// (unthrottled) -- the safe default that keeps monitoring at full rate rather
+// than risking a stall from a bad input.
+func clampRateMultiplier(mult float64) float64 {
+	if mult <= 0 || mult > 1 {
+		return 1.0
+	}
+	return mult
+}
+
+// scaledRate computes a pinglist type's aggregate limiter rate: the per-target
+// pps times the number of targets of that type, scaled by the self-protection
+// throttle multiplier. A non-positive multiplier (the zero value of a
+// struct-literal Prober, or an unset throttle) is treated as 1.0 so throttling
+// is opt-in and never silently disables the limiter; multiplying by an exact
+// 1.0 is bit-identical to the un-throttled pps*n, so unthrottled behavior is
+// unchanged. A pps of 0 yields 0, which RateLimiter.SetRate reads as disabled.
+func scaledRate(pps float64, n int, mult float64) float64 {
+	if mult <= 0 {
+		mult = 1.0
+	}
+	return pps * float64(n) * mult
 }
 
 // countTargetsByType counts how many targets belong to each pinglist type. A
@@ -514,10 +585,10 @@ func (p *Prober) UpdateTargets(targets []*controller_agent.PingTarget) {
 	nTorMesh, nInterTor := countTargetsByType(targets)
 	p.rateMu.Lock()
 	if p.torMeshRate.pps > 0 {
-		p.torMeshRate.limiter.SetRate(p.torMeshRate.pps * float64(nTorMesh))
+		p.torMeshRate.limiter.SetRate(scaledRate(p.torMeshRate.pps, nTorMesh, p.rateMultiplier))
 	}
 	if p.interTorRate.pps > 0 {
-		p.interTorRate.limiter.SetRate(p.interTorRate.pps * float64(nInterTor))
+		p.interTorRate.limiter.SetRate(scaledRate(p.interTorRate.pps, nInterTor, p.rateMultiplier))
 	}
 	p.rateMu.Unlock()
 

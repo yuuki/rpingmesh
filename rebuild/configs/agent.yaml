@@ -43,5 +43,20 @@ allowed_device_names: []         # Empty = all devices
 metrics_enabled: true
 otel_collector_addr: "localhost:4317"
 
+# Self-protection (opt-in)
+# When enabled, a watchdog samples this process's CPU/memory every
+# watchdog_interval_sec and, on threshold breach, steps the probe send rate down
+# (fail-slow: 1.0 -> 0.5 -> 0.25 -> 0.1, never 0) to shed load, restoring it as
+# usage recovers. It never stops probing (no monitoring blind spot). The current
+# multiplier is exported as the rpingmesh.agent.self_throttle gauge.
+self_protection_enabled: false   # opt-in; default keeps prior behavior
+watchdog_interval_sec: 5         # resource sampling period
+# Hard runtime caps (applied whenever > 0, independent of self_protection_enabled):
+max_memory_mb: 0                 # GOMEMLIMIT via debug.SetMemoryLimit (0 = disabled)
+max_procs: 0                     # cap GOMAXPROCS (0 = Go default: all cores)
+# Throttle thresholds (used only when self_protection_enabled):
+throttle_memory_ratio: 0.9       # engage at 90% of max_memory_mb (only if max_memory_mb > 0)
+throttle_cpu_percent: 90         # engage at 90% of available CPU capacity (GOMAXPROCS cores)
+
 # Logging
 log_level: "info"                # debug, info, warn, error

@@ -122,6 +122,7 @@ type MetricsCollector struct {
 	probeFailed      metric.Int64Counter
 	probeTotal       metric.Int64Counter
 	eventRingDropped metric.Int64ObservableCounter
+	selfThrottle     metric.Float64ObservableGauge
 	logger           zerolog.Logger
 }
 
@@ -297,6 +298,21 @@ func registerInstruments(provider *sdkmetric.MeterProvider) (*MetricsCollector, 
 		return nil, err
 	}
 
+	// Registered without a callback here for the same reason as
+	// eventRingDropped: the value it reports (the current self-protection rate
+	// multiplier) is owned by the agent package's Watchdog, not telemetry.
+	// RegisterSelfThrottleCallback wires the reader in once the agent has
+	// created its watchdog. The gauge carries no attributes: it is a single
+	// process-wide value (1.0 = unthrottled, down to 0.1 = maximally throttled).
+	selfThrottle, err := meter.Float64ObservableGauge(
+		"rpingmesh.agent.self_throttle",
+		metric.WithDescription("Current self-protection probe-rate multiplier (1.0 = unthrottled, lower = throttled to protect local CPU/memory)"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &MetricsCollector{
 		meterProvider:    provider,
 		meter:            meter,
@@ -307,6 +323,7 @@ func registerInstruments(provider *sdkmetric.MeterProvider) (*MetricsCollector, 
 		probeFailed:      probeFailed,
 		probeTotal:       probeTotal,
 		eventRingDropped: eventRingDropped,
+		selfThrottle:     selfThrottle,
 		logger:           log.With().Str("component", "telemetry").Logger(),
 	}, nil
 }
@@ -398,6 +415,29 @@ func (mc *MetricsCollector) RegisterEventRingDropCallback(readers map[string]fun
 	)
 	if err != nil {
 		return fmt.Errorf("register event ring drop callback: %w", err)
+	}
+	return nil
+}
+
+// RegisterSelfThrottleCallback registers an OTel callback that reports the
+// agent's current self-protection rate multiplier on the
+// rpingmesh.agent.self_throttle gauge. read returns the live multiplier
+// (1.0 = unthrottled, down to 0.1 = maximally throttled) and must be cheap
+// (an atomic load, per Watchdog.CurrentMultiplier): it is invoked once per
+// collection cycle by the reader. Like RegisterEventRingDropCallback, the
+// value is owned by the agent package (the Watchdog), so telemetry takes a
+// plain closure rather than importing it. The gauge is intentionally
+// attribute-free to keep it a single, low-cardinality process-wide series.
+func (mc *MetricsCollector) RegisterSelfThrottleCallback(read func() float64) error {
+	_, err := mc.meter.RegisterCallback(
+		func(_ context.Context, o metric.Observer) error {
+			o.ObserveFloat64(mc.selfThrottle, read())
+			return nil
+		},
+		mc.selfThrottle,
+	)
+	if err != nil {
+		return fmt.Errorf("register self throttle callback: %w", err)
 	}
 	return nil
 }

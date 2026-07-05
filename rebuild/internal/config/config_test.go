@@ -322,6 +322,26 @@ func TestLoadAgentConfig_Defaults(t *testing.T) {
 	if cfg.TLSMode != TLSModeDisabled {
 		t.Errorf("TLSMode = %q, want %q (backward-compatible default)", cfg.TLSMode, TLSModeDisabled)
 	}
+	// Self-protection is opt-in: disabled by default, with sane threshold
+	// defaults so that merely enabling it needs no other settings.
+	if cfg.SelfProtectionEnabled != DefaultSelfProtectionEnabled {
+		t.Errorf("SelfProtectionEnabled = %v, want %v", cfg.SelfProtectionEnabled, DefaultSelfProtectionEnabled)
+	}
+	if cfg.WatchdogIntervalSec != DefaultWatchdogIntervalSec {
+		t.Errorf("WatchdogIntervalSec = %d, want %d", cfg.WatchdogIntervalSec, DefaultWatchdogIntervalSec)
+	}
+	if cfg.MaxMemoryMB != 0 {
+		t.Errorf("MaxMemoryMB = %d, want 0 (disabled)", cfg.MaxMemoryMB)
+	}
+	if cfg.MaxProcs != 0 {
+		t.Errorf("MaxProcs = %d, want 0 (Go default)", cfg.MaxProcs)
+	}
+	if cfg.ThrottleMemoryRatio != DefaultThrottleMemoryRatio {
+		t.Errorf("ThrottleMemoryRatio = %g, want %g", cfg.ThrottleMemoryRatio, DefaultThrottleMemoryRatio)
+	}
+	if cfg.ThrottleCPUPercent != DefaultThrottleCPUPercent {
+		t.Errorf("ThrottleCPUPercent = %g, want %g", cfg.ThrottleCPUPercent, float64(DefaultThrottleCPUPercent))
+	}
 }
 
 // TestEffectiveProbeRates verifies the per-pinglist-type rate resolution,
@@ -649,6 +669,85 @@ func TestAgentConfig_Validate(t *testing.T) {
 			cfg: AgentConfig{
 				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
 				TLSMode: TLSModeMTLS,
+			},
+			wantErr: true,
+		},
+		{
+			name: "self-protection enabled with valid thresholds",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				SelfProtectionEnabled: true, WatchdogIntervalSec: 5,
+				ThrottleMemoryRatio: 0.9, ThrottleCPUPercent: 90,
+			},
+			wantErr: false,
+		},
+		{
+			name: "self-protection enabled rejects zero watchdog interval",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				SelfProtectionEnabled: true, WatchdogIntervalSec: 0,
+				ThrottleMemoryRatio: 0.9, ThrottleCPUPercent: 90,
+			},
+			wantErr: true,
+		},
+		{
+			name: "self-protection enabled rejects memory ratio of zero",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				SelfProtectionEnabled: true, WatchdogIntervalSec: 5,
+				ThrottleMemoryRatio: 0, ThrottleCPUPercent: 90,
+			},
+			wantErr: true,
+		},
+		{
+			name: "self-protection enabled rejects memory ratio above one",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				SelfProtectionEnabled: true, WatchdogIntervalSec: 5,
+				ThrottleMemoryRatio: 1.5, ThrottleCPUPercent: 90,
+			},
+			wantErr: true,
+		},
+		{
+			name: "self-protection enabled rejects cpu percent of zero",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				SelfProtectionEnabled: true, WatchdogIntervalSec: 5,
+				ThrottleMemoryRatio: 0.9, ThrottleCPUPercent: 0,
+			},
+			wantErr: true,
+		},
+		{
+			name: "self-protection enabled rejects cpu percent above 100",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				SelfProtectionEnabled: true, WatchdogIntervalSec: 5,
+				ThrottleMemoryRatio: 0.9, ThrottleCPUPercent: 101,
+			},
+			wantErr: true,
+		},
+		{
+			name: "self-protection disabled ignores throttle knobs",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				SelfProtectionEnabled: false, WatchdogIntervalSec: 0,
+				ThrottleMemoryRatio: 0, ThrottleCPUPercent: 0,
+			},
+			wantErr: false,
+		},
+		{
+			name: "negative max_memory_mb rejected regardless of self-protection",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				MaxMemoryMB: -1,
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative max_procs rejected regardless of self-protection",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				MaxProcs: -1,
 			},
 			wantErr: true,
 		},

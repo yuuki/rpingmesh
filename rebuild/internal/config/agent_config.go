@@ -39,6 +39,23 @@ const DefaultFlowLabelRotationPeriodSec = 3600
 // volume against detection latency.
 const DefaultAnalysisWindowSec = 30
 
+// Defaults for agent self-protection (P2-G). The feature is opt-in
+// (SelfProtectionEnabled defaults to false), so an untouched config behaves
+// exactly as before. When enabled, the watchdog samples this process's
+// CPU/memory usage every WatchdogIntervalSec seconds and, on threshold breach,
+// steps the probe-rate multiplier down (fail-slow) rather than stopping.
+const (
+	DefaultSelfProtectionEnabled = false
+	DefaultWatchdogIntervalSec   = 5
+	// DefaultThrottleMemoryRatio triggers throttling once runtime-managed
+	// memory reaches this fraction of max_memory_mb (the GOMEMLIMIT budget).
+	// Memory throttling is inactive unless max_memory_mb > 0.
+	DefaultThrottleMemoryRatio = 0.9
+	// DefaultThrottleCPUPercent triggers throttling once the process's CPU use
+	// reaches this percentage of its available capacity (GOMAXPROCS cores).
+	DefaultThrottleCPUPercent = 90
+)
+
 // MaxGIDIndex is a coarse sanity upper bound for gid_index. Real ibv GID
 // tables are small (rdma_rxe typically exposes a handful of entries; mlx5
 // rarely exceeds a few dozen), so a huge value can never be valid on any
@@ -104,6 +121,31 @@ type AgentConfig struct {
 	// the controller; useful when controller_addr is an IP literal that
 	// doesn't match the server certificate's subject.
 	TLSServerName string `mapstructure:"tls_server_name"`
+
+	// SelfProtectionEnabled turns on the resource watchdog (P2-G): a background
+	// goroutine that samples this process's CPU/memory every
+	// WatchdogIntervalSec and, on threshold breach, steps the probe-rate
+	// multiplier down (fail-slow) to shed load, restoring it on recovery. It
+	// defaults to false, so the agent's behavior is unchanged unless opted in.
+	SelfProtectionEnabled bool `mapstructure:"self_protection_enabled"`
+	// WatchdogIntervalSec is how often the watchdog samples resource usage.
+	WatchdogIntervalSec uint32 `mapstructure:"watchdog_interval_sec"`
+	// MaxMemoryMB sets a soft runtime memory limit via debug.SetMemoryLimit
+	// (GOMEMLIMIT equivalent) at startup; 0 disables it. It is also the
+	// reference budget for memory-based throttling (see ThrottleMemoryRatio):
+	// memory throttling is inactive when this is 0. Applied whenever > 0,
+	// independent of SelfProtectionEnabled, so it can be used as a plain
+	// runtime knob.
+	MaxMemoryMB int `mapstructure:"max_memory_mb"`
+	// MaxProcs caps runtime.GOMAXPROCS at startup; 0 leaves the Go default
+	// (all cores). Applied whenever > 0, independent of SelfProtectionEnabled.
+	MaxProcs int `mapstructure:"max_procs"`
+	// ThrottleMemoryRatio is the fraction of MaxMemoryMB at which memory-based
+	// throttling engages (e.g. 0.9 = 90%). Only meaningful when MaxMemoryMB > 0.
+	ThrottleMemoryRatio float64 `mapstructure:"throttle_memory_ratio"`
+	// ThrottleCPUPercent is the percentage of available CPU capacity (GOMAXPROCS
+	// cores) at which CPU-based throttling engages (e.g. 90 = 90%).
+	ThrottleCPUPercent float64 `mapstructure:"throttle_cpu_percent"`
 }
 
 // LoadAgentConfig loads agent configuration from a YAML file, environment
@@ -141,6 +183,12 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("tls_key_file", "")
 	v.SetDefault("tls_ca_file", "")
 	v.SetDefault("tls_server_name", "")
+	v.SetDefault("self_protection_enabled", DefaultSelfProtectionEnabled)
+	v.SetDefault("watchdog_interval_sec", DefaultWatchdogIntervalSec)
+	v.SetDefault("max_memory_mb", 0)
+	v.SetDefault("max_procs", 0)
+	v.SetDefault("throttle_memory_ratio", DefaultThrottleMemoryRatio)
+	v.SetDefault("throttle_cpu_percent", DefaultThrottleCPUPercent)
 
 	// Enable environment variable override with RPINGMESH_ prefix.
 	// Underscores in env var names map to underscores in config keys.
@@ -218,6 +266,12 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		TLSKeyFile:                 v.GetString("tls_key_file"),
 		TLSCAFile:                  v.GetString("tls_ca_file"),
 		TLSServerName:              v.GetString("tls_server_name"),
+		SelfProtectionEnabled:      v.GetBool("self_protection_enabled"),
+		WatchdogIntervalSec:        v.GetUint32("watchdog_interval_sec"),
+		MaxMemoryMB:                v.GetInt("max_memory_mb"),
+		MaxProcs:                   v.GetInt("max_procs"),
+		ThrottleMemoryRatio:        v.GetFloat64("throttle_memory_ratio"),
+		ThrottleCPUPercent:         v.GetFloat64("throttle_cpu_percent"),
 	}
 
 	if err := config.Validate(); err != nil {
@@ -279,6 +333,37 @@ func (c *AgentConfig) Validate() error {
 		return fmt.Errorf("analysis_window_sec must be > 0 when analysis_report_enabled, got: %d", c.AnalysisWindowSec)
 	}
 
+	// Hard runtime limits are honored regardless of self-protection, so range
+	// checks always apply. Negative values are meaningless (the runtime APIs
+	// take non-negative sizes/counts), so reject them up front.
+	if c.MaxMemoryMB < 0 {
+		return fmt.Errorf("max_memory_mb must be >= 0, got: %d", c.MaxMemoryMB)
+	}
+	if c.MaxProcs < 0 {
+		return fmt.Errorf("max_procs must be >= 0, got: %d", c.MaxProcs)
+	}
+
+	// The throttle thresholds only drive behavior when self-protection is
+	// enabled; validate them only then so a disabled feature never blocks
+	// startup over a knob it does not use.
+	if c.SelfProtectionEnabled {
+		// The interval drives a time.Ticker, which panics on a non-positive
+		// period.
+		if c.WatchdogIntervalSec == 0 {
+			return fmt.Errorf("watchdog_interval_sec must be > 0 when self_protection_enabled, got: %d", c.WatchdogIntervalSec)
+		}
+		// The memory ratio is a fraction of the limit; a value outside (0, 1]
+		// would trigger either never or only after exceeding the limit.
+		if c.ThrottleMemoryRatio <= 0 || c.ThrottleMemoryRatio > 1 {
+			return fmt.Errorf("throttle_memory_ratio must be in (0, 1] when self_protection_enabled, got: %g", c.ThrottleMemoryRatio)
+		}
+		// CPU is measured as a percentage of GOMAXPROCS-core capacity, so the
+		// threshold lives in (0, 100].
+		if c.ThrottleCPUPercent <= 0 || c.ThrottleCPUPercent > 100 {
+			return fmt.Errorf("throttle_cpu_percent must be in (0, 100] when self_protection_enabled, got: %g", c.ThrottleCPUPercent)
+		}
+	}
+
 	// The agent is the gRPC client of the controller connection: fail fast
 	// if the certificate files required by tls_mode are missing, rather
 	// than at the first dial attempt.
@@ -336,4 +421,10 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.String("tls-key-file", "", "Client private key file (required when tls-mode=mtls)")
 	flags.String("tls-ca-file", "", "CA file used to verify the controller's certificate (required when tls-mode is tls or mtls)")
 	flags.String("tls-server-name", "", "Server name for TLS SNI/verification (optional; defaults to the name derived from controller-addr)")
+	flags.Bool("self-protection-enabled", DefaultSelfProtectionEnabled, "Enable the resource watchdog that throttles probing (fail-slow) under local CPU/memory pressure")
+	flags.Uint32("watchdog-interval-sec", DefaultWatchdogIntervalSec, "How often the self-protection watchdog samples resource usage (seconds)")
+	flags.Int("max-memory-mb", 0, "Soft runtime memory limit in MiB (GOMEMLIMIT via debug.SetMemoryLimit; 0 = disabled). Also the reference budget for memory throttling")
+	flags.Int("max-procs", 0, "Cap runtime.GOMAXPROCS to this many cores (0 = Go default: all cores)")
+	flags.Float64("throttle-memory-ratio", DefaultThrottleMemoryRatio, "Fraction of max-memory-mb at which memory throttling engages (0-1; only when max-memory-mb > 0)")
+	flags.Float64("throttle-cpu-percent", DefaultThrottleCPUPercent, "Percentage of available CPU capacity (GOMAXPROCS cores) at which CPU throttling engages (0-100)")
 }

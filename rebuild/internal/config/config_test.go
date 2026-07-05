@@ -45,6 +45,9 @@ func TestLoadControllerConfig_Defaults(t *testing.T) {
 	if cfg.InterTorSampleSize != DefaultInterTorSampleSize {
 		t.Errorf("InterTorSampleSize = %d, want %d", cfg.InterTorSampleSize, DefaultInterTorSampleSize)
 	}
+	if cfg.TLSMode != TLSModeDisabled {
+		t.Errorf("TLSMode = %q, want %q (backward-compatible default)", cfg.TLSMode, TLSModeDisabled)
+	}
 }
 
 func TestLoadControllerConfig_FileOverridesDefault(t *testing.T) {
@@ -234,6 +237,46 @@ func TestControllerConfig_Validate(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "tls_mode disabled requires no certificate files",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+				TLSMode: TLSModeDisabled,
+			},
+			wantErr: false,
+		},
+		{
+			name: "unknown tls_mode is rejected",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+				TLSMode: "bogus",
+			},
+			wantErr: true,
+		},
+		{
+			name: "tls_mode=tls without server cert/key is rejected",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+				TLSMode: TLSModeTLS,
+			},
+			wantErr: true,
+		},
+		{
+			name: "tls_mode=mtls without ca/cert/key is rejected",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+				TLSMode: TLSModeMTLS,
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -275,6 +318,9 @@ func TestLoadAgentConfig_Defaults(t *testing.T) {
 	}
 	if cfg.HostName == "" {
 		t.Error("HostName should be auto-detected, got empty string")
+	}
+	if cfg.TLSMode != TLSModeDisabled {
+		t.Errorf("TLSMode = %q, want %q (backward-compatible default)", cfg.TLSMode, TLSModeDisabled)
 	}
 }
 
@@ -371,6 +417,22 @@ func TestLoadAgentConfig_ZeroProbeInterval(t *testing.T) {
 	}
 }
 
+func TestLoadAgentConfig_MTLSMissingFiles(t *testing.T) {
+	t.Setenv("RPINGMESH_TLS_MODE", TLSModeMTLS)
+
+	if _, err := LoadAgentConfig("", nil); err == nil {
+		t.Fatal("expected an error for tls_mode=mtls with no cert/key/ca configured, got nil")
+	}
+}
+
+func TestLoadAgentConfig_InvalidTLSMode(t *testing.T) {
+	t.Setenv("RPINGMESH_TLS_MODE", "bogus")
+
+	if _, err := LoadAgentConfig("", nil); err == nil {
+		t.Fatal("expected an error for an unknown tls_mode, got nil")
+	}
+}
+
 func TestAgentConfig_Validate(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -437,6 +499,38 @@ func TestAgentConfig_Validate(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "tls_mode disabled requires no certificate files",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				TLSMode: TLSModeDisabled,
+			},
+			wantErr: false,
+		},
+		{
+			name: "unknown tls_mode is rejected",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				TLSMode: "bogus",
+			},
+			wantErr: true,
+		},
+		{
+			name: "tls_mode=tls without ca file is rejected",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				TLSMode: TLSModeTLS,
+			},
+			wantErr: true,
+		},
+		{
+			name: "tls_mode=mtls without ca/cert/key is rejected",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				TLSMode: TLSModeMTLS,
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -446,5 +540,24 @@ func TestAgentConfig_Validate(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestAgentConfig_Validate_MTLSWithRealFiles verifies that tls_mode=mtls
+// passes Validate() once all three certificate files actually exist on
+// disk, using freshly generated test certificates rather than a hard-coded
+// stub path (real existence checking is the behavior under test).
+func TestAgentConfig_Validate_MTLSWithRealFiles(t *testing.T) {
+	certs := newTestCertSet(t)
+
+	cfg := AgentConfig{
+		GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+		TLSMode:     TLSModeMTLS,
+		TLSCertFile: certs.clientCertFile,
+		TLSKeyFile:  certs.clientKeyFile,
+		TLSCAFile:   certs.caFile,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil when all tls files exist", err)
 	}
 }

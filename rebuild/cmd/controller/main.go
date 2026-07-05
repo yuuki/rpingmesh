@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 
 	"github.com/yuuki/rpingmesh/rebuild/internal/config"
 	"github.com/yuuki/rpingmesh/rebuild/internal/controller"
@@ -70,6 +71,7 @@ func run(cmd *cobra.Command, args []string) error {
 		Int("ecmpPathsAssumed", cfg.EcmpPathsAssumed).
 		Float64("ecmpCoverageProbability", cfg.EcmpCoverageProbability).
 		Int("ecmpMaxFlowLabels", cfg.EcmpMaxFlowLabels).
+		Str("tlsMode", cfg.TLSMode).
 		Msg("Starting rpingmesh-controller")
 
 	// Initialize RNIC registry backed by rqlite.
@@ -96,8 +98,24 @@ func run(cmd *cobra.Command, args []string) error {
 		MaxFlowLabels:       cfg.EcmpMaxFlowLabels,
 	})
 
+	// Configure gRPC server transport security from tls_mode. disabled (the
+	// default) preserves the original plaintext behavior for backward
+	// compatibility.
+	var serverOpts []grpc.ServerOption
+	switch cfg.TLSMode {
+	case config.TLSModeDisabled, "":
+		log.Warn().Msg("gRPC server starting with tls_mode=disabled: controller-agent traffic is plaintext and unauthenticated; set tls_mode to tls or mtls for production deployments")
+	default:
+		tlsConfig, err := config.ServerTLSConfig(cfg.TLSMode, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile)
+		if err != nil {
+			return fmt.Errorf("failed to build server TLS configuration: %w", err)
+		}
+		serverOpts = append(serverOpts, grpc.Creds(credentials.NewTLS(tlsConfig)))
+		log.Info().Str("tlsMode", cfg.TLSMode).Msg("gRPC server TLS enabled")
+	}
+
 	// Create and configure the gRPC server.
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(serverOpts...)
 	controller_agent.RegisterControllerServiceServer(grpcServer, svc)
 
 	// Start listening on the configured address.

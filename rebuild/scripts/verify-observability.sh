@@ -4,6 +4,27 @@
 # and `make obs-seed`.
 set -euo pipefail
 
+# Resolve deploy/observability/.env from this script's own location, not the
+# caller's cwd, so `make obs-verify` (cwd=rebuild/) and a direct
+# `./scripts/verify-observability.sh` invocation both find it.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/../deploy/observability/.env"
+
+# If `make obs-up` started Grafana with a non-default admin user/password
+# from deploy/observability/.env, verify against those same credentials
+# instead of silently falling back to admin/admin. Env vars already
+# exported by the caller take priority over the .env file.
+if [ -f "$ENV_FILE" ]; then
+  _preset_user="${GF_SECURITY_ADMIN_USER-}"
+  _preset_pass="${GF_SECURITY_ADMIN_PASSWORD-}"
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+  [ -n "$_preset_user" ] && GF_SECURITY_ADMIN_USER="$_preset_user"
+  [ -n "$_preset_pass" ] && GF_SECURITY_ADMIN_PASSWORD="$_preset_pass"
+fi
+
 VM_URL="${VM_URL:-http://localhost:8428}"
 GRAFANA_URL="${GRAFANA_URL:-http://localhost:3000}"
 GRAFANA_USER="${GF_SECURITY_ADMIN_USER:-admin}"

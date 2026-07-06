@@ -51,6 +51,12 @@ make obs-down       # stop the stack and remove volumes
 `admin`/`admin` is the default Grafana credential for this local demo stack
 only — **never use it in production**. Pin the image tags in
 `.env` (copy from `.env.example`) before relying on this stack long-term.
+If you change `GF_SECURITY_ADMIN_USER`/`GF_SECURITY_ADMIN_PASSWORD` in
+`.env`, `make obs-verify` picks up the same values automatically —
+`scripts/verify-observability.sh` reads `deploy/observability/.env` itself
+(resolved from the script's own location, not the caller's cwd), falling
+back to `admin`/`admin` if the file or the variables are absent. Env vars
+already exported when you invoke the script take priority over `.env`.
 
 ## Connecting real telemetry
 

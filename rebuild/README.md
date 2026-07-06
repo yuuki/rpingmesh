@@ -650,14 +650,37 @@ Histogram bucket boundaries (nanoseconds):
 
 This covers the 100 ns to 10 ms range typical of datacenter RDMA networks.
 
-### Grafana Setup
+### Observability & Dashboards
 
-1. Deploy an OpenTelemetry Collector with an OTLP gRPC receiver on port 4317.
-2. Configure a Prometheus remote-write exporter or use the Prometheus receiver
-   to scrape the collector.
-3. Point the agent's `otel_collector_addr` to the collector.
-4. In Grafana, create dashboards querying `rpingmesh_network_rtt_ns` histograms,
-   grouped by `source_tor` and `target_tor`.
+A ready-to-use pipeline and two provisioned Grafana dashboards live in this
+repo: OTLP metrics (above) flow through `otel-collector-contrib` into
+VictoriaMetrics and are visualized in Grafana with zero custom plugins. See
+`docs/design/grafana-dashboards.md` for the full design (metric-name
+contract, panel layout, drilldown mechanism).
+
+**Metric name contract:** the collector's `prometheusremotewrite` exporter
+must escape `.` to `_` but must **not** append extra `_total`/unit suffixes,
+since the OTel instrument names already carry them (`rpingmesh.probe_total` →
+`rpingmesh_probe_total`, not `rpingmesh_probe_total_total`). The pinned
+collector version (`otel-collector/config.yaml`) is set to
+`add_metric_suffixes: false` for this; newer collector releases expose the
+equivalent as `translation_strategy: UnderscoreEscapingWithoutSuffixes` —
+never set both. Verified end-to-end against a live OTLP push in
+`deploy/observability/README.md`.
+
+Quick start:
+
+```bash
+make obs-up        # start VictoriaMetrics + otel-collector + Grafana (localhost:3000, admin/admin)
+make obs-seed       # load synthetic demo data (no RDMA hardware required)
+open http://localhost:3000  # dashboards under the "R-Pingmesh" folder
+```
+
+`admin`/`admin` is the default Grafana credential for this local demo stack
+only — never use it in production. To point a real agent/analyzer at the
+stack, set `otel_collector_addr: localhost:4317`. See
+`deploy/observability/README.md` for details, and `make obs-down` to tear the
+stack down.
 
 ### Logging
 

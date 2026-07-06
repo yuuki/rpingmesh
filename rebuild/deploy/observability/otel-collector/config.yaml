@@ -1,0 +1,37 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  prometheusremotewrite:
+    endpoint: http://victoriametrics:8428/api/v1/write
+    tls:
+      insecure: true
+    # CRITICAL: keep metric names identical to the OTLP names (dots -> underscores
+    # only). The instruments already carry _total / _ns, so DO NOT append suffixes.
+    # The pinned collector (0.117.0) predates the `translation_strategy` option
+    # (verified against exporter/prometheusremotewriteexporter/config.go at that
+    # tag: only `add_metric_suffixes` exists), so use the documented fallback.
+    # If/when upgrading to a collector version that supports translation_strategy,
+    # prefer `translation_strategy: UnderscoreEscapingWithoutSuffixes` instead of
+    # this flag -- never set both.
+    add_metric_suffixes: false
+    resource_to_telemetry_conversion:
+      enabled: false
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheusremotewrite]

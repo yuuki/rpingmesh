@@ -6,7 +6,8 @@
         generate generate-proto clean test test-go test-zig test-all vet \
         test-e2e setup-colima test-e2e-controller clean-e2e-controller \
         check-nfpm package package-agent package-controller \
-        package-build-agent package-build-controller help
+        package-build-agent package-build-controller \
+        obs-up obs-down obs-seed obs-verify obs-logs help
 
 # Directories
 ZIG_DIR := zig
@@ -215,6 +216,26 @@ clean:
 	cd $(ZIG_DIR) && rm -rf zig-out .zig-cache
 	@echo "==> Clean complete"
 
+# Observability stack (Grafana dashboards demo; see docs/design/grafana-dashboards.md)
+OBS_DIR := deploy/observability
+OBS_COMPOSE := $(OBS_DIR)/docker-compose.observability.yml
+
+obs-up: ## Start the observability stack (VictoriaMetrics + otel-collector + Grafana)
+	cd $(OBS_DIR) && [ -f .env ] || cp .env.example .env
+	docker compose -f $(OBS_COMPOSE) --env-file $(OBS_DIR)/.env up -d
+
+obs-down: ## Stop the observability stack and remove volumes
+	docker compose -f $(OBS_COMPOSE) down -v
+
+obs-seed: ## Seed synthetic mesh metrics into VictoriaMetrics
+	VM_URL=http://localhost:8428 ./scripts/seed-demo-metrics.sh
+
+obs-logs: ## Tail observability stack logs
+	docker compose -f $(OBS_COMPOSE) logs -f
+
+obs-verify: ## Verify Grafana health, provisioning, and every panel query
+	./scripts/verify-observability.sh
+
 # Help
 help:
 	@echo "R-Pingmesh Rebuild Build System"
@@ -241,6 +262,11 @@ help:
 	@echo "  package-agent        Build .deb/.rpm packages for the agent only"
 	@echo "  package-controller   Build .deb/.rpm packages for the controller only"
 	@echo "  clean                Remove all build artifacts"
+	@echo "  obs-up               Start the observability stack (VictoriaMetrics + otel-collector + Grafana)"
+	@echo "  obs-down             Stop the observability stack and remove volumes"
+	@echo "  obs-seed             Seed synthetic mesh metrics into VictoriaMetrics"
+	@echo "  obs-verify           Verify Grafana health, provisioning, and every panel query"
+	@echo "  obs-logs             Tail observability stack logs"
 	@echo ""
 	@echo "Requirements:"
 	@echo "  Go 1.26+, Zig 0.15.2, protoc, libibverbs-dev, librdmacm-dev"

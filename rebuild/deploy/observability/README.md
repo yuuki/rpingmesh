@@ -37,6 +37,13 @@ This was verified end-to-end, not just via the seed script's direct
 `rpingmesh_probe_total` in VictoriaMetrics (not `rpingmesh_probe_total_total`),
 with `job` correctly derived from the `service.name` resource attribute.
 
+`instance` is likewise derived from the OTel resource's `service.instance.id`
+(`internal/telemetry/otel_metrics.go`'s `buildResource()` sets it to
+`os.Hostname()`), so multiple agent processes covering the same ToR pair get
+distinct series instead of colliding onto one and corrupting `rate()`. See
+"Identity contract" in `rebuild/docs/design/grafana-dashboards.md` for the
+full rationale and verification.
+
 ## Quick start
 
 ```bash

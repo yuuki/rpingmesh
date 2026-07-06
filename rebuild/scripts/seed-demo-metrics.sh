@@ -29,55 +29,73 @@ gen() {
           if (i == 1 && j == 4) { loss = 0.06;  modal = 9 }   # a->d lossy
           if (i == 3 && j == 5) { loss = 0.04;  modal = 8 }   # c->e lossy
           if (i == 2 && j == 6) { loss = 0.002; modal = 10 }  # b->f high RTT (1-5ms)
-          per = 30                        # probes attempted per step
-          fail = int(per * loss + 0.5)
-          succ = per - fail
-          # accumulate counters
-          tot[key]  += per
-          ok[key]   += succ
-          # failures: most timeouts, a steady trickle of invalid_rtt
-          ftimeout[key] += fail
-          finvalid[key] += (( (i+j+t) % 7 == 0) ? 1 : 0)
-          # histogram cumulative buckets: put succ obs into modal bucket
-          for (b = 1; b <= nle; b++) if (b >= modal) hb[key,b] += succ
-          hcount[key] += succ
-          hsum[key]   += succ * LE[modal]   # rough sum using modal bucket bound (ns)
-          # SLA violations for the bad pairs.
-          # NOTE: gated on (t - start), not raw t: STEP (15s) shares a common
-          # factor with 60/90/120, so a raw "t % 60 == 0" check only ever
-          # fires if the absolute epoch `start` happens to be a multiple of
-          # 15 -- true for only 1 in 15 runs depending on wall-clock time at
-          # invocation. Anchoring to the loop-relative offset (always a
-          # multiple of STEP, starting at 0) makes it fire deterministically
-          # regardless of when the script is run.
-          if (i == 1 && j == 4) slaloss[key] += (((t - start) % 60 == 0) ? 1 : 0)
-          if (i == 3 && j == 5) slaloss[key] += (((t - start) % 90 == 0) ? 1 : 0)
-          if (i == 2 && j == 6) slartt[key]  += (((t - start) % 120 == 0) ? 1 : 0)
+          per_total = 30                  # probes attempted per step, across all agents
 
-          lbl = "source_tor=\"" T[i] "\",target_tor=\"" T[j] "\",job=\"rpingmesh-agent\""
-          printf "rpingmesh_probe_total{%s} %d %d\n", lbl, tot[key], ts
-          printf "rpingmesh_probe_success_total{%s} %d %d\n", lbl, ok[key], ts
-          if (ftimeout[key] > 0)
-            printf "rpingmesh_probe_failed_total{%s,reason=\"timeout\"} %d %d\n", lbl, ftimeout[key], ts
-          if (finvalid[key] > 0)
-            printf "rpingmesh_probe_failed_total{%s,reason=\"invalid_rtt\"} %d %d\n", lbl, finvalid[key], ts
-          for (b = 1; b <= nle; b++)
-            printf "rpingmesh_network_rtt_ns_bucket{%s,le=\"%s\"} %d %d\n", lbl, LE[b], hb[key,b], ts
-          printf "rpingmesh_network_rtt_ns_bucket{%s,le=\"+Inf\"} %d %d\n", lbl, hcount[key], ts
-          printf "rpingmesh_network_rtt_ns_sum{%s} %d %d\n", lbl, hsum[key], ts
-          printf "rpingmesh_network_rtt_ns_count{%s} %d %d\n", lbl, hcount[key], ts
-          # reuse the same distribution for prober/responder delay (demo only)
-          for (b = 1; b <= nle; b++) {
-            printf "rpingmesh_prober_delay_ns_bucket{%s,le=\"%s\"} %d %d\n", lbl, LE[b], hb[key,b], ts
-            printf "rpingmesh_responder_delay_ns_bucket{%s,le=\"%s\"} %d %d\n", lbl, LE[b], hb[key,b], ts
+          # Split this pairs probes across two synthetic agent instances
+          # (instance="agent-1"/"agent-2") instead of one combined series.
+          # This exercises the identity contract (job <- service.name,
+          # instance <- service.instance.id, see
+          # docs/design/grafana-dashboards.md): without an instance label,
+          # multiple agents covering the same ToR pair would collide onto
+          # one Prometheus series and corrupt rate(); with it, each agent
+          # gets its own well-formed monotonic counter and dashboard panels
+          # (all of which aggregate with sum by (source_tor, target_tor) /
+          # sum by (le) / etc., never by instance) recombine them correctly.
+          for (inst = 1; inst <= 2; inst++) {
+            per = int(per_total / 2) + ((inst == 1 && per_total % 2 == 1) ? 1 : 0)
+            fail = int(per * loss + 0.5)
+            succ = per - fail
+            ik = key SUBSEP inst
+            # accumulate counters
+            tot[ik]  += per
+            ok[ik]   += succ
+            # failures: most timeouts, a steady trickle of invalid_rtt
+            ftimeout[ik] += fail
+            finvalid[ik] += (( (i+j+t+inst) % 7 == 0) ? 1 : 0)
+            # histogram cumulative buckets: put succ obs into modal bucket
+            for (b = 1; b <= nle; b++) if (b >= modal) hb[ik,b] += succ
+            hcount[ik] += succ
+            hsum[ik]   += succ * LE[modal]   # rough sum using modal bucket bound (ns)
+            # SLA violations for the bad pairs, attributed to instance 1
+            # only (the analyzer emits one violation per detection window,
+            # not per contributing agent).
+            # NOTE: gated on (t - start), not raw t: STEP (15s) shares a
+            # common factor with 60/90/120, so a raw "t % 60 == 0" check
+            # only ever fires if the absolute epoch `start` happens to be a
+            # multiple of 15 -- true for only 1 in 15 runs depending on
+            # wall-clock time at invocation. Anchoring to the loop-relative
+            # offset (always a multiple of STEP, starting at 0) makes it
+            # fire deterministically regardless of when the script is run.
+            if (inst == 1 && i == 1 && j == 4) slaloss[key] += (((t - start) % 60 == 0) ? 1 : 0)
+            if (inst == 1 && i == 3 && j == 5) slaloss[key] += (((t - start) % 90 == 0) ? 1 : 0)
+            if (inst == 1 && i == 2 && j == 6) slartt[key]  += (((t - start) % 120 == 0) ? 1 : 0)
+
+            lbl = "source_tor=\"" T[i] "\",target_tor=\"" T[j] "\",job=\"rpingmesh-agent\",instance=\"agent-" inst "\""
+            printf "rpingmesh_probe_total{%s} %d %d\n", lbl, tot[ik], ts
+            printf "rpingmesh_probe_success_total{%s} %d %d\n", lbl, ok[ik], ts
+            if (ftimeout[ik] > 0)
+              printf "rpingmesh_probe_failed_total{%s,reason=\"timeout\"} %d %d\n", lbl, ftimeout[ik], ts
+            if (finvalid[ik] > 0)
+              printf "rpingmesh_probe_failed_total{%s,reason=\"invalid_rtt\"} %d %d\n", lbl, finvalid[ik], ts
+            for (b = 1; b <= nle; b++)
+              printf "rpingmesh_network_rtt_ns_bucket{%s,le=\"%s\"} %d %d\n", lbl, LE[b], hb[ik,b], ts
+            printf "rpingmesh_network_rtt_ns_bucket{%s,le=\"+Inf\"} %d %d\n", lbl, hcount[ik], ts
+            printf "rpingmesh_network_rtt_ns_sum{%s} %d %d\n", lbl, hsum[ik], ts
+            printf "rpingmesh_network_rtt_ns_count{%s} %d %d\n", lbl, hcount[ik], ts
+            # reuse the same distribution for prober/responder delay (demo only)
+            for (b = 1; b <= nle; b++) {
+              printf "rpingmesh_prober_delay_ns_bucket{%s,le=\"%s\"} %d %d\n", lbl, LE[b], hb[ik,b], ts
+              printf "rpingmesh_responder_delay_ns_bucket{%s,le=\"%s\"} %d %d\n", lbl, LE[b], hb[ik,b], ts
+            }
+            printf "rpingmesh_prober_delay_ns_bucket{%s,le=\"+Inf\"} %d %d\n", lbl, hcount[ik], ts
+            printf "rpingmesh_prober_delay_ns_sum{%s} %d %d\n", lbl, hsum[ik], ts
+            printf "rpingmesh_prober_delay_ns_count{%s} %d %d\n", lbl, hcount[ik], ts
+            printf "rpingmesh_responder_delay_ns_bucket{%s,le=\"+Inf\"} %d %d\n", lbl, hcount[ik], ts
+            printf "rpingmesh_responder_delay_ns_sum{%s} %d %d\n", lbl, hsum[ik], ts
+            printf "rpingmesh_responder_delay_ns_count{%s} %d %d\n", lbl, hcount[ik], ts
           }
-          printf "rpingmesh_prober_delay_ns_bucket{%s,le=\"+Inf\"} %d %d\n", lbl, hcount[key], ts
-          printf "rpingmesh_prober_delay_ns_sum{%s} %d %d\n", lbl, hsum[key], ts
-          printf "rpingmesh_prober_delay_ns_count{%s} %d %d\n", lbl, hcount[key], ts
-          printf "rpingmesh_responder_delay_ns_bucket{%s,le=\"+Inf\"} %d %d\n", lbl, hcount[key], ts
-          printf "rpingmesh_responder_delay_ns_sum{%s} %d %d\n", lbl, hsum[key], ts
-          printf "rpingmesh_responder_delay_ns_count{%s} %d %d\n", lbl, hcount[key], ts
-          # analyzer SLA violations (job=rpingmesh-analyzer)
+          # analyzer SLA violations (job=rpingmesh-analyzer; the analyzer is
+          # a separate, single process in this demo, so no instance split).
           albl = "source_tor=\"" T[i] "\",target_tor=\"" T[j] "\",job=\"rpingmesh-analyzer\""
           if (slaloss[key] > 0)
             printf "rpingmesh_analyzer_sla_violations_total{%s,kind=\"loss\"} %d %d\n", albl, slaloss[key], ts

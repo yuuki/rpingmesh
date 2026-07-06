@@ -103,6 +103,32 @@ same fixed names:
 they are unaffected by the strategy choice. The seed script emits these exact
 names, closing the loop: exporter, dashboards, and seed all agree.
 
+**Identity contract: `job` and `instance`.** The name contract above is
+necessary but not sufficient: a metric name plus its `source_tor`/`target_tor`
+attributes does not uniquely identify a *series* across a real deployment with
+more than one agent process. `prometheusremotewrite` derives the Prometheus
+`job` label from the OTel resource's `service.name` and the `instance` label
+from `service.instance.id`. `internal/telemetry/otel_metrics.go`'s
+`buildResource()` sets `service.name` (`rpingmesh-agent` /
+`rpingmesh-analyzer`, per `WithServiceName`) and `service.instance.id`
+(`os.Hostname()`, falling back to a random UUID only if that fails). Without
+`service.instance.id`, every agent process reporting the same metric name and
+ToR-pair attributes — the attribute-free `rpingmesh.agent.self_throttle` and
+`rpingmesh.event_ring_dropped_total{ring=...}` are the sharpest examples, but
+the same collision hits `rpingmesh.probe_total{source_tor,target_tor}` for any
+two agents covering the same ToR pair — collapses onto one Prometheus series.
+Interleaved writers on one series corrupt `rate()`/`increase()` (spurious
+resets and double-counting look identical to real signal). Every dashboard
+panel aggregates with `sum by (...)`/`min(...)`/`topk(...)` clauses that never
+include `instance`, so per-agent series are recombined into the correct
+fleet/pair total once each agent's counter is well-formed on its own — the
+fix is entirely in what identifies a series, not in how the dashboards query
+it. Verified end-to-end (not just unit-tested): a real OTLP push through the
+actual Go SDK landed with `instance` equal to the pushing host's real
+hostname, and two OTLP pushes for the same metric/ToR-pair with distinct
+`service.instance.id` values produced two separate, non-colliding series that
+`sum by (source_tor, target_tor)` still correctly combined into one total.
+
 ## Decision 2: two dashboards, native panels only
 
 Two dashboards, matching the two operator questions:

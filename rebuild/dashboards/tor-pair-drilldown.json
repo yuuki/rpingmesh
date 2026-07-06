@@ -36,7 +36,7 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "100 * sum(rate(rpingmesh_probe_success_total{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])) / clamp_min(sum(rate(rpingmesh_probe_total{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])), 1)",
+          "expr": "100 * sum(rate(rpingmesh_probe_success_total{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])) / (sum(rate(rpingmesh_probe_total{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])) > 0)",
           "range": true } ],
       "fieldConfig": { "defaults": { "unit": "percent", "decimals": 3, "color": { "mode": "thresholds" },
         "thresholds": { "mode": "absolute", "steps": [

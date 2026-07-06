@@ -30,7 +30,7 @@ curl -s -u "${GRAFANA_USER}:${GRAFANA_PASS}" "${GRAFANA_URL}/api/datasources" \
 echo "== Panel queries against VictoriaMetrics ==" >&2
 queries=(
   'sum(rate(rpingmesh_probe_total[5m]))'
-  '100 * (1 - sum by (source_tor,target_tor)(rate(rpingmesh_probe_success_total[30m])) / clamp_min(sum by (source_tor,target_tor)(rate(rpingmesh_probe_total[30m])),1))'
+  '100 * (1 - sum by (source_tor,target_tor)(rate(rpingmesh_probe_success_total[30m])) / (sum by (source_tor,target_tor)(rate(rpingmesh_probe_total[30m])) > 0))'
   'sum by (reason)(rate(rpingmesh_probe_failed_total[5m]))'
   'sum by (kind)(rate(rpingmesh_analyzer_sla_violations_total[5m]))'
   'histogram_quantile(0.99, sum by (le)(rate(rpingmesh_network_rtt_ns_bucket{source_tor="tor-a",target_tor="tor-d"}[5m])))'

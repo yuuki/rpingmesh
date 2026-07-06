@@ -117,6 +117,14 @@ point:
   matrix* transformation (`rowField=source_tor`, `columnField=target_tor`,
   `valueField=Value`) and colored by threshold via a color-background cell type.
   This is the paper's "at a glance, where is the fabric broken" view.
+  All success-ratio/loss% queries divide by `(sum(rate(rpingmesh_probe_total[...])) > 0)`
+  rather than `clamp_min(..., 1)`: `rate()` is in probes/sec, so a ToR pair
+  probed at less than 1/s (a low `inter_tor_probe_rate_per_second`, or a
+  self-throttled agent) would clamp to a denominator of 1 and read as a huge,
+  fabricated loss% even at 100% success. Filtering out zero/negative
+  denominators instead drops those pairs from the result (a "no data" matrix
+  cell), which is correct — there is no loss ratio to report when there were
+  no probes.
 - A **companion "Worst ToR pairs" table** (`topk` by loss%) carrying the
   drilldown data link. See Decision 3 for why the clickable path lives here and
   not on the matrix cells.

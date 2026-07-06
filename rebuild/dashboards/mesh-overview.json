@@ -30,7 +30,7 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "100 * sum(rate(rpingmesh_probe_success_total[$__rate_interval])) / clamp_min(sum(rate(rpingmesh_probe_total[$__rate_interval])), 1)",
+          "expr": "100 * sum(rate(rpingmesh_probe_success_total[$__rate_interval])) / (sum(rate(rpingmesh_probe_total[$__rate_interval])) > 0)",
           "range": true } ],
       "fieldConfig": { "defaults": { "unit": "percent", "decimals": 3, "color": { "mode": "thresholds" },
         "thresholds": { "mode": "absolute", "steps": [
@@ -83,7 +83,7 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "100 * (1 - sum by (source_tor, target_tor) (rate(rpingmesh_probe_success_total[$__range])) / clamp_min(sum by (source_tor, target_tor) (rate(rpingmesh_probe_total[$__range])), 1))",
+          "expr": "100 * (1 - sum by (source_tor, target_tor) (rate(rpingmesh_probe_success_total[$__range])) / (sum by (source_tor, target_tor) (rate(rpingmesh_probe_total[$__range])) > 0))",
           "format": "table", "instant": true, "range": false } ],
       "transformations": [
         { "id": "groupingToMatrix",
@@ -106,7 +106,7 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "topk(20, 100 * (1 - sum by (source_tor, target_tor) (rate(rpingmesh_probe_success_total[$__range])) / clamp_min(sum by (source_tor, target_tor) (rate(rpingmesh_probe_total[$__range])), 1)))",
+          "expr": "topk(20, 100 * (1 - sum by (source_tor, target_tor) (rate(rpingmesh_probe_success_total[$__range])) / (sum by (source_tor, target_tor) (rate(rpingmesh_probe_total[$__range])) > 0)))",
           "format": "table", "instant": true, "range": false } ],
       "transformations": [
         { "id": "organize",

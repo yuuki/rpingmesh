@@ -221,7 +221,7 @@ OBS_DIR := deploy/observability
 OBS_COMPOSE := $(OBS_DIR)/docker-compose.observability.yml
 
 obs-up: ## Start the observability stack (VictoriaMetrics + otel-collector + Grafana)
-	cd $(OBS_DIR) && [ -f .env ] || cp .env.example .env
+	cd $(OBS_DIR) && { [ -f .env ] || cp .env.example .env; }
 	docker compose -f $(OBS_COMPOSE) --env-file $(OBS_DIR)/.env up -d
 
 obs-down: ## Stop the observability stack and remove volumes

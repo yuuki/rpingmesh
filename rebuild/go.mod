@@ -3,6 +3,7 @@ module github.com/yuuki/rpingmesh/rebuild
 go 1.26.0
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/rqlite/gorqlite v0.0.0-20260504155303-50d445fd0ab9
 	github.com/rs/zerolog v1.35.1
 	github.com/spf13/cobra v1.10.2
@@ -15,7 +16,6 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.44.0
 	golang.org/x/sys v0.46.0
 	google.golang.org/grpc v1.82.0
-	google.golang.org/protobuf v1.36.11
 )
 
 require (
@@ -25,7 +25,6 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
@@ -44,4 +43,5 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 )

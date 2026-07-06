@@ -1,0 +1,12 @@
+apiVersion: 1
+providers:
+  - name: rpingmesh
+    orgId: 1
+    folder: R-Pingmesh
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

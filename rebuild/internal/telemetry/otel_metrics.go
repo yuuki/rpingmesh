@@ -10,9 +10,11 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/rebuild/internal/probe"
@@ -126,10 +128,38 @@ type MetricsCollector struct {
 	logger           zerolog.Logger
 }
 
+// instanceID returns a value suitable for the OTel resource's
+// service.instance.id attribute: the machine's hostname, which is stable
+// across an agent's lifetime and distinct per host in the common case of
+// one agent per machine. os.Hostname() essentially never fails on Linux,
+// but if it does (e.g. a container with an unusual /proc setup), fall back
+// to a random UUID rather than leaving service.instance.id unset -- an
+// unset instance ID is exactly the bug this exists to prevent (see
+// buildResource): multiple agents would collide onto the same Prometheus
+// series after prometheusremotewrite derives `instance` from this
+// attribute.
+func instanceID() string {
+	host, err := os.Hostname()
+	if err != nil {
+		log.Warn().Err(err).Msg("os.Hostname failed; falling back to a random service.instance.id")
+		return uuid.NewString()
+	}
+	return host
+}
+
 // buildResource builds the OTel resource identifying this service, merging
-// process/host defaults with the given service name and a fixed service
-// version. Extracted as its own function so tests can verify service-name
+// process/host defaults with the given service name, a fixed service
+// version, and a per-process service.instance.id (see instanceID).
+// Extracted as its own function so tests can verify service-name
 // parameterization without dialing a real OTLP collector.
+//
+// service.instance.id matters beyond identification: the collector's
+// prometheusremotewrite exporter derives the Prometheus `instance` label
+// from it (as it derives `job` from service.name). Without it, every agent
+// process reporting the same metric name+ToR-pair attributes collides onto
+// one Prometheus series -- rate() then mixes counters from unrelated
+// processes, corrupting every rate/quantile derived from it. See
+// docs/design/grafana-dashboards.md's "identity contract" note.
 func buildResource(serviceName string) (*resource.Resource, error) {
 	return resource.Merge(
 		resource.Default(),
@@ -137,6 +167,7 @@ func buildResource(serviceName string) (*resource.Resource, error) {
 			semconv.SchemaURL,
 			semconv.ServiceName(serviceName),
 			semconv.ServiceVersion("0.1.0"),
+			semconv.ServiceInstanceID(instanceID()),
 		),
 	)
 }

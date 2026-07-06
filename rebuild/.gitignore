@@ -8,3 +8,7 @@ zig/.zig-cache/
 
 # Packaged .deb/.rpm output (`make package`)
 dist/
+
+# Local observability stack env overrides (copy of .env.example; may pin
+# image tags per-machine, never commit local secrets)
+deploy/observability/.env

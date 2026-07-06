@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -38,6 +39,49 @@ func TestBuildResource_DefaultServiceName(t *testing.T) {
 	}
 	if got != "rpingmesh-agent" {
 		t.Errorf("service.name = %q, want rpingmesh-agent", got)
+	}
+}
+
+// TestBuildResource_InstanceID verifies that buildResource sets a non-empty
+// service.instance.id attribute, and that it matches os.Hostname() in the
+// common case (no fallback triggered). This is the attribute
+// prometheusremotewrite derives the Prometheus `instance` label from; a
+// missing or empty value here means every agent process reporting the same
+// metric name+ToR-pair attributes collides onto one series (see
+// buildResource's doc comment).
+func TestBuildResource_InstanceID(t *testing.T) {
+	res, err := buildResource(defaultServiceName)
+	if err != nil {
+		t.Fatalf("buildResource(%q) returned error: %v", defaultServiceName, err)
+	}
+
+	var got string
+	var ok bool
+	for _, kv := range res.Attributes() {
+		if kv.Key == semconv.ServiceInstanceIDKey {
+			got, ok = kv.Value.AsString(), true
+			break
+		}
+	}
+	if !ok {
+		t.Fatal("service.instance.id attribute not found in resource")
+	}
+	if got == "" {
+		t.Error("service.instance.id is empty, want a non-empty host identifier")
+	}
+
+	wantHost, hostErr := os.Hostname()
+	if hostErr == nil && got != wantHost {
+		t.Errorf("service.instance.id = %q, want os.Hostname() = %q", got, wantHost)
+	}
+}
+
+// TestInstanceID_NonEmpty verifies instanceID() never returns an empty
+// string: an empty service.instance.id would be exactly the bug this
+// attribute exists to prevent (per-agent series collision).
+func TestInstanceID_NonEmpty(t *testing.T) {
+	if got := instanceID(); got == "" {
+		t.Error("instanceID() returned an empty string, want a non-empty host identifier")
 	}
 }
 

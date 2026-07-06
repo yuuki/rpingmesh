@@ -1,0 +1,54 @@
+name: rpingmesh-observability
+
+services:
+  victoriametrics:
+    image: ${VM_IMAGE:-victoriametrics/victoria-metrics:v1.103.0}
+    command:
+      - "-storageDataPath=/vmdata"
+      - "-retentionPeriod=7d"
+      - "-httpListenAddr=:8428"
+    ports:
+      - "8428:8428"
+    volumes:
+      - vmdata:/vmdata
+    healthcheck:
+      # NOTE: 127.0.0.1, not localhost -- inside this image wget resolves
+      # "localhost" to ::1 first and VictoriaMetrics only binds 0.0.0.0
+      # (IPv4), so "localhost" makes the healthcheck fail even though the
+      # server is up (deviation found during verification; see PR notes).
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8428/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  otel-collector:
+    image: ${OTELCOL_IMAGE:-otel/opentelemetry-collector-contrib:0.117.0}
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC (agent/analyzer -> collector)
+      - "4318:4318"   # OTLP HTTP (optional)
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:11.6.0}
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      - GF_USERS_DEFAULT_THEME=light
+      # zero-plugin design: install nothing
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+
+volumes:
+  vmdata: {}

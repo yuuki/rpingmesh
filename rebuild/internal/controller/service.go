@@ -14,9 +14,9 @@ import (
 // registryClient is the subset of registry.RnicRegistry's API used directly
 // by ControllerService (RegisterRNICs) and, via the embedded
 // PinglistGenerator, its read methods (GetRNICsByToR,
-// GetSampleRNICsFromOtherToRs). It is declared here, at the point of use, so
-// that RegisterAgent and GetPinglist can be unit tested against a fake
-// instead of a real rqlite-backed registry.
+// GetActiveRNICsInOtherToRs, ResolveHostnameByGID). It is declared here, at the
+// point of use, so that RegisterAgent and GetPinglist can be unit tested
+// against a fake instead of a real rqlite-backed registry.
 type registryClient interface {
 	pinglist.RnicSource
 	RegisterRNICs(ctx context.Context, agentID, agentIP string, rnics []*controller_agent.RnicInfo) error
@@ -45,12 +45,13 @@ type ControllerService struct {
 
 // NewControllerService creates a new ControllerService backed by the given
 // RNIC registry. A PinglistGenerator is automatically created from the
-// registry and the ECMP config, which sizes how many distinct flow labels
-// each target is probed with (Eq.(1) coverage).
-func NewControllerService(reg registryClient, ecmp pinglist.ECMPConfig) *ControllerService {
+// registry, the ECMP config (which sizes how many distinct flow labels each
+// target is probed with, Eq.(1) coverage), and interTorSampleSize (the number
+// of distinct foreign ToRs sampled per inter-ToR pinglist).
+func NewControllerService(reg registryClient, ecmp pinglist.ECMPConfig, interTorSampleSize int) *ControllerService {
 	return &ControllerService{
 		registry: reg,
-		pinglist: pinglist.NewPinglistGenerator(reg, ecmp),
+		pinglist: pinglist.NewPinglistGenerator(reg, ecmp, interTorSampleSize),
 	}
 }
 

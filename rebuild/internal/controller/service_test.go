@@ -18,7 +18,7 @@ func newTestService(reg registryClient) *ControllerService {
 		PathsAssumed:        16,
 		CoverageProbability: 0.9,
 		MaxFlowLabels:       64,
-	})
+	}, pinglist.DefaultInterTorSampleSize)
 }
 
 // fakeRegistry implements registryClient without any real rqlite backend,
@@ -49,8 +49,15 @@ func (f *fakeRegistry) GetRNICsByToR(_ context.Context, _ string) ([]*controller
 	return f.torMeshRnics, f.torMeshErr
 }
 
-func (f *fakeRegistry) GetSampleRNICsFromOtherToRs(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
+func (f *fakeRegistry) GetActiveRNICsInOtherToRs(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
 	return f.interTorRnics, f.interTorErr
+}
+
+// ResolveHostnameByGID reports the requester as unregistered ("") so the
+// service-level tests exercise the GID self-exclusion fallback; the same-host
+// filtering itself is covered by the pinglist package's unit tests.
+func (f *fakeRegistry) ResolveHostnameByGID(_ context.Context, _ string) (string, error) {
+	return "", nil
 }
 
 func statusCode(t *testing.T, err error) codes.Code {

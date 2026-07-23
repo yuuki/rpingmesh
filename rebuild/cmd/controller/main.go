@@ -86,7 +86,6 @@ func run(cmd *cobra.Command, args []string) error {
 		cfg.DatabaseURI,
 		cfg.ActiveThresholdSec,
 		cfg.StaleThresholdSec,
-		cfg.InterTorSampleSize,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize registry: %w", err)
@@ -103,7 +102,7 @@ func run(cmd *cobra.Command, args []string) error {
 		PathsAssumed:        cfg.EcmpPathsAssumed,
 		CoverageProbability: cfg.EcmpCoverageProbability,
 		MaxFlowLabels:       cfg.EcmpMaxFlowLabels,
-	})
+	}, cfg.InterTorSampleSize)
 
 	// Set up the Phase 1 analyzer if enabled: it ingests agent-reported
 	// per-path summaries and flags SLA violations. Its OTLP metrics are

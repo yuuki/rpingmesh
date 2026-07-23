@@ -67,19 +67,33 @@ func TestComputeFlowLabelCount_MonotonicInProbability(t *testing.T) {
 }
 
 // fakeRnicSource is a minimal RnicSource returning a fixed set of RNICs so the
-// generator's PingTarget construction (seed/count stamping) can be tested
-// without a real registry.
+// generator's PingTarget construction (seed/count stamping) and its same-host /
+// same-family filtering can be tested without a real registry.
 type fakeRnicSource struct {
 	torMesh  []*controller_agent.RnicInfo
 	interTor []*controller_agent.RnicInfo
+	// hostnameByGID maps a requester GID to the hostname it is registered
+	// under. A GID absent from the map resolves to "" (unregistered), which
+	// exercises the GID self-exclusion fallback.
+	hostnameByGID map[string]string
+	// resolveErr, if set, is returned by ResolveHostnameByGID to exercise the
+	// graceful-degradation path.
+	resolveErr error
 }
 
 func (f *fakeRnicSource) GetRNICsByToR(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
 	return f.torMesh, nil
 }
 
-func (f *fakeRnicSource) GetSampleRNICsFromOtherToRs(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
+func (f *fakeRnicSource) GetActiveRNICsInOtherToRs(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
 	return f.interTor, nil
+}
+
+func (f *fakeRnicSource) ResolveHostnameByGID(_ context.Context, gid string) (string, error) {
+	if f.resolveErr != nil {
+		return "", f.resolveErr
+	}
+	return f.hostnameByGID[gid], nil
 }
 
 // TestPinglistCarriesSeedAndCount verifies that generated PingTargets carry the
@@ -98,7 +112,7 @@ func TestPinglistCarriesSeedAndCount(t *testing.T) {
 		PathsAssumed:        16,
 		CoverageProbability: 0.9,
 		MaxFlowLabels:       64,
-	})
+	}, DefaultInterTorSampleSize)
 
 	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1")
 	if err != nil {

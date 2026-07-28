@@ -1,27 +1,17 @@
-name: Rebuild Tests
+name: Tests
 
-# Validates rebuild/ (the active codebase). The legacy top-level
-# implementation is covered separately by go-test.yml.
+# Validates the active implementation at the repository root. The archived
+# implementation is covered separately by legacy-test.yml.
 on:
   pull_request:
     branches: [ main ]
-    paths:
-      - 'rebuild/**'
-      - '.github/workflows/rebuild-test.yml'
   push:
     branches: [ main ]
-    paths:
-      - 'rebuild/**'
-      - '.github/workflows/rebuild-test.yml'
 
 # Prevent concurrent runs of the same workflow on the same ref.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
-defaults:
-  run:
-    working-directory: rebuild
 
 jobs:
   # Full build (Zig static lib + CGO agent + pure-Go controller) and the

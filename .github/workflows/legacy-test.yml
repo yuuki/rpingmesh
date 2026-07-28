@@ -1,10 +1,16 @@
-name: Go Tests
+name: Legacy Tests
 
 on:
   pull_request:
     branches: [ main ]
+    paths:
+      - 'legacy/**'
+      - '.github/workflows/legacy-test.yml'
   push:
     branches: [ main ]
+    paths:
+      - 'legacy/**'
+      - '.github/workflows/legacy-test.yml'
 
 # Prevent concurrent runs of the same workflow
 concurrency:
@@ -12,8 +18,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  controller-test:
-    name: Controller integration tests
+  legacy-test:
+    name: Legacy integration tests
     runs-on: ubuntu-latest
 
     steps:
@@ -24,4 +30,4 @@ jobs:
       uses: docker/setup-buildx-action@v3
 
     - name: Run tests
-      run: make test
+      run: make -C legacy test

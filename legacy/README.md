@@ -1,7 +1,11 @@
 # R-Pingmesh
 
-[![Go Tests](https://github.com/yuuki/rpingmesh/actions/workflows/go-test.yml/badge.svg)](https://github.com/yuuki/rpingmesh/actions/workflows/go-test.yml)
+[![Go Tests](https://github.com/yuuki/rpingmesh/actions/workflows/legacy-test.yml/badge.svg)](https://github.com/yuuki/rpingmesh/actions/workflows/legacy-test.yml)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/yuuki/rpingmesh)
+
+> **Archived:** This directory contains the previous implementation and
+> receives limited maintenance. The active implementation is at the repository
+> root.
 
 R-Pingmesh is still *under heavy development*. Please do not use it in production.
 
@@ -341,7 +345,7 @@ make test-local
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](../LICENSE) file for details.
 
 The eBPF programs in `internal/ebpf/bpf/` are dual-licensed under MIT and GPLv2.
 

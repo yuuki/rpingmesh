@@ -5,7 +5,7 @@ package controller_agent;
 option go_package = "github.com/yuuki/rpingmesh/proto/controller_agent";
 
 // ControllerService provides agent registration and pinglist distribution.
-// This is the simplified rebuild version without GetTargetRnicInfo (eBPF out of scope).
+// The current implementation omits GetTargetRnicInfo (eBPF is out of scope).
 service ControllerService {
     // RegisterAgent registers an agent and its RNICs with the controller.
     rpc RegisterAgent(AgentRegistrationRequest) returns (AgentRegistrationResponse);

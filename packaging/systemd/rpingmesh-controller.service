@@ -1,14 +1,13 @@
 # rpingmesh-controller.service - R-Pingmesh controller (pure Go, CGO_ENABLED=0).
 #
-# The controller has no RDMA/CGO dependency (see rebuild/README.md
+# The controller has no RDMA/CGO dependency (see README.md
 # "Prerequisites"/"Building"), so this unit is hardened much more tightly
 # than rpingmesh-agent.service: no device access, no elevated capabilities,
 # no writable filesystem paths are needed at runtime (config and, if
 # tls_mode != disabled, TLS certificate/key/CA files are only ever read).
 #
 # Install layout assumed by this unit (see the nfpm packaging definitions in
-# rebuild/packaging/nfpm/ and the "Deployment (systemd)" section of
-# rebuild/README.md):
+# packaging/nfpm/ and the "Deployment (systemd)" section of README.md):
 #   /usr/bin/rpingmesh-controller       - binary
 #   /etc/rpingmesh/controller.yaml      - config (edit before enabling)
 #   /etc/rpingmesh/controller.env       - optional environment overrides

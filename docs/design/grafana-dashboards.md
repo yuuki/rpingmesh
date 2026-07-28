@@ -1,11 +1,11 @@
 # Grafana Dashboards for R-Pingmesh Telemetry
 
 Status: Design + implementation spec (P4-observability). This document specifies
-the operator-facing Grafana dashboards for the rebuild, the metric-name contract
-between the OpenTelemetry pipeline and the dashboard JSON, and a self-contained
-docker-compose observability stack used to validate and demo them. The
-accompanying implementation lands `rebuild/dashboards/*.json`,
-`rebuild/deploy/observability/`, and `rebuild/scripts/seed-demo-metrics.sh`.
+the operator-facing Grafana dashboards for the current implementation, the
+metric-name contract between the OpenTelemetry pipeline and the dashboard JSON,
+and a self-contained docker-compose observability stack used to validate and
+demo them. The accompanying implementation lands `dashboards/*.json`,
+`deploy/observability/`, and `scripts/seed-demo-metrics.sh`.
 
 ## Goals
 

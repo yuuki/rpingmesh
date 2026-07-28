@@ -1,9 +1,13 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with
+the archived implementation in this directory.
 
 ## Codebase Status
 
-**`rebuild/` is the active codebase.** All new development should happen there.
+`legacy/` is the archived previous implementation and remains a separate Go
+module. It is retained for reference and limited maintenance.
 
-The code outside of `rebuild/` (top-level `internal/`, `cmd/`, `proto/`, `Makefile`, etc.) is the **legacy implementation** and is no longer actively maintained. Refer to `rebuild/CLAUDE.md` for development guidance.
+The active implementation is at the repository root, one directory above this
+file. Refer to `../CLAUDE.md` for active development guidance. Modify files
+under `legacy/` only when a task explicitly requests legacy maintenance.

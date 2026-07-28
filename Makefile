@@ -1,4 +1,4 @@
-# R-Pingmesh Rebuild - Build System
+# R-Pingmesh - Build System
 # Requires: Go 1.26+, Zig 0.15.2 (the version verified in e2e/CI), protoc,
 # clang, libibverbs-dev, librdmacm-dev
 
@@ -238,7 +238,7 @@ obs-verify: ## Verify Grafana health, provisioning, and every panel query
 
 # Help
 help:
-	@echo "R-Pingmesh Rebuild Build System"
+	@echo "R-Pingmesh Build System"
 	@echo ""
 	@echo "Targets:"
 	@echo "  all                  Build everything (default)"

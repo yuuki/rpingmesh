@@ -1,10 +1,13 @@
-# R-Pingmesh Rebuild
+# R-Pingmesh
 
-A ground-up reimplementation of R-Pingmesh, a service-aware RoCE network monitoring
-system based on the SIGCOMM 2024 paper by Liu et al. This rebuild uses **Zig** for
-the RDMA data-path library and **Go** for agent orchestration, controller logic,
-and telemetry. The system performs end-to-end probing across RDMA (RoCEv2) fabrics
-and computes sub-microsecond network RTT using a 6-timestamp protocol.
+[![Tests](https://github.com/yuuki/rpingmesh/actions/workflows/test.yml/badge.svg)](https://github.com/yuuki/rpingmesh/actions/workflows/test.yml)
+
+A ground-up reimplementation of R-Pingmesh, a service-aware RoCE network
+monitoring system based on the SIGCOMM 2024 paper by Liu et al. The current
+implementation uses **Zig** for the RDMA data-path library and **Go** for agent
+orchestration, controller logic, and telemetry. The system performs end-to-end
+probing across RDMA (RoCEv2) fabrics and computes sub-microsecond network RTT
+using a 6-timestamp protocol.
 
 ## Architecture
 
@@ -59,7 +62,7 @@ serialization, and send/receive. Exposes a C-ABI that Go calls via Cgo.
 > via `ReportProbeAnalysis`, where an in-process analyzer detects per-path SLA
 > violations (loss ratio and p99 network-RTT thresholds). Topology-aware
 > switch/link fault localization (Phase 2) and eBPF service tracing remain out
-> of scope for this rebuild.
+> of scope.
 
 ## 6-Timestamp Probing Protocol
 
@@ -109,7 +112,7 @@ and are flagged as invalid.
 ## Directory Structure
 
 ```
-rebuild/
+./
   Makefile                                  Build orchestration
   go.mod                                    Go module definition
   configs/
@@ -159,7 +162,17 @@ rebuild/
       queue.zig                             UD QP creation, AH management
       cq.zig                                CQ poller thread, GRH parsing
       packet.zig                            Wire format, send operations
+  legacy/                                   Archived previous implementation
 ```
+
+`legacy/` is a separate Go module containing the previous implementation. It is
+kept for reference and limited maintenance; the repository root is the active
+implementation.
+
+**Module migration:** The active Go module moved from
+`github.com/yuuki/rpingmesh/rebuild` to `github.com/yuuki/rpingmesh`. There is
+no compatibility shim for the old import path, so downstream users must update
+their imports.
 
 ## Prerequisites
 
@@ -180,7 +193,7 @@ required for agent operation. The controller runs without RDMA hardware.
 
 ## Building
 
-All commands are run from the `rebuild/` directory.
+Run all commands from the repository root.
 
 ```sh
 # Full build: Zig library -> proto codegen -> Go binaries
@@ -341,8 +354,8 @@ GC cycle, which would leave a low-allocation agent's CPU reading stale.
 
 ### Environment Variable Overrides
 
-All configuration fields can be overridden with environment variables using the
-`RPINGMESH_` prefix. Dots and dashes in field names become underscores:
+All configuration fields can be overridden with environment variables using
+the `RPINGMESH_` prefix and uppercase, underscore-separated field names:
 
 ```sh
 export RPINGMESH_CONTROLLER_ADDR="controller.internal:50051"
@@ -443,7 +456,7 @@ sudo systemctl enable --now rpingmesh-controller.service   # or rpingmesh-agent.
 # Install nfpm (https://nfpm.goreleaser.com/install/), e.g.:
 go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
 
-# From the rebuild/ directory:
+# From the repository root:
 make package              # builds both agent and controller .deb + .rpm into dist/
 make package-agent         # agent only (Linux/CGO_ENABLED=1 build host required)
 make package-controller    # controller only (cross-compiles to GOOS=linux automatically -- safe to run from macOS)
@@ -756,8 +769,8 @@ sudo rdma link add rxe0 type rxe netdev eth0
   in-memory (a bounded recent-window ring); durable storage is not yet wired up.
 
 - **eBPF service tracing not implemented.** The original R-Pingmesh uses eBPF to
-  monitor RDMA QP lifecycle events for service-aware monitoring. This rebuild
-  focuses on the probing infrastructure.
+  monitor RDMA QP lifecycle events for service-aware monitoring. The current
+  implementation focuses on the probing infrastructure.
 
 - **TLS/mTLS on gRPC is opt-in, not default.** Controller-agent communication
   supports `tls`/`mtls` transport security (see
@@ -777,7 +790,7 @@ sudo rdma link add rxe0 type rxe netdev eth0
   noted above, the analyzer detects SLA violations (Phase 1) but does not yet
   perform topology-aware switch/link fault localization or priority ranking
   (Phase 2); eBPF-based service tracing from the original design is also not
-  part of this rebuild.
+  part of the current implementation.
 
 - **Agent self-protection is fail-slow and CPU/memory only (opt-in).** The
   watchdog (`self_protection_enabled`, see [Self-protection](#self-protection))
@@ -804,12 +817,13 @@ sudo rdma link add rxe0 type rxe netdev eth0
   detection/re-initialization path; the affected Prober/Responder simply
   stops functioning until the agent is restarted.
 
-- **No systemd unit or OS packaging.** Deployment artifacts (systemd units,
-  .deb/.rpm packages, etc.) are not provided. There is intentionally no
-  Agent Dockerfile: the agent binary requires `CGO_ENABLED=1` and a real (or
-  soft-RoCE) RDMA device, which is impractical to containerize generically;
-  only the Controller (`Dockerfile.controller`) and test-only images
-  (`Dockerfile.e2e`, `Dockerfile.e2e-controller`) are provided.
+- **No generic Agent container image.** systemd units and nfpm definitions for
+  `.deb`/`.rpm` packages are provided under `packaging/`, but there is
+  intentionally no production Agent Dockerfile. The agent requires
+  `CGO_ENABLED=1`, libibverbs/librdmacm, and access to a real or soft-RoCE RDMA
+  device, so its runtime setup is host-specific. Only the Controller
+  (`Dockerfile.controller`) and test images (`Dockerfile.e2e`,
+  `Dockerfile.e2e-controller`) are provided.
 
 ## References
 

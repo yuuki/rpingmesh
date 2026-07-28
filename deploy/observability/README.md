@@ -1,8 +1,8 @@
 # R-Pingmesh Observability Stack
 
 A self-contained `docker compose` stack for developing and demoing the
-Grafana dashboards in `rebuild/dashboards/` without any RDMA hardware. See
-`rebuild/docs/design/grafana-dashboards.md` for the design rationale.
+Grafana dashboards in `dashboards/` without any RDMA hardware. See
+`docs/design/grafana-dashboards.md` for the design rationale.
 
 ## Components
 
@@ -11,7 +11,7 @@ Grafana dashboards in `rebuild/dashboards/` without any RDMA hardware. See
 - **otel-collector-contrib** — receives OTLP/gRPC metrics from the agent /
   analyzer and forwards them to VictoriaMetrics via `prometheusremotewrite`.
 - **Grafana** — provisioned with the VictoriaMetrics datasource and the two
-  `rebuild/dashboards/*.json` dashboards (zero custom plugins).
+  `dashboards/*.json` dashboards (zero custom plugins).
 
 ## Metric name contract
 
@@ -41,13 +41,13 @@ with `job` correctly derived from the `service.name` resource attribute.
 (`internal/telemetry/otel_metrics.go`'s `buildResource()` sets it to
 `os.Hostname()`), so multiple agent processes covering the same ToR pair get
 distinct series instead of colliding onto one and corrupting `rate()`. See
-"Identity contract" in `rebuild/docs/design/grafana-dashboards.md` for the
+"Identity contract" in `docs/design/grafana-dashboards.md` for the
 full rationale and verification.
 
 ## Quick start
 
 ```bash
-cd rebuild
+cd /path/to/rpingmesh
 make obs-up        # start VictoriaMetrics + otel-collector + Grafana (localhost:3000, admin/admin)
 make obs-seed       # load ~30 min of synthetic 6-ToR mesh demo data
 open http://localhost:3000  # dashboards live under the "R-Pingmesh" folder

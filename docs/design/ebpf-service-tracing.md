@@ -33,10 +33,10 @@ results can be attributed to the services actually using each RNIC — the
 
 ## Current State (verified against code)
 
-- **No eBPF anywhere.** `rebuild/CLAUDE.md` states the eBPF component is out of
-  scope; the Makefile confirms it ("there is no eBPF; `make generate-bpf` does
-  not exist"). The legacy top-level tree had eBPF ambitions but the rebuild has
-  none.
+- **No eBPF in the active implementation.** `CLAUDE.md` states the eBPF
+  component is out of scope; the Makefile confirms it ("there is no eBPF;
+  `make generate-bpf` does not exist"). The archived legacy implementation had
+  eBPF ambitions, but the current implementation has none.
 - **Agent build**: `CGO_ENABLED=1 go build ./cmd/agent/` linking the Zig static
   library `zig/zig-out/lib/librdmabridge.a` via Cgo LDFLAGS in
   `internal/rdmabridge/bridge.go`. Controller is `CGO_ENABLED=0` pure Go. Any

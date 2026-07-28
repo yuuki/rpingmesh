@@ -6,7 +6,7 @@
 # Runs on both fresh install and upgrade (deb: "configure", rpm: arg 1 or 2).
 # It deliberately does NOT enable or start the service: controller.yaml
 # ships only as an .example, so an unconfigured service would fail to reach
-# rqlite. See rebuild/README.md "Deployment (systemd)" for the manual
+# rqlite. See README.md "Deployment (systemd)" for the manual
 # enable/start steps.
 set -e
 

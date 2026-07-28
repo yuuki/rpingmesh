@@ -5,7 +5,7 @@
 # Runs on both fresh install and upgrade (deb: "configure", rpm: arg 1 or 2).
 # It deliberately does NOT enable or start the service: rpingmesh-agent.yaml
 # ships only as an .example (tor_id has no default), so an unconfigured
-# service would just crash-loop. See rebuild/README.md "Deployment (systemd)"
+# service would just crash-loop. See README.md "Deployment (systemd)"
 # for the manual enable/start steps.
 set -e
 

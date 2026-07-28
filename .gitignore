@@ -1,14 +1,20 @@
 # Generated protobuf bindings (regenerate with `make generate-proto`)
-proto/controller_agent/*.pb.go
+/proto/controller_agent/*.pb.go
 
 # Build outputs
-bin/
-zig/zig-out/
-zig/.zig-cache/
+/bin/
+/dist/
+/zig/zig-out/
+/zig/.zig-cache/
+/tmp/
+*.test
+coverage.out
+/vendor/
 
-# Packaged .deb/.rpm output (`make package`)
-dist/
+# Local tool state
+/.claude/
+/.specstory/
 
 # Local observability stack env overrides (copy of .env.example; may pin
 # image tags per-machine, never commit local secrets)
-deploy/observability/.env
+/deploy/observability/.env

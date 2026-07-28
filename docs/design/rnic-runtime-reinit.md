@@ -144,10 +144,10 @@ deterministically. Two workable mechanisms, to be chosen during implementation:
    > future async-event user), which could then spin on `EAGAIN`. The
    > "`dup` isolates the original fd" assumption is therefore wrong. The `poll`
    > approach sidesteps this entirely by never touching the flags: readiness is
-   > established by `poll`, not by non-blocking reads. (In today's rebuild the
-   > watcher would be the sole `ibv_get_async_event` consumer, but relying on that
-   > to justify flipping a shared flag is fragile; the flag-free `poll` design is
-   > correct regardless.)
+   > established by `poll`, not by non-blocking reads. (In the current
+   > implementation the watcher would be the sole `ibv_get_async_event`
+   > consumer, but relying on that to justify flipping a shared flag is fragile;
+   > the flag-free `poll` design is correct regardless.)
 2. **Close-to-unblock**: rely on device close to error the blocking call. This
    races the very reinit we are performing and is harder to reason about;
    avoid.

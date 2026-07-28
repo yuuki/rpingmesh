@@ -8,7 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-All commands must be run from within the `rebuild/` directory. This is a separate Go module (`github.com/yuuki/rpingmesh/rebuild`).
+Run all active-development commands from the repository root. The canonical Go
+module is `github.com/yuuki/rpingmesh`.
 
 ### Building
 
@@ -38,7 +39,12 @@ The `internal/probe/` package is the only package guaranteed to have tests that 
 
 ## Architecture
 
-R-Pingmesh rebuild is a clean-room redesign of the SIGCOMM 2024 R-Pingmesh system. It keeps the paper's core concepts (6-timestamp probing, UD QP per RNIC, ToR-mesh/inter-ToR pinglists, ECMP via flow_label) but replaces the Go/Cgo RDMA data-path with a Zig static library. The Analyzer and eBPF components are out of scope.
+R-Pingmesh is a clean-room redesign of the SIGCOMM 2024 R-Pingmesh system. It
+keeps the paper's core concepts (6-timestamp probing, UD QP per RNIC,
+ToR-mesh/inter-ToR pinglists, ECMP via flow_label) but replaces the Go/Cgo RDMA
+data-path with a Zig static library. The Phase 1 Analyzer is implemented;
+topology-aware Phase 2 fault localization and eBPF service tracing are out of
+scope.
 
 **Components:**
 - **Controller** (pure Go, `CGO_ENABLED=0`): manages agent registry in rqlite, distributes pinglists via gRPC.
@@ -91,7 +97,10 @@ Default config files are in `configs/`. All components use Viper (YAML + env var
 - `configs/agent.yaml`: `probe_interval_ms: 500`, `gid_index: 0`, `controller_addr: localhost:50051`, `otel_collector_addr: localhost:4317`
 - `configs/controller.yaml`: `listen_addr: :50051`, `database_uri: http://localhost:4001`
 
-Environment variables: `RQLITE_DB_URI` for controller database connection.
+Configuration fields can be overridden with the `RPINGMESH_` prefix and
+uppercase, underscore-separated field names (for example,
+`RPINGMESH_CONTROLLER_ADDR`, `RPINGMESH_DATABASE_URI`, and
+`RPINGMESH_LOG_LEVEL`).
 
 ## Development Patterns
 
@@ -100,6 +109,8 @@ Environment variables: `RQLITE_DB_URI` for controller database connection.
 - gRPC client: use `grpc.NewClient()` (not the deprecated `grpc.Dial`).
 - C-ABI types: no `bool` — use `uint8_t` (0/1). GIDs are always `rdma_gid_t` (16-byte binary); string conversion only at display/config boundaries.
 - ECMP path diversity: controlled via `flow_label` in `ibv_ah_attr.grh.flow_label`. The `source_port` field in `PingTarget` is metadata only — RoCEv2 UD UDP source port is driver-generated and cannot be set directly.
+- `legacy/` is an archived, separate Go module. Do not modify it unless a task
+  explicitly requests legacy maintenance.
 
 ## Requirements
 

@@ -318,14 +318,14 @@ function LocalizeSetCover(window, fabric):
     return greedyMinimalCover(candidates, degradedPaths)   # fewest comps explaining all
 ```
 
-This requires three things the rebuild does not have today:
+This requires three things the current implementation does not have today:
 
 1. **A fabric model**: switches and links as first-class entities, with tiers.
 2. **A path→component mapping**: which links a given (src RNIC, dst RNIC,
    flow_label) actually traverses. ECMP hashing is generally not invertible
-   exactly; the paper approximates it by covering many flow labels (the rebuild
-   already rotates flow labels, sized by Eq.(1)) and by knowing the tiered
-   topology so a path's *candidate* link set is enumerable.
+   exactly; the paper approximates it by covering many flow labels (the current
+   implementation already rotates flow labels, sized by Eq.(1)) and by knowing
+   the tiered topology so a path's *candidate* link set is enumerable.
 3. **flow-label→path-class identity carried into the summary** so paths are
    distinguishable at the controller. Today `PathAggregator` collapses all flow
    labels of a (source,target) pair into one summary; per-flow-label

@@ -2,7 +2,7 @@
 #
 # nfpm packaging definition for rpingmesh-controller (.deb/.rpm).
 #
-# Run from the rebuild/ directory (contents `src` paths below are relative
+# Run from the repository root (contents `src` paths below are relative
 # to the current working directory, not to this file):
 #
 #   make package-controller
@@ -14,7 +14,7 @@
 #
 # Requires bin/rpingmesh-controller to already be built (`make
 # build-controller`; pure Go, CGO_ENABLED=0, builds on any platform/arch --
-# see rebuild/README.md "Building").
+# see README.md "Building").
 
 name: "rpingmesh-controller"
 arch: "${NFPM_ARCH}"
@@ -22,7 +22,7 @@ platform: "linux"
 version: "${NFPM_VERSION}"
 section: "net"
 priority: "optional"
-maintainer: "R-Pingmesh rebuild maintainers"
+maintainer: "R-Pingmesh maintainers"
 description: |
   R-Pingmesh controller service.
   Manages agent registration and RNIC registry (backed by rqlite) and

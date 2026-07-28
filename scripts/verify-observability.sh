@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # Resolve deploy/observability/.env from this script's own location, not the
-# caller's cwd, so `make obs-verify` (cwd=rebuild/) and a direct
+# caller's cwd, so `make obs-verify` from the repository root and a direct
 # `./scripts/verify-observability.sh` invocation both find it.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/../deploy/observability/.env"

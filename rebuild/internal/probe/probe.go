@@ -292,3 +292,57 @@ func GIDToIPv4(gid [16]byte) string {
 	// Not IPv4-mapped, return full GID hex notation.
 	return FormatGID(gid)
 }
+
+// GID address-family classifications returned by GIDFamily. The controller's
+// pinglist generators use them to avoid pairing a native-IPv6 GID with an
+// IPv4-mapped one: ibv_create_ah() resolves the destination via a route lookup
+// that fails when the source and destination GID families differ, so a
+// cross-family probe can never leave the source host and every such pair would
+// retry-and-fail forever (see issue #41).
+const (
+	// GIDFamilyIPv4Mapped is an IPv4-mapped IPv6 GID (::ffff:a.b.c.d): bytes
+	// 0-9 are zero and bytes 10-11 are 0xff. These typically live on
+	// RoCE-capable management NICs.
+	GIDFamilyIPv4Mapped = "ipv4-mapped"
+	// GIDFamilyIPv6 is a native IPv6 GID (e.g. a fabric-rail link-local GID).
+	GIDFamilyIPv6 = "ipv6"
+	// GIDFamilyUnknown is returned when the GID string cannot be parsed. It is
+	// treated as its own family, so an unparseable GID never pairs with a
+	// parseable one while two unparseable GIDs still pair (see GIDFamily).
+	GIDFamilyUnknown = "unknown"
+)
+
+// GIDFamily classifies a textual GID into its address family so the controller
+// can skip cross-address-family probe pairs that ibv_create_ah() would reject.
+//
+// Why parse rather than string-match: GIDs travel in several textual forms. The
+// Zig bridge emits the full 8-group hex form (an IPv4-mapped address becomes
+// "0000:0000:0000:0000:0000:ffff:c0a8:0101"), while abbreviated inputs and
+// tests use "::ffff:a.b.c.d" or "fe80::1". Parsing to the 16-byte form and
+// inspecting the IPv4-mapped prefix classifies all of these consistently,
+// whereas a SQL/string `LIKE '::ffff:%'` would miss the full-hex form entirely.
+//
+// Why unparseable is its own family and not force-matched: we cannot know
+// whether a probe to an unparseable GID would succeed, so it only ever pairs
+// with another equally-unparseable GID. That keeps a parser quirk from silently
+// force-pairing (and log-spamming) against the parseable majority, while never
+// emitting a pair we already know ibv_create_ah() would reject. In practice all
+// production GIDs originate from the Zig bridge's canonical hex form and always
+// parse, so this branch is purely defensive.
+func GIDFamily(gid string) string {
+	parsed, err := ParseGID(gid)
+	if err != nil {
+		return GIDFamilyUnknown
+	}
+	// IPv4-mapped IPv6: bytes 0-9 zero, bytes 10-11 == 0xff (the same test
+	// GIDToIPv4 uses to switch to dotted-decimal rendering).
+	for i := 0; i < 10; i++ {
+		if parsed[i] != 0 {
+			return GIDFamilyIPv6
+		}
+	}
+	if parsed[10] == 0xff && parsed[11] == 0xff {
+		return GIDFamilyIPv4Mapped
+	}
+	return GIDFamilyIPv6
+}

@@ -23,10 +23,6 @@ const (
 	// DefaultStaleThresholdSec is the window (in seconds) after which an
 	// RNIC entry is considered stale and eligible for removal.
 	DefaultStaleThresholdSec = 900
-
-	// DefaultInterTorSampleSize is the default number of distinct ToRs
-	// sampled for inter-ToR pinglist generation.
-	DefaultInterTorSampleSize = 5
 )
 
 // dbConn is the subset of gorqlite.Connection's API used by RnicRegistry. It
@@ -51,17 +47,17 @@ type RnicRegistry struct {
 	// staleThresholdSec is the window (seconds) after which entries are
 	// considered stale and removed or excluded.
 	staleThresholdSec int
-	// interTorSampleSize caps the number of distinct ToRs sampled by
-	// GetSampleRNICsFromOtherToRs.
-	interTorSampleSize int
 }
 
 // NewRnicRegistry creates a new RNIC registry connected to the given rqlite
 // URI. It initializes the database schema (table + indexes) before
-// returning. activeThresholdSec, staleThresholdSec, and interTorSampleSize
-// configure the thresholds described above; a value <= 0 falls back to the
-// corresponding Default* constant.
-func NewRnicRegistry(dbURI string, activeThresholdSec, staleThresholdSec, interTorSampleSize int) (*RnicRegistry, error) {
+// returning. activeThresholdSec and staleThresholdSec configure the thresholds
+// described above; a value <= 0 falls back to the corresponding Default*
+// constant. Inter-ToR sampling (one representative RNIC per foreign ToR) is
+// performed by the pinglist generator, not here, because it must run after the
+// generator's same-host / same-address-family filtering so that a ToR is only
+// dropped when it has no valid target for the requester (see issues #39, #41).
+func NewRnicRegistry(dbURI string, activeThresholdSec, staleThresholdSec int) (*RnicRegistry, error) {
 	log.Info().Str("dbURI", dbURI).Msg("Initializing RNIC registry with rqlite")
 
 	if activeThresholdSec <= 0 {
@@ -69,9 +65,6 @@ func NewRnicRegistry(dbURI string, activeThresholdSec, staleThresholdSec, interT
 	}
 	if staleThresholdSec <= 0 {
 		staleThresholdSec = DefaultStaleThresholdSec
-	}
-	if interTorSampleSize <= 0 {
-		interTorSampleSize = DefaultInterTorSampleSize
 	}
 
 	conn, err := gorqlite.Open(dbURI)
@@ -83,7 +76,6 @@ func NewRnicRegistry(dbURI string, activeThresholdSec, staleThresholdSec, interT
 		conn:               conn,
 		activeThresholdSec: activeThresholdSec,
 		staleThresholdSec:  staleThresholdSec,
-		interTorSampleSize: interTorSampleSize,
 	}
 
 	if err := registry.initializeSchema(); err != nil {
@@ -250,19 +242,23 @@ func (r *RnicRegistry) GetRNICsByToR(
 	return scanRnicInfoRows(result)
 }
 
-// GetSampleRNICsFromOtherToRs returns one representative RNIC from each ToR
-// other than the excluded one, up to interTorSampleSize distinct ToRs. Only
-// active entries (updated within the configured active-threshold window)
-// are considered. Candidate rows are fetched in random order (ORDER BY
-// RANDOM()) so that, across repeated calls, a different representative ToR
-// set and RNIC is chosen each time rather than always sampling the same
-// fixed 5 ToRs and RNICs (as GROUP BY without ORDER BY would, since SQLite
-// does not guarantee which row within a group is returned).
-func (r *RnicRegistry) GetSampleRNICsFromOtherToRs(
+// GetActiveRNICsInOtherToRs returns every active RNIC (updated within the
+// configured active-threshold window) that belongs to a ToR other than the
+// excluded one, in random order (ORDER BY RANDOM()).
+//
+// It intentionally does NOT sample one-per-ToR here: the pinglist generator
+// samples after filtering out same-host and cross-address-family targets, so
+// that inter-ToR coverage is only dropped for a foreign ToR when that ToR has
+// no valid representative for the requester. Sampling in SQL (or here) before
+// that filtering could silently blind a whole ToR whenever its randomly-chosen
+// representative happened to be a same-host or cross-family RNIC (issues #39,
+// #41). Rows are still returned in random order so the generator picks a
+// randomly-varying representative per ToR across repeated calls.
+func (r *RnicRegistry) GetActiveRNICsInOtherToRs(
 	ctx context.Context,
 	excludeTorID string,
 ) ([]*controller_agent.RnicInfo, error) {
-	log.Debug().Str("excludeTorID", excludeTorID).Msg("Getting sample RNICs from other ToRs")
+	log.Debug().Str("excludeTorID", excludeTorID).Msg("Getting active RNICs in other ToRs")
 
 	querySQL := `
 	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
@@ -278,31 +274,32 @@ func (r *RnicRegistry) GetSampleRNICsFromOtherToRs(
 
 	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query sample RNICs from other ToRs: %w", err)
+		return nil, fmt.Errorf("failed to query active RNICs in other ToRs: %w", err)
 	}
 
-	candidates, err := scanRnicInfoRows(result)
+	return scanRnicInfoRows(result)
+}
+
+// ResolveHostnameByGID returns the hostname the RNIC identified by gid is
+// registered under, or "" when no active entry matches (e.g. the requester has
+// not registered yet). A "" result signals the pinglist generator to fall back
+// to GID-based self-exclusion instead of same-host filtering. Genuine query
+// errors are propagated. It reuses GetRNICInfo's active-window GID lookup.
+func (r *RnicRegistry) ResolveHostnameByGID(
+	ctx context.Context,
+	gid string,
+) (string, error) {
+	if gid == "" {
+		return "", nil
+	}
+	info, err := r.GetRNICInfo(ctx, "", gid)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-
-	// Pick at most one RNIC per distinct ToR, up to interTorSampleSize
-	// ToRs. Since candidates arrived in random order, this yields a
-	// randomly chosen representative ToR set and RNIC on each call.
-	seenToRs := make(map[string]bool, r.interTorSampleSize)
-	sampled := make([]*controller_agent.RnicInfo, 0, r.interTorSampleSize)
-	for _, rnic := range candidates {
-		if seenToRs[rnic.GetTorId()] {
-			continue
-		}
-		seenToRs[rnic.GetTorId()] = true
-		sampled = append(sampled, rnic)
-		if len(sampled) >= r.interTorSampleSize {
-			break
-		}
+	if info == nil {
+		return "", nil
 	}
-
-	return sampled, nil
+	return info.GetHostName(), nil
 }
 
 // GetRNICInfo looks up a single RNIC by GID (primary key) or IP address.

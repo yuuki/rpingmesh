@@ -340,6 +340,41 @@ func TestGIDToIPv4_LoopbackMapped(t *testing.T) {
 	}
 }
 
+// TestGIDFamily classifies GIDs across every textual form the controller sees:
+// the Zig bridge's full 8-group hex form (production), abbreviated IPv6, the
+// abbreviated IPv4-mapped form, and unparseable junk. This is the classifier
+// the pinglist generators use to skip cross-address-family probe pairs that
+// ibv_create_ah() would reject (issue #41).
+func TestGIDFamily(t *testing.T) {
+	tests := []struct {
+		name string
+		gid  string
+		want string
+	}{
+		// Native IPv6.
+		{"native_ipv6_abbrev", "fe80::1", GIDFamilyIPv6},
+		{"native_ipv6_full", "fe80:0000:0000:0000:0001:0002:0003:0004", GIDFamilyIPv6},
+		// IPv4-mapped, both the full-hex form the Zig bridge emits and the
+		// abbreviated ::ffff: form used in configs/tests.
+		{"ipv4_mapped_full_hex", "0000:0000:0000:0000:0000:ffff:c0a8:0101", GIDFamilyIPv4Mapped},
+		{"ipv4_mapped_abbrev", "::ffff:192.168.1.1", GIDFamilyIPv4Mapped},
+		{"ipv4_mapped_loopback", "::ffff:127.0.0.1", GIDFamilyIPv4Mapped},
+		// All-zeros parses but is not IPv4-mapped (bytes 10-11 are not 0xff).
+		{"all_zeros", "::", GIDFamilyIPv6},
+		// Unparseable inputs fall back to the "unknown" family.
+		{"empty", "", GIDFamilyUnknown},
+		{"junk", "not-a-gid", GIDFamilyUnknown},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := GIDFamily(tc.gid); got != tc.want {
+				t.Errorf("GIDFamily(%q) = %q, want %q", tc.gid, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCalculateRTT_RealisticTimestamps(t *testing.T) {
 	// Simulate a realistic datacenter probe with ~50us RTT.
 	baseNS := uint64(1_000_000_000_000) // 1000 seconds in nanoseconds

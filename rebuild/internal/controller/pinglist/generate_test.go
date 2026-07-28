@@ -19,8 +19,12 @@ func (erroringRnicSource) GetRNICsByToR(_ context.Context, _ string) ([]*control
 	return nil, errFakeRegistry
 }
 
-func (erroringRnicSource) GetSampleRNICsFromOtherToRs(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
+func (erroringRnicSource) GetActiveRNICsInOtherToRs(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
 	return nil, errFakeRegistry
+}
+
+func (erroringRnicSource) ResolveHostnameByGID(_ context.Context, _ string) (string, error) {
+	return "", nil
 }
 
 func newTestGenerator(src RnicSource) *PinglistGenerator {
@@ -28,7 +32,7 @@ func newTestGenerator(src RnicSource) *PinglistGenerator {
 		PathsAssumed:        16,
 		CoverageProbability: 0.9,
 		MaxFlowLabels:       64,
-	})
+	}, DefaultInterTorSampleSize)
 }
 
 // TestGenerateTorMeshPinglist_Error verifies that a registry error is
@@ -76,8 +80,8 @@ func TestGenerateTorMeshPinglist_EmptyToR(t *testing.T) {
 
 // TestGenerateInterTorPinglist_Success verifies that sampled RNICs from other
 // ToRs are converted into PingTargets carrying the ECMP seed/count, mirroring
-// GenerateTorMeshPinglist's contract but without excluding the requester
-// (GetSampleRNICsFromOtherToRs already excludes the requester's own ToR).
+// GenerateTorMeshPinglist's contract. The requester's own ToR is already
+// excluded by GetActiveRNICsInOtherToRs's query.
 func TestGenerateInterTorPinglist_Success(t *testing.T) {
 	src := &fakeRnicSource{
 		interTor: []*controller_agent.RnicInfo{

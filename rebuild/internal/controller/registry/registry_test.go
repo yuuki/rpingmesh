@@ -85,7 +85,6 @@ func newTestRegistry(conn dbConn) *RnicRegistry {
 		conn:               conn,
 		activeThresholdSec: DefaultActiveThresholdSec,
 		staleThresholdSec:  DefaultStaleThresholdSec,
-		interTorSampleSize: DefaultInterTorSampleSize,
 	}
 }
 
@@ -330,11 +329,11 @@ func TestGetRNICsByToR_QueryErrorPropagates(t *testing.T) {
 	}
 }
 
-func TestGetSampleRNICsFromOtherToRs_UsesActiveThresholdAndExcludesToR(t *testing.T) {
+func TestGetActiveRNICsInOtherToRs_UsesActiveThresholdAndExcludesToR(t *testing.T) {
 	fake := &fakeConn{}
 	reg := newTestRegistry(fake)
 
-	if _, err := reg.GetSampleRNICsFromOtherToRs(context.Background(), "tor-1"); err != nil {
+	if _, err := reg.GetActiveRNICsInOtherToRs(context.Background(), "tor-1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -347,12 +346,67 @@ func TestGetSampleRNICsFromOtherToRs_UsesActiveThresholdAndExcludesToR(t *testin
 	}
 }
 
-func TestGetSampleRNICsFromOtherToRs_QueryErrorPropagates(t *testing.T) {
+func TestGetActiveRNICsInOtherToRs_QueryErrorPropagates(t *testing.T) {
 	wantErr := errors.New("query failed")
 	fake := &fakeConn{queryOneParameterizedErr: wantErr}
 	reg := newTestRegistry(fake)
 
-	_, err := reg.GetSampleRNICsFromOtherToRs(context.Background(), "tor-1")
+	_, err := reg.GetActiveRNICsInOtherToRs(context.Background(), "tor-1")
+	if err == nil || !errors.Is(err, wantErr) {
+		t.Fatalf("got error %v, want wrapping %v", err, wantErr)
+	}
+}
+
+// TestResolveHostnameByGID_EmptyGIDShortCircuits verifies that an empty GID
+// resolves to "" without touching the database, so callers get the
+// unregistered-fallback signal cheaply.
+func TestResolveHostnameByGID_EmptyGIDShortCircuits(t *testing.T) {
+	fake := &fakeConn{}
+	reg := newTestRegistry(fake)
+
+	hostname, err := reg.ResolveHostnameByGID(context.Background(), "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hostname != "" {
+		t.Errorf("hostname = %q, want empty", hostname)
+	}
+	if len(fake.queryOneParameterizedCalls) != 0 {
+		t.Errorf("made %d queries, want 0 for an empty GID", len(fake.queryOneParameterizedCalls))
+	}
+}
+
+// TestResolveHostnameByGID_NotFoundReturnsEmpty verifies that a GID with no
+// active row resolves to "" (not an error), so the generator falls back to GID
+// self-exclusion rather than failing the request.
+func TestResolveHostnameByGID_NotFoundReturnsEmpty(t *testing.T) {
+	fake := &fakeConn{} // fakeConn yields an empty result set
+	reg := newTestRegistry(fake)
+
+	hostname, err := reg.ResolveHostnameByGID(context.Background(), "fe80::1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hostname != "" {
+		t.Errorf("hostname = %q, want empty for a GID with no active row", hostname)
+	}
+	if len(fake.queryOneParameterizedCalls) != 1 {
+		t.Fatalf("QueryOneParameterizedContext called %d times, want 1", len(fake.queryOneParameterizedCalls))
+	}
+	if !strings.Contains(fake.queryOneParameterizedCalls[0].Query, "rnic_gid = ?") {
+		t.Errorf("query = %q, want a GID lookup", fake.queryOneParameterizedCalls[0].Query)
+	}
+}
+
+// TestResolveHostnameByGID_QueryErrorPropagates verifies that a genuine query
+// failure is surfaced (not swallowed as ""), so it is distinguishable from a
+// not-found result.
+func TestResolveHostnameByGID_QueryErrorPropagates(t *testing.T) {
+	wantErr := errors.New("query failed")
+	fake := &fakeConn{queryOneParameterizedErr: wantErr}
+	reg := newTestRegistry(fake)
+
+	_, err := reg.ResolveHostnameByGID(context.Background(), "fe80::1")
 	if err == nil || !errors.Is(err, wantErr) {
 		t.Fatalf("got error %v, want wrapping %v", err, wantErr)
 	}

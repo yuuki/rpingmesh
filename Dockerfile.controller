@@ -1,28 +1,47 @@
-FROM golang:1.25-bookworm AS builder
+# Build stage for the rpingmesh controller.
+# CGO_ENABLED=0 — no RDMA or Zig dependencies needed.
+FROM golang:1.26.0-bookworm AS builder
+
+# Install protoc and Go protobuf plugins for code generation. This layer
+# only depends on apt/Go tool versions, not application source, so it stays
+# cached across source-only rebuilds.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/* \
+    && go install google.golang.org/protobuf/cmd/protoc-gen-go@latest \
+    && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 
 WORKDIR /app
 
-# Copy go.mod and go.sum first to leverage Docker cache
+# Copy module files first and resolve dependencies before copying the rest
+# of the source tree, so `go mod download` is only re-run when go.mod/go.sum
+# change (not on every source edit). go.sum is trusted as-is; it is expected
+# to already be complete and committed (no `go mod tidy` in the container).
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
-# Copy the source code
+# Copy remaining source and generate protobuf bindings.
 COPY . .
+RUN cd proto/controller_agent && \
+    protoc --go_out=. --go_opt=paths=source_relative \
+           --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+           controller_agent.proto
 
-# Build the Go application
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /app/bin/controller cmd/controller/main.go
+# Build the controller binary.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -o /app/bin/rpingmesh-controller ./cmd/controller/
 
-# Create default configuration
-RUN mkdir -p /app && \
-    /app/bin/controller --create-config --config-output /app/controller.yaml || true
-
-# Runtime image
+# Runtime image — minimal footprint.
 FROM debian:bookworm-slim
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
+COPY --from=builder /app/bin/rpingmesh-controller ./rpingmesh-controller
 
-# Copy binary and config
-COPY --from=builder /app/bin/controller ./controller
-COPY --from=builder /app/controller.yaml ./controller.yaml
-
-ENTRYPOINT ["./controller"]
+EXPOSE 50051
+ENTRYPOINT ["./rpingmesh-controller"]

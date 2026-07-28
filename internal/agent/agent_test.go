@@ -1,178 +1,348 @@
+// Package agent tests for Agent's multi-device wiring: one Prober and one
+// ClusterMonitor per opened RDMA device (see agent.go's createClusterMonitors
+// and createResultsFanIn), so that every RNIC on a multi-rail host actively
+// probes instead of only the first one.
+//
+// These tests avoid rdmabridge.Init()/OpenDevice()/CreateQueue(), which
+// require real RDMA hardware or soft-RoCE, by constructing bare *Device and
+// *Prober values directly (mirroring newTestProber() in
+// cluster_monitor_test.go) and exercising the pure-Go wiring logic in
+// isolation.
 package agent
 
 import (
-	"context"
-	"os"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/yuuki/rpingmesh/internal/config"
+	"github.com/yuuki/rpingmesh/internal/probe"
+	"github.com/yuuki/rpingmesh/internal/rdmabridge"
 )
 
-// TestNew tests the New function
-func TestNew(t *testing.T) {
-	// Create a test configuration
-	cfg := &config.AgentConfig{
-		AgentID:        "test-agent",
-		ControllerAddr: "localhost:50051",
-		AnalyzerAddr:   "localhost:50052",
-		LogLevel:       "info",
+// fakeDevice builds a *rdmabridge.Device carrying only the metadata the
+// agent-level wiring logic reads (GID, DeviceName). It never touches the
+// zero-valued Cgo handles, so it is safe to use without a real RDMA context.
+func fakeDevice(deviceName, gid string) *rdmabridge.Device {
+	return &rdmabridge.Device{
+		Info: rdmabridge.DeviceInfo{
+			DeviceName: deviceName,
+			GID:        gid,
+			IPAddr:     "10.200.0." + gid,
+		},
 	}
-
-	// Try to create a new agent
-	a, err := New(cfg)
-	if err != nil {
-		t.Fatalf("Failed to create new agent: %v", err)
-	}
-
-	// Check that the agent was created correctly
-	if a == nil {
-		t.Fatal("Agent should not be nil")
-	}
-
-	if a.config == nil {
-		t.Fatal("Agent config should not be nil")
-	}
-
-	if a.config.AgentID != "test-agent" {
-		t.Errorf("Expected agent ID 'test-agent', got '%s'", a.config.AgentID)
-	}
-
-	if a.config.ControllerAddr != "localhost:50051" {
-		t.Errorf("Expected controller addr 'localhost:50051', got '%s'", a.config.ControllerAddr)
-	}
-
-	// Cleanup
-	a.Stop()
 }
 
-// TestAgentBasicOperation tests the basic operations of an agent
-func TestAgentBasicOperation(t *testing.T) {
-	// This is an integration test that would test basic agent functionality
-	// For now, just create an agent and verify it starts and stops without errors
+// fakeProber builds a *Prober with only the fields exercised by the tests
+// below (logger and resultChan) populated, bypassing NewProber (which
+// requires a real RDMA device and queue).
+func fakeProber(resultChanBuf int) *Prober {
+	return &Prober{
+		logger:     zerolog.Nop(),
+		resultChan: make(chan *probe.ProbeResult, resultChanBuf),
+	}
+}
 
-	// Skip full tests if not running in CI
-	if os.Getenv("CI") != "true" {
-		t.Skip("Skipping integration tests when not in CI environment")
+// newTestAgent builds an Agent with the given fake devices and probers
+// wired in, for use by tests that exercise createClusterMonitors and
+// createResultsFanIn without initializing any real RDMA resources.
+func newTestAgent(devices []*rdmabridge.Device, probers []*Prober) *Agent {
+	return &Agent{
+		cfg: &config.AgentConfig{
+			AgentID:                   "agent-1",
+			TorID:                     "tor-1",
+			PinglistUpdateIntervalSec: 3600,
+		},
+		devices: devices,
+		probers: probers,
+		logger:  zerolog.Nop(),
+	}
+}
+
+func TestAgent_CreateClusterMonitors_OnePerDeviceWithMatchingRequesterGID(t *testing.T) {
+	devices := []*rdmabridge.Device{
+		fakeDevice("rxe0", "gid-0"),
+		fakeDevice("rxe1", "gid-1"),
+	}
+	probers := []*Prober{fakeProber(1), fakeProber(1)}
+
+	a := newTestAgent(devices, probers)
+	a.createClusterMonitors()
+
+	if len(a.monitors) != 2 {
+		t.Fatalf("expected 2 cluster monitors (one per device), got %d", len(a.monitors))
 	}
 
-	// Create a test configuration
-	cfg := &config.AgentConfig{
-		AgentID:              "test-agent",
-		ControllerAddr:       "localhost:50051",
-		AnalyzerAddr:         "localhost:50052",
-		LogLevel:             "info",
-		ProbeIntervalMS:      1000,
-		DataUploadIntervalMS: 10000,
+	for i, dev := range devices {
+		monitor := a.monitors[i]
+		if monitor.requesterGID != dev.Info.GID {
+			t.Errorf("monitor[%d].requesterGID = %q, want device GID %q", i, monitor.requesterGID, dev.Info.GID)
+		}
+		if monitor.prober != probers[i] {
+			t.Errorf("monitor[%d].prober is not wired to probers[%d]", i, i)
+		}
 	}
 
-	// Create an agent
-	a, err := New(cfg)
-	if err != nil {
-		t.Fatalf("Failed to create agent: %v", err)
+	// The two monitors must use distinct requester GIDs, matching the two
+	// distinct devices -- this is the core multi-rail fix: every RNIC
+	// requests its own pinglist instead of all devices sharing devices[0]'s
+	// GID.
+	if a.monitors[0].requesterGID == a.monitors[1].requesterGID {
+		t.Errorf("expected distinct requester GIDs per device, both monitors use %q", a.monitors[0].requesterGID)
+	}
+}
+
+func TestAgent_CreateResultsFanIn_MergesResultsFromEveryProber(t *testing.T) {
+	probers := []*Prober{fakeProber(4), fakeProber(4)}
+	a := newTestAgent(nil, probers)
+	a.metricsResultsActive = true // a metrics consumer will drain a.results
+
+	a.createResultsFanIn()
+
+	// Emit one distinguishable result from each prober directly onto its
+	// resultChan (emitResult is unexported but same-package, matching the
+	// production emission path in prober.go).
+	probers[0].emitResult(&probe.ProbeResult{SequenceNum: 100})
+	probers[1].emitResult(&probe.ProbeResult{SequenceNum: 200})
+
+	seen := map[uint64]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case result := <-a.results:
+			seen[result.SequenceNum] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for fan-in result %d", i)
+		}
 	}
 
-	// Start with a timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	if !seen[100] || !seen[200] {
+		t.Fatalf("expected fan-in to deliver results from both probers, got %v", seen)
+	}
+}
 
-	// Start the agent
-	errCh := make(chan error, 1)
+// TestAgent_CreateResultsFanIn_TeesToAnalysis verifies that, with analysis
+// reporting enabled, every fan-in result is delivered to BOTH the metrics
+// channel and the analysis branch (the tee), so the analyzer sees the same
+// stream the metrics consumer does.
+func TestAgent_CreateResultsFanIn_TeesToAnalysis(t *testing.T) {
+	probers := []*Prober{fakeProber(4)}
+	a := newTestAgent(nil, probers)
+	a.cfg.AnalysisReportEnabled = true
+	a.metricsResultsActive = true // a metrics consumer will drain a.results
+
+	a.createResultsFanIn()
+
+	if a.analysisResults == nil {
+		t.Fatal("analysisResults channel not created when analysis enabled")
+	}
+
+	probers[0].emitResult(&probe.ProbeResult{SequenceNum: 7})
+
+	// Metrics branch.
+	select {
+	case r := <-a.results:
+		if r.SequenceNum != 7 {
+			t.Errorf("metrics branch seq = %d, want 7", r.SequenceNum)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for result on metrics branch")
+	}
+
+	// Analysis branch (the tee).
+	select {
+	case r := <-a.analysisResults:
+		if r.SequenceNum != 7 {
+			t.Errorf("analysis branch seq = %d, want 7", r.SequenceNum)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for result on analysis branch")
+	}
+}
+
+// TestAgent_CreateResultsFanIn_SlowAnalysisDoesNotStallMetrics verifies the
+// key non-blocking contract: when the analysis branch backs up (nothing drains
+// a.analysisResults, its buffer fills), the metrics path must still receive
+// every result. The tee's analysis send is non-blocking (drops on a full
+// buffer) precisely so a slow aggregator cannot stall metrics.
+func TestAgent_CreateResultsFanIn_SlowAnalysisDoesNotStallMetrics(t *testing.T) {
+	// More than the analysis branch buffer (resultChanSize) so it overflows.
+	const total = resultChanSize + 100
+
+	prober := fakeProber(total) // hold all emitted results without dropping
+	a := newTestAgent(nil, []*Prober{prober})
+	a.cfg.AnalysisReportEnabled = true
+	a.metricsResultsActive = true // metrics consumer active; it drains a.results
+
+	a.createResultsFanIn()
+
+	// Nothing ever drains a.analysisResults: the aggregator is "stuck".
+	for i := 0; i < total; i++ {
+		prober.emitResult(&probe.ProbeResult{SequenceNum: uint64(i)})
+	}
+	prober.Destroy() // close Results() so the fan-in drains and eventually exits
+
+	// The metrics branch must still receive all `total` results.
+	got := 0
+	timeout := time.After(5 * time.Second)
+	for got < total {
+		select {
+		case _, ok := <-a.results:
+			if !ok {
+				t.Fatalf("metrics channel closed after %d results, want %d", got, total)
+			}
+			got++
+		case <-timeout:
+			t.Fatalf("slow analysis branch stalled metrics: only %d/%d results delivered", got, total)
+		}
+	}
+}
+
+func TestAgent_StopResultsFanIn_ClosesSharedChannelAfterAllProbersDestroyed(t *testing.T) {
+	probers := []*Prober{fakeProber(1), fakeProber(1)}
+	a := newTestAgent(nil, probers)
+
+	a.createResultsFanIn()
+
+	// Destroy() is safe on a bare fake Prober: Stop() is a no-op because
+	// running was never set true (no goroutines were started), so
+	// destroyOnce only closes resultChan and skips the nil queue teardown --
+	// mirroring what Agent.Stop does to every real prober. Per
+	// stopResultsFanIn's contract, this must happen before calling it so
+	// every fan-in goroutine's range loop can observe the closed source
+	// channel.
+	for _, p := range probers {
+		p.Destroy()
+	}
+
+	done := make(chan struct{})
 	go func() {
-		errCh <- a.Start()
+		a.stopResultsFanIn()
+		close(done)
 	}()
 
-	// Wait for either completion or timeout
 	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("Failed to start agent: %v", err)
-		}
-	case <-ctx.Done():
-		// Timeout is expected since Start() is blocking
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stopResultsFanIn did not return within 2s after all probers were destroyed")
 	}
 
-	// Stop the agent
-	a.Stop()
+	select {
+	case result, ok := <-a.results:
+		if ok {
+			t.Fatalf("expected a.results to be closed with no pending data, got result: %+v", result)
+		}
+	default:
+		t.Fatal("expected a.results to already be closed once stopResultsFanIn returned")
+	}
 }
 
-// TestAgentConfiguration tests configuration loading and validation
-func TestAgentConfiguration(t *testing.T) {
-	// Create a temporary config file to test LoadAgentConfig
-	tmpFile, err := os.CreateTemp("", "rpingmesh-agent-test-*.yaml")
-	if err != nil {
-		t.Fatalf("Failed to create temp file: %v", err)
-	}
-	defer os.Remove(tmpFile.Name())
+// TestAgent_StopResultsFanIn_ClosesAnalysisBranch verifies that shutting down
+// the fan-in also closes the analysis branch (after every fan-in goroutine has
+// exited), which is what ends the AnalysisReporter's run loop.
+func TestAgent_StopResultsFanIn_ClosesAnalysisBranch(t *testing.T) {
+	probers := []*Prober{fakeProber(1)}
+	a := newTestAgent(nil, probers)
+	a.cfg.AnalysisReportEnabled = true
 
-	// Write config with various settings
-	configContent := `
-agent_id: "config-test-agent"
-controller_addr: "localhost:12345"
-analyzer_addr: "localhost:12346"
-log_level: "debug"
-probe_interval_ms: 2000
-data_upload_interval_ms: 5000
-traceroute_interval_ms: 300000
-traceroute_on_timeout: true
-ebpf_enabled: false
-`
-	if _, err := tmpFile.Write([]byte(configContent)); err != nil {
-		t.Fatalf("Failed to write to temp file: %v", err)
+	a.createResultsFanIn()
+	for _, p := range probers {
+		p.Destroy()
 	}
-	if err := tmpFile.Close(); err != nil {
-		t.Fatalf("Failed to close temp file: %v", err)
+	a.stopResultsFanIn()
+
+	select {
+	case _, ok := <-a.analysisResults:
+		if ok {
+			t.Fatal("expected analysisResults closed with no pending data")
+		}
+	default:
+		t.Fatal("expected analysisResults to be closed after stopResultsFanIn")
 	}
+}
 
-	// Set environment variables explicitly for testing
-	os.Setenv("RPINGMESH_AGENT_ID", "config-test-agent")
-	os.Setenv("RPINGMESH_CONTROLLER_ADDR", "localhost:12345")
-	os.Setenv("RPINGMESH_ANALYZER_ADDR", "localhost:12346")
-	os.Setenv("RPINGMESH_LOG_LEVEL", "debug")
-	os.Setenv("RPINGMESH_PROBE_INTERVAL_MS", "2000")
-	os.Setenv("RPINGMESH_DATA_UPLOAD_INTERVAL_MS", "5000")
-	os.Setenv("RPINGMESH_TRACEROUTE_INTERVAL_MS", "300000")
-	os.Setenv("RPINGMESH_TRACEROUTE_ON_TIMEOUT", "true")
-	os.Setenv("RPINGMESH_EBPF_ENABLED", "false")
+// TestAgent_StopResultsFanIn_NoConsumer_DoesNotDeadlock reproduces the
+// scenario a review of PR #31 flagged: the metrics branch is active (so the
+// fan-in forwards to a.results), but nothing is draining a.results at shutdown
+// -- e.g. Stop is reached after the metrics result consumer has already
+// stopped, or before Start ever ran it. If a fan-in goroutine had no way to
+// abandon a blocked send once a.results fills up, stopResultsFanIn (called
+// from Agent.Stop) would hang forever waiting on resultsWg, leaking the
+// goroutine and every buffered result. createResultsFanIn's select on
+// resultsDone must let it return promptly regardless.
+func TestAgent_StopResultsFanIn_NoConsumer_DoesNotDeadlock(t *testing.T) {
+	// More results than a.results' buffer (resultChanSize) can hold, so at
+	// least one forwarded result is guaranteed to overflow it and block the
+	// fan-in goroutine's send with nothing there to drain it.
+	const overflow = resultChanSize + 8
 
-	// Create config manually with the expected values
-	cfg := &config.AgentConfig{
-		AgentID:              "config-test-agent",
-		ControllerAddr:       "localhost:12345",
-		AnalyzerAddr:         "localhost:12346",
-		LogLevel:             "debug",
-		ProbeIntervalMS:      2000,
-		DataUploadIntervalMS: 5000,
-		TracerouteIntervalMS: 300000,
-		TracerouteOnTimeout:  true,
-		EBPFEnabled:          false,
-	}
+	prober := fakeProber(overflow)
+	a := newTestAgent(nil, []*Prober{prober})
+	// Metrics branch active: the fan-in forwards to a.results, exercising the
+	// resultsDone escape when nothing drains it.
+	a.metricsResultsActive = true
 
-	// Verify configuration values
-	if cfg.AgentID != "config-test-agent" {
-		t.Errorf("Expected agent ID 'config-test-agent', got '%s'", cfg.AgentID)
+	a.createResultsFanIn()
+
+	for i := 0; i < overflow; i++ {
+		prober.emitResult(&probe.ProbeResult{SequenceNum: uint64(i)})
 	}
 
-	if cfg.ControllerAddr != "localhost:12345" {
-		t.Errorf("Expected controller addr 'localhost:12345', got '%s'", cfg.ControllerAddr)
+	// Nothing ever reads from a.results in this test: no metrics result
+	// consumer is draining it.
+	prober.Destroy()
+
+	done := make(chan struct{})
+	go func() {
+		a.stopResultsFanIn()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stopResultsFanIn deadlocked with no consumer draining a.results: " +
+			"the fan-in goroutine could not abandon a blocked send")
+	}
+}
+
+// TestAgent_CreateResultsFanIn_NoMetricsConsumer_AnalysisStillFlows verifies
+// the fix for the metrics/analysis coupling: when NO metrics consumer will
+// drain a.results (metrics disabled, or MetricsCollector creation failed:
+// a.metricsResultsActive == false) but analysis reporting IS enabled, the
+// fan-in must keep delivering results to the analysis branch instead of
+// blocking on a.results once its buffer fills.
+//
+// The emit-one/receive-one loop makes the check deterministic: a fan-in that
+// (incorrectly) still forwarded to the undrained a.results would fill it after
+// resultChanSize results and then block on the metrics send, so the analysis
+// branch would stop receiving around that point. Because the loop runs well
+// past resultChanSize, the fix (skip the a.results send when no consumer) is
+// what lets every result reach analysis.
+func TestAgent_CreateResultsFanIn_NoMetricsConsumer_AnalysisStillFlows(t *testing.T) {
+	const total = resultChanSize + 50 // well past where a coupled fan-in would jam
+
+	prober := fakeProber(total)
+	a := newTestAgent(nil, []*Prober{prober})
+	a.cfg.AnalysisReportEnabled = true
+	a.metricsResultsActive = false // no metrics consumer will drain a.results
+
+	a.createResultsFanIn()
+
+	// Emit one, receive one. Draining each result before emitting the next
+	// keeps the analysis buffer from filling (so nothing is dropped) and, more
+	// importantly, proves flow continues past resultChanSize -- the point a
+	// metrics-coupled fan-in would have jammed.
+	for i := 0; i < total; i++ {
+		prober.emitResult(&probe.ProbeResult{SequenceNum: uint64(i)})
+		select {
+		case <-a.analysisResults:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("analysis stalled at result %d (past a.results buffer %d): "+
+				"fan-in is coupled to the undrained metrics channel", i, resultChanSize)
+		}
 	}
 
-	if cfg.ProbeIntervalMS != 2000 {
-		t.Errorf("Expected probe interval 2000, got %d", cfg.ProbeIntervalMS)
-	}
-
-	if cfg.EBPFEnabled != false {
-		t.Errorf("Expected EBPFEnabled to be false")
-	}
-
-	// Create agent with this config and verify it loads correctly
-	a, err := New(cfg)
-	if err != nil {
-		t.Fatalf("Failed to create agent with config: %v", err)
-	}
-
-	// Verify agent has the correct config
-	if a.config.AgentID != "config-test-agent" {
-		t.Errorf("Agent config mismatch: expected agent ID 'config-test-agent', got '%s'", a.config.AgentID)
-	}
+	// Clean shutdown of the fan-in.
+	prober.Destroy()
+	a.stopResultsFanIn()
 }

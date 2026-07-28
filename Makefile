@@ -1,139 +1,274 @@
-.PHONY: build agent-up debugfs-volume generate-config generate-proto generate-bpf generate test-controller test-agent test test-e2e clean-compose build-local build-debug
+# R-Pingmesh Rebuild - Build System
+# Requires: Go 1.26+, Zig 0.15.2 (the version verified in e2e/CI), protoc,
+# clang, libibverbs-dev, librdmacm-dev
 
-# Default configuration
-VERSION := 0.1.0
-KERNEL_VERSION := 5.10.0-34
+.PHONY: all build build-zig build-go build-controller build-agent \
+        generate generate-proto clean test test-go test-zig test-all vet \
+        test-e2e setup-colima test-e2e-controller clean-e2e-controller \
+        check-nfpm package package-agent package-controller \
+        package-build-agent package-build-controller \
+        obs-up obs-down obs-seed obs-verify obs-logs help
 
-build: build-controller build-agent
+# Directories
+ZIG_DIR := zig
+ZIG_OUT := $(ZIG_DIR)/zig-out
+BIN_DIR := bin
+PROTO_DIR := proto/controller_agent
+DIST_DIR := dist
 
-build-controller:
-	@echo "Building controller with Docker Compose"
-	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml build controller-builder
-	@echo "Copying controller binary from container..."
-	@chmod +x scripts/copy-from-image.sh
-	@./scripts/copy-from-image.sh rpingmesh-controller-builder controller-temp /app/controller ./bin/rpingmesh-controller
-	@./scripts/copy-from-image.sh rpingmesh-controller-builder controller-temp /app/controller.yaml ./bin/rpingmesh-controller.yaml
+# Output binaries
+CONTROLLER_BIN := $(BIN_DIR)/rpingmesh-controller
+AGENT_BIN := $(BIN_DIR)/rpingmesh-agent
 
-build-agent:
-	@echo "Building agent with Docker Compose"
-	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose -f docker-compose.build.yml build agent-builder
-	@echo "Copying agent binary from container..."
-	@chmod +x scripts/copy-from-image.sh
-	@./scripts/copy-from-image.sh rpingmesh-agent-builder agent-temp /app/agent ./bin/rpingmesh-agent
-	@./scripts/copy-from-image.sh rpingmesh-agent-builder agent-temp /app/agent.yaml ./bin/rpingmesh-agent.yaml
+# Package version/arch, consumed by packaging/nfpm/*.yaml via ${NFPM_VERSION}
+# / ${NFPM_ARCH}. Override on the command line for a release build, e.g.:
+#   make package VERSION=1.2.3
+# deb/rpm both require the version to start with a digit, so the untagged
+# fallback below is "0.0.0+git.<short sha>" rather than raw `git describe`
+# output (which starts with the commit hash, not a digit, when there is no
+# tag on HEAD -- true for this repo today).
+NFPM_VERSION ?= $(shell v=$$(git describe --tags --exact-match 2>/dev/null); if [ -n "$$v" ]; then printf '%s' "$$v" | sed 's/^v//'; else printf '0.0.0+git.%s' "$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; fi)
+NFPM_ARCH ?= $(shell go env GOARCH 2>/dev/null || echo amd64)
+ifdef VERSION
+NFPM_VERSION := $(VERSION)
+endif
+export NFPM_VERSION NFPM_ARCH
 
-# Run with Docker Compose
-agent-up:
-	@echo "Starting service with Docker Compose"
-	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose up agent
+# Default target
+all: build
 
-# Create a debugfs volume for Docker Desktop
-debugfs-volume:
-	@echo "Creating debugfs volume for Docker Desktop..."
-	@docker volume create --driver local --opt type=debugfs --opt device=debugfs debugfs || echo "Volume may already exist"
-	@echo "debugfs volume created."
+# Build everything
+build: build-zig generate build-go
 
-generate-config:
-	@echo "Generating default configuration file with Docker Compose"
-	@KERNEL_VERSION=$(KERNEL_VERSION) VERSION=$(VERSION) docker compose run --rm generate-config > agent.yaml
-	@echo "Configuration file generated: ./agent.yaml"
-
-# Clean up Docker Compose resources
-clean-compose:
-	@echo "Cleaning up Docker Compose resources"
-	@docker compose down -v
-	@docker compose rm -f
-
-build-local: generate
-	@echo "Building controller and agent locally"
-	@go build -buildvcs=false -race -o ./bin/rpingmesh-controller ./cmd/controller
-	@go build -buildvcs=false -race -o ./bin/rpingmesh-agent ./cmd/agent
-
-# Debug build targets
-build-debug-controller: generate-proto
-	@echo "Building controller for debug locally"
-	@export CGO_ENABLED=1
-	@export CGO_CFLAGS="-g -O0"
-	@export CGO_LDFLAGS="-g"
-	@go build -o -race ./bin/rpingmesh-controller.debug -gcflags "all=-N -l" -ldflags "-compressdwarf=false" ./cmd/controller
-
-build-debug-agent: generate
-	@echo "Building agent for debug locally"
-	@export CGO_ENABLED=1
-	@export CGO_CFLAGS="-g -O0"
-	@export CGO_LDFLAGS="-g"
-	@go build -race -o ./bin/rpingmesh-agent.debug -gcflags "all=-N -l" -ldflags "-compressdwarf=false" ./cmd/agent
-
-build-debug: build-debug-controller build-debug-agent
+# Build Zig static library
+build-zig:
+	@echo "==> Building Zig RDMA bridge library..."
+	cd $(ZIG_DIR) && zig build
+	@echo "==> Zig library built: $(ZIG_OUT)/lib/librdmabridge.a"
 
 # Generate protobuf code
+generate: generate-proto
+
 generate-proto:
-	@echo "Generating protobuf Go bindings"
-	@go generate ./proto/controller_agent
-	@go generate ./proto/agent_analyzer
+	@echo "==> Generating protobuf code..."
+	cd $(PROTO_DIR) && go generate
+	@echo "==> Proto generation complete"
 
-# Generate all code (protobuf + eBPF)
-generate: generate-proto generate-bpf
+# Build Go binaries
+build-go: build-controller build-agent
 
-# Generate bpf2go code locally (requires local dependencies)
-ARCH_SUFFIX := $(shell if [ -d /usr/include/$$(uname -m)-linux-gnu ]; then echo "$$(uname -m)-linux-gnu"; fi)
-INCLUDE_PATHS := -Ipkg/ebpf/bpf/include -I/usr/include
-ifneq ($(ARCH_SUFFIX),)
-	INCLUDE_PATHS += -I/usr/include/$(ARCH_SUFFIX)
-	INCLUDE_PATHS += -I/usr/include/$(ARCH_SUFFIX)/asm
-endif
-ifeq ($(wildcard /usr/include/asm),/usr/include/asm)
-	INCLUDE_PATHS += -I/usr/include/asm
-endif
-ifeq ($(wildcard /usr/include/asm-generic),/usr/include/asm-generic)
-	INCLUDE_PATHS += -I/usr/include/asm-generic
-endif
+build-controller:
+	@echo "==> Building controller..."
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 go build -o $(CONTROLLER_BIN) ./cmd/controller/
+	@echo "==> Controller built: $(CONTROLLER_BIN)"
 
-generate-bpf:
-	@echo "Generating eBPF Go bindings"
-	@go generate ./internal/ebpf
+build-agent:
+	@echo "==> Building agent..."
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=1 go build -o $(AGENT_BIN) ./cmd/agent/
+	@echo "==> Agent built: $(AGENT_BIN)"
 
-# Test controller
-test-controller:
-	@echo "Running controller tests with Docker..."
-	@docker compose -f docker-compose.test.yml up --build controller_test --abort-on-container-exit --remove-orphans
+# Run Go tests. NOTE: this only covers internal/probe/... (pure Go, no RDMA
+# hardware needed). Use `make test-all` to run every package's tests (Linux,
+# full CGO/RDMA build env) or `make test-e2e` / `make test-e2e-controller`
+# for the Docker-based end-to-end suites.
+test: test-go
 
-# Test agent
-test-agent:
-	@echo "Running agent tests with Docker..."
-	@KERNEL_VERSION=$(KERNEL_VERSION) docker compose -f docker-compose.test.yml up --build agent_test --abort-on-container-exit --remove-orphans
+test-go:
+	@echo "==> Running Go tests..."
+	go test -v ./internal/probe/...
+	@echo "==> Tests complete"
 
-# Run all tests
-test:
-	@echo "Running all tests with Docker..."
-	@KERNEL_VERSION=$(KERNEL_VERSION) docker compose -f docker-compose.test.yml up --build controller_test agent_test --abort-on-container-exit
+# Run Zig unit tests (types.zig, ring.zig, cq.zig, etc.). Pure Zig, no Go/CGO
+# involved, but still needs libibverbs/librdmacm headers on the build host
+# (some modules @cImport them), so like build-zig this is Linux-only in
+# practice (see Dockerfile.e2e).
+test-zig:
+	@echo "==> Running Zig unit tests..."
+	cd $(ZIG_DIR) && zig build test
+	@echo "==> Zig tests complete"
 
-# Run RDMA e2e tests via rebuild/ (requires Colima or Docker with privileged containers)
-# Sets up two soft-RoCE devices (rxe0 on eth0, rxe1 on dummy0) and runs TestRDMAE2E.
+# Run `go vet` across the whole module.
+vet:
+	@echo "==> Running go vet..."
+	go vet ./...
+	@echo "==> Vet complete"
+
+# Run all Go tests in the module (excluding ./e2e/..., which requires live
+# infrastructure or RDMA hardware/soft-RoCE and is exercised by
+# test-e2e / test-e2e-controller instead), plus the Zig unit tests. Requires
+# the full CGO/RDMA build environment (libibverbs-dev, librdmacm-dev,
+# librdmabridge.a already built), so this is intended for Linux, not local
+# macOS development.
+test-all: test-zig
+	@echo "==> Running all Go tests (excluding ./e2e/...)..."
+	go test $$(go list ./... | grep -v '/e2e')
+	@echo "==> Tests complete"
+
+# Install rdma_rxe kernel module on the Colima VM (run once before first test-e2e).
+# Requires colima to be running: colima start
+setup-colima:
+	@chmod +x scripts/setup-colima-rdma.sh
+	@bash scripts/setup-colima-rdma.sh
+
+# Run RDMA e2e tests via Docker (requires Colima or Docker with privileged containers).
+# Sets up two soft-RoCE devices (rxe0, rxe1) and runs TestRDMAE2E.
+# First-time setup: run 'make setup-colima' to install rdma_rxe on the Colima VM.
 test-e2e:
-	@$(MAKE) -C rebuild test-e2e
+	@echo "==> Running RDMA e2e tests (soft-RoCE, rxe0+rxe1)..."
+	docker compose -f docker-compose.e2e.yml run --rm --build rdma-e2e
+	@echo "==> e2e tests complete"
 
-test-local:
-	@echo "Running all Go tests locally"
-	@export RQLITE_LOCAL_TEST_URI="http://localhost:4001"
-	@go test ./...
+# Run Agent-to-Controller E2E tests (requires Docker, no RDMA needed)
+test-e2e-controller:
+	@echo "==> Running Agent-to-Controller E2E tests..."
+	COMPOSE_FILE=docker-compose.e2e-controller.yml docker compose up --build --abort-on-container-exit e2e_test
+	@echo "==> E2E tests complete"
 
-# Help target
+# Clean up Agent-to-Controller E2E Docker resources
+clean-e2e-controller:
+	COMPOSE_FILE=docker-compose.e2e-controller.yml docker compose down -v
+
+# Fail fast with an actionable message if nfpm isn't installed, rather than
+# letting `nfpm package` below fail with "command not found".
+check-nfpm:
+	@command -v nfpm >/dev/null 2>&1 || { \
+		echo "ERROR: nfpm not found on PATH."; \
+		echo "Install it (e.g. 'go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest'"; \
+		echo "or see https://nfpm.goreleaser.com/install/), then re-run 'make package'."; \
+		exit 1; \
+	}
+
+# Build .deb/.rpm packages for both the agent and the controller. See
+# packaging/nfpm/*.yaml and packaging/systemd/*.service, and the "Deployment
+# (systemd)" section of README.md for the full install/enable workflow.
+package: package-agent package-controller
+
+# Packaging-only build steps: unlike build-agent/build-controller (which
+# target the host running `make`), these force GOOS=linux and
+# GOARCH=$(NFPM_ARCH) so the resulting binary always matches what the nfpm
+# packages below declare (platform: linux, arch: ${NFPM_ARCH}) -- regardless
+# of what host `make package` is invoked from. Without this, `go build` on a
+# macOS host would silently produce a Darwin binary and nfpm would happily
+# wrap it in a package labelled "linux".
+#
+# The controller is CGO_ENABLED=0 (pure Go), so this cross-compiles cleanly
+# from any host, including macOS. The agent is CGO_ENABLED=1 and links
+# libibverbs/librdmacm via Cgo, which cannot cross-compile against a foreign
+# C toolchain/sysroot -- GOOS=linux GOARCH=$(NFPM_ARCH) here only produces a
+# working binary when `make` is actually run on a matching Linux host (see
+# README.md "Building"); on any other host this step fails, same as
+# build-agent does today.
+# Depends on generate (proto codegen): both binaries import the generated
+# proto/controller_agent/*.pb.go package, which is gitignored (regenerated by
+# `make generate-proto`, not checked in). build-controller/build-agent have
+# this same requirement, but today only the top-level `build` target
+# sequences `generate` before them (build: build-zig generate build-go).
+# package-build-controller is meant to be runnable standalone (e.g. straight
+# after a fresh checkout or `make clean`, as `package-controller`'s
+# prerequisite), so it declares the dependency explicitly rather than
+# relying on the caller to remember the ordering.
+package-build-controller: generate
+	@echo "==> Building controller for packaging (GOOS=linux GOARCH=$(NFPM_ARCH))..."
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(NFPM_ARCH) go build -o $(CONTROLLER_BIN) ./cmd/controller/
+	@echo "==> Controller built for packaging: $(CONTROLLER_BIN)"
+
+# Depends on build-zig: the agent's Cgo build links zig/zig-out/lib/librdmabridge.a
+# (see internal/rdmabridge/bridge.go's cgo LDFLAGS), which plain `go build`
+# does not produce. Also depends on generate (proto codegen), for the same
+# reason as package-build-controller above -- see that target's comment.
+# build-agent has both of these same requirements, but today only the
+# top-level `build` target sequences build-zig and generate before it (see
+# CLAUDE.md, "After modifying Zig source ... run `make build-zig` before
+# `make build-agent`"). package-build-agent is meant to be runnable
+# standalone (e.g. straight after a fresh checkout or `make clean`, as
+# `package-agent`'s prerequisite), so it declares both dependencies
+# explicitly rather than relying on the caller to remember the ordering.
+package-build-agent: build-zig generate
+	@echo "==> Building agent for packaging (GOOS=linux GOARCH=$(NFPM_ARCH))..."
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=1 GOOS=linux GOARCH=$(NFPM_ARCH) go build -o $(AGENT_BIN) ./cmd/agent/
+	@echo "==> Agent built for packaging: $(AGENT_BIN)"
+
+# Requires a Linux/CGO_ENABLED=1 build host with libibverbs-dev/librdmacm-dev
+# whose GOARCH matches $(NFPM_ARCH) (same requirement as build-agent; see
+# README.md "Building").
+package-agent: package-build-agent check-nfpm
+	@echo "==> Packaging rpingmesh-agent $(NFPM_VERSION) ($(NFPM_ARCH))..."
+	@mkdir -p $(DIST_DIR)
+	nfpm package --config packaging/nfpm/nfpm-agent.yaml --packager deb --target $(DIST_DIR)/
+	nfpm package --config packaging/nfpm/nfpm-agent.yaml --packager rpm --target $(DIST_DIR)/
+	@echo "==> Agent packages written to $(DIST_DIR)/"
+
+package-controller: package-build-controller check-nfpm
+	@echo "==> Packaging rpingmesh-controller $(NFPM_VERSION) ($(NFPM_ARCH))..."
+	@mkdir -p $(DIST_DIR)
+	nfpm package --config packaging/nfpm/nfpm-controller.yaml --packager deb --target $(DIST_DIR)/
+	nfpm package --config packaging/nfpm/nfpm-controller.yaml --packager rpm --target $(DIST_DIR)/
+	@echo "==> Controller packages written to $(DIST_DIR)/"
+
+# Clean build artifacts
+clean:
+	@echo "==> Cleaning build artifacts..."
+	rm -rf $(BIN_DIR) $(DIST_DIR)
+	cd $(ZIG_DIR) && rm -rf zig-out .zig-cache
+	@echo "==> Clean complete"
+
+# Observability stack (Grafana dashboards demo; see docs/design/grafana-dashboards.md)
+OBS_DIR := deploy/observability
+OBS_COMPOSE := $(OBS_DIR)/docker-compose.observability.yml
+
+obs-up: ## Start the observability stack (VictoriaMetrics + otel-collector + Grafana)
+	cd $(OBS_DIR) && { [ -f .env ] || cp .env.example .env; }
+	docker compose -f $(OBS_COMPOSE) --env-file $(OBS_DIR)/.env up -d
+
+obs-down: ## Stop the observability stack and remove volumes
+	docker compose -f $(OBS_COMPOSE) down -v
+
+obs-seed: ## Seed synthetic mesh metrics into VictoriaMetrics
+	VM_URL=http://localhost:8428 ./scripts/seed-demo-metrics.sh
+
+obs-logs: ## Tail observability stack logs
+	docker compose -f $(OBS_COMPOSE) logs -f
+
+obs-verify: ## Verify Grafana health, provisioning, and every panel query
+	./scripts/verify-observability.sh
+
+# Help
 help:
-	@echo "Available targets:"
-	@echo "  build            - Build the Docker image with Docker Compose"
-	@echo "  build-local      - Build the controller and agent binaries locally"
-	@echo "  build-debug      - Build the controller and agent binaries for debugging locally"
-	@echo "  agent-up         - Run the agent container with Docker Compose"
-	@echo "  debugfs-volume   - Create debugfs volume for Docker Desktop"
-	@echo "  generate-config  - Generate default configuration file with Docker Compose"
-	@echo "  generate-proto   - Generate protobuf Go bindings"
-	@echo "  generate-bpf     - Generate eBPF Go bindings locally"
-	@echo "  generate         - Generate all code (protobuf + eBPF)"
-	@echo "  test-controller  - Run controller tests with Docker Compose"
-	@echo "  test-agent       - Run agent tests with Docker Compose"
-	@echo "  test             - Run all tests with Docker Compose"
-	@echo "  test-local       - Run all Go tests locally"
-	@echo "  clean            - Remove the Docker image"
-	@echo "  clean-compose    - Clean up Docker Compose resources"
-	@echo "  help             - Show this help message"
+	@echo "R-Pingmesh Rebuild Build System"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all                  Build everything (default)"
+	@echo "  build                Build Zig library, generate proto, build Go"
+	@echo "  build-zig            Build Zig RDMA bridge static library"
+	@echo "  build-go             Build Go controller and agent binaries"
+	@echo "  build-controller     Build controller binary only"
+	@echo "  build-agent          Build agent binary only"
+	@echo "  generate             Generate all code (proto)"
+	@echo "  generate-proto       Generate protobuf Go code"
+	@echo "  test                 Run tests"
+	@echo "  test-go              Run Go tests (internal/probe only, pure Go)"
+	@echo "  test-zig             Run Zig unit tests (zig build test)"
+	@echo "  vet                  Run go vet ./..."
+	@echo "  test-all             Run go test on all packages except ./e2e/..., plus test-zig (Linux, full build env)"
+	@echo "  setup-colima         Install rdma_rxe kernel module on Colima VM (run once)"
+	@echo "  test-e2e             Run RDMA e2e tests via Docker (requires Colima)"
+	@echo "  test-e2e-controller  Run Agent-to-Controller E2E tests (Docker)"
+	@echo "  clean-e2e-controller Clean up Agent-to-Controller E2E Docker resources"
+	@echo "  package              Build .deb/.rpm packages for agent and controller (requires nfpm)"
+	@echo "  package-agent        Build .deb/.rpm packages for the agent only"
+	@echo "  package-controller   Build .deb/.rpm packages for the controller only"
+	@echo "  clean                Remove all build artifacts"
+	@echo "  obs-up               Start the observability stack (VictoriaMetrics + otel-collector + Grafana)"
+	@echo "  obs-down             Stop the observability stack and remove volumes"
+	@echo "  obs-seed             Seed synthetic mesh metrics into VictoriaMetrics"
+	@echo "  obs-verify           Verify Grafana health, provisioning, and every panel query"
+	@echo "  obs-logs             Tail observability stack logs"
+	@echo ""
+	@echo "Requirements:"
+	@echo "  Go 1.26+, Zig 0.15.2, protoc, libibverbs-dev, librdmacm-dev"
+	@echo "  For test-e2e: colima running, run 'make setup-colima' first"
+	@echo "  For package: nfpm (https://nfpm.goreleaser.com/install/)"

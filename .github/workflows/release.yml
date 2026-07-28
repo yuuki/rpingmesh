@@ -63,8 +63,8 @@ jobs:
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.3
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Build Linux amd64 packages
-        run: make package VERSION="${GITHUB_REF_NAME#v}" NFPM_ARCH=amd64
+      - name: Build Linux amd64 release assets
+        run: make package archive VERSION="${GITHUB_REF_NAME#v}" NFPM_ARCH=amd64
 
       - name: Generate checksums
         run: |

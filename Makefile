@@ -7,6 +7,7 @@
         test-e2e setup-colima test-e2e-controller clean-e2e-controller \
         check-nfpm package package-agent package-controller \
         package-build-agent package-build-controller \
+        archive archive-agent archive-controller \
         obs-up obs-down obs-seed obs-verify obs-logs help
 
 # Directories
@@ -216,6 +217,32 @@ package-controller: package-build-controller check-nfpm
 	nfpm package --config packaging/nfpm/nfpm-controller.yaml --packager rpm --target $(DIST_DIR)/
 	@echo "==> Controller packages written to $(DIST_DIR)/"
 
+# Build compressed binary-only archives for GitHub Releases. Each archive has
+# one top-level directory so extraction never writes the binary directly into
+# the caller's current directory. The agent archive has the same Linux/Cgo
+# build-host requirement as package-agent.
+archive: archive-agent archive-controller
+
+archive-agent: package-build-agent
+	@echo "==> Archiving rpingmesh-agent $(NFPM_VERSION) ($(NFPM_ARCH))..."
+	@mkdir -p $(DIST_DIR)
+	@stage=$$(mktemp -d); trap 'rm -rf "$$stage"' EXIT; \
+		archive=rpingmesh-agent_$(NFPM_VERSION)_linux_$(NFPM_ARCH); \
+		mkdir -p "$$stage/$$archive"; \
+		cp $(AGENT_BIN) "$$stage/$$archive/rpingmesh-agent"; \
+		tar -C "$$stage" -czf "$(DIST_DIR)/$$archive.tar.gz" "$$archive"
+	@echo "==> Agent archive written to $(DIST_DIR)/"
+
+archive-controller: package-build-controller
+	@echo "==> Archiving rpingmesh-controller $(NFPM_VERSION) ($(NFPM_ARCH))..."
+	@mkdir -p $(DIST_DIR)
+	@stage=$$(mktemp -d); trap 'rm -rf "$$stage"' EXIT; \
+		archive=rpingmesh-controller_$(NFPM_VERSION)_linux_$(NFPM_ARCH); \
+		mkdir -p "$$stage/$$archive"; \
+		cp $(CONTROLLER_BIN) "$$stage/$$archive/rpingmesh-controller"; \
+		tar -C "$$stage" -czf "$(DIST_DIR)/$$archive.tar.gz" "$$archive"
+	@echo "==> Controller archive written to $(DIST_DIR)/"
+
 # Clean build artifacts
 clean:
 	@echo "==> Cleaning build artifacts..."
@@ -268,6 +295,7 @@ help:
 	@echo "  package              Build .deb/.rpm packages for agent and controller (requires nfpm)"
 	@echo "  package-agent        Build .deb/.rpm packages for the agent only"
 	@echo "  package-controller   Build .deb/.rpm packages for the controller only"
+	@echo "  archive              Build .tar.gz binary archives for GitHub Releases"
 	@echo "  clean                Remove all build artifacts"
 	@echo "  obs-up               Start the observability stack (VictoriaMetrics + otel-collector + Grafana)"
 	@echo "  obs-down             Stop the observability stack and remove volumes"

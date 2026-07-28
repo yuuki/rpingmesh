@@ -480,16 +480,33 @@ your distro's equivalents), then follow step 3-4 above.
 
 ### Installing from GitHub Releases
 
-Each release tag publishes Linux/amd64 `.deb` and `.rpm` packages for both the
-agent and controller, together with `checksums.txt`. Download the package for
-your distribution and verify it before installation:
+Each release tag publishes Linux/amd64 `.deb`, `.rpm`, and binary-only
+`.tar.gz` archives for both the agent and controller, together with
+`checksums.txt`. Download the asset for your distribution and verify it before
+installation:
 
 ```sh
-gh release download v0.1.0 --repo yuuki/rpingmesh \
+gh release download v0.1.1 --repo yuuki/rpingmesh \
     --pattern 'rpingmesh-*' --pattern checksums.txt
 sha256sum -c checksums.txt
 sudo apt install ./rpingmesh-controller_*.deb
 ```
+
+The archives contain only one executable beneath a versioned top-level
+directory. To use the controller archive instead of a system package:
+
+```sh
+tar -xzf rpingmesh-controller_*_linux_amd64.tar.gz
+sudo install -m 0755 rpingmesh-controller_*_linux_amd64/rpingmesh-controller \
+    /usr/local/bin/rpingmesh-controller
+```
+
+Unlike the system packages, archives do not install systemd units, sample
+configuration, runtime dependencies, or the `rpingmesh` service account. Use
+the manual-install instructions above to provision those pieces. In
+particular, an agent archive still requires the host-provided `libibverbs` and
+`librdmacm` libraries, a supported RDMA device, and access to
+`/dev/infiniband/*`.
 
 Use the equivalent agent package only on a Linux host with a supported
 RDMA-capable device or soft-RoCE device. The agent package declares the

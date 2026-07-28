@@ -1,47 +1,18 @@
-# Git
 .git
-.gitignore
-
-# Go
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-*.test
-*.out
-go.work
-
-# IDE
-.idea
-.vscode
-*.swp
-*.swo
-.cursor
-
-# Build artifacts
+legacy/
 bin/
 dist/
+zig/zig-out/
+zig/.zig-cache/
+proto/controller_agent/*.pb.go
+deploy/observability/.env
+.claude/
+.specstory/
+.vscode/
+.idea/
+*.test
+coverage.*
 *.o
 *.a
-
-# Test files
-*.test
-coverage.txt
-coverage.html
-
-# Documentation
+go.work
 docs/
-
-# Docker
-.dockerignore
-Dockerfile*
-docker-compose*
-
-# Misc
-.DS_Store
-*.log
-*.tmp
-*.temp
-
-.specstory

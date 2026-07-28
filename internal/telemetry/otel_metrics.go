@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/yuuki/rpingmesh/internal/buildinfo"
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -148,8 +149,8 @@ func instanceID() string {
 }
 
 // buildResource builds the OTel resource identifying this service, merging
-// process/host defaults with the given service name, a fixed service
-// version, and a per-process service.instance.id (see instanceID).
+// process/host defaults with the given service name, the build version, and a
+// per-process service.instance.id (see instanceID).
 // Extracted as its own function so tests can verify service-name
 // parameterization without dialing a real OTLP collector.
 //
@@ -166,7 +167,7 @@ func buildResource(serviceName string) (*resource.Resource, error) {
 		resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceName(serviceName),
-			semconv.ServiceVersion("0.1.0"),
+			semconv.ServiceVersion(buildinfo.Version),
 			semconv.ServiceInstanceID(instanceID()),
 		),
 	)

@@ -34,6 +34,13 @@ NFPM_VERSION := $(VERSION)
 endif
 export NFPM_VERSION NFPM_ARCH
 
+# VERSION is intentionally optional for local development. Release builds pass
+# it explicitly so the binaries, packages, and GitHub Release share a version.
+GO_LDFLAGS :=
+ifdef VERSION
+GO_LDFLAGS := -X github.com/yuuki/rpingmesh/internal/buildinfo.Version=$(VERSION)
+endif
+
 # Default target
 all: build
 
@@ -60,13 +67,13 @@ build-go: build-controller build-agent
 build-controller:
 	@echo "==> Building controller..."
 	@mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 go build -o $(CONTROLLER_BIN) ./cmd/controller/
+	CGO_ENABLED=0 go build -ldflags "$(GO_LDFLAGS)" -o $(CONTROLLER_BIN) ./cmd/controller/
 	@echo "==> Controller built: $(CONTROLLER_BIN)"
 
 build-agent:
 	@echo "==> Building agent..."
 	@mkdir -p $(BIN_DIR)
-	CGO_ENABLED=1 go build -o $(AGENT_BIN) ./cmd/agent/
+	CGO_ENABLED=1 go build -ldflags "$(GO_LDFLAGS)" -o $(AGENT_BIN) ./cmd/agent/
 	@echo "==> Agent built: $(AGENT_BIN)"
 
 # Run Go tests. NOTE: this only covers internal/probe/... (pure Go, no RDMA
@@ -172,7 +179,7 @@ package: package-agent package-controller
 package-build-controller: generate
 	@echo "==> Building controller for packaging (GOOS=linux GOARCH=$(NFPM_ARCH))..."
 	@mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=$(NFPM_ARCH) go build -o $(CONTROLLER_BIN) ./cmd/controller/
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(NFPM_ARCH) go build -ldflags "$(GO_LDFLAGS)" -o $(CONTROLLER_BIN) ./cmd/controller/
 	@echo "==> Controller built for packaging: $(CONTROLLER_BIN)"
 
 # Depends on build-zig: the agent's Cgo build links zig/zig-out/lib/librdmabridge.a
@@ -189,7 +196,7 @@ package-build-controller: generate
 package-build-agent: build-zig generate
 	@echo "==> Building agent for packaging (GOOS=linux GOARCH=$(NFPM_ARCH))..."
 	@mkdir -p $(BIN_DIR)
-	CGO_ENABLED=1 GOOS=linux GOARCH=$(NFPM_ARCH) go build -o $(AGENT_BIN) ./cmd/agent/
+	CGO_ENABLED=1 GOOS=linux GOARCH=$(NFPM_ARCH) go build -ldflags "$(GO_LDFLAGS)" -o $(AGENT_BIN) ./cmd/agent/
 	@echo "==> Agent built for packaging: $(AGENT_BIN)"
 
 # Requires a Linux/CGO_ENABLED=1 build host with libibverbs-dev/librdmacm-dev

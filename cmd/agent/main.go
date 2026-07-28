@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/yuuki/rpingmesh/internal/agent"
+	"github.com/yuuki/rpingmesh/internal/buildinfo"
 	"github.com/yuuki/rpingmesh/internal/config"
 )
 
@@ -24,6 +25,12 @@ import (
 var configPath string
 
 func main() {
+	if err := newRootCommand().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func newRootCommand() *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:   "rpingmesh-agent",
 		Short: "R-Pingmesh agent service",
@@ -31,7 +38,8 @@ func main() {
 			"using the R-Pingmesh 6-timestamp protocol. The agent registers " +
 			"with a controller, receives probe targets, and exports RTT metrics " +
 			"via OpenTelemetry.",
-		RunE: run,
+		Version: buildinfo.Version,
+		RunE:    run,
 	}
 
 	// Bind the --config flag for specifying the configuration file path.
@@ -40,9 +48,7 @@ func main() {
 	// Bind all agent-specific CLI flags (--agent-id, --tor-id, etc.).
 	config.BindAgentFlags(rootCmd.Flags())
 
-	if err := rootCmd.Execute(); err != nil {
-		os.Exit(1)
-	}
+	return rootCmd
 }
 
 // run is the main entry point for the agent. It loads configuration, configures

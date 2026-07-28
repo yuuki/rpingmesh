@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yuuki/rpingmesh/internal/buildinfo"
 	"github.com/yuuki/rpingmesh/internal/probe"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -40,6 +41,23 @@ func TestBuildResource_DefaultServiceName(t *testing.T) {
 	if got != "rpingmesh-agent" {
 		t.Errorf("service.name = %q, want rpingmesh-agent", got)
 	}
+}
+
+func TestBuildResource_UsesBuildVersion(t *testing.T) {
+	res, err := buildResource(defaultServiceName)
+	if err != nil {
+		t.Fatalf("buildResource(%q) returned error: %v", defaultServiceName, err)
+	}
+
+	for _, kv := range res.Attributes() {
+		if kv.Key == semconv.ServiceVersionKey {
+			if got, want := kv.Value.AsString(), buildinfo.Version; got != want {
+				t.Fatalf("service.version = %q, want %q", got, want)
+			}
+			return
+		}
+	}
+	t.Fatal("service.version attribute not found in resource")
 }
 
 // TestBuildResource_InstanceID verifies that buildResource sets a non-empty

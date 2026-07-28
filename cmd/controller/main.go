@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
+	"github.com/yuuki/rpingmesh/internal/buildinfo"
 	"github.com/yuuki/rpingmesh/internal/config"
 	"github.com/yuuki/rpingmesh/internal/controller"
 	"github.com/yuuki/rpingmesh/internal/controller/analyzer"
@@ -32,20 +33,25 @@ const analyzerServiceName = "rpingmesh-analyzer"
 var configPath string
 
 func main() {
+	if err := newRootCommand().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func newRootCommand() *cobra.Command {
 	rootCmd := &cobra.Command{
-		Use:   "rpingmesh-controller",
-		Short: "R-Pingmesh controller service",
-		Long:  "Central coordination service that manages agent registration and distributes pinglists for RDMA network monitoring.",
-		RunE:  run,
+		Use:     "rpingmesh-controller",
+		Short:   "R-Pingmesh controller service",
+		Long:    "Central coordination service that manages agent registration and distributes pinglists for RDMA network monitoring.",
+		Version: buildinfo.Version,
+		RunE:    run,
 	}
 
 	// Bind CLI flags.
 	rootCmd.Flags().StringVar(&configPath, "config", "", "Path to configuration file")
 	config.BindControllerFlags(rootCmd.Flags())
 
-	if err := rootCmd.Execute(); err != nil {
-		os.Exit(1)
-	}
+	return rootCmd
 }
 
 // run is the main entry point for the controller. It loads configuration,

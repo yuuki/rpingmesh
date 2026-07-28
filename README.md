@@ -478,6 +478,24 @@ deliberately does not enable or start the service. Install with
 `dpkg -i dist/rpingmesh-agent_*.deb` / `rpm -i dist/rpingmesh-agent-*.rpm` (or
 your distro's equivalents), then follow step 3-4 above.
 
+### Installing from GitHub Releases
+
+Each release tag publishes Linux/amd64 `.deb` and `.rpm` packages for both the
+agent and controller, together with `checksums.txt`. Download the package for
+your distribution and verify it before installation:
+
+```sh
+gh release download v0.1.0 --repo yuuki/rpingmesh \
+    --pattern 'rpingmesh-*' --pattern checksums.txt
+sha256sum -c checksums.txt
+sudo apt install ./rpingmesh-controller_*.deb
+```
+
+Use the equivalent agent package only on a Linux host with a supported
+RDMA-capable device or soft-RoCE device. The agent package declares the
+`libibverbs` and `librdmacm` runtime dependencies, but the RDMA device and
+access to `/dev/infiniband/*` remain host-operator responsibilities.
+
 ## Wire Format
 
 Probe packets use a 40-byte explicit big-endian serialization format. Packed

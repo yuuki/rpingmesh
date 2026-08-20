@@ -92,13 +92,11 @@ jobs:
   # build the soft-RoCE driver, unlike linux-generic. There is no further
   # apt-level fix for this; it would require a different runner
   # image/kernel flavor (e.g. self-hosted or a non-Azure kernel) to resolve.
-  # `continue-on-error: true` so this does not fail the whole workflow; a
-  # real regression in the probe/ACK path itself should still be
-  # investigated by reading the job logs.
+  # Skip the e2e step when rxe cannot be loaded so the job stays green on
+  # those kernels; if rxe did load, a failing test must fail the workflow.
   e2e-rdma:
-    name: e2e-rdma (soft-RoCE, best-effort)
+    name: e2e-rdma (soft-RoCE)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -106,24 +104,24 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Install and load rdma_rxe kernel module (best-effort)
+      - name: Install and load rdma_rxe kernel module
+        id: rxe
         run: |
-          set +e
           echo "Installing linux-modules-extra-$(uname -r) (provides rdma_rxe)..."
-          sudo apt-get update
-          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
-          if [ $? -ne 0 ]; then
+          sudo apt-get update || echo "::warning::apt-get update failed"
+          if ! sudo apt-get install -y "linux-modules-extra-$(uname -r)"; then
             echo "::warning::Failed to install linux-modules-extra-$(uname -r); rdma_rxe may be unavailable on this runner kernel"
           fi
 
           echo "Loading rdma_rxe module on host..."
-          sudo modprobe rdma_rxe
-          if [ $? -eq 0 ]; then
+          if sudo modprobe rdma_rxe; then
             echo "rdma_rxe module loaded successfully"
+            echo "available=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::modprobe rdma_rxe failed; soft-RoCE e2e test below is expected to fail on this runner"
+            echo "::warning::modprobe rdma_rxe failed; skipping soft-RoCE e2e on this runner"
+            echo "available=false" >> "$GITHUB_OUTPUT"
           fi
-          exit 0
 
       - name: Run RDMA e2e tests (soft-RoCE)
+        if: steps.rxe.outputs.available == 'true'
         run: make test-e2e

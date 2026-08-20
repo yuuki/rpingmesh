@@ -11,6 +11,7 @@
 //   - When the ring is full, events are dropped and drop_count is incremented
 
 const std = @import("std");
+const last_error = @import("last_error.zig");
 
 // ---------------------------------------------------------------------------
 // CompletionEvent - matches rdma_completion_event_t in rdma_bridge.h
@@ -164,10 +165,14 @@ pub const EventRing = struct {
         }
 
         // Allocate the ring struct itself
-        const self = std.heap.page_allocator.create(EventRing) catch return null;
+        const self = std.heap.page_allocator.create(EventRing) catch {
+            last_error.setLastError("failed to allocate event ring");
+            return null;
+        };
 
         // Allocate the backing buffer
         const buffer = std.heap.page_allocator.alloc(CompletionEvent, @intCast(cap)) catch {
+            last_error.setLastError("failed to allocate event ring buffer");
             std.heap.page_allocator.destroy(self);
             return null;
         };

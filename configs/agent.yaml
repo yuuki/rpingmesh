@@ -3,7 +3,10 @@
 # Agent identification
 agent_id: ""        # Required: unique agent identifier (defaults to hostname)
 hostname: ""        # Auto-detected if empty
-tor_id: ""          # Required: Top-of-Rack switch identifier
+# Optional: Top-of-Rack switch identifier. Empty = untagged virtual rack.
+# "unspecified" is reserved (OTel/PathSummary label); the agent will not start
+# if tor_id is set to that value.
+tor_id: ""
 
 # Controller connection
 controller_addr: "localhost:50051"

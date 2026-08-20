@@ -277,7 +277,7 @@ func TestInterTor_SamplesOnePerToRUpToSize(t *testing.T) {
 		},
 	}
 	// Cap at 2 distinct ToRs.
-	gen := NewPinglistGenerator(src, ECMPConfig{PathsAssumed: 16, CoverageProbability: 0.9, MaxFlowLabels: 64}, 2)
+	gen := NewPinglistGenerator(src, ECMPConfig{PathsAssumed: 16, CoverageProbability: 0.9, MaxFlowLabels: 64}, 2, 0)
 
 	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1")
 	if err != nil {

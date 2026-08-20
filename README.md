@@ -224,7 +224,7 @@ via Cgo (`CGO_ENABLED=1`).
 |-------|---------|-------------|
 | `agent_id` | hostname | Unique agent identifier |
 | `hostname` | auto-detected | Hostname reported to the controller on registration (falls back to `os.Hostname()` if empty) |
-| `tor_id` | *(required)* | Top-of-Rack switch identifier |
+| `tor_id` | *(optional, empty)* | Top-of-Rack switch identifier. Empty/whitespace registers as an untagged virtual rack. The value `unspecified` is reserved (OTel/PathSummary label for unset ToRs) and is rejected by both the agent and the controller. See [Optional ToR rollout](#optional-tor-rollout). |
 | `controller_addr` | `localhost:50051` | Controller gRPC address |
 | `probe_interval_ms` | `500` | Milliseconds between probe rounds |
 | `target_probe_rate_per_second` | `10` | Legacy **uniform** per-target probe-rate cap. Used as the fallback for whichever per-type cap below is `0`, so a config that only sets this keeps a single uniform rate (a target's ECMP flow labels share this budget) |
@@ -280,6 +280,7 @@ mistaken for the port itself being down.
 | `active_threshold_sec` | `300` | Window (seconds) within which an RNIC entry is considered active for pinglist generation |
 | `stale_threshold_sec` | `900` | Window (seconds) after which an inactive RNIC entry is considered stale and removed |
 | `inter_tor_sample_size` | `5` | Distinct ToRs sampled per inter-ToR pinglist |
+| `unspecified_mesh_max_targets` | `32` | Cap on ToR-mesh targets for agents with unset `tor_id` (`0` = unlimited). Named ToR-mesh is never capped. |
 | `ecmp_paths_assumed` | `16` | Assumed ECMP fabric width (m) for Eq.(1) flow-label coverage sizing |
 | `ecmp_coverage_probability` | `0.9` | Target probability (p, in (0,1)) that generated flow labels cover all ECMP paths |
 | `ecmp_max_flow_labels` | `64` | Hard cap on flow labels per target (bounds probe amplification) |
@@ -429,7 +430,7 @@ sudo mkdir -p /etc/rpingmesh
 sudo install -m 0644 configs/controller.yaml /etc/rpingmesh/controller.yaml
 # (repeat with rpingmesh-agent / agent.yaml / rpingmesh-agent.service on agent hosts)
 
-# 3. Edit /etc/rpingmesh/*.yaml for the host (tor_id, controller_addr, etc.),
+# 3. Edit /etc/rpingmesh/*.yaml for the host (controller_addr, optional tor_id, etc.),
 #    then create the system user/group and RDMA group membership expected by
 #    the unit files (the nfpm packages below do this automatically).
 sudo groupadd --system rpingmesh
@@ -472,7 +473,7 @@ Each package installs the binary to `/usr/bin/`, the unit file to
 `/usr/lib/systemd/system/`, and a sample config to
 `/etc/rpingmesh/{agent,controller}.yaml.example` (not the live config --
 copy and edit it to `agent.yaml`/`controller.yaml` before starting, since
-required fields like `tor_id` have no default). The package's postinstall
+host-specific fields like `controller_addr` have no useful default). The package's postinstall
 script creates the `rpingmesh` system user/group and reloads systemd, but
 deliberately does not enable or start the service. Install with
 `dpkg -i dist/rpingmesh-agent_*.deb` / `rpm -i dist/rpingmesh-agent-*.rpm` (or
@@ -652,7 +653,36 @@ is deferred.
 OpenTelemetry histogram attributes use ToR IDs (`source_tor`, `target_tor`)
 rather than individual GIDs. In a large fabric with thousands of RNICs, using
 GIDs as metric labels would cause cardinality explosion. Per-GID detail is
-available in structured debug logs.
+available in structured debug logs. Agents that omit `tor_id` emit the label
+`unspecified` for both source and target when the peer is also untagged.
+If an agent is later given a real ToR ID, PathAggregator may keep the previous
+target ToR on summaries until the current aggregation window closes.
+
+### Optional ToR rollout
+
+Upgrade the **controller first**, then agents. New agents still register with
+an empty storage `tor_id`; they never send the display label `unspecified` as
+the registry key.
+
+Before upgrading the controller, inventory and rename any existing ToR that is
+literally named `unspecified` (previously a legal operator value). After the
+new controller is live, those agents' heartbeats are rejected, but
+`GetPinglist` still keys on that string and running agents keep probing.
+Their metric cell collides with untagged agents until they are renamed.
+
+`unspecified_mesh_max_targets` caps the TOR_MESH list **returned** to each
+untagged requester (after same-host / same-family filters). The controller
+still reads the full empty-ToR bucket from rqlite on every request.
+
+Rolling back to an old controller rejects empty `tor_id` on register/heartbeat
+again, and also restores an **uncapped** empty-ToR mesh for any empty rows
+that remain active. Heartbeat failure does not stop probing: drain or stop
+untagged agents (or delete those registry rows) before rollback.
+
+Old agents emit empty `source_tor`/`target_tor` OTLP attributes until they
+are upgraded. The new controller maps empty labels on `PathSummary` ingest;
+live probe histograms are only relabeled by the new agent binary (or by
+collector relabeling during a mixed-version window).
 
 ### Integer Epoch for Staleness Tracking
 

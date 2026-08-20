@@ -45,6 +45,9 @@ func TestLoadControllerConfig_Defaults(t *testing.T) {
 	if cfg.InterTorSampleSize != DefaultInterTorSampleSize {
 		t.Errorf("InterTorSampleSize = %d, want %d", cfg.InterTorSampleSize, DefaultInterTorSampleSize)
 	}
+	if cfg.UnspecifiedMeshMaxTargets != DefaultUnspecifiedMeshMaxTargets {
+		t.Errorf("UnspecifiedMeshMaxTargets = %d, want %d", cfg.UnspecifiedMeshMaxTargets, DefaultUnspecifiedMeshMaxTargets)
+	}
 	if cfg.TLSMode != TLSModeDisabled {
 		t.Errorf("TLSMode = %q, want %q (backward-compatible default)", cfg.TLSMode, TLSModeDisabled)
 	}
@@ -236,6 +239,26 @@ func TestControllerConfig_Validate(t *testing.T) {
 				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 0,
 			},
 			wantErr: true,
+		},
+		{
+			name: "negative unspecified mesh max",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				UnspecifiedMeshMaxTargets: -1,
+				EcmpPathsAssumed:          16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+			},
+			wantErr: true,
+		},
+		{
+			name: "zero unspecified mesh max is unlimited",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				UnspecifiedMeshMaxTargets: 0,
+				EcmpPathsAssumed:          16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+			},
+			wantErr: false,
 		},
 		{
 			name: "tls_mode disabled requires no certificate files",
@@ -573,6 +596,30 @@ func TestAgentConfig_Validate(t *testing.T) {
 		{
 			name:    "valid",
 			cfg:     AgentConfig{GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600},
+			wantErr: false,
+		},
+		{
+			name: "reserved tor_id",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				TorID: "unspecified",
+			},
+			wantErr: true,
+		},
+		{
+			name: "reserved tor_id with surrounding whitespace",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				TorID: " unspecified ",
+			},
+			wantErr: true,
+		},
+		{
+			name: "unknown is a valid named ToR",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				TorID: "unknown",
+			},
 			wantErr: false,
 		},
 		{

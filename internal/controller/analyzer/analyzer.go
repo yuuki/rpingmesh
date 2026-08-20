@@ -16,6 +16,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
@@ -94,6 +95,8 @@ func (a *Analyzer) Ingest(ctx context.Context, report *controller_agent.ProbeAna
 		if s == nil {
 			continue
 		}
+		s.SourceTorId = probe.TorMetricLabel(s.GetSourceTorId())
+		s.TargetTorId = probe.TorMetricLabel(s.GetTargetTorId())
 		a.metrics.recordSummary(ctx)
 		a.retainLocked(s)
 

@@ -47,15 +47,17 @@ func fakeProber(resultChanBuf int) *Prober {
 // wired in, for use by tests that exercise createClusterMonitors and
 // createResultsFanIn without initializing any real RDMA resources.
 func newTestAgent(devices []*rdmabridge.Device, probers []*Prober) *Agent {
+	cfg := &config.AgentConfig{
+		AgentID:                   "agent-1",
+		TorID:                     "tor-1",
+		PinglistUpdateIntervalSec: 3600,
+	}
 	return &Agent{
-		cfg: &config.AgentConfig{
-			AgentID:                   "agent-1",
-			TorID:                     "tor-1",
-			PinglistUpdateIntervalSec: 3600,
-		},
-		devices: devices,
-		probers: probers,
-		logger:  zerolog.Nop(),
+		cfg:            cfg,
+		canonicalTorID: probe.CanonicalTorID(cfg.TorID),
+		devices:        devices,
+		probers:        probers,
+		logger:         zerolog.Nop(),
 	}
 }
 
@@ -345,4 +347,57 @@ func TestAgent_CreateResultsFanIn_NoMetricsConsumer_AnalysisStillFlows(t *testin
 	// Clean shutdown of the fan-in.
 	prober.Destroy()
 	a.stopResultsFanIn()
+}
+
+func TestAgent_CanonicalTorID(t *testing.T) {
+	a, err := NewAgent(&config.AgentConfig{AgentID: "agent-1", TorID: " tor-1 "})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	if a.canonicalTorID != "tor-1" {
+		t.Errorf("canonicalTorID = %q, want tor-1", a.canonicalTorID)
+	}
+
+	req := a.buildRegistrationRequest()
+	if req.GetTorId() != "tor-1" {
+		t.Errorf("registration TorId = %q, want tor-1", req.GetTorId())
+	}
+}
+
+func TestAgent_EmptyTorIDUsesStorageForm(t *testing.T) {
+	a, err := NewAgent(&config.AgentConfig{
+		AgentID:                   "agent-1",
+		TorID:                     "  ",
+		PinglistUpdateIntervalSec: 3600,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	if a.canonicalTorID != "" {
+		t.Errorf("canonicalTorID = %q, want empty storage key", a.canonicalTorID)
+	}
+
+	req := a.buildRegistrationRequest()
+	if req.GetTorId() != "" {
+		t.Errorf("registration TorId = %q, want empty", req.GetTorId())
+	}
+
+	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "gid-0")}
+	a.probers = []*Prober{fakeProber(1)}
+	a.createClusterMonitors()
+	if len(a.monitors) != 1 {
+		t.Fatalf("monitors = %d, want 1", len(a.monitors))
+	}
+	if a.monitors[0].torID != "" {
+		t.Errorf("monitor.torID = %q, want empty", a.monitors[0].torID)
+	}
+}
+
+func TestAgent_ReservedTorIDRejected(t *testing.T) {
+	for _, torID := range []string{"unspecified", " unspecified "} {
+		_, err := NewAgent(&config.AgentConfig{AgentID: "agent-1", TorID: torID})
+		if err == nil {
+			t.Errorf("NewAgent(tor_id=%q) succeeded, want reserved-id error", torID)
+		}
+	}
 }

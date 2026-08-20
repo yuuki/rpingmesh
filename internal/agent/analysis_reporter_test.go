@@ -108,6 +108,30 @@ func TestAnalysisReporter_FinalFlushOnInputClose(t *testing.T) {
 	}
 }
 
+func TestAnalysisReporter_MapsEmptyTorLabels(t *testing.T) {
+	fake := &fakeSender{}
+	input := make(chan *probe.ProbeResult, 4)
+	r := NewAnalysisReporter(fake, "agent-1", "", 3600, input)
+	r.Start(context.Background())
+
+	src, tgt := srcGID(1), srcGID(2)
+	input <- validProbeResult(src, tgt, "", 42)
+	close(input)
+	r.Wait()
+
+	summaries := fake.allSummaries()
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 summary, got %d", len(summaries))
+	}
+	s := summaries[0]
+	if s.GetSourceTorId() != probe.UnspecifiedTorLabel {
+		t.Errorf("SourceTorId = %q, want %s", s.GetSourceTorId(), probe.UnspecifiedTorLabel)
+	}
+	if s.GetTargetTorId() != probe.UnspecifiedTorLabel {
+		t.Errorf("TargetTorId = %q, want %s", s.GetTargetTorId(), probe.UnspecifiedTorLabel)
+	}
+}
+
 // TestAnalysisReporter_CtxCancelAloneDoesNotStop verifies the shutdown
 // contract: the reporter does NOT exit on ctx cancellation; it exits only when
 // its input channel is closed. On a signal stop the ctx is cancelled before the

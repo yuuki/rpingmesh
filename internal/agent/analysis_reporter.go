@@ -206,9 +206,9 @@ func (r *AnalysisReporter) report(ctx context.Context, summaries []probe.PathSum
 func (r *AnalysisReporter) toProto(s *probe.PathSummary) *controller_agent.PathSummary {
 	return &controller_agent.PathSummary{
 		SourceGid:         probe.FormatGID(s.SourceGID),
-		SourceTorId:       r.sourceTorID,
+		SourceTorId:       probe.TorMetricLabel(r.sourceTorID),
 		TargetGid:         probe.FormatGID(s.TargetGID),
-		TargetTorId:       s.TargetTorID,
+		TargetTorId:       probe.TorMetricLabel(s.TargetTorID),
 		TargetQpn:         s.TargetQPN,
 		WindowStartUnixNs: s.WindowStartUnixNs,
 		WindowDurationMs:  s.WindowDurationMs,

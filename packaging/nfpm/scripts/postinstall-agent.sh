@@ -3,10 +3,10 @@
 # runs as, and reload systemd so it picks up the newly-installed unit.
 #
 # Runs on both fresh install and upgrade (deb: "configure", rpm: arg 1 or 2).
-# It deliberately does NOT enable or start the service: rpingmesh-agent.yaml
-# ships only as an .example (tor_id has no default), so an unconfigured
-# service would just crash-loop. See README.md "Deployment (systemd)"
-# for the manual enable/start steps.
+# It deliberately does NOT enable or start the service: agent.yaml ships
+# only as an .example because controller_addr is host-specific, so an
+# unconfigured service would just crash-loop. See README.md
+# "Deployment (systemd)" for the manual enable/start steps.
 set -e
 
 if ! getent group rpingmesh >/dev/null 2>&1; then

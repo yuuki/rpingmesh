@@ -18,7 +18,7 @@ func newTestService(reg registryClient) *ControllerService {
 		PathsAssumed:        16,
 		CoverageProbability: 0.9,
 		MaxFlowLabels:       64,
-	}, pinglist.DefaultInterTorSampleSize)
+	}, pinglist.DefaultInterTorSampleSize, 0)
 }
 
 // fakeRegistry implements registryClient without any real rqlite backend,
@@ -35,6 +35,11 @@ type fakeRegistry struct {
 	torMeshErr    error
 	interTorRnics []*controller_agent.RnicInfo
 	interTorErr   error
+
+	// lastTorMeshTorID / lastInterTorExcludeTorID capture the ToR argument
+	// forwarded into the registry so tests can assert canonicalization.
+	lastTorMeshTorID         string
+	lastInterTorExcludeTorID string
 }
 
 func (f *fakeRegistry) RegisterRNICs(_ context.Context, agentID, agentIP string, rnics []*controller_agent.RnicInfo) error {
@@ -45,11 +50,13 @@ func (f *fakeRegistry) RegisterRNICs(_ context.Context, agentID, agentIP string,
 	return f.registerErr
 }
 
-func (f *fakeRegistry) GetRNICsByToR(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
+func (f *fakeRegistry) GetRNICsByToR(_ context.Context, torID string) ([]*controller_agent.RnicInfo, error) {
+	f.lastTorMeshTorID = torID
 	return f.torMeshRnics, f.torMeshErr
 }
 
-func (f *fakeRegistry) GetActiveRNICsInOtherToRs(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
+func (f *fakeRegistry) GetActiveRNICsInOtherToRs(_ context.Context, excludeTorID string) ([]*controller_agent.RnicInfo, error) {
+	f.lastInterTorExcludeTorID = excludeTorID
 	return f.interTorRnics, f.interTorErr
 }
 
@@ -83,14 +90,50 @@ func TestRegisterAgent_MissingAgentID(t *testing.T) {
 	}
 }
 
-func TestRegisterAgent_MissingTorID(t *testing.T) {
+func TestRegisterAgent_EmptyTorID(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		torID string
+	}{
+		{"empty", ""},
+		{"whitespace only", "  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeRegistry{}
+			svc := newTestService(fake)
+
+			resp, err := svc.RegisterAgent(context.Background(), &controller_agent.AgentRegistrationRequest{
+				AgentId:  "agent-1",
+				Hostname: "host-1",
+				TorId:    tc.torID,
+				Rnics:    []*controller_agent.RnicInfo{{Gid: "gid-1"}},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !resp.GetSuccess() {
+				t.Errorf("resp.Success = false, want true; message: %s", resp.GetMessage())
+			}
+			if len(fake.lastRnics) != 1 {
+				t.Fatalf("registered %d RNICs, want 1", len(fake.lastRnics))
+			}
+			if got := fake.lastRnics[0].GetTorId(); got != "" {
+				t.Errorf("RNIC TorId = %q, want empty storage key", got)
+			}
+		})
+	}
+}
+
+func TestRegisterAgent_ReservedTorID(t *testing.T) {
 	svc := newTestService(&fakeRegistry{})
 
 	_, err := svc.RegisterAgent(context.Background(), &controller_agent.AgentRegistrationRequest{
 		AgentId: "agent-1",
+		TorId:   " unspecified ",
+		Rnics:   []*controller_agent.RnicInfo{{Gid: "gid-1"}},
 	})
 	if err == nil {
-		t.Fatal("expected an error for missing tor_id, got nil")
+		t.Fatal("expected an error for reserved tor_id, got nil")
 	}
 	if got := statusCode(t, err); got != codes.InvalidArgument {
 		t.Errorf("status code = %v, want %v", got, codes.InvalidArgument)
@@ -248,5 +291,43 @@ func TestGetPinglist_RegistryFailure(t *testing.T) {
 	}
 	if got := statusCode(t, err); got != codes.Internal {
 		t.Errorf("status code = %v, want %v", got, codes.Internal)
+	}
+}
+
+func TestGetPinglist_CanonicalizesEmptyTorID(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		torID string
+		ptype controller_agent.PinglistType
+	}{
+		{"empty tor mesh", "", controller_agent.PinglistType_TOR_MESH},
+		{"whitespace tor mesh", "  ", controller_agent.PinglistType_TOR_MESH},
+		{"empty inter tor", "", controller_agent.PinglistType_INTER_TOR},
+		{"whitespace inter tor", "  ", controller_agent.PinglistType_INTER_TOR},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeRegistry{}
+			svc := newTestService(fake)
+
+			_, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
+				AgentId:      "agent-1",
+				RequesterGid: "gid-1",
+				TorId:        tc.torID,
+				Type:         tc.ptype,
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			switch tc.ptype {
+			case controller_agent.PinglistType_TOR_MESH:
+				if fake.lastTorMeshTorID != "" {
+					t.Errorf("GetRNICsByToR torID = %q, want empty", fake.lastTorMeshTorID)
+				}
+			case controller_agent.PinglistType_INTER_TOR:
+				if fake.lastInterTorExcludeTorID != "" {
+					t.Errorf("GetActiveRNICsInOtherToRs excludeTorID = %q, want empty", fake.lastInterTorExcludeTorID)
+				}
+			}
+		})
 	}
 }

@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- `tor_id` is optional. Unset agents register into an empty-ToR virtual rack,
+  emit the OTel/PathSummary label `unspecified`, and have their ToR-mesh capped
+  by `unspecified_mesh_max_targets` (default 32). Agents refuse to start with
+  the reserved `tor_id` `unspecified`. Upgrade the controller before agents;
+  inventory any existing ToR actually named `unspecified` first. Rolling back
+  the controller rejects empty `tor_id` again and also restores an uncapped
+  empty-ToR mesh for remaining empty rows — drain untagged agents before
+  rollback.
+
 ## [0.1.1] - 2026-07-28
 
 ### Added

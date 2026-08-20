@@ -37,7 +37,19 @@ type Config struct {
 	// WindowRetention is the number of distinct windows retained in the
 	// in-memory ring (oldest evicted first). Must be >= 1.
 	WindowRetention int
+	// MaxSummariesPerWindow caps how many PathSummary records are kept in a
+	// single window bucket. WindowRetention only bounds distinct window
+	// starts; without this cap a stuck window_start or a retry storm can
+	// grow one bucket without bound. Values < 1 are replaced by
+	// DefaultMaxSummariesPerWindow.
+	MaxSummariesPerWindow int
 }
+
+// DefaultMaxSummariesPerWindow is applied when Config.MaxSummariesPerWindow
+// is unset or non-positive. 8192 is well above a healthy per-window report
+// (agents already cap a single report at 256 summaries) and still bounds
+// memory if one window start is reused indefinitely.
+const DefaultMaxSummariesPerWindow = 8192
 
 // windowBucket groups the summaries retained for one aggregation window,
 // identified by its wall-clock start. Kept for recency/retention and as the
@@ -63,10 +75,14 @@ type Analyzer struct {
 
 // New creates an Analyzer with the given config and metrics (metrics may be
 // nil, in which case findings are logged but no OTLP metrics are emitted).
-// WindowRetention is clamped to at least 1.
+// WindowRetention is clamped to at least 1. MaxSummariesPerWindow values
+// below 1 are replaced by DefaultMaxSummariesPerWindow.
 func New(cfg Config, metrics *Metrics) *Analyzer {
 	if cfg.WindowRetention < 1 {
 		cfg.WindowRetention = 1
+	}
+	if cfg.MaxSummariesPerWindow < 1 {
+		cfg.MaxSummariesPerWindow = DefaultMaxSummariesPerWindow
 	}
 	return &Analyzer{
 		cfg:     cfg,
@@ -167,6 +183,14 @@ func (a *Analyzer) retainLocked(s *controller_agent.PathSummary) {
 	// Locate an existing bucket for this window (ring is small: retention count).
 	for _, b := range a.ring {
 		if b.windowStartUnixNs == ws {
+			if len(b.summaries) >= a.cfg.MaxSummariesPerWindow {
+				a.logger.Debug().
+					Uint64("window_start_unix_ns", ws).
+					Int("retained", len(b.summaries)).
+					Int("cap", a.cfg.MaxSummariesPerWindow).
+					Msg("dropping summary: per-window retention cap reached")
+				return
+			}
 			b.summaries = append(b.summaries, s)
 			return
 		}
@@ -193,4 +217,16 @@ func (a *Analyzer) RetainedWindows() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return len(a.ring)
+}
+
+// RetainedSummaries returns the total number of PathSummary records currently
+// held across all retained windows. Exposed for tests and diagnostics.
+func (a *Analyzer) RetainedSummaries() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := 0
+	for _, b := range a.ring {
+		n += len(b.summaries)
+	}
+	return n
 }

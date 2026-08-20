@@ -139,6 +139,46 @@ func TestAnalyzer_WindowRetentionRing(t *testing.T) {
 	}
 }
 
+func TestAnalyzer_PerWindowSummaryCap(t *testing.T) {
+	cfg := testConfig()
+	cfg.WindowRetention = 2
+	cfg.MaxSummariesPerWindow = 2
+	a := New(cfg, nil)
+	ctx := context.Background()
+
+	// Three summaries in one window: only the first two are retained.
+	a.Ingest(ctx, report(
+		summary("tor-a", "tor-b", 100, 0, 0, 1),
+		summary("tor-a", "tor-c", 100, 0, 0, 1),
+		summary("tor-a", "tor-d", 100, 0, 0, 1),
+	))
+	if got := a.RetainedWindows(); got != 1 {
+		t.Errorf("RetainedWindows = %d, want 1", got)
+	}
+	if got := a.RetainedSummaries(); got != 2 {
+		t.Errorf("RetainedSummaries = %d, want 2 (per-window cap)", got)
+	}
+
+	// A new window is still accepted; the previous window stays at the cap.
+	a.Ingest(ctx, report(summary("tor-a", "tor-e", 100, 0, 0, 2)))
+	if got := a.RetainedWindows(); got != 2 {
+		t.Errorf("RetainedWindows = %d, want 2 after second window", got)
+	}
+	if got := a.RetainedSummaries(); got != 3 {
+		t.Errorf("RetainedSummaries = %d, want 3 (2 in window 1 + 1 in window 2)", got)
+	}
+
+	// Same-window ingest under the cap still coalesces (existing ring contract).
+	a.Ingest(ctx, report(summary("tor-a", "tor-f", 100, 0, 0, 2)))
+	if got := a.RetainedSummaries(); got != 4 {
+		t.Errorf("RetainedSummaries = %d, want 4 after coalescing into window 2", got)
+	}
+	a.Ingest(ctx, report(summary("tor-a", "tor-g", 100, 0, 0, 2)))
+	if got := a.RetainedSummaries(); got != 4 {
+		t.Errorf("RetainedSummaries = %d, want 4 (window 2 at cap)", got)
+	}
+}
+
 func TestAnalyzer_NilReportSafe(t *testing.T) {
 	a := New(testConfig(), nil)
 	if v := a.Ingest(context.Background(), nil); v != 0 {

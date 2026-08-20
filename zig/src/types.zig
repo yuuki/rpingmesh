@@ -336,7 +336,7 @@ pub const UdQueue = struct {
     }
 
     /// Destroy every remaining per-slot AH. Safe only after the CQ poller
-    /// has stopped and the QP has been destroyed (no outstanding UD WRs).
+    /// has stopped and ibv_destroy_qp has succeeded (no outstanding UD WRs).
     pub fn destroyAllSendSlotAhs(self: *UdQueue) void {
         for (0..NUM_SEND_SLOTS) |i| {
             self.destroySendSlotAh(@intCast(i));

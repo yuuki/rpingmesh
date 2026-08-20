@@ -248,6 +248,24 @@ func TestControllerConfig_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "stale threshold below active threshold",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 60, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+			},
+			wantErr: true,
+		},
+		{
+			name: "stale threshold equals active threshold",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 300, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+			},
+			wantErr: false,
+		},
+		{
 			name: "non-positive inter-tor sample size",
 			cfg: ControllerConfig{
 				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",

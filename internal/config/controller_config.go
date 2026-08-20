@@ -242,6 +242,9 @@ func (c *ControllerConfig) Validate() error {
 	if c.StaleThresholdSec <= 0 {
 		return fmt.Errorf("stale_threshold_sec must be > 0, got: %d", c.StaleThresholdSec)
 	}
+	if c.StaleThresholdSec < c.ActiveThresholdSec {
+		return fmt.Errorf("stale_threshold_sec (%d) must be >= active_threshold_sec (%d)", c.StaleThresholdSec, c.ActiveThresholdSec)
+	}
 	if c.InterTorSampleSize <= 0 {
 		return fmt.Errorf("inter_tor_sample_size must be > 0, got: %d", c.InterTorSampleSize)
 	}

@@ -382,14 +382,21 @@ func (p *Prober) Start(ctx context.Context) error {
 // wakes goroutines immediately instead of waiting for the next ticker
 // or sleep to fire.
 func (p *Prober) Stop() {
-	if !p.running.CompareAndSwap(true, false) {
-		return // not running
+	// Always Wait, even when running is already false. A loop that
+	// observed ctx.Done may have exited (or be exiting) while a sibling
+	// is still in SendProbe / ring poll; skipping Wait here would let
+	// Destroy free the queue under that sibling. Only the CAS winner
+	// closes stopCh, so a second Stop cannot double-close.
+	signaled := p.running.CompareAndSwap(true, false)
+	if signaled {
+		p.stopMu.Lock()
+		close(p.stopCh)
+		p.stopMu.Unlock()
 	}
-	p.stopMu.Lock()
-	close(p.stopCh)
-	p.stopMu.Unlock()
 	p.wg.Wait()
-	p.logger.Info().Msg("Prober stopped")
+	if signaled {
+		p.logger.Info().Msg("Prober stopped")
+	}
 }
 
 // SetPerTargetRateLimit caps the probe send rate to at most pps packets per
@@ -623,7 +630,9 @@ func (p *Prober) probeLoop(ctx context.Context) {
 	for p.running.Load() {
 		select {
 		case <-ctx.Done():
-			p.running.Store(false)
+			// Do not Store(false) here: Stop() is the only writer of
+			// running, and it must Wait after the CAS so Destroy cannot
+			// race a sibling still in SendProbe.
 			return
 		case <-p.stopCh:
 			// Stop() was called; exit immediately without waiting for
@@ -905,7 +914,6 @@ func (p *Prober) ackProcessLoop(ctx context.Context) {
 		// even when the ring is continuously delivering events.
 		select {
 		case <-ctx.Done():
-			p.running.Store(false)
 			return
 		case <-p.stopCh:
 			return
@@ -926,7 +934,6 @@ func (p *Prober) ackProcessLoop(ctx context.Context) {
 			idleTimer.Reset(idleSleep)
 			select {
 			case <-ctx.Done():
-				p.running.Store(false)
 				return
 			case <-p.stopCh:
 				// Stop() was called; exit without waiting for the idle sleep.

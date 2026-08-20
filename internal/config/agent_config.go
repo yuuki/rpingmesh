@@ -217,13 +217,8 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		v.AddConfigPath("/etc/rpingmesh")
 	}
 
-	if err := v.ReadInConfig(); err != nil {
-		// A missing config file is acceptable; other read errors are not
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			if !os.IsNotExist(err) {
-				return nil, fmt.Errorf("failed to read config file: %w", err)
-			}
-		}
+	if err := readConfigFile(v, configPath); err != nil {
+		return nil, err
 	}
 
 	// Auto-detect hostname if not explicitly configured

@@ -416,7 +416,7 @@ func TestRegistrationValidation(t *testing.T) {
 		torID   string
 	}{
 		{"empty agent_id", "", "tor-01"},
-		{"empty tor_id", "agent-01", ""},
+		{"reserved tor_id", "agent-01", "unspecified"},
 	}
 
 	for _, tt := range tests {
@@ -456,5 +456,68 @@ func TestPinglistEmptyToR(t *testing.T) {
 	targets := getPinglist(t, client, "lonely-agent", torID, gid, controller_agent.PinglistType_TOR_MESH)
 	if len(targets) != 0 {
 		t.Fatalf("expected 0 TOR_MESH targets for single-agent ToR, got %d", len(targets))
+	}
+}
+
+// TestUntaggedAgentsMesh verifies that agents that omit tor_id share one
+// virtual rack: TOR_MESH includes the other untagged agent, INTER_TOR is empty
+// when the cluster has no named ToRs.
+func TestUntaggedAgentsMesh(t *testing.T) {
+	cleanDatabase(t)
+	client := newClient(t)
+	id := uint16(time.Now().UnixNano())
+	gidA := fmt.Sprintf("fe80::1:%04x", id)
+	gidB := fmt.Sprintf("fe80::2:%04x", id)
+
+	registerAgent(t, client, "untagged-a", "192.168.50.1", "untagged-host-a", "",
+		[]*controller_agent.RnicInfo{
+			makeRNIC(gidA, 600, "10.50.0.1", "untagged-host-a", "", "mlx5_0"),
+		})
+	registerAgent(t, client, "untagged-b", "192.168.50.2", "untagged-host-b", "",
+		[]*controller_agent.RnicInfo{
+			makeRNIC(gidB, 601, "10.50.0.2", "untagged-host-b", "", "mlx5_0"),
+		})
+
+	meshA := getPinglist(t, client, "untagged-a", "", gidA, controller_agent.PinglistType_TOR_MESH)
+	if !containsGID(meshA, gidB) {
+		t.Errorf("untagged TOR_MESH for A missing B (got %d targets)", len(meshA))
+	}
+	if containsGID(meshA, gidA) {
+		t.Errorf("untagged TOR_MESH for A included self")
+	}
+
+	interA := getPinglist(t, client, "untagged-a", "", gidA, controller_agent.PinglistType_INTER_TOR)
+	if len(interA) != 0 {
+		t.Errorf("untagged INTER_TOR in an all-untagged cluster: got %d targets, want 0", len(interA))
+	}
+}
+
+// TestMixedUntaggedAndNamed verifies mixed clusters: a named-ToR agent's
+// INTER_TOR list may include the untagged bucket, and an untagged agent's
+// TOR_MESH does not include named-ToR RNICs.
+func TestMixedUntaggedAndNamed(t *testing.T) {
+	cleanDatabase(t)
+	client := newClient(t)
+	id := uint16(time.Now().UnixNano())
+	gidUntagged := fmt.Sprintf("fe80::3:%04x", id)
+	gidNamed := fmt.Sprintf("fe80::4:%04x", id)
+
+	registerAgent(t, client, "mixed-untagged", "192.168.51.1", "mixed-untagged-host", "",
+		[]*controller_agent.RnicInfo{
+			makeRNIC(gidUntagged, 610, "10.51.0.1", "mixed-untagged-host", "", "mlx5_0"),
+		})
+	registerAgent(t, client, "mixed-named", "192.168.51.2", "mixed-named-host", "tor-M",
+		[]*controller_agent.RnicInfo{
+			makeRNIC(gidNamed, 611, "10.51.0.2", "mixed-named-host", "tor-M", "mlx5_0"),
+		})
+
+	interNamed := getPinglist(t, client, "mixed-named", "tor-M", gidNamed, controller_agent.PinglistType_INTER_TOR)
+	if !containsGID(interNamed, gidUntagged) {
+		t.Errorf("named INTER_TOR missing untagged agent (got %d targets)", len(interNamed))
+	}
+
+	meshUntagged := getPinglist(t, client, "mixed-untagged", "", gidUntagged, controller_agent.PinglistType_TOR_MESH)
+	if containsGID(meshUntagged, gidNamed) {
+		t.Errorf("untagged TOR_MESH included named-ToR agent")
 	}
 }

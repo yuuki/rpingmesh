@@ -26,6 +26,9 @@ const (
 	// DefaultInterTorSampleSize is the default number of distinct ToRs
 	// sampled for inter-ToR pinglist generation.
 	DefaultInterTorSampleSize = 5
+	// DefaultUnspecifiedMeshMaxTargets caps ToR-mesh pinglist size for
+	// agents that omit tor_id. 0 means unlimited.
+	DefaultUnspecifiedMeshMaxTargets = 32
 
 	// DefaultEcmpPathsAssumed is the assumed ECMP fabric width (m) used by
 	// Eq.(1) to size the per-target flow-label set. It cannot be measured
@@ -63,12 +66,13 @@ const (
 
 // ControllerConfig holds all configuration for the controller.
 type ControllerConfig struct {
-	ListenAddr         string `mapstructure:"listen_addr"`
-	DatabaseURI        string `mapstructure:"database_uri"`
-	LogLevel           string `mapstructure:"log_level"`
-	ActiveThresholdSec int    `mapstructure:"active_threshold_sec"`
-	StaleThresholdSec  int    `mapstructure:"stale_threshold_sec"`
-	InterTorSampleSize int    `mapstructure:"inter_tor_sample_size"`
+	ListenAddr                string `mapstructure:"listen_addr"`
+	DatabaseURI               string `mapstructure:"database_uri"`
+	LogLevel                  string `mapstructure:"log_level"`
+	ActiveThresholdSec        int    `mapstructure:"active_threshold_sec"`
+	StaleThresholdSec         int    `mapstructure:"stale_threshold_sec"`
+	InterTorSampleSize        int    `mapstructure:"inter_tor_sample_size"`
+	UnspecifiedMeshMaxTargets int    `mapstructure:"unspecified_mesh_max_targets"`
 	// EcmpPathsAssumed (m), EcmpCoverageProbability (p), and EcmpMaxFlowLabels
 	// (cap on n) drive R-Pingmesh Eq.(1) sizing of the per-target flow-label
 	// set for probabilistic ECMP path coverage.
@@ -115,6 +119,7 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 	v.SetDefault("active_threshold_sec", DefaultActiveThresholdSec)
 	v.SetDefault("stale_threshold_sec", DefaultStaleThresholdSec)
 	v.SetDefault("inter_tor_sample_size", DefaultInterTorSampleSize)
+	v.SetDefault("unspecified_mesh_max_targets", DefaultUnspecifiedMeshMaxTargets)
 	v.SetDefault("ecmp_paths_assumed", DefaultEcmpPathsAssumed)
 	v.SetDefault("ecmp_coverage_probability", DefaultEcmpCoverageProbability)
 	v.SetDefault("ecmp_max_flow_labels", DefaultEcmpMaxFlowLabels)
@@ -164,15 +169,16 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 	}
 
 	config := &ControllerConfig{
-		ListenAddr:              v.GetString("listen_addr"),
-		DatabaseURI:             v.GetString("database_uri"),
-		LogLevel:                v.GetString("log_level"),
-		ActiveThresholdSec:      v.GetInt("active_threshold_sec"),
-		StaleThresholdSec:       v.GetInt("stale_threshold_sec"),
-		InterTorSampleSize:      v.GetInt("inter_tor_sample_size"),
-		EcmpPathsAssumed:        v.GetInt("ecmp_paths_assumed"),
-		EcmpCoverageProbability: v.GetFloat64("ecmp_coverage_probability"),
-		EcmpMaxFlowLabels:       v.GetInt("ecmp_max_flow_labels"),
+		ListenAddr:                v.GetString("listen_addr"),
+		DatabaseURI:               v.GetString("database_uri"),
+		LogLevel:                  v.GetString("log_level"),
+		ActiveThresholdSec:        v.GetInt("active_threshold_sec"),
+		StaleThresholdSec:         v.GetInt("stale_threshold_sec"),
+		InterTorSampleSize:        v.GetInt("inter_tor_sample_size"),
+		UnspecifiedMeshMaxTargets: v.GetInt("unspecified_mesh_max_targets"),
+		EcmpPathsAssumed:          v.GetInt("ecmp_paths_assumed"),
+		EcmpCoverageProbability:   v.GetFloat64("ecmp_coverage_probability"),
+		EcmpMaxFlowLabels:         v.GetInt("ecmp_max_flow_labels"),
 
 		AnalyzerEnabled:            v.GetBool("analyzer_enabled"),
 		AnalyzerSLALossRatio:       v.GetFloat64("analyzer_sla_loss_ratio"),
@@ -245,6 +251,9 @@ func (c *ControllerConfig) Validate() error {
 	if c.InterTorSampleSize <= 0 {
 		return fmt.Errorf("inter_tor_sample_size must be > 0, got: %d", c.InterTorSampleSize)
 	}
+	if c.UnspecifiedMeshMaxTargets < 0 {
+		return fmt.Errorf("unspecified_mesh_max_targets must be >= 0, got: %d", c.UnspecifiedMeshMaxTargets)
+	}
 
 	if c.EcmpPathsAssumed < 1 {
 		return fmt.Errorf("ecmp_paths_assumed must be >= 1, got: %d", c.EcmpPathsAssumed)
@@ -296,6 +305,7 @@ func BindControllerFlags(flags *pflag.FlagSet) {
 	flags.Int("active-threshold-sec", DefaultActiveThresholdSec, "Window (seconds) within which an RNIC is considered active")
 	flags.Int("stale-threshold-sec", DefaultStaleThresholdSec, "Window (seconds) after which an inactive RNIC is removed")
 	flags.Int("inter-tor-sample-size", DefaultInterTorSampleSize, "Number of distinct ToRs sampled for inter-ToR pinglists")
+	flags.Int("unspecified-mesh-max-targets", DefaultUnspecifiedMeshMaxTargets, "Cap on ToR-mesh targets for agents with unset tor_id (0 = unlimited)")
 	flags.Int("ecmp-paths-assumed", DefaultEcmpPathsAssumed, "Assumed ECMP fabric width (m) for Eq.(1) flow-label coverage sizing")
 	flags.Float64("ecmp-coverage-probability", DefaultEcmpCoverageProbability, "Target probability (p, in (0,1)) that generated flow labels cover all ECMP paths")
 	flags.Int("ecmp-max-flow-labels", DefaultEcmpMaxFlowLabels, "Hard cap on the number of flow labels per target (bounds probe amplification)")

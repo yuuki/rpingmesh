@@ -375,13 +375,16 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		return
 	}
 
+	sourceTor := probe.TorMetricLabel(sourceTorID)
+	targetTor := probe.TorMetricLabel(result.TargetTorID)
+
 	ctx := context.Background()
 
 	// Build low-cardinality attribute set: ToR IDs only.
 	// NEVER use GIDs as metric attributes to avoid cardinality explosion.
 	attrs := metric.WithAttributes(
-		attribute.String("source_tor", sourceTorID),
-		attribute.String("target_tor", result.TargetTorID),
+		attribute.String("source_tor", sourceTor),
+		attribute.String("target_tor", targetTor),
 	)
 
 	// Always increment total probe count.
@@ -395,8 +398,8 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		mc.probeSuccess.Add(ctx, 1, attrs)
 	} else {
 		mc.probeFailed.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("source_tor", sourceTorID),
-			attribute.String("target_tor", result.TargetTorID),
+			attribute.String("source_tor", sourceTor),
+			attribute.String("target_tor", targetTor),
 			attribute.String("reason", probeFailureReason(result, rtt)),
 		))
 	}
@@ -405,8 +408,8 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 	// visibility without metric cardinality cost.
 	mc.logger.Debug().
 		Str("target_gid", probe.FormatGID(result.TargetGID)).
-		Str("source_tor", sourceTorID).
-		Str("target_tor", result.TargetTorID).
+		Str("source_tor", sourceTor).
+		Str("target_tor", targetTor).
 		Str("target_ip", result.TargetIP).
 		Uint32("flow_label", result.FlowLabel).
 		Uint64("seq", result.SequenceNum).

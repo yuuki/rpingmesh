@@ -32,7 +32,7 @@ func newTestGenerator(src RnicSource) *PinglistGenerator {
 		PathsAssumed:        16,
 		CoverageProbability: 0.9,
 		MaxFlowLabels:       64,
-	}, DefaultInterTorSampleSize)
+	}, DefaultInterTorSampleSize, 0)
 }
 
 // TestGenerateTorMeshPinglist_Error verifies that a registry error is

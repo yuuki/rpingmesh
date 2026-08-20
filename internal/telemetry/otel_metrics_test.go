@@ -300,6 +300,40 @@ func TestRecordProbeResult_Success(t *testing.T) {
 	}
 }
 
+func TestRecordProbeResult_EmptyTorMapped(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer provider.Shutdown(context.Background())
+
+	mc, err := NewMetricsCollectorWithProvider(provider)
+	if err != nil {
+		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
+	}
+
+	mc.RecordProbeResult(&probe.ProbeResult{TargetTorID: "  ", Success: false, ErrorMessage: "timed out waiting for ACKs"}, nil, "")
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("ManualReader.Collect: %v", err)
+	}
+	totalMetric := findMetric(&rm, "rpingmesh.probe_total")
+	if totalMetric == nil {
+		t.Fatal("rpingmesh.probe_total metric not found")
+	}
+	totalSum, ok := totalMetric.Data.(metricdata.Sum[int64])
+	if !ok || len(totalSum.DataPoints) != 1 {
+		t.Fatalf("rpingmesh.probe_total = %+v, want a single data point", totalMetric.Data)
+	}
+	src, ok := totalSum.DataPoints[0].Attributes.Value("source_tor")
+	if !ok || src.AsString() != probe.UnspecifiedTorLabel {
+		t.Errorf("source_tor = %q, want %s", src.AsString(), probe.UnspecifiedTorLabel)
+	}
+	tgt, ok := totalSum.DataPoints[0].Attributes.Value("target_tor")
+	if !ok || tgt.AsString() != probe.UnspecifiedTorLabel {
+		t.Errorf("target_tor = %q, want %s", tgt.AsString(), probe.UnspecifiedTorLabel)
+	}
+}
+
 // TestRecordProbeResult_NilResult verifies that RecordProbeResult is a no-op
 // when passed a nil ProbeResult (defensive guard against a caller mistake),
 // so no metrics are recorded and no panic occurs.

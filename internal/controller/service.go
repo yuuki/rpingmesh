@@ -6,6 +6,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/controller/pinglist"
+	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -46,12 +47,13 @@ type ControllerService struct {
 // NewControllerService creates a new ControllerService backed by the given
 // RNIC registry. A PinglistGenerator is automatically created from the
 // registry, the ECMP config (which sizes how many distinct flow labels each
-// target is probed with, Eq.(1) coverage), and interTorSampleSize (the number
-// of distinct foreign ToRs sampled per inter-ToR pinglist).
-func NewControllerService(reg registryClient, ecmp pinglist.ECMPConfig, interTorSampleSize int) *ControllerService {
+// target is probed with, Eq.(1) coverage), interTorSampleSize (the number
+// of distinct foreign ToRs sampled per inter-ToR pinglist), and
+// unspecifiedMeshMax (the ToR-mesh cap for untagged agents; 0 = unlimited).
+func NewControllerService(reg registryClient, ecmp pinglist.ECMPConfig, interTorSampleSize, unspecifiedMeshMax int) *ControllerService {
 	return &ControllerService{
 		registry: reg,
-		pinglist: pinglist.NewPinglistGenerator(reg, ecmp, interTorSampleSize),
+		pinglist: pinglist.NewPinglistGenerator(reg, ecmp, interTorSampleSize, unspecifiedMeshMax),
 	}
 }
 
@@ -63,9 +65,12 @@ func (s *ControllerService) SetAnalyzer(a probeAnalyzer) {
 }
 
 // RegisterAgent registers an agent and all of its RNICs with the controller.
-// Both agent_id and tor_id are required fields. For each RNIC in the request,
-// the hostname and tor_id from the top-level request fields are applied before
-// registration.
+// agent_id is required. tor_id is optional: empty or whitespace-only values are
+// stored as "" (one virtual rack of untagged agents). The display label
+// reserved for unset ToRs (probe.UnspecifiedTorLabel) is rejected so it cannot
+// collide with untagged metric series. For each RNIC in the request, the
+// hostname and canonical tor_id from the top-level request fields are applied
+// before registration.
 func (s *ControllerService) RegisterAgent(
 	ctx context.Context,
 	req *controller_agent.AgentRegistrationRequest,
@@ -74,15 +79,16 @@ func (s *ControllerService) RegisterAgent(
 	if req.GetAgentId() == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "agent_id is required")
 	}
-	if req.GetTorId() == "" {
-		return nil, status.Errorf(codes.InvalidArgument, "tor_id is required")
+	torID := probe.CanonicalTorID(req.GetTorId())
+	if probe.IsReservedTorID(torID) {
+		return nil, status.Errorf(codes.InvalidArgument, "tor_id %q is reserved for untagged agents", probe.UnspecifiedTorLabel)
 	}
 
 	log.Info().
 		Str("agentID", req.GetAgentId()).
 		Str("agentIP", req.GetAgentIp()).
 		Str("hostname", req.GetHostname()).
-		Str("torID", req.GetTorId()).
+		Str("torID", torID).
 		Int("rnicCount", len(req.GetRnics())).
 		Msg("Agent registration request")
 
@@ -90,7 +96,7 @@ func (s *ControllerService) RegisterAgent(
 	rnics := req.GetRnics()
 	for _, rnic := range rnics {
 		rnic.HostName = req.GetHostname()
-		rnic.TorId = req.GetTorId()
+		rnic.TorId = torID
 	}
 
 	// Register all RNICs for this agent as a single atomic operation. A
@@ -135,10 +141,12 @@ func (s *ControllerService) GetPinglist(
 		return nil, status.Errorf(codes.InvalidArgument, "requester_gid is required")
 	}
 
+	torID := probe.CanonicalTorID(req.GetTorId())
+
 	log.Info().
 		Str("agentID", req.GetAgentId()).
 		Str("requesterGID", req.GetRequesterGid()).
-		Str("torID", req.GetTorId()).
+		Str("torID", torID).
 		Str("type", req.GetType().String()).
 		Msg("Pinglist request")
 
@@ -147,9 +155,9 @@ func (s *ControllerService) GetPinglist(
 
 	switch req.GetType() {
 	case controller_agent.PinglistType_TOR_MESH:
-		targets, err = s.pinglist.GenerateTorMeshPinglist(ctx, req.GetRequesterGid(), req.GetTorId())
+		targets, err = s.pinglist.GenerateTorMeshPinglist(ctx, req.GetRequesterGid(), torID)
 	case controller_agent.PinglistType_INTER_TOR:
-		targets, err = s.pinglist.GenerateInterTorPinglist(ctx, req.GetRequesterGid(), req.GetTorId())
+		targets, err = s.pinglist.GenerateInterTorPinglist(ctx, req.GetRequesterGid(), torID)
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown pinglist type: %s", req.GetType().String())
 	}

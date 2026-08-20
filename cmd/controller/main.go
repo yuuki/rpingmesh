@@ -81,6 +81,7 @@ func run(cmd *cobra.Command, args []string) error {
 		Int("activeThresholdSec", cfg.ActiveThresholdSec).
 		Int("staleThresholdSec", cfg.StaleThresholdSec).
 		Int("interTorSampleSize", cfg.InterTorSampleSize).
+		Int("unspecifiedMeshMaxTargets", cfg.UnspecifiedMeshMaxTargets).
 		Int("ecmpPathsAssumed", cfg.EcmpPathsAssumed).
 		Float64("ecmpCoverageProbability", cfg.EcmpCoverageProbability).
 		Int("ecmpMaxFlowLabels", cfg.EcmpMaxFlowLabels).
@@ -108,7 +109,7 @@ func run(cmd *cobra.Command, args []string) error {
 		PathsAssumed:        cfg.EcmpPathsAssumed,
 		CoverageProbability: cfg.EcmpCoverageProbability,
 		MaxFlowLabels:       cfg.EcmpMaxFlowLabels,
-	}, cfg.InterTorSampleSize)
+	}, cfg.InterTorSampleSize, cfg.UnspecifiedMeshMaxTargets)
 
 	// Set up the Phase 1 analyzer if enabled: it ingests agent-reported
 	// per-path summaries and flags SLA violations. Its OTLP metrics are

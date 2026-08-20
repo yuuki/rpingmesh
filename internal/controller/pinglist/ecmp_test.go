@@ -72,6 +72,10 @@ func TestComputeFlowLabelCount_MonotonicInProbability(t *testing.T) {
 type fakeRnicSource struct {
 	torMesh  []*controller_agent.RnicInfo
 	interTor []*controller_agent.RnicInfo
+	// all, when non-nil, is the full RNIC set. GetRNICsByToR and
+	// GetActiveRNICsInOtherToRs filter it by the requested ToR so tests can
+	// assert empty-vs-named selection instead of a pre-sliced fixture.
+	all []*controller_agent.RnicInfo
 	// hostnameByGID maps a requester GID to the hostname it is registered
 	// under. A GID absent from the map resolves to "" (unregistered), which
 	// exercises the GID self-exclusion fallback.
@@ -81,12 +85,28 @@ type fakeRnicSource struct {
 	resolveErr error
 }
 
-func (f *fakeRnicSource) GetRNICsByToR(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
+func (f *fakeRnicSource) GetRNICsByToR(_ context.Context, torID string) ([]*controller_agent.RnicInfo, error) {
+	if f.all != nil {
+		return filterRnicsByToR(f.all, torID, true), nil
+	}
 	return f.torMesh, nil
 }
 
-func (f *fakeRnicSource) GetActiveRNICsInOtherToRs(_ context.Context, _ string) ([]*controller_agent.RnicInfo, error) {
+func (f *fakeRnicSource) GetActiveRNICsInOtherToRs(_ context.Context, excludeTorID string) ([]*controller_agent.RnicInfo, error) {
+	if f.all != nil {
+		return filterRnicsByToR(f.all, excludeTorID, false), nil
+	}
 	return f.interTor, nil
+}
+
+func filterRnicsByToR(rnics []*controller_agent.RnicInfo, torID string, match bool) []*controller_agent.RnicInfo {
+	out := make([]*controller_agent.RnicInfo, 0, len(rnics))
+	for _, r := range rnics {
+		if (r.GetTorId() == torID) == match {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func (f *fakeRnicSource) ResolveHostnameByGID(_ context.Context, gid string) (string, error) {
@@ -112,7 +132,7 @@ func TestPinglistCarriesSeedAndCount(t *testing.T) {
 		PathsAssumed:        16,
 		CoverageProbability: 0.9,
 		MaxFlowLabels:       64,
-	}, DefaultInterTorSampleSize)
+	}, DefaultInterTorSampleSize, 0)
 
 	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1")
 	if err != nil {

@@ -14,6 +14,12 @@ ecmp_paths_assumed: 16            # Assumed ECMP fabric width (m)
 ecmp_coverage_probability: 0.9    # Target coverage probability (p, in (0,1))
 ecmp_max_flow_labels: 64          # Hard cap on labels per target (bounds amplification)
 
+# Unset tor_id agents share one virtual rack. Their ToR-mesh pinglist is capped
+# after same-host / same-family filters so a forgotten fleet-wide setting
+# cannot become N^2 high-rate probes. 0 = unlimited (named ToR-mesh is never
+# capped). The empty-ToR rqlite query itself is not paginated.
+unspecified_mesh_max_targets: 32
+
 # Analyzer (Phase 1)
 # Ingests agent-reported per-path window summaries and flags SLA violations
 # (per-path loss ratio and p99 network-RTT threshold breaches). Findings go to

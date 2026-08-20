@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
@@ -142,5 +143,20 @@ func TestAnalyzer_NilReportSafe(t *testing.T) {
 	a := New(testConfig(), nil)
 	if v := a.Ingest(context.Background(), nil); v != 0 {
 		t.Errorf("nil report: got %d, want 0", v)
+	}
+}
+
+func TestAnalyzer_MapsEmptyTorLabels(t *testing.T) {
+	a := New(testConfig(), nil)
+	s := summary("", "  ", 100, 50, 0, 1)
+
+	if v := a.Ingest(context.Background(), report(s)); v != 1 {
+		t.Fatalf("loss violation: got %d, want 1", v)
+	}
+	if s.GetSourceTorId() != probe.UnspecifiedTorLabel {
+		t.Errorf("SourceTorId = %q, want %s", s.GetSourceTorId(), probe.UnspecifiedTorLabel)
+	}
+	if s.GetTargetTorId() != probe.UnspecifiedTorLabel {
+		t.Errorf("TargetTorId = %q, want %s", s.GetTargetTorId(), probe.UnspecifiedTorLabel)
 	}
 }

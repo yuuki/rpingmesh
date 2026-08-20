@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"github.com/yuuki/rpingmesh/internal/probe"
 )
 
 // DefaultTargetProbeRatePerSecond is the default number of probes per second
@@ -284,6 +285,13 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 // Validate checks that the agent configuration is well-formed. It returns
 // an error describing the first invalid field encountered.
 func (c *AgentConfig) Validate() error {
+	// The display label for unset ToRs must not be used as a real rack name:
+	// an older controller would persist it as a named ToR and collide with
+	// untagged metric series after upgrade.
+	if probe.IsReservedTorID(c.TorID) {
+		return fmt.Errorf("tor_id %q is reserved for untagged agents", probe.UnspecifiedTorLabel)
+	}
+
 	// GID index must be non-negative; it indexes into the RNIC's GID table.
 	// The upper bound is a coarse sanity check, not the real device limit
 	// (which is only known at device-open time): it exists purely to reject

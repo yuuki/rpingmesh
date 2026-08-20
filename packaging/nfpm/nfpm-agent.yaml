@@ -59,11 +59,11 @@ contents:
     file_info:
       mode: 0755
 
-  # Shipped as a sample, not the live config: agent.yaml has no default for
-  # the required `tor_id` field, so auto-installing it as a "config" file
-  # that systemd reads directly would leave the service crash-looping.
-  # Operators copy this to agent.yaml and edit it (see the "Deployment
-  # (systemd)" section of README.md).
+  # Shipped as a sample, not the live config: agent.yaml still needs a
+  # host-specific controller_addr (and typically a real tor_id in production),
+  # so auto-installing it as the live systemd config would point every host
+  # at localhost. Operators copy this to agent.yaml and edit it (see the
+  # "Deployment (systemd)" section of README.md).
   - src: configs/agent.yaml
     dst: /etc/rpingmesh/agent.yaml.example
     file_info:

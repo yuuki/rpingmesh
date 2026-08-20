@@ -117,6 +117,10 @@ type Agent struct {
 	// determined, which never blocks registration.
 	agentIP string
 
+	// canonicalTorID is cfg.TorID after whitespace trim. Empty means untagged
+	// (registry storage key ""); OTel/PathSummary use probe.TorMetricLabel.
+	canonicalTorID string
+
 	// heartbeatStopCh and heartbeatWg control the lifecycle of the
 	// background heartbeat goroutine that periodically re-registers with
 	// the controller to keep the agent's registry entry alive.
@@ -131,14 +135,26 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 		return nil, fmt.Errorf("agent config must not be nil")
 	}
 
+	canonicalTorID := probe.CanonicalTorID(cfg.TorID)
+	if probe.IsReservedTorID(canonicalTorID) {
+		return nil, fmt.Errorf("tor_id %q is reserved for untagged agents", probe.UnspecifiedTorLabel)
+	}
+
 	a := &Agent{
-		cfg:    cfg,
-		logger: log.With().Str("component", "agent").Logger(),
+		cfg:            cfg,
+		canonicalTorID: canonicalTorID,
+		logger:         log.With().Str("component", "agent").Logger(),
 	}
 
 	// Apply optional hard runtime caps as early as possible (before any heavy
 	// allocation) so a soft memory limit governs the whole process lifetime.
 	applyRuntimeLimits(cfg, a.logger)
+
+	if a.canonicalTorID == "" {
+		a.logger.Warn().
+			Str("otel_tor_label", probe.UnspecifiedTorLabel).
+			Msg("tor_id unset; registering under an empty ToR; ToR-mesh will include other untagged agents")
+	}
 
 	return a, nil
 }
@@ -265,7 +281,7 @@ func (a *Agent) Initialize(ctx context.Context) error {
 		a.analysisReporter = NewAnalysisReporter(
 			a.grpcClient,
 			a.cfg.AgentID,
-			a.cfg.TorID,
+			probe.TorMetricLabel(a.canonicalTorID),
 			a.cfg.AnalysisWindowSec,
 			a.analysisResults,
 		)
@@ -362,7 +378,7 @@ func (a *Agent) createClusterMonitors() {
 			a.grpcClient,
 			a.probers[i],
 			a.cfg.AgentID,
-			a.cfg.TorID,
+			a.canonicalTorID,
 			requesterGID,
 			a.cfg.PinglistUpdateIntervalSec,
 		)
@@ -385,7 +401,7 @@ func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRe
 			Qpn:        queueInfo.QPN,
 			IpAddress:  dev.Info.IPAddr,
 			HostName:   a.cfg.HostName,
-			TorId:      a.cfg.TorID,
+			TorId:      a.canonicalTorID,
 			DeviceName: dev.Info.DeviceName,
 		}
 		rnics = append(rnics, rnic)
@@ -402,7 +418,7 @@ func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRe
 		AgentId:  a.cfg.AgentID,
 		AgentIp:  a.agentIP,
 		Hostname: a.cfg.HostName,
-		TorId:    a.cfg.TorID,
+		TorId:    a.canonicalTorID,
 		Rnics:    rnics,
 	}
 }
@@ -522,7 +538,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	// the fan-in channel that merges every prober's results (see
 	// createResultsFanIn), so results from every device are recorded.
 	if a.metrics != nil {
-		a.metrics.StartResultConsumer(ctx, a.results, a.cfg.TorID)
+		a.metrics.StartResultConsumer(ctx, a.results, probe.TorMetricLabel(a.canonicalTorID))
 		a.logger.Info().Msg("Metrics result consumer started")
 	}
 

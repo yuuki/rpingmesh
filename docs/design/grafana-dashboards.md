@@ -56,6 +56,11 @@ All three histograms share the same 11 explicit bucket boundaries in
 nanoseconds: `100, 500, 1 000, 5 000, 10 000, 50 000, 100 000, 500 000,
 1 000 000, 5 000 000, 10 000 000` (plus the implicit `+Inf`). Cardinality is
 deliberately ToR-level only — GID detail is confined to debug logs.
+Unset `tor_id` appears as the nonempty label `unspecified` on those
+attributes so Grafana template variables and the ToR×ToR matrix still
+render (one `unspecified`×`unspecified` cell for an all-untagged mesh).
+If an agent later receives a real ToR ID, PathAggregator may keep the
+previous target ToR until the current aggregation window closes.
 
 Resource attribution: the agent meter is created on a provider with
 `service.name = rpingmesh-agent`; the analyzer's with `rpingmesh-analyzer`.

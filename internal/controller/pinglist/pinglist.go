@@ -3,6 +3,7 @@ package pinglist
 import (
 	"context"
 	"hash/fnv"
+	"math/rand/v2"
 
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/probe"
@@ -31,6 +32,11 @@ type RnicSource interface {
 	ResolveHostnameByGID(ctx context.Context, gid string) (string, error)
 }
 
+// DefaultUnspecifiedMeshMaxTargets is the fallback cap on ToR-mesh targets
+// generated for the untagged (empty tor_id) bucket. It mirrors
+// config.DefaultUnspecifiedMeshMaxTargets. 0 means unlimited.
+const DefaultUnspecifiedMeshMaxTargets = 32
+
 // PinglistGenerator generates probe target lists for agents.
 type PinglistGenerator struct {
 	registry RnicSource
@@ -43,6 +49,9 @@ type PinglistGenerator struct {
 	// an inter-ToR pinglist. Sampling lives here (not in the registry) because
 	// it must run after same-host / same-family filtering to keep coverage.
 	interTorSampleSize int
+	// unspecifiedMeshMax caps ToR-mesh targets when the requester's ToR is
+	// unset (empty). 0 means unlimited. Named ToR-mesh is never capped.
+	unspecifiedMeshMax int
 }
 
 // NewPinglistGenerator creates a new PinglistGenerator backed by the given
@@ -50,9 +59,15 @@ type PinglistGenerator struct {
 // target is probed with (Eq.(1) coverage), computed once here.
 // interTorSampleSize caps distinct foreign ToRs per inter-ToR pinglist; a
 // non-positive value falls back to DefaultInterTorSampleSize.
-func NewPinglistGenerator(registry RnicSource, ecmp ECMPConfig, interTorSampleSize int) *PinglistGenerator {
+// unspecifiedMeshMax caps ToR-mesh size for the untagged bucket only; 0
+// means unlimited, and a negative value falls back to
+// DefaultUnspecifiedMeshMaxTargets.
+func NewPinglistGenerator(registry RnicSource, ecmp ECMPConfig, interTorSampleSize, unspecifiedMeshMax int) *PinglistGenerator {
 	if interTorSampleSize <= 0 {
 		interTorSampleSize = DefaultInterTorSampleSize
+	}
+	if unspecifiedMeshMax < 0 {
+		unspecifiedMeshMax = DefaultUnspecifiedMeshMaxTargets
 	}
 	return &PinglistGenerator{
 		registry: registry,
@@ -62,6 +77,7 @@ func NewPinglistGenerator(registry RnicSource, ecmp ECMPConfig, interTorSampleSi
 			ecmp.MaxFlowLabels,
 		),
 		interTorSampleSize: interTorSampleSize,
+		unspecifiedMeshMax: unspecifiedMeshMax,
 	}
 }
 
@@ -120,8 +136,11 @@ func (rc requesterContext) shouldProbe(target *controller_agent.RnicInfo) bool {
 // GenerateTorMeshPinglist returns PingTargets for the RNICs in the same ToR
 // that the requester should probe: its own RNIC and every other RNIC on the
 // same host are excluded (issue #39), and cross-address-family targets are
-// dropped (issue #41). Each target carries deterministic 5-tuple values derived
-// from the requester-target GID pair.
+// dropped (issue #41). When torID is empty (untagged agents), the result is
+// additionally capped at unspecifiedMeshMax (0 = unlimited) after a shuffle
+// so an omitted fleet-wide ToR setting cannot become an N² mesh. Named
+// ToR-mesh is never capped. Each target carries deterministic 5-tuple values
+// derived from the requester-target GID pair.
 func (g *PinglistGenerator) GenerateTorMeshPinglist(
 	ctx context.Context,
 	requesterGID, torID string,
@@ -139,6 +158,20 @@ func (g *PinglistGenerator) GenerateTorMeshPinglist(
 			continue
 		}
 		targets = append(targets, g.buildPingTarget(requesterGID, rnic, controller_agent.PinglistType_TOR_MESH))
+	}
+
+	if probe.CanonicalTorID(torID) == "" && g.unspecifiedMeshMax > 0 && len(targets) > g.unspecifiedMeshMax {
+		eligible := len(targets)
+		rand.Shuffle(len(targets), func(i, j int) {
+			targets[i], targets[j] = targets[j], targets[i]
+		})
+		targets = targets[:g.unspecifiedMeshMax]
+		log.Warn().
+			Str("requesterGID", requesterGID).
+			Int("kept", len(targets)).
+			Int("eligible", eligible).
+			Int("cap", g.unspecifiedMeshMax).
+			Msg("Capped untagged ToR-mesh pinglist")
 	}
 
 	log.Info().

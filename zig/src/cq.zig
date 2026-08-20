@@ -541,6 +541,9 @@ pub fn processSendCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
 /// comment in types.zig.
 fn signalSendCompletion(queue: *types.UdQueue, wr_id: u64, timestamp_ns: u64, status: i32) void {
     const slot_index: u32 = @intCast(wr_id & 0xFFFFFFFF);
+    // Destroy the AH before freeing the slot: this is the matching
+    // completion for the posted WR, so the AH is no longer referenced.
+    queue.destroySendSlotAh(slot_index);
     queue.freeSendSlot(slot_index);
 
     queue.send_completion_timestamp.store(timestamp_ns, .monotonic);

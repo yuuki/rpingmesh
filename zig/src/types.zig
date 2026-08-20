@@ -205,6 +205,15 @@ pub const UdQueue = struct {
     /// Back-pointer to the parent device.
     device: *RdmaDevice,
 
+    /// Per-slot Address Handle for an in-flight UD send. The sender stores
+    /// the AH here before ibv_post_send and must not destroy it until the
+    /// matching send completion arrives: destroying an AH while a UD WR that
+    /// references it is still outstanding is undefined (completion error or
+    /// crash). The CQ poller takes and destroys the AH in freeSendSlot's
+    /// companion destroySendSlotAh(). Timed-out sends keep the slot (and AH)
+    /// allocated until that late completion. Null means no AH is owned.
+    send_slot_ah: [NUM_SEND_SLOTS]?*c.ibv_ah,
+
     /// Per-slot state tracking for send buffers, stored atomically (as the
     /// SlotState enum's u8 tag). Slots are allocated by the sender thread via
     /// allocSendSlot() and freed by the CQ poller thread via freeSendSlot()
@@ -286,6 +295,35 @@ pub const UdQueue = struct {
     pub fn freeSendSlot(self: *UdQueue, slot_index: u32) void {
         if (slot_index < NUM_SEND_SLOTS) {
             self.send_slot_states[slot_index].store(@intFromEnum(SlotState.Free), .release);
+        }
+    }
+
+    /// Store an AH on a send slot. Called by the sender after ibv_create_ah
+    /// and before ibv_post_send so a completion cannot observe a null handle.
+    pub fn setSendSlotAh(self: *UdQueue, slot_index: u32, ah: *c.ibv_ah) void {
+        if (slot_index < NUM_SEND_SLOTS) {
+            self.send_slot_ah[slot_index] = ah;
+        }
+    }
+
+    /// Take and destroy the AH stored on a send slot, if any. Called by the
+    /// CQ poller when the send completion arrives, and by the sender on
+    /// post_send failure (the WR was never accepted). Also used at queue
+    /// teardown after the QP is destroyed so leftover timed-out AHs are
+    /// not leaked.
+    pub fn destroySendSlotAh(self: *UdQueue, slot_index: u32) void {
+        if (slot_index >= NUM_SEND_SLOTS) return;
+        if (self.send_slot_ah[slot_index]) |ah| {
+            self.send_slot_ah[slot_index] = null;
+            _ = c.ibv_destroy_ah(ah);
+        }
+    }
+
+    /// Destroy every remaining per-slot AH. Safe only after the CQ poller
+    /// has stopped and the QP has been destroyed (no outstanding UD WRs).
+    pub fn destroyAllSendSlotAhs(self: *UdQueue) void {
+        for (0..NUM_SEND_SLOTS) |i| {
+            self.destroySendSlotAh(@intCast(i));
         }
     }
 };

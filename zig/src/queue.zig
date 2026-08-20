@@ -156,6 +156,7 @@ pub fn createQueue(
         .event_ring = event_ring,
         .cq_thread = null,
         .device = dev,
+        .send_slot_ah = [_]?*c.ibv_ah{null} ** types.NUM_SEND_SLOTS,
         .send_slot_states = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(types.SlotState.Free))} ** types.NUM_SEND_SLOTS,
         .recv_slot_states = [_]types.SlotState{types.SlotState.Free} ** types.NUM_RECV_SLOTS,
         .running = std.atomic.Value(bool).init(false),
@@ -204,6 +205,11 @@ pub fn destroyQueue(queue: *types.UdQueue) void {
     if (qp_ret != 0) {
         log.err("ibv_destroy_qp() failed with errno={d}", .{qp_ret});
     }
+
+    // Outstanding UD sends (including timed-out WRs whose slots were left
+    // allocated) referenced per-slot AHs. Destroy those AHs only after the
+    // QP is gone so no WR can still point at them.
+    queue.destroyAllSendSlotAhs();
 
     // Free send/recv buffers and deregister their MRs by delegating to
     // memory.freeBuffers(), so the dereg-failure handling (intentional leak

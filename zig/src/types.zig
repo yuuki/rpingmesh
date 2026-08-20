@@ -219,14 +219,15 @@ pub const UdQueue = struct {
     /// Back-pointer to the parent device.
     device: *RdmaDevice,
 
-    /// Per-slot Address Handle for an in-flight UD send. The sender stores
-    /// the AH here before ibv_post_send and must not destroy it until the
-    /// matching send completion arrives: destroying an AH while a UD WR that
-    /// references it is still outstanding is undefined (completion error or
-    /// crash). The CQ poller takes and destroys the AH in freeSendSlot's
-    /// companion destroySendSlotAh(). Timed-out sends keep the slot (and AH)
-    /// allocated until that late completion. Null means no AH is owned.
-    send_slot_ah: [NUM_SEND_SLOTS]?*c.ibv_ah,
+    /// Per-slot Address Handle for an in-flight UD send, stored as a usize
+    /// pointer (0 = none) so the sender and CQ poller can publish/take it
+    /// atomically. The sender release-stores the AH before ibv_post_send
+    /// and must not destroy it until the matching send completion: destroying
+    /// an AH while a UD WR that references it is still outstanding is
+    /// undefined (completion error or crash). The CQ poller takes the AH
+    /// with an acq_rel swap in destroySendSlotAh(). Timed-out sends keep
+    /// the slot (and AH) allocated until that late completion.
+    send_slot_ah: [NUM_SEND_SLOTS]std.atomic.Value(usize),
 
     /// Per-slot state tracking for send buffers, stored atomically (as the
     /// SlotState enum's u8 tag). Slots are allocated by the sender thread via
@@ -313,24 +314,25 @@ pub const UdQueue = struct {
     }
 
     /// Store an AH on a send slot. Called by the sender after ibv_create_ah
-    /// and before ibv_post_send so a completion cannot observe a null handle.
+    /// and before ibv_post_send. Release-ordered so a CQ thread that
+    /// observes the later send completion also observes this pointer.
     pub fn setSendSlotAh(self: *UdQueue, slot_index: u32, ah: *c.ibv_ah) void {
         if (slot_index < NUM_SEND_SLOTS) {
-            self.send_slot_ah[slot_index] = ah;
+            self.send_slot_ah[slot_index].store(@intFromPtr(ah), .release);
         }
     }
 
-    /// Take and destroy the AH stored on a send slot, if any. Called by the
-    /// CQ poller when the send completion arrives, and by the sender on
-    /// post_send failure (the WR was never accepted). Also used at queue
-    /// teardown after the QP is destroyed so leftover timed-out AHs are
-    /// not leaked.
+    /// Take and destroy the AH stored on a send slot, if any. The acq_rel
+    /// swap makes a concurrent take (CQ completion vs post_send failure vs
+    /// teardown) destroy the handle at most once. Called by the CQ poller
+    /// on send completion, by the sender on post_send failure (the WR was
+    /// never accepted), and at queue teardown after a successful QP destroy.
     pub fn destroySendSlotAh(self: *UdQueue, slot_index: u32) void {
         if (slot_index >= NUM_SEND_SLOTS) return;
-        if (self.send_slot_ah[slot_index]) |ah| {
-            self.send_slot_ah[slot_index] = null;
-            _ = c.ibv_destroy_ah(ah);
-        }
+        const ptr = self.send_slot_ah[slot_index].swap(0, .acq_rel);
+        if (ptr == 0) return;
+        const ah: *c.ibv_ah = @ptrFromInt(ptr);
+        _ = c.ibv_destroy_ah(ah);
     }
 
     /// Destroy every remaining per-slot AH. Safe only after the CQ poller

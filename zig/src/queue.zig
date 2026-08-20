@@ -156,7 +156,7 @@ pub fn createQueue(
         .event_ring = event_ring,
         .cq_thread = null,
         .device = dev,
-        .send_slot_ah = [_]?*c.ibv_ah{null} ** types.NUM_SEND_SLOTS,
+        .send_slot_ah = [_]std.atomic.Value(usize){std.atomic.Value(usize).init(0)} ** types.NUM_SEND_SLOTS,
         .send_slot_states = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(types.SlotState.Free))} ** types.NUM_SEND_SLOTS,
         .recv_slot_states = [_]types.SlotState{types.SlotState.Free} ** types.NUM_RECV_SLOTS,
         .running = std.atomic.Value(bool).init(false),

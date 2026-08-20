@@ -170,9 +170,19 @@ fn readBigEndianU64(buf: [*]const u8, offset: usize) u64 {
         @as(u64, buf[offset + 7]);
 }
 
+/// True when the UD completion is long enough to hold a GRH plus a full
+/// 40-byte probe payload. Short completions can still succeed with the
+/// configured QKEY; reading past byte_len would interpret stale slot bytes.
+fn recvByteLenOK(byte_len: u32) bool {
+    return byte_len >= types.GRH_SIZE + types.PROBE_PACKET_SIZE;
+}
+
 /// Parse a probe packet payload from raw bytes.
 /// Reads fields at the correct wire format offsets (see ProbePayload comment above).
-fn parseProbePayload(buf: [*]const u8) ProbePayload {
+/// Returns null when the version byte is not PACKET_VERSION so the caller
+/// can drop the completion instead of treating leftover slot data as a probe.
+fn parseProbePayload(buf: [*]const u8) ?ProbePayload {
+    if (buf[0] != types.PACKET_VERSION) return null;
     return ProbePayload{
         .sequence_num = readBigEndianU64(buf, 4), // offset 4: after 4-byte header
         .t1 = readBigEndianU64(buf, 12), // offset 12
@@ -181,6 +191,11 @@ fn parseProbePayload(buf: [*]const u8) ProbePayload {
         .is_ack = buf[1], // msg_type: 0=probe, 1=ack
         .ack_type = buf[2], // ack_type: 0=none, 1=first, 2=second
     };
+}
+
+/// Drop a receive completion without delivering it to Go and repost the slot.
+fn dropAndRepostRecv(queue: *types.UdQueue, slot_index: u32) void {
+    memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {};
 }
 
 // ---------------------------------------------------------------------------
@@ -328,13 +343,21 @@ fn processRecvClassic(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
     // buffer.  For RoCEv2 UD this should always be set, but if it is not we
     // cannot determine the sender's GID — repost the buffer and drop.
     if ((wc.wc_flags & 1) == 0) {
-        memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {};
+        dropAndRepostRecv(queue, slot_index);
+        return;
+    }
+
+    if (!recvByteLenOK(wc.byte_len)) {
+        dropAndRepostRecv(queue, slot_index);
         return;
     }
 
     const grh_info = parseGRH(slot_ptr);
     const payload_ptr = slot_ptr + types.GRH_SIZE;
-    const payload = parseProbePayload(payload_ptr);
+    const payload = parseProbePayload(payload_ptr) orelse {
+        dropAndRepostRecv(queue, slot_index);
+        return;
+    };
 
     const event = ring.CompletionEvent{
         .sequence_num = payload.sequence_num,
@@ -467,14 +490,25 @@ pub fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
     // instead of being safely dropped.
     //
     // ibv_wc_read_wc_flags() is available unconditionally here: unlike
-    // byte_len, src_qp, or the timestamp fields (which are optional CQE
-    // metadata gated by IBV_WC_EX_WITH_* flags requested at CQ creation
-    // time), wc_flags has no corresponding IBV_WC_EX_WITH_* flag in
-    // libibverbs -- it is a core field, always populated the same way
-    // opcode/status are.
+    // src_qp or the timestamp fields (which are optional CQE metadata
+    // gated by IBV_WC_EX_WITH_* flags requested at CQ creation time),
+    // wc_flags has no corresponding IBV_WC_EX_WITH_* flag in libibverbs
+    // -- it is a core field, always populated the same way opcode/status
+    // are. byte_len is requested via IBV_WC_EX_WITH_BYTE_LEN and is read
+    // below.
     const wc_flags = c.ibv_wc_read_wc_flags(cq);
     if ((wc_flags & c.IBV_WC_GRH) == 0) {
-        memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {};
+        dropAndRepostRecv(queue, slot_index);
+        return;
+    }
+
+    // IBV_WC_EX_WITH_BYTE_LEN is requested at CQ creation, so this read is
+    // valid. Reject completions shorter than GRH + probe payload: a UD send
+    // with the right QKEY can still complete with a short datagram, and the
+    // remainder of the slot would be stale bytes from a previous recv.
+    const byte_len = c.ibv_wc_read_byte_len(cq);
+    if (!recvByteLenOK(byte_len)) {
+        dropAndRepostRecv(queue, slot_index);
         return;
     }
 
@@ -483,7 +517,10 @@ pub fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
 
     // Parse probe payload from bytes after the GRH
     const payload_ptr = slot_ptr + types.GRH_SIZE;
-    const payload = parseProbePayload(payload_ptr);
+    const payload = parseProbePayload(payload_ptr) orelse {
+        dropAndRepostRecv(queue, slot_index);
+        return;
+    };
 
     // Build the completion event
     const event = ring.CompletionEvent{
@@ -661,6 +698,8 @@ test "parseProbePayload extracts fields" {
     //   bytes 36-39: reserved
     var payload: [40]u8 = [_]u8{0} ** 40;
 
+    payload[0] = types.PACKET_VERSION;
+
     // msg_type (is_ack) = 1 (byte 1)
     payload[1] = 1;
 
@@ -682,13 +721,28 @@ test "parseProbePayload extracts fields" {
     payload[34] = 0x0B;
     payload[35] = 0xB8;
 
-    const parsed = parseProbePayload(&payload);
+    const parsed = parseProbePayload(&payload) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 1), parsed.sequence_num);
     try std.testing.expectEqual(@as(u64, 1000), parsed.t1);
     try std.testing.expectEqual(@as(u64, 2000), parsed.t3);
     try std.testing.expectEqual(@as(u64, 3000), parsed.t4);
     try std.testing.expectEqual(@as(u8, 1), parsed.is_ack);
     try std.testing.expectEqual(@as(u8, 2), parsed.ack_type);
+}
+
+test "parseProbePayload rejects unexpected version" {
+    var payload: [40]u8 = [_]u8{0} ** 40;
+    payload[1] = 1;
+    try std.testing.expect(parseProbePayload(&payload) == null);
+    payload[0] = types.PACKET_VERSION + 1;
+    try std.testing.expect(parseProbePayload(&payload) == null);
+}
+
+test "recvByteLenOK requires GRH plus probe payload" {
+    const need: u32 = types.GRH_SIZE + types.PROBE_PACKET_SIZE;
+    try std.testing.expect(!recvByteLenOK(need - 1));
+    try std.testing.expect(recvByteLenOK(need));
+    try std.testing.expect(recvByteLenOK(need + 16));
 }
 
 test "GRHInfo struct has expected fields" {

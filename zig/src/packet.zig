@@ -28,7 +28,7 @@ const c = types.c;
 // ---------------------------------------------------------------------------
 
 /// Current version of the probe packet wire format.
-pub const PACKET_VERSION: u8 = 1;
+pub const PACKET_VERSION: u8 = types.PACKET_VERSION;
 
 /// Message type: probe packet (initiator sends to responder).
 pub const MSG_TYPE_PROBE: u8 = 0;

@@ -39,6 +39,11 @@ pub const QKEY: u32 = 0x11111111;
 /// Size of a probe packet payload in bytes.
 pub const PROBE_PACKET_SIZE: u32 = 40;
 
+/// Current version of the probe packet wire format. Mirrored by packet.zig
+/// as PACKET_VERSION so send/recv stay in lockstep. cq.zig reads this
+/// constant instead of importing packet.zig (that import would cycle).
+pub const PACKET_VERSION: u8 = 1;
+
 /// Number of send slots in the send memory region.
 pub const NUM_SEND_SLOTS: u32 = 32;
 

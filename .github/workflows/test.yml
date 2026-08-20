@@ -60,7 +60,7 @@ jobs:
         run: make test-zig
 
       - name: Run Go unit tests (excludes ./e2e/...)
-        run: go test $(go list ./... | grep -v '/e2e')
+        run: go test -race $(go list ./... | grep -v '/e2e')
 
   # Agent-to-Controller e2e tests: pure-Go gRPC path against a real
   # rqlite-backed Controller, no RDMA hardware needed. Runs entirely via

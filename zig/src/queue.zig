@@ -156,6 +156,7 @@ pub fn createQueue(
         .event_ring = event_ring,
         .cq_thread = null,
         .device = dev,
+        .send_slot_ah = [_]std.atomic.Value(usize){std.atomic.Value(usize).init(0)} ** types.NUM_SEND_SLOTS,
         .send_slot_states = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(types.SlotState.Free))} ** types.NUM_SEND_SLOTS,
         .recv_slot_states = [_]types.SlotState{types.SlotState.Free} ** types.NUM_RECV_SLOTS,
         .running = std.atomic.Value(bool).init(false),
@@ -202,7 +203,12 @@ pub fn destroyQueue(queue: *types.UdQueue) void {
     // operational signal during teardown even though we cannot recover.
     const qp_ret = c.ibv_destroy_qp(queue.qp);
     if (qp_ret != 0) {
-        log.err("ibv_destroy_qp() failed with errno={d}", .{qp_ret});
+        log.err("ibv_destroy_qp() failed with errno={d}; leaking leftover send-slot AHs to avoid destroying them while the QP may still reference them", .{qp_ret});
+    } else {
+        // Outstanding UD sends (including timed-out WRs whose slots were
+        // left allocated) referenced per-slot AHs. Destroy those AHs only
+        // after the QP is gone so no WR can still point at them.
+        queue.destroyAllSendSlotAhs();
     }
 
     // Free send/recv buffers and deregister their MRs by delegating to

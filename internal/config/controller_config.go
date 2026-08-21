@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"os"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -159,13 +158,8 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		v.AddConfigPath("/etc/rpingmesh")
 	}
 
-	if err := v.ReadInConfig(); err != nil {
-		// A missing config file is acceptable; other read errors are not
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			if !os.IsNotExist(err) {
-				return nil, fmt.Errorf("failed to read config file: %w", err)
-			}
-		}
+	if err := readConfigFile(v, configPath); err != nil {
+		return nil, err
 	}
 
 	config := &ControllerConfig{
@@ -247,6 +241,9 @@ func (c *ControllerConfig) Validate() error {
 	}
 	if c.StaleThresholdSec <= 0 {
 		return fmt.Errorf("stale_threshold_sec must be > 0, got: %d", c.StaleThresholdSec)
+	}
+	if c.StaleThresholdSec < c.ActiveThresholdSec {
+		return fmt.Errorf("stale_threshold_sec (%d) must be >= active_threshold_sec (%d)", c.StaleThresholdSec, c.ActiveThresholdSec)
 	}
 	if c.InterTorSampleSize <= 0 {
 		return fmt.Errorf("inter_tor_sample_size must be > 0, got: %d", c.InterTorSampleSize)

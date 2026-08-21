@@ -43,10 +43,12 @@ const (
 //	q = (m-1)/m be the probability a probe MISSES a given path. After n
 //	independent draws, that path is still uncovered with probability q^n, so
 //	it is covered with probability (1 - q^n). Treating the m paths' coverage
-//	events as independent (a standard, slightly conservative closed form —
-//	the true events are negatively correlated, so this never underestimates
-//	the labels needed), the probability that ALL m paths are covered is
-//	approximately:
+//	events as independent is a standard closed form. The true coverage
+//	indicators are negatively correlated, so the product (1 - q^n)^m
+//	overestimates P(cover all) and the resulting n is slightly optimistic
+//	(it can underestimate the labels needed). The strict union bound
+//	P(cover all) >= 1 - m*q^n is the conservative direction. The
+//	probability that ALL m paths are covered is approximately:
 //
 //	    P(cover all) ≈ (1 - q^n)^m
 //
@@ -61,9 +63,9 @@ const (
 //
 //	This agrees to within one probe with the strict union bound
 //	P(cover all) >= 1 - m*q^n (which yields n = ceil(ln((1-p)/m)/ln(q))); we
-//	use the closed form above as directed. At the defaults (m=16, p=0.9) both
-//	give ~78, so the MaxFlowLabels cap (64) is the binding constraint and the
-//	choice between the two forms is immaterial.
+//	use the independence closed form above as directed. At the defaults
+//	(m=16, p=0.9) both give ~78, so the MaxFlowLabels cap (64) is the
+//	binding constraint and the choice between the two forms is immaterial.
 //
 // Edge cases:
 //   - m <= 1: a single path is covered by any one label -> n = 1.

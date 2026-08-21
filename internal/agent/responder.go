@@ -82,14 +82,19 @@ func (r *Responder) Start(ctx context.Context) error {
 // background goroutine to exit. Closing stopCh wakes the loop immediately
 // instead of waiting out an idle sleep or a long in-flight ACK batch.
 func (r *Responder) Stop() {
-	if !r.running.CompareAndSwap(true, false) {
-		return // not running
+	// Always Wait, even when running is already false. ctx.Done in
+	// processLoop must not skip the join: Destroy tears down the queue
+	// immediately after Stop returns. Only the CAS winner closes stopCh.
+	signaled := r.running.CompareAndSwap(true, false)
+	if signaled {
+		r.stopMu.Lock()
+		close(r.stopCh)
+		r.stopMu.Unlock()
 	}
-	r.stopMu.Lock()
-	close(r.stopCh)
-	r.stopMu.Unlock()
 	r.wg.Wait()
-	r.logger.Info().Msg("Responder stopped")
+	if signaled {
+		r.logger.Info().Msg("Responder stopped")
+	}
 }
 
 // processLoop is the main event processing loop. It polls the event ring
@@ -113,7 +118,7 @@ func (r *Responder) processLoop(ctx context.Context) {
 		// Check for shutdown or context cancellation on every iteration.
 		select {
 		case <-ctx.Done():
-			r.running.Store(false)
+			// Do not Store(false): Stop() joins remaining work after CAS.
 			return
 		case <-r.stopCh:
 			return
@@ -133,7 +138,6 @@ func (r *Responder) processLoop(ctx context.Context) {
 			idleTimer.Reset(idleSleep)
 			select {
 			case <-ctx.Done():
-				r.running.Store(false)
 				return
 			case <-r.stopCh:
 				return
@@ -149,7 +153,6 @@ func (r *Responder) processLoop(ctx context.Context) {
 			// responsive.
 			select {
 			case <-ctx.Done():
-				r.running.Store(false)
 				return
 			case <-r.stopCh:
 				return

@@ -69,6 +69,21 @@ func TestLoadControllerConfig_FileOverridesDefault(t *testing.T) {
 	}
 }
 
+func TestLoadControllerConfig_ExplicitMissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "does-not-exist.yaml")
+	_, err := LoadControllerConfig(path, nil)
+	if err == nil {
+		t.Fatal("expected error for missing explicit --config path")
+	}
+}
+
+func TestLoadControllerConfig_SearchPathMissingOK(t *testing.T) {
+	// Empty path uses the search list; a miss is not an error.
+	if _, err := LoadControllerConfig("", nil); err != nil {
+		t.Fatalf("search-path miss should be OK: %v", err)
+	}
+}
+
 func TestLoadControllerConfig_EnvOverridesFile(t *testing.T) {
 	path := writeYAML(t, "controller.yaml", "listen_addr: \":9000\"\n")
 	t.Setenv("RPINGMESH_LISTEN_ADDR", ":9100")
@@ -233,6 +248,24 @@ func TestControllerConfig_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "stale threshold below active threshold",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 60, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+			},
+			wantErr: true,
+		},
+		{
+			name: "stale threshold equals active threshold",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				ActiveThresholdSec: 300, StaleThresholdSec: 300, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+			},
+			wantErr: false,
+		},
+		{
 			name: "non-positive inter-tor sample size",
 			cfg: ControllerConfig{
 				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
@@ -364,6 +397,14 @@ func TestLoadAgentConfig_Defaults(t *testing.T) {
 	}
 	if cfg.ThrottleCPUPercent != DefaultThrottleCPUPercent {
 		t.Errorf("ThrottleCPUPercent = %g, want %g", cfg.ThrottleCPUPercent, float64(DefaultThrottleCPUPercent))
+	}
+}
+
+func TestLoadAgentConfig_ExplicitMissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "does-not-exist.yaml")
+	_, err := LoadAgentConfig(path, nil)
+	if err == nil {
+		t.Fatal("expected error for missing explicit --config path")
 	}
 }
 

@@ -28,7 +28,7 @@ const c = types.c;
 // ---------------------------------------------------------------------------
 
 /// Current version of the probe packet wire format.
-pub const PACKET_VERSION: u8 = 1;
+pub const PACKET_VERSION: u8 = types.PACKET_VERSION;
 
 /// Message type: probe packet (initiator sends to responder).
 pub const MSG_TYPE_PROBE: u8 = 0;
@@ -347,13 +347,16 @@ fn sendPacketInternal(
     const buf_ptr: *[40]u8 = @ptrCast(slot_ptr);
     serializeProbePacket(pkt, buf_ptr);
 
-    // Step 3: Create an address handle for the target
+    // Step 3: Create an address handle for the target. Ownership transfers
+    // to the send slot before post_send: the CQ poller destroys the AH when
+    // the completion arrives. Destroying it here via defer would free the AH
+    // on waitSendCompletion timeout while the WR is still outstanding.
     const ah = queue_module.createAddressHandle(queue.device, target_gid, flow_label) catch {
         // Error message already set by createAddressHandle
         freeSendSlot(queue, slot_index);
         return PacketError.CreateAhFailed;
     };
-    defer queue_module.destroyAddressHandle(ah);
+    queue.setSendSlotAh(slot_index, ah);
 
     // Step 4: Reset the completion mailbox before posting so that a reused
     // slot's previous completion value cannot false-match our wait. Safe under
@@ -384,7 +387,8 @@ fn sendPacketInternal(
     if (ret != 0) {
         types.setLastError("ibv_post_send() failed");
         // No WR was accepted by the QP, so no completion will ever arrive to
-        // free this slot; free it here.
+        // free this slot or its AH; destroy both here.
+        queue.destroySendSlotAh(slot_index);
         freeSendSlot(queue, slot_index);
         return PacketError.PostSendFailed;
     }

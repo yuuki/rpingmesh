@@ -589,16 +589,19 @@ probability, and the agent rotates through that set.
 equal-probability ECMP paths with probability at least `p`, model each probe as
 drawing one of `m` paths uniformly. Let `q = (m-1)/m` be the per-probe miss
 probability for a given path; after `n` draws that path is uncovered with
-probability `q^n`. Treating the `m` paths' coverage as independent (a standard,
-slightly conservative closed form) gives `P(cover all) ≈ (1 - q^n)^m ≥ p`,
-which solves to:
+probability `q^n`. Treating the `m` paths' coverage as independent is a standard
+closed form: `P(cover all) ≈ (1 - q^n)^m ≥ p`. The true coverage indicators are
+negatively correlated, so that product overestimates `P(cover all)` and the
+resulting `n` is slightly optimistic. The strict union bound
+`P(cover all) ≥ 1 - m·q^n` is the conservative direction. Both agree to within
+one probe at the defaults; `ecmp_max_flow_labels` (64) is the binding cap. The
+independence form solves to:
 
 ```
 n = ceil( ln(1 - p^(1/m)) / ln((m-1)/m) )
 ```
 
-This agrees to within one probe with the strict union bound
-`P(cover all) ≥ 1 - m·q^n`. The controller computes `n` once from
+The controller computes `n` once from
 `ecmp_paths_assumed` (m), `ecmp_coverage_probability` (p), and the
 `ecmp_max_flow_labels` cap (which bounds probe amplification), and stamps
 `flow_label_count = n` and a full 32-bit `flow_label_seed` into every

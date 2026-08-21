@@ -17,6 +17,7 @@ const std = @import("std");
 // ---------------------------------------------------------------------------
 
 pub const types = @import("types.zig");
+pub const last_error = @import("last_error.zig");
 pub const ring = @import("ring.zig");
 pub const device = @import("device.zig");
 pub const memory = @import("memory.zig");
@@ -69,6 +70,7 @@ comptime {
 
 test {
     _ = types;
+    _ = last_error;
     _ = ring;
     _ = device;
     _ = memory;

@@ -39,6 +39,11 @@ pub const QKEY: u32 = 0x11111111;
 /// Size of a probe packet payload in bytes.
 pub const PROBE_PACKET_SIZE: u32 = 40;
 
+/// Current version of the probe packet wire format. Mirrored by packet.zig
+/// as PACKET_VERSION so send/recv stay in lockstep. cq.zig reads this
+/// constant instead of importing packet.zig (that import would cycle).
+pub const PACKET_VERSION: u8 = 1;
+
 /// Number of send slots in the send memory region.
 pub const NUM_SEND_SLOTS: u32 = 32;
 
@@ -85,6 +90,15 @@ pub const QueueType = enum(u8) {
 // ---------------------------------------------------------------------------
 
 const ring = @import("ring.zig");
+const last_error = @import("last_error.zig");
+
+/// Store an error message in the thread-local error buffer. Re-exported so
+/// existing types.setLastError call sites stay unchanged.
+pub const setLastError = last_error.setLastError;
+
+/// Get a pointer to the thread-local error string. Re-exported for the
+/// C-ABI wrapper in main.zig and for tests in this file.
+pub const getLastError = last_error.getLastError;
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -205,6 +219,16 @@ pub const UdQueue = struct {
     /// Back-pointer to the parent device.
     device: *RdmaDevice,
 
+    /// Per-slot Address Handle for an in-flight UD send, stored as a usize
+    /// pointer (0 = none) so the sender and CQ poller can publish/take it
+    /// atomically. The sender release-stores the AH before ibv_post_send
+    /// and must not destroy it until the matching send completion: destroying
+    /// an AH while a UD WR that references it is still outstanding is
+    /// undefined (completion error or crash). The CQ poller takes the AH
+    /// with an acq_rel swap in destroySendSlotAh(). Timed-out sends keep
+    /// the slot (and AH) allocated until that late completion.
+    send_slot_ah: [NUM_SEND_SLOTS]std.atomic.Value(usize),
+
     /// Per-slot state tracking for send buffers, stored atomically (as the
     /// SlotState enum's u8 tag). Slots are allocated by the sender thread via
     /// allocSendSlot() and freed by the CQ poller thread via freeSendSlot()
@@ -288,6 +312,36 @@ pub const UdQueue = struct {
             self.send_slot_states[slot_index].store(@intFromEnum(SlotState.Free), .release);
         }
     }
+
+    /// Store an AH on a send slot. Called by the sender after ibv_create_ah
+    /// and before ibv_post_send. Release-ordered so a CQ thread that
+    /// observes the later send completion also observes this pointer.
+    pub fn setSendSlotAh(self: *UdQueue, slot_index: u32, ah: *c.ibv_ah) void {
+        if (slot_index < NUM_SEND_SLOTS) {
+            self.send_slot_ah[slot_index].store(@intFromPtr(ah), .release);
+        }
+    }
+
+    /// Take and destroy the AH stored on a send slot, if any. The acq_rel
+    /// swap makes a concurrent take (CQ completion vs post_send failure vs
+    /// teardown) destroy the handle at most once. Called by the CQ poller
+    /// on send completion, by the sender on post_send failure (the WR was
+    /// never accepted), and at queue teardown after a successful QP destroy.
+    pub fn destroySendSlotAh(self: *UdQueue, slot_index: u32) void {
+        if (slot_index >= NUM_SEND_SLOTS) return;
+        const ptr = self.send_slot_ah[slot_index].swap(0, .acq_rel);
+        if (ptr == 0) return;
+        const ah: *c.ibv_ah = @ptrFromInt(ptr);
+        _ = c.ibv_destroy_ah(ah);
+    }
+
+    /// Destroy every remaining per-slot AH. Safe only after the CQ poller
+    /// has stopped and ibv_destroy_qp has succeeded (no outstanding UD WRs).
+    pub fn destroyAllSendSlotAhs(self: *UdQueue) void {
+        for (0..NUM_SEND_SLOTS) |i| {
+            self.destroySendSlotAh(@intCast(i));
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -342,47 +396,6 @@ pub fn gidToString(gid_bytes: [16]u8) [64]u8 {
     }
     // Remaining bytes are already zero from initialization.
     return result;
-}
-
-// ---------------------------------------------------------------------------
-// Thread-local error message
-// ---------------------------------------------------------------------------
-
-/// Thread-local buffer for the last error message. Each thread gets its
-/// own copy so concurrent RDMA operations do not clobber each other's
-/// error strings. Initialized to all zeros (empty string).
-threadlocal var last_error: [256]u8 = [_]u8{0} ** 256;
-
-/// Store an error message in the thread-local error buffer.
-///
-/// The message is copied and null-terminated. If the input exceeds 255
-/// bytes it is silently truncated to fit the buffer.
-pub fn setLastError(msg: []const u8) void {
-    // Explicit `usize` annotation matters here: @min's peer-type resolution
-    // narrows its result to the smallest integer type that can hold the
-    // known upper bound (last_error.len - 1 == 255 fits in a u8), so without
-    // this annotation copy_len is inferred as u8. copy_len + 1 below then
-    // overflows a u8 when copy_len == 255 (the max-length-message case),
-    // triggering a safety-checked integer-overflow panic. Keeping copy_len
-    // as usize keeps all arithmetic in the same domain as last_error.len.
-    const copy_len: usize = @min(msg.len, last_error.len - 1);
-    @memcpy(last_error[0..copy_len], msg[0..copy_len]);
-    last_error[copy_len] = 0;
-    // Zero out any leftover bytes from a previous longer message.
-    if (copy_len + 1 < last_error.len) {
-        @memset(last_error[copy_len + 1 ..], 0);
-    }
-}
-
-/// Get a pointer to the thread-local error string.
-///
-/// Returns a null-terminated C string suitable for returning across the
-/// FFI boundary. The pointer is valid until the next call to setLastError()
-/// on the same thread.
-pub fn getLastError() [*:0]const u8 {
-    // The buffer is always null-terminated by setLastError() and by the
-    // zero-initialization, so we can safely cast.
-    return @ptrCast(&last_error);
 }
 
 // ---------------------------------------------------------------------------

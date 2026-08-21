@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"time"
 	"unsafe"
 )
@@ -127,6 +128,9 @@ type ProbePacket struct {
 // Init initializes the RDMA subsystem and returns a new Context.
 // The context must be destroyed with Destroy() when no longer needed.
 func Init() (*Context, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	var handle C.rdma_context_t
 	rc := C.rdma_init(&handle)
 	if rc != 0 {
@@ -162,6 +166,9 @@ func (ctx *Context) GetDeviceCount() int {
 // sl and tc are the Service Level (PFC priority, 0-7) and GRH traffic class
 // (DSCP << 2) applied to every Address Handle created for this device.
 func (ctx *Context) OpenDevice(index int, gidIndex int, sl uint8, tc uint8) (*Device, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	var devHandle C.rdma_device_t
 	var cInfo C.rdma_device_info_t
 
@@ -192,6 +199,9 @@ func (ctx *Context) OpenDevice(index int, gidIndex int, sl uint8, tc uint8) (*De
 // sl and tc are the Service Level (PFC priority, 0-7) and GRH traffic class
 // (DSCP << 2) applied to every Address Handle created for this device.
 func (ctx *Context) OpenDeviceByName(name string, gidIndex int, sl uint8, tc uint8) (*Device, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
 
@@ -236,6 +246,9 @@ func (dev *Device) Close() {
 // NewEventRing creates a lock-free SPSC ring buffer for completion event
 // delivery. The capacity should be a power of 2 for optimal performance.
 func NewEventRing(capacity int) (*EventRing, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	handle := C.rdma_event_ring_create(C.uint32_t(capacity))
 	if handle == nil {
 		return nil, fmt.Errorf("rdma_event_ring_create(capacity=%d) failed: %s",
@@ -299,6 +312,9 @@ func (ring *EventRing) DropCount() uint64 {
 // QueueTypeSender or QueueTypeResponder. The ring is used by the CQ poller
 // to deliver completion events asynchronously.
 func (dev *Device) CreateQueue(queueType int, ring *EventRing) (*Queue, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	var qHandle C.rdma_queue_t
 	var cInfo C.rdma_queue_info_t
 
@@ -342,6 +358,9 @@ func (q *Queue) Destroy() {
 // a ProbePacket, posts it via the UD QP, and waits for send completion within
 // the given timeout. Returns timestamps T1 (post time) and T2 (completion time).
 func (q *Queue) SendProbe(targetGID [16]byte, targetQPN uint32, seqNum uint64, flowLabel uint32, timeoutMS uint32) SendResult {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	cGID := goGIDToC(targetGID)
 
 	cResult := C.rdma_send_probe(
@@ -375,6 +394,9 @@ func (q *Queue) SendFirstAck(targetGID [16]byte, targetQPN uint32, flowLabel uin
 		return 0, fmt.Errorf("recvPacket too short: got %d bytes, need at least %d", len(recvPacket), ProbePacketSize)
 	}
 
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	cGID := goGIDToC(targetGID)
 	var outT4 C.uint64_t
 
@@ -406,6 +428,9 @@ func (q *Queue) SendSecondAck(targetGID [16]byte, targetQPN uint32, flowLabel ui
 	if len(recvPacket) < ProbePacketSize {
 		return fmt.Errorf("recvPacket too short: got %d bytes, need at least %d", len(recvPacket), ProbePacketSize)
 	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	cGID := goGIDToC(targetGID)
 
@@ -467,8 +492,10 @@ func (q *Queue) StartEventPoller(ctx context.Context, handler func(CompletionEve
 // ---------------------------------------------------------------------------
 
 // GetLastError returns the last error message from the Zig RDMA library.
-// The string is valid only until the next call to any rdma_* function on
-// the same thread.
+// The Zig buffer is thread-local: the failing rdma_* call and this read
+// must run on the same OS thread. Bridge wrappers that interpolate the
+// string lock the OS thread around both Cgo calls. The string is valid
+// only until the next rdma_* call on that thread.
 func GetLastError() string {
 	cStr := C.rdma_get_last_error()
 	if cStr == nil {

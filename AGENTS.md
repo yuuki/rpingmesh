@@ -41,7 +41,7 @@ Run active-development commands from the repository root.
 
 ## Toolchain and Platform Constraints
 
-- Use Go 1.26 or newer, Zig 0.15.2, protoc, protoc-gen-go, and
+- Use Go 1.27 or newer, Zig 0.15.2, protoc, protoc-gen-go, and
   protoc-gen-go-grpc.
 - Agent builds require Linux, Cgo, libibverbs, and librdmacm. Agent runtime and
   RDMA e2e tests additionally require RDMA hardware or privileged soft-RoCE.

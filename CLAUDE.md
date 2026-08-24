@@ -114,7 +114,7 @@ uppercase, underscore-separated field names (for example,
 
 ## Requirements
 
-- Go 1.26+
+- Go 1.27+
 - Zig 0.15.2 (the version verified in e2e/CI; see `build.zig`, `Dockerfile.e2e`, `docker-compose.e2e.yml`)
 - protoc, protoc-gen-go, protoc-gen-go-grpc
 - libibverbs-dev, librdmacm-dev (Linux only; for agent build and RDMA testing)

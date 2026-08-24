@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Require Go 1.27.0 or later for building the agent and controller.
 - `tor_id` is optional. Unset agents register into an empty-ToR virtual rack,
   emit the OTel/PathSummary label `unspecified`, and have their ToR-mesh capped
   by `unspecified_mesh_max_targets` (default 32). Agents refuse to start with

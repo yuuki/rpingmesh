@@ -178,7 +178,7 @@ their imports.
 
 | Dependency | Version | Purpose |
 |------------|---------|---------|
-| Go | 1.26.0+ | Agent and controller binaries |
+| Go | 1.27.0+ | Agent and controller binaries |
 | Zig | 0.15.2 | RDMA data-path library (the version verified in e2e/CI; see `build.zig`, `Dockerfile.e2e`) |
 | protoc | 3.x | Protocol buffer compilation |
 | protoc-gen-go | latest | Go protobuf codegen |

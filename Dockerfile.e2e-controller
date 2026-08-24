@@ -1,6 +1,6 @@
 # E2E test runner for Agent-to-Controller tests.
 # Generates proto bindings, resolves dependencies, and runs Go tests.
-FROM golang:1.26.0-bookworm
+FROM golang:1.27.0-bookworm
 
 # Install protoc for code generation. This layer only depends on apt/Go tool
 # versions, not application source, so it stays cached across source-only

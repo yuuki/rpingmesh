@@ -1,6 +1,6 @@
 # Build stage for the rpingmesh controller.
 # CGO_ENABLED=0 — no RDMA or Zig dependencies needed.
-FROM golang:1.26.0-bookworm AS builder
+FROM golang:1.27.0-bookworm AS builder
 
 # Install protoc and Go protobuf plugins for code generation. This layer
 # only depends on apt/Go tool versions, not application source, so it stays

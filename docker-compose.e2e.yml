@@ -14,7 +14,7 @@ services:
       context: .
       dockerfile: Dockerfile.e2e
       args:
-        GO_VERSION: "1.26.0"
+        GO_VERSION: "1.27.0"
         ZIG_VERSION: "0.15.2"
     privileged: true
     cap_add:

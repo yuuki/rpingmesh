@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-24
+
 ### Changed
 
 - `tor_id` is optional. Unset agents register into an empty-ToR virtual rack,
@@ -14,6 +16,23 @@ All notable changes to this project are documented in this file.
   the controller rejects empty `tor_id` again and also restores an uncapped
   empty-ToR mesh for remaining empty rows — drain untagged agents before
   rollback.
+
+### Fixed
+
+- Wait for prober loops after context cancel so Stop cannot destroy a queue
+  while SendProbe or a ring poll is still running.
+- Keep UD address handles until send completion, publish send-slot handles
+  atomically, and skip destroying them if QP destroy fails.
+- Cap analyzer summaries per window so a stuck `window_start` cannot grow
+  without bound.
+- Drop short or version-mismatched RDMA recv completions instead of parsing
+  stale slot bytes.
+- Read Zig `last_error` on the same OS thread as the failing Cgo call, and
+  record an error when event-ring allocation fails.
+- Fail startup when an explicit `--config` file is missing, and require
+  `stale_threshold_sec >= active_threshold_sec`.
+- Run Go unit tests with the race detector in CI, and fail RDMA e2e only when
+  soft-RoCE actually loaded.
 
 ## [0.1.1] - 2026-07-28
 

@@ -86,7 +86,7 @@ pub fn allocateBuffers(dev: *types.RdmaDevice, num_slots: u32) MemoryError!Buffe
 
     // Allocate page-aligned memory. The page_allocator produces page-aligned
     // allocations by default, but we explicitly request the alignment.
-    const buf = std.heap.page_allocator.alignedAlloc(u8, @as(std.mem.Alignment, @enumFromInt(@ctz(@as(usize, PAGE_SIZE)))), total_size) catch {
+    const buf = std.heap.page_allocator.alignedAlloc(u8, @as(std.mem.Alignment, @fromBackingInt(@intCast(@ctz(@as(usize, PAGE_SIZE))))), total_size) catch {
         types.setLastError("failed to allocate page-aligned buffer");
         return MemoryError.AllocFailed;
     };
@@ -290,10 +290,10 @@ test "BufferSet struct has expected fields" {
     const info = @typeInfo(BufferSet);
     try std.testing.expect(info == .@"struct");
 
-    const fields = info.@"struct".fields;
-    try std.testing.expectEqual(@as(usize, 4), fields.len);
-    try std.testing.expectEqualStrings("buf", fields[0].name);
-    try std.testing.expectEqualStrings("mr", fields[1].name);
-    try std.testing.expectEqualStrings("num_slots", fields[2].name);
-    try std.testing.expectEqualStrings("size", fields[3].name);
+    const names = info.@"struct".field_names;
+    try std.testing.expectEqual(@as(usize, 4), names.len);
+    try std.testing.expectEqualStrings("buf", names[0]);
+    try std.testing.expectEqualStrings("mr", names[1]);
+    try std.testing.expectEqualStrings("num_slots", names[2]);
+    try std.testing.expectEqualStrings("size", names[3]);
 }

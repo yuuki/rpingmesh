@@ -2,7 +2,7 @@ name: rpingmesh-observability
 
 services:
   victoriametrics:
-    image: ${VM_IMAGE:-victoriametrics/victoria-metrics:v1.103.0}
+    image: ${VM_IMAGE:-victoriametrics/victoria-metrics:v1.153.0}
     command:
       - "-storageDataPath=/vmdata"
       - "-retentionPeriod=7d"
@@ -23,7 +23,7 @@ services:
       start_period: 5s
 
   otel-collector:
-    image: ${OTELCOL_IMAGE:-otel/opentelemetry-collector-contrib:0.117.0}
+    image: ${OTELCOL_IMAGE:-otel/opentelemetry-collector-contrib:0.162.0}
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
       - ./otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
@@ -35,7 +35,7 @@ services:
         condition: service_healthy
 
   grafana:
-    image: ${GRAFANA_IMAGE:-grafana/grafana:11.6.0}
+    image: ${GRAFANA_IMAGE:-grafana/grafana:13.2.3}
     environment:
       - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER:-admin}
       - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:-admin}

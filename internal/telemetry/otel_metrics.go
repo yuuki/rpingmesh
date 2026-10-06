@@ -24,13 +24,13 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
-	// Pinned to v1.41.0 to match the schema URL baked into resource.Default()
-	// by go.opentelemetry.io/otel/sdk v1.44.0's process/telemetry-sdk resource
+	// Pinned to v1.43.0 to match the schema URL baked into resource.Default()
+	// by go.opentelemetry.io/otel/sdk v1.47.0's process/telemetry-sdk resource
 	// detectors. A mismatched semconv version here (e.g. v1.39.0, which
 	// matched sdk v1.40.0) makes resource.Merge fail with "conflicting Schema
 	// URL" on every call, breaking MetricsCollector initialization entirely.
 	// Bump this in lockstep with go.opentelemetry.io/otel/sdk.
-	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
 // Histogram bucket boundaries in nanoseconds, covering sub-microsecond to

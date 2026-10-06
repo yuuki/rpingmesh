@@ -156,9 +156,9 @@ pub fn createQueue(
         .event_ring = event_ring,
         .cq_thread = null,
         .device = dev,
-        .send_slot_ah = [_]std.atomic.Value(usize){std.atomic.Value(usize).init(0)} ** types.NUM_SEND_SLOTS,
-        .send_slot_states = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(types.SlotState.Free))} ** types.NUM_SEND_SLOTS,
-        .recv_slot_states = [_]types.SlotState{types.SlotState.Free} ** types.NUM_RECV_SLOTS,
+        .send_slot_ah = @splat(std.atomic.Value(usize).init(0)),
+        .send_slot_states = @splat(std.atomic.Value(u8).init(@backingInt(types.SlotState.Free))),
+        .recv_slot_states = @splat(types.SlotState.Free),
         .running = std.atomic.Value(bool).init(false),
         .send_completion_wr_id = std.atomic.Value(u64).init(types.SEND_WR_ID_NONE),
         .send_completion_timestamp = std.atomic.Value(u64).init(0),
@@ -344,8 +344,8 @@ fn createExtendedCqs(dev: *types.RdmaDevice) ?ExtendedCqResult {
     // Hardware timestamp creation failed. Check if it is EOPNOTSUPP/ENOTSUP
     // and fall back to software timestamps.
     const errno_val = std.c._errno().*;
-    const eopnotsupp = @as(c_int, if (@hasDecl(std.c.E, "OPNOTSUPP")) @intFromEnum(std.c.E.OPNOTSUPP) else 95);
-    const enotsup = @as(c_int, if (@hasDecl(std.c.E, "NOTSUP")) @intFromEnum(std.c.E.NOTSUP) else eopnotsupp);
+    const eopnotsupp = @as(c_int, if (@hasDecl(std.c.E, "OPNOTSUPP")) @backingInt(std.c.E.OPNOTSUPP) else 95);
+    const enotsup = @as(c_int, if (@hasDecl(std.c.E, "NOTSUP")) @backingInt(std.c.E.NOTSUP) else eopnotsupp);
 
     if (errno_val == eopnotsupp or errno_val == enotsup) {
         // Retry without the timestamp flag

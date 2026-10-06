@@ -178,14 +178,14 @@ their imports.
 
 | Dependency | Version | Purpose |
 |------------|---------|---------|
-| Go | 1.27.0+ | Agent and controller binaries |
-| Zig | 0.15.2 | RDMA data-path library (the version verified in e2e/CI; see `build.zig`, `Dockerfile.e2e`) |
+| Go | 1.27.1+ | Agent and controller binaries |
+| Zig | 0.17.0 | RDMA data-path library (the version verified in e2e/CI; see `build.zig`, `Dockerfile.e2e`) |
 | protoc | 3.x | Protocol buffer compilation |
 | protoc-gen-go | latest | Go protobuf codegen |
 | protoc-gen-go-grpc | latest | Go gRPC codegen |
 | libibverbs-dev | any | RDMA verbs API |
 | librdmacm-dev | any | RDMA CM (linking only) |
-| rqlite | 8.x | Distributed SQLite for controller |
+| rqlite | 10.x | Distributed SQLite for controller |
 | Linux kernel | 5.4+ | RDMA support (5.8+ for ring buffer) |
 
 RDMA-capable hardware (e.g., Mellanox ConnectX) or soft-RoCE (`rxe` driver) is
@@ -739,14 +739,14 @@ VictoriaMetrics and are visualized in Grafana with zero custom plugins. See
 `docs/design/grafana-dashboards.md` for the full design (metric-name
 contract, panel layout, drilldown mechanism).
 
-**Metric name contract:** the collector's `prometheusremotewrite` exporter
+**Metric name contract:** the collector's `prometheus_remote_write` exporter
 must escape `.` to `_` but must **not** append extra `_total`/unit suffixes,
 since the OTel instrument names already carry them (`rpingmesh.probe_total` →
 `rpingmesh_probe_total`, not `rpingmesh_probe_total_total`). The pinned
-collector version (`otel-collector/config.yaml`) is set to
-`add_metric_suffixes: false` for this; newer collector releases expose the
-equivalent as `translation_strategy: UnderscoreEscapingWithoutSuffixes` —
-never set both. Verified end-to-end against a live OTLP push in
+collector (`otel-collector/config.yaml`) is set to
+`translation_strategy: UnderscoreEscapingWithoutSuffixes` for this; older
+collector releases expose the equivalent as the now-deprecated
+`add_metric_suffixes: false` — never set both. Verified end-to-end against a live OTLP push in
 `deploy/observability/README.md`.
 
 Quick start:

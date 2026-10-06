@@ -1,5 +1,5 @@
 # R-Pingmesh - Build System
-# Requires: Go 1.27+, Zig 0.15.2 (the version verified in e2e/CI), protoc,
+# Requires: Go 1.27.1+, Zig 0.17.0 (the version verified in e2e/CI), protoc,
 # clang, libibverbs-dev, librdmacm-dev
 
 .PHONY: all build build-zig build-go build-controller build-agent \
@@ -304,6 +304,6 @@ help:
 	@echo "  obs-logs             Tail observability stack logs"
 	@echo ""
 	@echo "Requirements:"
-	@echo "  Go 1.27+, Zig 0.15.2, protoc, libibverbs-dev, librdmacm-dev"
+	@echo "  Go 1.27.1+, Zig 0.17.0, protoc, libibverbs-dev, librdmacm-dev"
 	@echo "  For test-e2e: colima running, run 'make setup-colima' first"
 	@echo "  For package: nfpm (https://nfpm.goreleaser.com/install/)"

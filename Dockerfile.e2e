@@ -11,10 +11,10 @@
 #   - Privileged container with NET_ADMIN, SYS_ADMIN, IPC_LOCK capabilities
 #   - Host kernel with rdma_rxe and dummy module support
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
-ARG GO_VERSION=1.27.0
-ARG ZIG_VERSION=0.15.2
+ARG GO_VERSION=1.27.1
+ARG ZIG_VERSION=0.17.0
 
 # Install runtime and build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

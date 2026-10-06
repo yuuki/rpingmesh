@@ -133,6 +133,14 @@ func TestLoadControllerConfig_UnsetFlagDoesNotOverrideEnv(t *testing.T) {
 	}
 }
 
+func TestLoadControllerConfig_OTLPAddrWithSchemeRejected(t *testing.T) {
+	t.Setenv("RPINGMESH_OTEL_COLLECTOR_ADDR", "http://collector:4317")
+
+	if _, err := LoadControllerConfig("", nil); err == nil {
+		t.Fatal("expected an error for an otel_collector_addr with a URL scheme, got nil")
+	}
+}
+
 func TestLoadControllerConfig_InvalidLogLevel(t *testing.T) {
 	t.Setenv("RPINGMESH_LOG_LEVEL", "not-a-level")
 
@@ -365,6 +373,11 @@ func TestLoadAgentConfig_Defaults(t *testing.T) {
 	if !cfg.MetricsEnabled {
 		t.Error("MetricsEnabled = false, want true")
 	}
+	// The default must be a bare host:port: the OTLP gRPC exporter's
+	// WithEndpoint cannot dial a "grpc://" URL.
+	if cfg.OtelCollectorAddr != "localhost:4317" {
+		t.Errorf("OtelCollectorAddr = %q, want localhost:4317", cfg.OtelCollectorAddr)
+	}
 	if cfg.TargetProbeRatePerSecond != DefaultTargetProbeRatePerSecond {
 		t.Errorf("TargetProbeRatePerSecond = %d, want %d", cfg.TargetProbeRatePerSecond, DefaultTargetProbeRatePerSecond)
 	}
@@ -532,6 +545,14 @@ func TestLoadAgentConfig_EnvOverridesFile(t *testing.T) {
 	}
 	if cfg.ControllerAddr != "env-addr:2" {
 		t.Errorf("ControllerAddr = %q, want env-addr:2 (env overrides file)", cfg.ControllerAddr)
+	}
+}
+
+func TestLoadAgentConfig_OTLPAddrWithSchemeRejected(t *testing.T) {
+	t.Setenv("RPINGMESH_OTEL_COLLECTOR_ADDR", "grpc://collector:4317")
+
+	if _, err := LoadAgentConfig("", nil); err == nil {
+		t.Fatal("expected an error for an otel_collector_addr with a URL scheme, got nil")
 	}
 }
 

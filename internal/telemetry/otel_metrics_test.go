@@ -523,3 +523,50 @@ func TestNewMetricsCollector_Construct(t *testing.T) {
 		t.Error("Shutdown with a pre-cancelled context: want error, got nil")
 	}
 }
+
+// TestBuildResource_HostName verifies that buildResource sets host.name to
+// os.Hostname(). Collector pipelines that strip service.instance.id still
+// need a per-host identity to keep agents on distinct series.
+func TestBuildResource_HostName(t *testing.T) {
+	wantHost, hostErr := os.Hostname()
+	if hostErr != nil || wantHost == "" {
+		t.Skip("os.Hostname unavailable; host.name is intentionally omitted")
+	}
+
+	res, err := buildResource(defaultServiceName)
+	if err != nil {
+		t.Fatalf("buildResource(%q) returned error: %v", defaultServiceName, err)
+	}
+
+	for _, kv := range res.Attributes() {
+		if kv.Key == semconv.HostNameKey {
+			if got := kv.Value.AsString(); got != wantHost {
+				t.Errorf("host.name = %q, want os.Hostname() = %q", got, wantHost)
+			}
+			return
+		}
+	}
+	t.Fatal("host.name attribute not found in resource")
+}
+
+// TestRTTBucketBoundaries_SupersetOfAggregator verifies that the exported
+// histogram ladder is strictly increasing and contains every boundary of the
+// analyzer's aggregation ladder, so percentiles computed on either side are
+// never split across incompatible buckets.
+func TestRTTBucketBoundaries_SupersetOfAggregator(t *testing.T) {
+	for i := 1; i < len(rttBucketBoundaries); i++ {
+		if rttBucketBoundaries[i] <= rttBucketBoundaries[i-1] {
+			t.Fatalf("rttBucketBoundaries not strictly increasing at %d: %v <= %v",
+				i, rttBucketBoundaries[i], rttBucketBoundaries[i-1])
+		}
+	}
+	have := make(map[uint64]bool, len(rttBucketBoundaries))
+	for _, b := range rttBucketBoundaries {
+		have[uint64(b)] = true
+	}
+	for _, b := range probe.RTTBucketBoundariesNs() {
+		if !have[b] {
+			t.Errorf("aggregator boundary %dns missing from rttBucketBoundaries", b)
+		}
+	}
+}

@@ -38,7 +38,16 @@ pub fn build(b: *std.Build) void {
         .name = "rdmabridge",
         .root_module = lib_module,
         .linkage = .static,
+        // Always emit objects through LLVM. Zig 0.15's self-hosted x86_64
+        // backend (the Debug default) emits local-dynamic TLS relocations
+        // (R_X86_64_DTPOFF32) and DWARF 5 forms that older system linkers,
+        // e.g. GNU ld 2.35 on RHEL/Rocky 9, fail to link into the cgo binary.
+        .use_llvm = true,
     });
+    // The archive is linked by the system C toolchain (via cgo), not by Zig,
+    // so compiler-rt symbols the LLVM backend references (for example
+    // __zig_probe_stack in ReleaseSafe) must travel inside the archive.
+    lib.bundle_compiler_rt = true;
     b.installArtifact(lib);
 
     // -----------------------------------------------------------------------

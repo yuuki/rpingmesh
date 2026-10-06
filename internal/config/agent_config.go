@@ -166,7 +166,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("controller_addr", "localhost:50051")
 	v.SetDefault("log_level", "info")
 	v.SetDefault("probe_interval_ms", 500)
-	v.SetDefault("otel_collector_addr", "grpc://localhost:4317")
+	v.SetDefault("otel_collector_addr", "localhost:4317")
 	v.SetDefault("metrics_enabled", true)
 	v.SetDefault("allowed_device_names", []string{})
 	v.SetDefault("gid_index", 0)
@@ -367,6 +367,10 @@ func (c *AgentConfig) Validate() error {
 		}
 	}
 
+	if err := validateOTLPEndpoint(c.OtelCollectorAddr); err != nil {
+		return err
+	}
+
 	// The agent is the gRPC client of the controller connection: fail fast
 	// if the certificate files required by tls_mode are missing, rather
 	// than at the first dial attempt.
@@ -406,7 +410,7 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.String("controller-addr", "localhost:50051", "Controller gRPC address")
 	flags.String("log-level", "info", "Log level (debug, info, warn, error)")
 	flags.Uint32("probe-interval-ms", 500, "Probe interval in milliseconds")
-	flags.String("otel-collector-addr", "grpc://localhost:4317", "OpenTelemetry collector address")
+	flags.String("otel-collector-addr", "localhost:4317", "OpenTelemetry collector address")
 	flags.Bool("metrics-enabled", true, "Enable OpenTelemetry metrics export")
 	flags.StringSlice("allowed-device-names", []string{}, "List of allowed RDMA device names (empty = all)")
 	flags.Int("gid-index", 0, "GID index to use for RDMA devices (0-255)")

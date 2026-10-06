@@ -331,3 +331,50 @@ func TestGetPinglist_CanonicalizesEmptyTorID(t *testing.T) {
 		})
 	}
 }
+
+// TestRegisterAgent_PerRnicTorID verifies that an RNIC's own tor_id (sent by
+// agents with per-device ToRs on rail-optimized hosts) is kept, while RNICs
+// without one fall back to the request-wide tor_id.
+func TestRegisterAgent_PerRnicTorID(t *testing.T) {
+	fake := &fakeRegistry{}
+	svc := newTestService(fake)
+
+	_, err := svc.RegisterAgent(context.Background(), &controller_agent.AgentRegistrationRequest{
+		AgentId:  "agent-1",
+		Hostname: "host-1",
+		TorId:    "host-tor",
+		Rnics: []*controller_agent.RnicInfo{
+			{Gid: "gid-1", TorId: "leaf-a"},
+			{Gid: "gid-2", TorId: " leaf-b "},
+			{Gid: "gid-3"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := map[string]string{"gid-1": "leaf-a", "gid-2": "leaf-b", "gid-3": "host-tor"}
+	for _, rnic := range fake.lastRnics {
+		if rnic.GetTorId() != want[rnic.GetGid()] {
+			t.Errorf("rnic %s: torID=%q, want %q", rnic.GetGid(), rnic.GetTorId(), want[rnic.GetGid()])
+		}
+		if rnic.GetHostName() != "host-1" {
+			t.Errorf("rnic %s: hostname=%q, want host-1", rnic.GetGid(), rnic.GetHostName())
+		}
+	}
+}
+
+func TestRegisterAgent_PerRnicReservedTorID(t *testing.T) {
+	fake := &fakeRegistry{}
+	svc := newTestService(fake)
+
+	_, err := svc.RegisterAgent(context.Background(), &controller_agent.AgentRegistrationRequest{
+		AgentId: "agent-1",
+		Rnics:   []*controller_agent.RnicInfo{{Gid: "gid-1", TorId: "unspecified"}},
+	})
+	if code := statusCode(t, err); code != codes.InvalidArgument {
+		t.Errorf("code = %v, want InvalidArgument", code)
+	}
+	if fake.registerCalls != 0 {
+		t.Errorf("registerCalls = %d, want 0", fake.registerCalls)
+	}
+}

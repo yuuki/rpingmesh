@@ -225,6 +225,7 @@ via Cgo (`CGO_ENABLED=1`).
 | `agent_id` | hostname | Unique agent identifier |
 | `hostname` | auto-detected | Hostname reported to the controller on registration (falls back to `os.Hostname()` if empty) |
 | `tor_id` | *(optional, empty)* | Top-of-Rack switch identifier. Empty/whitespace registers as an untagged virtual rack. The value `unspecified` is reserved (OTel/PathSummary label for unset ToRs) and is rejected by both the agent and the controller. See [Optional ToR rollout](#optional-tor-rollout). |
+| `device_tor_ids` | `{}` | Optional per-device ToR IDs (`device name: tor_id`) for rail-optimized multi-rail hosts whose RNICs are cabled to different leaf switches. Unlisted devices use `tor_id`; keys match device names case-insensitively; values must be non-empty. See [ToR mapping on multi-rail hosts](docs/design/multi-rail-tor-mapping.md). Upgrade the controller before agents that use it. |
 | `controller_addr` | `localhost:50051` | Controller gRPC address |
 | `probe_interval_ms` | `500` | Milliseconds between probe rounds |
 | `target_probe_rate_per_second` | `10` | Legacy **uniform** per-target probe-rate cap. Used as the fallback for whichever per-type cap below is `0`, so a config that only sets this keeps a single uniform rate (a target's ECMP flow labels share this budget) |

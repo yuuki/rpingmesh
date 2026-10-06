@@ -9,6 +9,7 @@ import (
 	"net"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -121,6 +122,11 @@ type Agent struct {
 	// (registry storage key ""); OTel/PathSummary use probe.TorMetricLabel.
 	canonicalTorID string
 
+	// deviceTorIDs holds the canonical ToR of each opened device, parallel to
+	// devices: the device's device_tor_ids entry, or canonicalTorID. Filled by
+	// resolveDeviceTorIDs right after the devices are opened.
+	deviceTorIDs []string
+
 	// heartbeatStopCh and heartbeatWg control the lifecycle of the
 	// background heartbeat goroutine that periodically re-registers with
 	// the controller to keep the agent's registry entry alive.
@@ -150,13 +156,55 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 	// allocation) so a soft memory limit governs the whole process lifetime.
 	applyRuntimeLimits(cfg, a.logger)
 
-	if a.canonicalTorID == "" {
-		a.logger.Warn().
-			Str("otel_tor_label", probe.UnspecifiedTorLabel).
-			Msg("tor_id unset; registering under an empty ToR; ToR-mesh will include other untagged agents")
-	}
-
 	return a, nil
+}
+
+// resolveDeviceTorIDs assigns each opened device its ToR (device_tor_ids
+// entry, else the host-wide tor_id) and logs the result. device_tor_ids keys
+// that match no opened device are warned about, since a typo there silently
+// leaves that RNIC under the host-wide ToR.
+func (a *Agent) resolveDeviceTorIDs() {
+	a.deviceTorIDs = make([]string, len(a.devices))
+	matched := make(map[string]bool, len(a.cfg.DeviceTorIDs))
+	untagged := 0
+	for i, dev := range a.devices {
+		tor := a.cfg.TorIDForDevice(dev.Info.DeviceName)
+		a.deviceTorIDs[i] = tor
+		for key := range a.cfg.DeviceTorIDs {
+			if strings.EqualFold(strings.TrimSpace(key), dev.Info.DeviceName) {
+				matched[key] = true
+			}
+		}
+		if tor == "" {
+			untagged++
+		}
+		a.logger.Info().
+			Str("device", dev.Info.DeviceName).
+			Str("tor_id", tor).
+			Msg("Resolved device ToR")
+	}
+	for key := range a.cfg.DeviceTorIDs {
+		if !matched[key] {
+			a.logger.Warn().
+				Str("device", key).
+				Msg("device_tor_ids entry matches no opened RDMA device; ignored")
+		}
+	}
+	if untagged > 0 {
+		a.logger.Warn().
+			Int("untagged_devices", untagged).
+			Str("otel_tor_label", probe.UnspecifiedTorLabel).
+			Msg("Some devices have no ToR; they register under an empty ToR whose ToR-mesh includes other untagged RNICs")
+	}
+}
+
+// torIDForDevice returns the canonical ToR of devices[i], falling back to the
+// host-wide tor_id when per-device ToRs have not been resolved.
+func (a *Agent) torIDForDevice(i int) string {
+	if i >= 0 && i < len(a.deviceTorIDs) {
+		return a.deviceTorIDs[i]
+	}
+	return a.canonicalTorID
 }
 
 // applyRuntimeLimits applies the optional hard runtime caps from config: a soft
@@ -204,6 +252,7 @@ func (a *Agent) Initialize(ctx context.Context) error {
 		return fmt.Errorf("no RDMA devices available")
 	}
 	a.logger.Info().Int("device_count", len(a.devices)).Msg("RDMA devices opened")
+	a.resolveDeviceTorIDs()
 
 	// Step 3: Create gRPC client for controller communication.
 	a.logger.Info().
@@ -238,6 +287,7 @@ func (a *Agent) Initialize(ctx context.Context) error {
 			return fmt.Errorf("failed to create prober for device %s: %w",
 				dev.Info.DeviceName, err)
 		}
+		prober.SetSourceTorID(a.torIDForDevice(i))
 		torMeshRate := a.cfg.EffectiveTorMeshProbeRate()
 		interTorRate := a.cfg.EffectiveInterTorProbeRate()
 		if torMeshRate > 0 || interTorRate > 0 {
@@ -372,13 +422,14 @@ func (a *Agent) createClusterMonitors() {
 		a.logger.Info().
 			Str("device", dev.Info.DeviceName).
 			Str("requester_gid", requesterGID).
+			Str("tor_id", a.torIDForDevice(i)).
 			Uint32("update_interval_sec", a.cfg.PinglistUpdateIntervalSec).
 			Msg("Creating cluster monitor")
 		monitor := NewClusterMonitor(
 			a.grpcClient,
 			a.probers[i],
 			a.cfg.AgentID,
-			a.canonicalTorID,
+			a.torIDForDevice(i),
 			requesterGID,
 			a.cfg.PinglistUpdateIntervalSec,
 		)
@@ -401,7 +452,7 @@ func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRe
 			Qpn:        queueInfo.QPN,
 			IpAddress:  dev.Info.IPAddr,
 			HostName:   a.cfg.HostName,
-			TorId:      a.canonicalTorID,
+			TorId:      a.torIDForDevice(i),
 			DeviceName: dev.Info.DeviceName,
 		}
 		rnics = append(rnics, rnic)

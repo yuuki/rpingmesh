@@ -401,3 +401,68 @@ func TestAgent_ReservedTorIDRejected(t *testing.T) {
 		}
 	}
 }
+
+// TestAgent_PerDeviceTorIDs verifies the rail-optimized wiring: each device's
+// device_tor_ids entry (else tor_id) is used for its registered RNIC, its
+// cluster monitor's pinglist requests, and its prober's results.
+func TestAgent_PerDeviceTorIDs(t *testing.T) {
+	a, err := NewAgent(&config.AgentConfig{
+		AgentID:                   "agent-1",
+		TorID:                     "host-tor",
+		DeviceTorIDs:              map[string]string{"rxe0": "leaf-a", "RXE1": "leaf-b", "rxe9": "leaf-z"},
+		PinglistUpdateIntervalSec: 3600,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	a.devices = []*rdmabridge.Device{
+		fakeDevice("rxe0", "gid-0"),
+		fakeDevice("rxe1", "gid-1"),
+		fakeDevice("rxe2", "gid-2"),
+	}
+	a.probers = []*Prober{fakeProber(1), fakeProber(1), fakeProber(1)}
+	a.responders = []*Responder{{}, {}, {}}
+
+	a.resolveDeviceTorIDs()
+	want := []string{"leaf-a", "leaf-b", "host-tor"}
+
+	req := a.buildRegistrationRequest()
+	if req.GetTorId() != "host-tor" {
+		t.Errorf("registration TorId = %q, want host-tor", req.GetTorId())
+	}
+	if len(req.GetRnics()) != len(want) {
+		t.Fatalf("rnics = %d, want %d", len(req.GetRnics()), len(want))
+	}
+	for i, rnic := range req.GetRnics() {
+		if rnic.GetTorId() != want[i] {
+			t.Errorf("rnic[%d] TorId = %q, want %q", i, rnic.GetTorId(), want[i])
+		}
+	}
+
+	a.createClusterMonitors()
+	for i, m := range a.monitors {
+		if m.torID != want[i] {
+			t.Errorf("monitor[%d].torID = %q, want %q", i, m.torID, want[i])
+		}
+	}
+
+	for i, p := range a.probers {
+		p.SetSourceTorID(a.torIDForDevice(i))
+		p.emitResult(&probe.ProbeResult{})
+		if got := (<-p.resultChan).SourceTorID; got != want[i] {
+			t.Errorf("prober[%d] result SourceTorID = %q, want %q", i, got, want[i])
+		}
+	}
+}
+
+// TestProber_SetSourceTorID_UntaggedUsesLabel verifies that an untagged
+// device stamps the metric label, so consumers never fall back to a
+// different default for it.
+func TestProber_SetSourceTorID_UntaggedUsesLabel(t *testing.T) {
+	p := fakeProber(1)
+	p.SetSourceTorID("")
+	p.emitResult(&probe.ProbeResult{})
+	if got := (<-p.resultChan).SourceTorID; got != probe.UnspecifiedTorLabel {
+		t.Errorf("SourceTorID = %q, want %q", got, probe.UnspecifiedTorLabel)
+	}
+}

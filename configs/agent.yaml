@@ -7,6 +7,12 @@ hostname: ""        # Auto-detected if empty
 # "unspecified" is reserved (OTel/PathSummary label); the agent will not start
 # if tor_id is set to that value.
 tor_id: ""
+# Optional: per-device ToR IDs for rail-optimized multi-rail hosts, where each
+# RNIC is cabled to a different leaf switch. Unlisted devices use tor_id.
+# See docs/design/multi-rail-tor-mapping.md (scripts/topology/ can generate it).
+# device_tor_ids:
+#   mlx5_0: "leaf-a"
+#   mlx5_1: "leaf-b"
 
 # Controller connection
 controller_addr: "localhost:50051"

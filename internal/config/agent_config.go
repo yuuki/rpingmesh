@@ -69,16 +69,27 @@ const MaxGIDIndex = 255
 
 // AgentConfig holds all configuration for the agent.
 type AgentConfig struct {
-	AgentID            string   `mapstructure:"agent_id"`
-	HostName           string   `mapstructure:"hostname"`
-	TorID              string   `mapstructure:"tor_id"`
-	ControllerAddr     string   `mapstructure:"controller_addr"`
-	LogLevel           string   `mapstructure:"log_level"`
-	ProbeIntervalMS    uint32   `mapstructure:"probe_interval_ms"`
-	OtelCollectorAddr  string   `mapstructure:"otel_collector_addr"`
-	MetricsEnabled     bool     `mapstructure:"metrics_enabled"`
-	AllowedDeviceNames []string `mapstructure:"allowed_device_names"`
-	GIDIndex           int      `mapstructure:"gid_index"`
+	AgentID  string `mapstructure:"agent_id"`
+	HostName string `mapstructure:"hostname"`
+	TorID    string `mapstructure:"tor_id"`
+	// DeviceTorIDs optionally assigns a ToR per RDMA device (device name ->
+	// ToR ID). It exists for rail-optimized multi-rail hosts, where each RNIC
+	// is cabled to a different leaf switch, so a single host-wide TorID
+	// misplaces every RNIC but one. Devices not listed use TorID. Keys are
+	// lower-cased at load time (Viper lower-cases map keys anyway) and device
+	// names are matched case-insensitively; values are canonicalized like
+	// TorID and must be non-empty (proto3 cannot tell an explicitly empty
+	// per-RNIC ToR from an unset one, so the controller would fall back to
+	// tor_id). To leave a device untagged, leave tor_id empty and do not list
+	// the device.
+	DeviceTorIDs       map[string]string `mapstructure:"device_tor_ids"`
+	ControllerAddr     string            `mapstructure:"controller_addr"`
+	LogLevel           string            `mapstructure:"log_level"`
+	ProbeIntervalMS    uint32            `mapstructure:"probe_interval_ms"`
+	OtelCollectorAddr  string            `mapstructure:"otel_collector_addr"`
+	MetricsEnabled     bool              `mapstructure:"metrics_enabled"`
+	AllowedDeviceNames []string          `mapstructure:"allowed_device_names"`
+	GIDIndex           int               `mapstructure:"gid_index"`
 	// ServiceLevel is the Service Level (SL, PFC priority) applied to every
 	// Address Handle the agent's RDMA devices create (0-7; see Validate()).
 	ServiceLevel int `mapstructure:"service_level"`
@@ -163,6 +174,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("agent_id", "")
 	v.SetDefault("hostname", "")
 	v.SetDefault("tor_id", "")
+	v.SetDefault("device_tor_ids", map[string]string{})
 	v.SetDefault("controller_addr", "localhost:50051")
 	v.SetDefault("log_level", "info")
 	v.SetDefault("probe_interval_ms", 500)
@@ -241,6 +253,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		AgentID:                    agentID,
 		HostName:                   hostname,
 		TorID:                      v.GetString("tor_id"),
+		DeviceTorIDs:               canonicalDeviceTorIDs(v.GetStringMapString("device_tor_ids")),
 		ControllerAddr:             v.GetString("controller_addr"),
 		LogLevel:                   v.GetString("log_level"),
 		ProbeIntervalMS:            v.GetUint32("probe_interval_ms"),
@@ -285,6 +298,17 @@ func (c *AgentConfig) Validate() error {
 	// untagged metric series after upgrade.
 	if probe.IsReservedTorID(c.TorID) {
 		return fmt.Errorf("tor_id %q is reserved for untagged agents", probe.UnspecifiedTorLabel)
+	}
+	for dev, tor := range c.DeviceTorIDs {
+		if strings.TrimSpace(dev) == "" {
+			return fmt.Errorf("device_tor_ids has an empty device name")
+		}
+		if probe.CanonicalTorID(tor) == "" {
+			return fmt.Errorf("device_tor_ids[%s] must not be empty; omit the device to use tor_id", dev)
+		}
+		if probe.IsReservedTorID(tor) {
+			return fmt.Errorf("device_tor_ids[%s] %q is reserved for untagged agents", dev, probe.UnspecifiedTorLabel)
+		}
 	}
 
 	// GID index must be non-negative; it indexes into the RNIC's GID table.
@@ -434,4 +458,29 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.Int("max-procs", 0, "Cap runtime.GOMAXPROCS to this many cores (0 = Go default: all cores)")
 	flags.Float64("throttle-memory-ratio", DefaultThrottleMemoryRatio, "Fraction of max-memory-mb at which memory throttling engages (0-1; only when max-memory-mb > 0)")
 	flags.Float64("throttle-cpu-percent", DefaultThrottleCPUPercent, "Percentage of available CPU capacity (GOMAXPROCS cores) at which CPU throttling engages (0-100)")
+}
+
+// canonicalDeviceTorIDs lower-cases device-name keys and canonicalizes ToR
+// values so lookups in TorIDForDevice are case-insensitive and whitespace-safe.
+func canonicalDeviceTorIDs(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for dev, tor := range in {
+		out[strings.ToLower(strings.TrimSpace(dev))] = probe.CanonicalTorID(tor)
+	}
+	return out
+}
+
+// TorIDForDevice returns the canonical ToR ID for an RDMA device: its
+// device_tor_ids entry when present, otherwise the host-wide tor_id.
+func (c *AgentConfig) TorIDForDevice(deviceName string) string {
+	name := strings.TrimSpace(deviceName)
+	for dev, tor := range c.DeviceTorIDs {
+		if strings.EqualFold(strings.TrimSpace(dev), name) {
+			return probe.CanonicalTorID(tor)
+		}
+	}
+	return probe.CanonicalTorID(c.TorID)
 }

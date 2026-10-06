@@ -69,8 +69,8 @@ func (s *ControllerService) SetAnalyzer(a probeAnalyzer) {
 // stored as "" (one virtual rack of untagged agents). The display label
 // reserved for unset ToRs (probe.UnspecifiedTorLabel) is rejected so it cannot
 // collide with untagged metric series. For each RNIC in the request, the
-// hostname and canonical tor_id from the top-level request fields are applied
-// before registration.
+// top-level hostname is applied, and the RNIC's own canonical tor_id is kept
+// when set (falling back to the top-level tor_id) before registration.
 func (s *ControllerService) RegisterAgent(
 	ctx context.Context,
 	req *controller_agent.AgentRegistrationRequest,
@@ -92,11 +92,23 @@ func (s *ControllerService) RegisterAgent(
 		Int("rnicCount", len(req.GetRnics())).
 		Msg("Agent registration request")
 
-	// Apply hostname and tor_id from the top-level request to every RNIC.
+	// Apply the hostname from the top-level request to every RNIC. An RNIC's
+	// own tor_id wins over the request-wide one: on rail-optimized multi-rail
+	// hosts each RNIC is cabled to a different leaf switch, so the agent
+	// reports a ToR per RNIC. Agents that predate per-RNIC ToRs send the same
+	// value in both places, so they are unaffected.
 	rnics := req.GetRnics()
 	for _, rnic := range rnics {
 		rnic.HostName = req.GetHostname()
-		rnic.TorId = torID
+		rnicTor := probe.CanonicalTorID(rnic.GetTorId())
+		if probe.IsReservedTorID(rnicTor) {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"rnic %s tor_id %q is reserved for untagged agents", rnic.GetGid(), probe.UnspecifiedTorLabel)
+		}
+		if rnicTor == "" {
+			rnicTor = torID
+		}
+		rnic.TorId = rnicTor
 	}
 
 	// Register all RNICs for this agent as a single atomic operation. A

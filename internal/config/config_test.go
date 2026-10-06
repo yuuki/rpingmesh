@@ -890,3 +890,52 @@ func TestAgentConfig_Validate_MTLSWithRealFiles(t *testing.T) {
 		t.Errorf("Validate() = %v, want nil when all tls files exist", err)
 	}
 }
+
+func TestLoadAgentConfig_DeviceTorIDs(t *testing.T) {
+	path := writeYAML(t, "agent.yaml", `tor_id: "host-tor"
+device_tor_ids:
+  mlx5_0: "leaf-a"
+  MLX5_1: " leaf-b "
+`)
+	cfg, err := LoadAgentConfig(path, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cases := map[string]string{
+		"mlx5_0": "leaf-a",
+		"mlx5_1": "leaf-b",   // key case and value whitespace are normalized
+		"MLX5_0": "leaf-a",   // device names match case-insensitively
+		"mlx5_2": "host-tor", // unlisted devices use tor_id
+	}
+	for dev, want := range cases {
+		if got := cfg.TorIDForDevice(dev); got != want {
+			t.Errorf("TorIDForDevice(%q) = %q, want %q", dev, got, want)
+		}
+	}
+}
+
+func TestLoadAgentConfig_DeviceTorIDsDefaultEmpty(t *testing.T) {
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.DeviceTorIDs) != 0 {
+		t.Errorf("DeviceTorIDs = %v, want empty", cfg.DeviceTorIDs)
+	}
+	if got := cfg.TorIDForDevice("mlx5_0"); got != "" {
+		t.Errorf("TorIDForDevice = %q, want empty (untagged)", got)
+	}
+}
+
+func TestLoadAgentConfig_DeviceTorIDsRejectsInvalid(t *testing.T) {
+	for name, content := range map[string]string{
+		"empty value":    "device_tor_ids:\n  mlx5_0: \"  \"\n",
+		"reserved value": "device_tor_ids:\n  mlx5_0: \"unspecified\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := LoadAgentConfig(writeYAML(t, "agent.yaml", content), nil); err == nil {
+				t.Error("expected a validation error, got nil")
+			}
+		})
+	}
+}

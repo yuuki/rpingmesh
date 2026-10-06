@@ -47,6 +47,22 @@ type RnicRegistry struct {
 	// staleThresholdSec is the window (seconds) after which entries are
 	// considered stale and removed or excluded.
 	staleThresholdSec int
+
+	// now is the clock used both to stamp last_updated_epoch and to compute
+	// the active/stale cutoffs (time.Now; injectable in tests). Cutoffs are
+	// computed here and bound as parameters instead of using SQLite's
+	// strftime('%s','now'): rqlite rewrites 'now' in write statements for
+	// Raft determinism and renders it in the server's local timezone, so on a
+	// non-UTC host the stale cleanup DELETE saw every row as hours old and
+	// wiped the whole registry. Using one clock for stamping and comparing
+	// also keeps reads and writes consistent.
+	now func() time.Time
+}
+
+// cutoff returns the Unix epoch (seconds) before which an entry falls outside
+// a window of windowSec seconds.
+func (r *RnicRegistry) cutoff(windowSec int) int64 {
+	return r.now().Unix() - int64(windowSec)
 }
 
 // NewRnicRegistry creates a new RNIC registry connected to the given rqlite
@@ -76,6 +92,7 @@ func NewRnicRegistry(dbURI string, activeThresholdSec, staleThresholdSec int) (*
 		conn:               conn,
 		activeThresholdSec: activeThresholdSec,
 		staleThresholdSec:  staleThresholdSec,
+		now:                time.Now,
 	}
 
 	if err := registry.initializeSchema(); err != nil {
@@ -173,7 +190,7 @@ func (r *RnicRegistry) RegisterRNICs(
 	(rnic_gid, qpn, agent_id, agent_ip, rnic_ip, tor_id, hostname, device_name, last_updated_epoch)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`
 
-	now := time.Now().Unix()
+	now := r.now().Unix()
 
 	statements := make([]gorqlite.ParameterizedStatement, 0, len(rnics)+1)
 	statements = append(statements, gorqlite.ParameterizedStatement{
@@ -227,11 +244,11 @@ func (r *RnicRegistry) GetRNICsByToR(
 	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 	FROM rnics
 	WHERE tor_id = ?
-	AND last_updated_epoch > (strftime('%s','now') - ?);`
+	AND last_updated_epoch > ?;`
 
 	stmt := gorqlite.ParameterizedStatement{
 		Query:     querySQL,
-		Arguments: []interface{}{torID, r.activeThresholdSec},
+		Arguments: []interface{}{torID, r.cutoff(r.activeThresholdSec)},
 	}
 
 	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
@@ -264,12 +281,12 @@ func (r *RnicRegistry) GetActiveRNICsInOtherToRs(
 	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 	FROM rnics
 	WHERE tor_id != ?
-	AND last_updated_epoch > (strftime('%s','now') - ?)
+	AND last_updated_epoch > ?
 	ORDER BY RANDOM();`
 
 	stmt := gorqlite.ParameterizedStatement{
 		Query:     querySQL,
-		Arguments: []interface{}{excludeTorID, r.activeThresholdSec},
+		Arguments: []interface{}{excludeTorID, r.cutoff(r.activeThresholdSec)},
 	}
 
 	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
@@ -327,11 +344,11 @@ func (r *RnicRegistry) GetRNICInfo(
 		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 		FROM rnics
 		WHERE rnic_gid = ?
-		AND last_updated_epoch > (strftime('%s','now') - ?)
+		AND last_updated_epoch > ?
 		LIMIT 1;`
 		stmt = gorqlite.ParameterizedStatement{
 			Query:     querySQL,
-			Arguments: []interface{}{targetGID, r.activeThresholdSec},
+			Arguments: []interface{}{targetGID, r.cutoff(r.activeThresholdSec)},
 		}
 	} else {
 		// Fallback to IP-based lookup.
@@ -339,11 +356,11 @@ func (r *RnicRegistry) GetRNICInfo(
 		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 		FROM rnics
 		WHERE rnic_ip = ?
-		AND last_updated_epoch > (strftime('%s','now') - ?)
+		AND last_updated_epoch > ?
 		LIMIT 1;`
 		stmt = gorqlite.ParameterizedStatement{
 			Query:     querySQL,
-			Arguments: []interface{}{targetIP, r.activeThresholdSec},
+			Arguments: []interface{}{targetIP, r.cutoff(r.activeThresholdSec)},
 		}
 	}
 
@@ -380,11 +397,11 @@ func (r *RnicRegistry) CleanupStaleEntries(ctx context.Context) error {
 
 	cleanupSQL := `
 	DELETE FROM rnics
-	WHERE last_updated_epoch < (strftime('%s','now') - ?);`
+	WHERE last_updated_epoch < ?;`
 
 	stmt := gorqlite.ParameterizedStatement{
 		Query:     cleanupSQL,
-		Arguments: []interface{}{r.staleThresholdSec},
+		Arguments: []interface{}{r.cutoff(r.staleThresholdSec)},
 	}
 
 	result, err := r.conn.WriteOneParameterizedContext(ctx, stmt)
@@ -407,12 +424,12 @@ func (r *RnicRegistry) ListAllRNICs(ctx context.Context) ([]*controller_agent.Rn
 	querySQL := `
 	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
 	FROM rnics
-	WHERE last_updated_epoch > (strftime('%s','now') - ?)
+	WHERE last_updated_epoch > ?
 	ORDER BY tor_id, hostname;`
 
 	stmt := gorqlite.ParameterizedStatement{
 		Query:     querySQL,
-		Arguments: []interface{}{r.staleThresholdSec},
+		Arguments: []interface{}{r.cutoff(r.staleThresholdSec)},
 	}
 
 	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)

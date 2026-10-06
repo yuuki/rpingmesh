@@ -8,7 +8,7 @@ const std = @import("std");
 /// Thread-local buffer for the last error message. Each thread gets its
 /// own copy so concurrent RDMA operations do not clobber each other's
 /// error strings. Initialized to all zeros (empty string).
-threadlocal var last_error: [256]u8 = [_]u8{0} ** 256;
+threadlocal var last_error: [256]u8 = @splat(0);
 
 /// Store an error message in the thread-local error buffer.
 ///
@@ -50,8 +50,8 @@ test "setLastError and getLastError" {
 }
 
 test "setLastError truncates long messages" {
-    const long_msg = "A" ** 300;
-    setLastError(long_msg);
+    const long_msg: [300]u8 = @splat('A');
+    setLastError(&long_msg);
     const err = getLastError();
     const err_slice = std.mem.sliceTo(err, 0);
     try std.testing.expectEqual(@as(usize, 255), err_slice.len);

@@ -82,7 +82,7 @@ pub fn parseGRH(buf: [*]const u8) GRHInfo {
         // Source IP at buf[32..35] (IPv4 header offset 12).
         // Dest   IP at buf[36..39] (IPv4 header offset 16).
         // Construct IPv4-mapped IPv6 GIDs: ::ffff:a.b.c.d
-        var source_gid = [_]u8{0} ** 16;
+        var source_gid: [16]u8 = @splat(0);
         source_gid[10] = 0xff;
         source_gid[11] = 0xff;
         source_gid[12] = buf[32];
@@ -90,7 +90,7 @@ pub fn parseGRH(buf: [*]const u8) GRHInfo {
         source_gid[14] = buf[34];
         source_gid[15] = buf[35];
 
-        var dest_gid = [_]u8{0} ** 16;
+        var dest_gid: [16]u8 = @splat(0);
         dest_gid[10] = 0xff;
         dest_gid[11] = 0xff;
         dest_gid[12] = buf[36];
@@ -257,7 +257,10 @@ fn cqPollerLoop(queue: *types.UdQueue) void {
 
         // Sleep briefly between polls to reduce CPU usage.
         // 50 microseconds gives good responsiveness while staying efficient.
-        std.Thread.sleep(50_000);
+        // libc nanosleep: std.Thread.sleep was removed in Zig 0.16 (sleeping
+        // now goes through std.Io, which this C-ABI library does not carry).
+        const req: types.c.struct_timespec = .{ .tv_sec = 0, .tv_nsec = 50_000 };
+        _ = types.c.nanosleep(&req, null);
     }
     log.debug("@{x} exiting after {d} iters", .{ @intFromPtr(queue), iter });
 }
@@ -411,8 +414,8 @@ fn pollCqExtended(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
 /// Return the current monotonic clock time in nanoseconds (software fallback).
 ///
 /// Delegates to the shared `types.monotonicNs()` helper, which uses true
-/// CLOCK_MONOTONIC (not `std.time.nanoTimestamp()`, which is CLOCK_REALTIME
-/// in Zig 0.15.2) so that SW-fallback T2/T3/T4/T5 stay in the same clock
+/// CLOCK_MONOTONIC (not `std.time.nanoTimestamp()`, which was CLOCK_REALTIME
+/// in Zig 0.15.x) so that SW-fallback T2/T3/T4/T5 stay in the same clock
 /// domain as T1 (`packet.zig`) and the Go side's T6.
 fn swTimestampNs() u64 {
     return types.monotonicNs();
@@ -616,7 +619,7 @@ fn getCompletionTimestamp(queue: *types.UdQueue, cq: *c.ibv_cq_ex) u64 {
 
 test "parseGRH extracts source and dest GID" {
     // Construct a minimal 40-byte GRH
-    var grh: [40]u8 = [_]u8{0} ** 40;
+    var grh: [40]u8 = @splat(0);
 
     // Version=6, TC=0, Flow Label=0x12345
     // First 4 bytes: 0110 0000 | 0000 0001 | 0010 0011 | 0100 0101
@@ -652,7 +655,7 @@ test "parseGRH extracts source and dest GID" {
 }
 
 test "parseGRH flow label zero" {
-    var grh: [40]u8 = [_]u8{0} ** 40;
+    var grh: [40]u8 = @splat(0);
     grh[0] = 0x60; // version=6
 
     const info = parseGRH(&grh);
@@ -660,7 +663,7 @@ test "parseGRH flow label zero" {
 }
 
 test "parseGRH flow label max (20 bits)" {
-    var grh: [40]u8 = [_]u8{0} ** 40;
+    var grh: [40]u8 = @splat(0);
     // Flow label = 0xFFFFF (20 bits all set)
     // First 4 bytes: 0110 0000 | 0000 1111 | 1111 1111 | 1111 1111
     grh[0] = 0x60;
@@ -696,7 +699,7 @@ test "parseProbePayload extracts fields" {
     //   bytes 20-27: t3 (u64 BigEndian)
     //   bytes 28-35: t4 (u64 BigEndian)
     //   bytes 36-39: reserved
-    var payload: [40]u8 = [_]u8{0} ** 40;
+    var payload: [40]u8 = @splat(0);
 
     payload[0] = types.PACKET_VERSION;
 
@@ -731,7 +734,7 @@ test "parseProbePayload extracts fields" {
 }
 
 test "parseProbePayload rejects unexpected version" {
-    var payload: [40]u8 = [_]u8{0} ** 40;
+    var payload: [40]u8 = @splat(0);
     payload[1] = 1;
     try std.testing.expect(parseProbePayload(&payload) == null);
     payload[0] = types.PACKET_VERSION + 1;
@@ -747,8 +750,8 @@ test "recvByteLenOK requires GRH plus probe payload" {
 
 test "GRHInfo struct has expected fields" {
     const info = GRHInfo{
-        .source_gid = [_]u8{0} ** 16,
-        .dest_gid = [_]u8{0} ** 16,
+        .source_gid = @splat(0),
+        .dest_gid = @splat(0),
         .flow_label = 0,
     };
     try std.testing.expectEqual(@as(u32, 0), info.flow_label);

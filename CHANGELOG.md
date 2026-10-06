@@ -6,6 +6,15 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Require Go 1.27.1 or later and Zig 0.17.0 (the Zig library now gets its C
+  bindings from a build-system TranslateC step, since Zig 0.16 removed
+  `@cImport`).
+- Update Go module dependencies (OpenTelemetry 1.47.0, gRPC 1.84.0, and
+  others), build/runtime images to Debian trixie, and the e2e rqlite image to
+  10.5.2.
+- Update the observability demo stack to Grafana 13.2.3, VictoriaMetrics
+  1.153.0, and otel-collector-contrib 0.162.0; the collector config now uses
+  the `prometheus_remote_write` exporter with `translation_strategy`.
 - `make build-zig` builds `librdmabridge.a` in ReleaseSafe (previously Debug,
   because `preferred_optimize_mode` only applies with `--release`).
 - The RTT/delay histograms use a denser bucket ladder in 1–10 µs, where

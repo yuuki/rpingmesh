@@ -9,27 +9,25 @@ Grafana dashboards in `dashboards/` without any RDMA hardware. See
 - **VictoriaMetrics** (`victoriametrics/victoria-metrics`) — Prometheus
   remote-write receiver and query backend.
 - **otel-collector-contrib** — receives OTLP/gRPC metrics from the agent /
-  analyzer and forwards them to VictoriaMetrics via `prometheusremotewrite`.
+  analyzer and forwards them to VictoriaMetrics via `prometheus_remote_write`.
 - **Grafana** — provisioned with the VictoriaMetrics datasource and the two
   `dashboards/*.json` dashboards (zero custom plugins).
 
 ## Metric name contract
 
-The `prometheusremotewrite` exporter is pinned to `add_metric_suffixes: false`
+The `prometheus_remote_write` exporter is pinned to
+`translation_strategy: UnderscoreEscapingWithoutSuffixes`
 (`otel-collector/config.yaml`). This escapes `.` to `_` in OTLP metric names
 but does **not** append `_total`/unit suffixes — the OTel instruments already
 carry them (e.g. `rpingmesh.probe_total`, `rpingmesh.network_rtt_ns`). Using
 the exporter's default settings instead would double up suffixes (e.g.
 `rpingmesh_probe_total_total`) and silently break every dashboard panel.
 
-Newer collector builds expose the same behavior as
-`translation_strategy: UnderscoreEscapingWithoutSuffixes` instead of
-`add_metric_suffixes` — the pinned version here
-(`otel/opentelemetry-collector-contrib:0.117.0`) predates that option (its
-`prometheusremotewriteexporter` config schema only has `add_metric_suffixes`;
-confirmed against the exporter's `config.go` for that release). If you
-upgrade the pinned image, prefer `translation_strategy` and never set both
-on the same exporter.
+Collector releases before `translation_strategy` existed (e.g. 0.117.0) express
+the same behavior as `add_metric_suffixes: false`; that option is deprecated in
+the pinned version (`otel/opentelemetry-collector-contrib:0.162.0`), which also
+renamed the exporter type from `prometheusremotewrite` (still accepted as a
+deprecated alias). Never set both suffix options on the same exporter.
 
 This was verified end-to-end, not just via the seed script's direct
 `/api/v1/import/prometheus` bypass: a real OTLP/HTTP push of

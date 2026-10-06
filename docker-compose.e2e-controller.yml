@@ -1,7 +1,7 @@
 services:
   # rqlite — distributed SQLite used by the controller's RNIC registry.
   rqlite:
-    image: rqlite/rqlite:8.37.0
+    image: rqlite/rqlite:10.5.2
     command: -http-addr "0.0.0.0:4001"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:4001/status"]

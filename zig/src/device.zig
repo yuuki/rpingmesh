@@ -152,7 +152,7 @@ pub fn openDevice(ctx: *types.RdmaContext, index: i32, gid_index: i32, sl: u8, t
     // and for the sysfs GID-type validation performed inside
     // findActivePortAndGid(), so it is extracted before that call.
     const dev_name_ptr = c.ibv_get_device_name(device);
-    var device_name: [64]u8 = [_]u8{0} ** 64;
+    var device_name: [64]u8 = @splat(0);
     var device_name_len: usize = 0;
     if (dev_name_ptr != null) {
         const name_slice = std.mem.sliceTo(dev_name_ptr, 0);
@@ -263,7 +263,7 @@ pub fn closeDevice(dev: *types.RdmaDevice) void {
 /// 10-11 are 0xFF), the last 4 bytes are formatted as dotted-decimal IPv4.
 /// Otherwise the full GID is formatted as colon-separated IPv6 hex groups.
 pub fn extractIPFromGID(gid: [16]u8) [64]u8 {
-    var result: [64]u8 = [_]u8{0} ** 64;
+    var result: [64]u8 = @splat(0);
 
     // Check for IPv4-mapped IPv6: first 10 bytes zero, bytes 10-11 are 0xFF
     const is_ipv4_mapped = blk: {
@@ -486,17 +486,27 @@ fn readGidTypeFromSysfs(dev_name: []const u8, port_num: u8, gid_index: i32) ?Gid
     if (dev_name.len == 0) return null;
 
     var path_buf: [256]u8 = undefined;
-    const path = std.fmt.bufPrint(
+    const path = std.mem.printSentinel(
         &path_buf,
         "/sys/class/infiniband/{s}/ports/{d}/gid_attrs/types/{d}",
         .{ dev_name, port_num, gid_index },
+        0,
     ) catch return null;
 
-    var file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
+    // Plain libc I/O: std.fs file APIs require an std.Io instance since Zig
+    // 0.16, which this C-ABI library does not carry.
+    const fd = types.c.open(path.ptr, types.c.O_RDONLY);
+    if (fd < 0) return null;
+    defer _ = types.c.close(fd);
 
     var content_buf: [64]u8 = undefined;
-    const n = file.readAll(&content_buf) catch return null;
+    var n: usize = 0;
+    while (n < content_buf.len) {
+        const r = types.c.read(fd, content_buf[n..].ptr, content_buf.len - n);
+        if (r < 0) return null;
+        if (r == 0) break;
+        n += @intCast(r);
+    }
     const content = std.mem.trim(u8, content_buf[0..n], " \t\r\n");
 
     // Order matters: check the more specific "RoCE v2" before the "RoCE v1"

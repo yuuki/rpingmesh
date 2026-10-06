@@ -1,6 +1,6 @@
 # Build stage for the rpingmesh controller.
 # CGO_ENABLED=0 — no RDMA or Zig dependencies needed.
-FROM golang:1.27.0-bookworm AS builder
+FROM golang:1.27.1-trixie AS builder
 
 # Install protoc and Go protobuf plugins for code generation. This layer
 # only depends on apt/Go tool versions, not application source, so it stays
@@ -34,7 +34,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux go build -o /app/bin/rpingmesh-controller ./cmd/controller/
 
 # Runtime image — minimal footprint.
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         netcat-openbsd \

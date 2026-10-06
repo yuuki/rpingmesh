@@ -15,7 +15,7 @@ module is `github.com/yuuki/rpingmesh`.
 
 ```bash
 make build           # Full pipeline: Zig library → protobuf codegen → Go binaries
-make build-zig       # Build zig/zig-out/lib/librdmabridge.a only (requires Zig 0.15.2)
+make build-zig       # Build zig/zig-out/lib/librdmabridge.a only (requires Zig 0.17.0)
 make generate-proto  # Regenerate protobuf Go bindings
 make build-controller  # CGO_ENABLED=0, no Zig link
 make build-agent       # CGO_ENABLED=1, links librdmabridge.a
@@ -114,8 +114,8 @@ uppercase, underscore-separated field names (for example,
 
 ## Requirements
 
-- Go 1.27+
-- Zig 0.15.2 (the version verified in e2e/CI; see `build.zig`, `Dockerfile.e2e`, `docker-compose.e2e.yml`)
+- Go 1.27.1+
+- Zig 0.17.0 (the version verified in e2e/CI; see `build.zig`, `Dockerfile.e2e`, `docker-compose.e2e.yml`)
 - protoc, protoc-gen-go, protoc-gen-go-grpc
 - libibverbs-dev, librdmacm-dev (Linux only; for agent build and RDMA testing)
 - rqlite (for controller and integration tests)

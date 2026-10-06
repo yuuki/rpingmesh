@@ -292,8 +292,8 @@ pub fn waitSendCompletion(queue: *types.UdQueue, expected_wr_id: u64, timeout_ms
 /// Get the current monotonic clock time in nanoseconds.
 ///
 /// Delegates to the shared `types.monotonicNs()` helper, which uses true
-/// CLOCK_MONOTONIC (not `std.time.nanoTimestamp()`, which is CLOCK_REALTIME
-/// in Zig 0.15.2) so that T1 stays in the same clock domain as the Go
+/// CLOCK_MONOTONIC (not `std.time.nanoTimestamp()`, which was CLOCK_REALTIME
+/// in Zig 0.15.x) so that T1 stays in the same clock domain as the Go
 /// side's T6.
 fn getMonotonicNs() u64 {
     return types.monotonicNs();
@@ -726,7 +726,7 @@ test "writeBigEndianU64 produces correct byte order" {
 }
 
 test "writeBigEndianU64 with offset" {
-    var buf: [16]u8 = [_]u8{0} ** 16;
+    var buf: [16]u8 = @splat(0);
     writeBigEndianU64(&buf, 4, 0x0A0B0C0D0E0F1011);
 
     // Bytes before offset should be untouched
@@ -808,7 +808,7 @@ test "deserializeProbePacket roundtrip" {
 }
 
 test "deserializeProbePacket with version mismatch returns error-flagged packet" {
-    var buf: [40]u8 = [_]u8{0} ** 40;
+    var buf: [40]u8 = @splat(0);
     buf[0] = 99; // Invalid version
 
     const pkt = deserializeProbePacket(&buf);
@@ -824,7 +824,7 @@ test "serialize probe packet has correct total size" {
 }
 
 test "serializeProbePacket zeroes reserved bytes even if buffer was dirty" {
-    var buf: [40]u8 = [_]u8{0xFF} ** 40; // Fill with 0xFF
+    var buf: [40]u8 = @splat(0xFF); // Fill with 0xFF
 
     const pkt = ProbePacket{
         .version = PACKET_VERSION,
@@ -929,7 +929,7 @@ test "findFreeSendSlot and freeSendSlot basic behavior" {
     // with a stack-allocated slot states array.
     // Note: We cannot create a full UdQueue without RDMA hardware, so we test
     // the logic conceptually via the state array.
-    var states: [types.NUM_SEND_SLOTS]types.SlotState = [_]types.SlotState{.Free} ** types.NUM_SEND_SLOTS;
+    var states: [types.NUM_SEND_SLOTS]types.SlotState = @splat(.Free);
 
     // Simulate findFreeSendSlot: find the first Free slot
     var found_slot: ?u32 = null;
@@ -952,7 +952,7 @@ test "findFreeSendSlot and freeSendSlot basic behavior" {
 }
 
 test "findFreeSendSlot returns null when all slots busy" {
-    const states: [types.NUM_SEND_SLOTS]types.SlotState = [_]types.SlotState{.InUse} ** types.NUM_SEND_SLOTS;
+    const states: [types.NUM_SEND_SLOTS]types.SlotState = @splat(.InUse);
 
     // All slots are InUse, should not find any
     var found: ?u32 = null;

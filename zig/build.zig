@@ -7,7 +7,8 @@
 // defined in rdma_bridge.h. Compiles for the native target architecture.
 // Requires: libibverbs-dev, librdmacm-dev (Linux only).
 //
-// Compatible with Zig 0.15.x build API (uses createModule + addLibrary).
+// Requires Zig 0.17.x. C bindings come from a TranslateC step (src/c.h)
+// because Zig 0.16 removed the @cImport builtin.
 
 const std = @import("std");
 
@@ -17,6 +18,18 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{
         .preferred_optimize_mode = .ReleaseSafe,
     });
+
+    // -----------------------------------------------------------------------
+    // C bindings (libibverbs, librdmacm, libc) imported as module "c"
+    // -----------------------------------------------------------------------
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/c.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    translate_c.addIncludePath(b.path("include"));
+    const c_module = translate_c.createModule();
 
     // -----------------------------------------------------------------------
     // Root module for librdmabridge.a
@@ -30,6 +43,7 @@ pub fn build(b: *std.Build) void {
     lib_module.linkSystemLibrary("rdmacm", .{});
     lib_module.linkSystemLibrary("ibverbs", .{});
     lib_module.addIncludePath(b.path("include"));
+    lib_module.addImport("c", c_module);
 
     // -----------------------------------------------------------------------
     // Static library: librdmabridge.a
@@ -66,6 +80,7 @@ pub fn build(b: *std.Build) void {
     test_module.linkSystemLibrary("rdmacm", .{});
     test_module.linkSystemLibrary("ibverbs", .{});
     test_module.addIncludePath(b.path("include"));
+    test_module.addImport("c", c_module);
 
     const lib_tests = b.addTest(.{
         .root_module = test_module,

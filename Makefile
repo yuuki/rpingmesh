@@ -51,7 +51,7 @@ build: build-zig generate build-go
 # Build Zig static library
 build-zig:
 	@echo "==> Building Zig RDMA bridge library..."
-	cd $(ZIG_DIR) && zig build
+	cd $(ZIG_DIR) && zig build --release=safe
 	@echo "==> Zig library built: $(ZIG_OUT)/lib/librdmabridge.a"
 
 # Generate protobuf code

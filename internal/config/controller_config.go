@@ -283,6 +283,10 @@ func (c *ControllerConfig) Validate() error {
 		}
 	}
 
+	if err := validateOTLPEndpoint(c.OtelCollectorAddr); err != nil {
+		return err
+	}
+
 	// The controller is the gRPC server of the controller-agent connection:
 	// fail fast if the certificate files required by tls_mode are missing,
 	// rather than at the first client handshake.

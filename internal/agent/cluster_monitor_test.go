@@ -26,12 +26,14 @@ type mockControllerClient struct {
 	mu        sync.Mutex
 	responses map[controller_agent.PinglistType][]pinglistResponse
 	callIndex map[controller_agent.PinglistType]int
+	calls     map[controller_agent.PinglistType]int
 }
 
 func newMockControllerClient() *mockControllerClient {
 	return &mockControllerClient{
 		responses: make(map[controller_agent.PinglistType][]pinglistResponse),
 		callIndex: make(map[controller_agent.PinglistType]int),
+		calls:     make(map[controller_agent.PinglistType]int),
 	}
 }
 
@@ -53,6 +55,7 @@ func (m *mockControllerClient) GetPinglist(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.calls[ptype]++
 	queue := m.responses[ptype]
 	if len(queue) == 0 {
 		return nil, nil
@@ -241,5 +244,151 @@ func TestClusterMonitor_Stop_ReturnsQuickly(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Stop did not return within 5s; monitor loop likely blocked on the ticker instead of stopCh")
+	}
+}
+
+// callCount returns how many times GetPinglist was called for ptype.
+func (m *mockControllerClient) callCount(ptype controller_agent.PinglistType) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls[ptype]
+}
+
+// waitForCalls polls until GetPinglist(ptype) has been called at least want
+// times, failing the test after timeout.
+func waitForCalls(t *testing.T, client *mockControllerClient, ptype controller_agent.PinglistType, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for client.callCount(ptype) < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("GetPinglist(%v) called %d times, want >= %d within %v",
+				ptype, client.callCount(ptype), want, timeout)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestEarlyRefreshBackoff(t *testing.T) {
+	b := newEarlyRefreshBackoff(30*time.Second, 300*time.Second)
+	if got := b.delay(); got != 30*time.Second {
+		t.Fatalf("initial delay = %v, want 30s", got)
+	}
+	for _, want := range []time.Duration{60, 120, 240, 300, 300} {
+		b.observe(false)
+		if got := b.delay(); got != want*time.Second {
+			t.Fatalf("delay after unchanged refresh = %v, want %v", got, want*time.Second)
+		}
+	}
+	b.observe(true)
+	if got := b.delay(); got != 30*time.Second {
+		t.Errorf("delay after changed refresh = %v, want reset to 30s", got)
+	}
+
+	// A base above the cap (e.g. a short update interval) clamps to the cap.
+	if got := newEarlyRefreshBackoff(30*time.Second, time.Second).delay(); got != time.Second {
+		t.Errorf("clamped delay = %v, want 1s", got)
+	}
+}
+
+func TestQPNChanged(t *testing.T) {
+	prev := map[string]uint32{"g1": 10, "g2": 20}
+	cases := []struct {
+		name string
+		cur  map[string]uint32
+		want bool
+	}{
+		{"identical", map[string]uint32{"g1": 10, "g2": 20}, false},
+		{"membership only (inter-ToR resample)", map[string]uint32{"g1": 10, "g3": 30}, false},
+		{"empty", map[string]uint32{}, false},
+		{"qpn replaced", map[string]uint32{"g1": 10, "g2": 21}, true},
+	}
+	for _, tc := range cases {
+		if got := qpnChanged(prev, tc.cur); got != tc.want {
+			t.Errorf("%s: qpnChanged = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestClusterMonitor_RefreshHint_TriggersEarlyRefresh verifies that a
+// prober refresh hint causes a pinglist fetch long before the next tick.
+func TestClusterMonitor_RefreshHint_TriggersEarlyRefresh(t *testing.T) {
+	client := newMockControllerClient()
+	client.enqueue(controller_agent.PinglistType_TOR_MESH,
+		[]*controller_agent.PingTarget{{TargetGid: "g1", TargetQpn: 10}}, nil)
+	client.enqueue(controller_agent.PinglistType_TOR_MESH,
+		[]*controller_agent.PingTarget{{TargetGid: "g1", TargetQpn: 11}}, nil)
+
+	prober := newTestProber()
+	prober.refreshHint = make(chan struct{}, 1)
+	monitor := NewClusterMonitor(client, prober, "agent-1", "tor-1", "gid-requester", 3600)
+	monitor.logger = zerolog.Nop()
+	monitor.minEarlyRefresh = 10 * time.Millisecond
+
+	if err := monitor.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer monitor.Stop()
+
+	waitForCalls(t, client, controller_agent.PinglistType_TOR_MESH, 1, 2*time.Second)
+	time.Sleep(20 * time.Millisecond) // let the base delay elapse
+	prober.refreshHint <- struct{}{}
+	waitForCalls(t, client, controller_agent.PinglistType_TOR_MESH, 2, 2*time.Second)
+
+	prober.targetsMu.RLock()
+	defer prober.targetsMu.RUnlock()
+	if len(prober.targets) != 1 || prober.targets[0].GetTargetQpn() != 11 {
+		t.Errorf("prober targets after early refresh = %v, want the refreshed QPN 11", prober.targets)
+	}
+}
+
+// TestClusterMonitor_RefreshHint_RateLimited verifies that a hint arriving
+// before the backoff delay has elapsed since the last fetch is dropped.
+func TestClusterMonitor_RefreshHint_RateLimited(t *testing.T) {
+	client := newMockControllerClient()
+	client.enqueue(controller_agent.PinglistType_TOR_MESH, []*controller_agent.PingTarget{targetWithGID("g1")}, nil)
+
+	prober := newTestProber()
+	prober.refreshHint = make(chan struct{}, 1)
+	monitor := NewClusterMonitor(client, prober, "agent-1", "tor-1", "gid-requester", 3600)
+	monitor.logger = zerolog.Nop()
+	monitor.minEarlyRefresh = time.Hour
+
+	if err := monitor.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer monitor.Stop()
+
+	waitForCalls(t, client, controller_agent.PinglistType_TOR_MESH, 1, 2*time.Second)
+	prober.refreshHint <- struct{}{}
+	time.Sleep(100 * time.Millisecond)
+	if got := client.callCount(controller_agent.PinglistType_TOR_MESH); got != 1 {
+		t.Errorf("GetPinglist called %d times, want 1 (hint within backoff delay must be dropped)", got)
+	}
+}
+
+// TestClusterMonitor_EmptyPinglist_RetriesEarly verifies that an agent whose
+// first fetch returns no targets (e.g. it registered before its peers)
+// retries without waiting for the update interval.
+func TestClusterMonitor_EmptyPinglist_RetriesEarly(t *testing.T) {
+	client := newMockControllerClient()
+	client.enqueue(controller_agent.PinglistType_TOR_MESH, nil, nil)
+	client.enqueue(controller_agent.PinglistType_TOR_MESH, []*controller_agent.PingTarget{targetWithGID("g1")}, nil)
+
+	prober := newTestProber()
+	monitor := NewClusterMonitor(client, prober, "agent-1", "tor-1", "gid-requester", 3600)
+	monitor.logger = zerolog.Nop()
+	monitor.minEarlyRefresh = 10 * time.Millisecond
+
+	if err := monitor.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer monitor.Stop()
+
+	waitForCalls(t, client, controller_agent.PinglistType_TOR_MESH, 2, 2*time.Second)
+
+	// Once the pinglist is non-empty, no further early retries happen.
+	time.Sleep(100 * time.Millisecond)
+	if got := client.callCount(controller_agent.PinglistType_TOR_MESH); got != 2 {
+		t.Errorf("GetPinglist called %d times, want 2 (no retry once targets exist)", got)
 	}
 }

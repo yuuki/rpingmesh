@@ -34,6 +34,15 @@ const (
 	// is considered stale and eligible for cleanup.
 	stalePendingTimeout = 30 * time.Second
 
+	// staleTargetTimeoutStreak is the number of consecutive ACK timeouts to
+	// one target (GID + QPN) after which the prober asks its ClusterMonitor
+	// for an early pinglist refresh. A restarted peer re-registers its RNIC
+	// under a new responder QPN, so probes addressed to the old QPN time out
+	// until the pinglist is refreshed; requesting a refresh on a timeout
+	// streak bounds that window by the stale-pending timeout rather than the
+	// (much longer) pinglist update interval.
+	staleTargetTimeoutStreak = 3
+
 	// stalePendingCleanupPeriod is the wall-clock interval between stale-pending
 	// sweeps. Using elapsed time (rather than a tick count) decouples cleanup
 	// cadence from the probe interval, so the sweep runs at a predictable rate
@@ -271,6 +280,24 @@ type Prober struct {
 	// key, same goroutine confinement, and pruned alongside labelRotation.
 	labelCache map[string]*labelSet
 
+	// timeoutStreak counts consecutive ACK timeouts per target key (GID and
+	// QPN, see targetKey), reset by any completed probe to that target and
+	// cleared on every UpdateTargets. currentKeys is the key set of the
+	// current pinglist: timeouts of probes addressed to a key no longer in it
+	// (sent before a refresh replaced the QPN, but expiring after it) are not
+	// counted, so they cannot re-trigger a refresh that already happened.
+	// Written from both the probe-loop goroutine (timeouts) and the ACK
+	// goroutine (completions), hence streakMu.
+	streakMu      sync.Mutex
+	timeoutStreak map[string]int
+	currentKeys   map[string]struct{}
+
+	// refreshHint carries a request for an early pinglist refresh to the
+	// ClusterMonitor (see staleTargetTimeoutStreak). Buffered with capacity 1
+	// and written non-blockingly, so repeated requests coalesce. Nil for a
+	// struct-literal Prober, which then never requests refreshes.
+	refreshHint chan struct{}
+
 	logger zerolog.Logger
 }
 
@@ -324,6 +351,7 @@ func NewProber(device *rdmabridge.Device, ring *rdmabridge.EventRing, probeInter
 	}
 
 	p := &Prober{
+		refreshHint:                make(chan struct{}, 1),
 		queue:                      queue,
 		ring:                       ring,
 		device:                     device,
@@ -585,6 +613,19 @@ func (p *Prober) UpdateTargets(targets []*controller_agent.PingTarget) {
 	defer p.targetsMu.Unlock()
 	p.targets = targets
 
+	// A new pinglist may carry fresh QPNs for previously failing targets, so
+	// timeout streaks restart from zero against the new list.
+	keys := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		if t != nil {
+			keys[targetKey(t)] = struct{}{}
+		}
+	}
+	p.streakMu.Lock()
+	p.timeoutStreak = nil
+	p.currentKeys = keys
+	p.streakMu.Unlock()
+
 	// Keep each type's aggregate limiter in sync with its per-target rate so the
 	// per-target cadence survives pinglist size changes (a type whose count
 	// shrinks must slow its aggregate, and vice versa). Lock order is always
@@ -610,6 +651,59 @@ func (p *Prober) UpdateTargets(targets []*controller_agent.PingTarget) {
 // for consumption by the telemetry/metrics layer.
 func (p *Prober) Results() <-chan *probe.ProbeResult {
 	return p.resultChan
+}
+
+// RefreshHint returns a channel that receives a value when the prober has
+// observed staleTargetTimeoutStreak consecutive ACK timeouts to some target
+// and the pinglist should be refreshed early. It returns nil (never ready)
+// for a Prober built without NewProber.
+func (p *Prober) RefreshHint() <-chan struct{} {
+	return p.refreshHint
+}
+
+// targetKey identifies a probe target by GID and responder QPN, so a target
+// that re-registered under a new QPN starts a fresh timeout streak.
+func targetKey(target *controller_agent.PingTarget) string {
+	return fmt.Sprintf("%s/%d", target.GetTargetGid(), target.GetTargetQpn())
+}
+
+// recordTargetOutcome updates the consecutive-timeout streak for target and
+// requests an early pinglist refresh when the streak reaches
+// staleTargetTimeoutStreak. The streak restarts after each request, so a
+// target that stays unreachable keeps re-requesting at most once per
+// streak; the ClusterMonitor rate-limits the resulting fetches.
+func (p *Prober) recordTargetOutcome(target *controller_agent.PingTarget, timedOut bool) {
+	if target == nil {
+		return
+	}
+	key := targetKey(target)
+
+	p.streakMu.Lock()
+	if !timedOut {
+		delete(p.timeoutStreak, key)
+		p.streakMu.Unlock()
+		return
+	}
+	if _, current := p.currentKeys[key]; !current {
+		p.streakMu.Unlock()
+		return
+	}
+	if p.timeoutStreak == nil {
+		p.timeoutStreak = make(map[string]int)
+	}
+	p.timeoutStreak[key]++
+	fire := p.timeoutStreak[key] >= staleTargetTimeoutStreak
+	if fire {
+		delete(p.timeoutStreak, key)
+	}
+	p.streakMu.Unlock()
+
+	if fire && p.refreshHint != nil {
+		select {
+		case p.refreshHint <- struct{}{}:
+		default: // a request is already pending
+		}
+	}
 }
 
 // probeLoop runs on a ticker at probeInterval, sending one probe packet
@@ -1125,6 +1219,10 @@ func (p *Prober) emitResult(result *probe.ProbeResult) {
 // results channel. It is called without holding pendingMu so a slow consumer
 // cannot stall ACK processing under the lock.
 func (p *Prober) deliverResult(seqNum uint64, target *controller_agent.PingTarget, result *probe.ProbeResult) {
+	// Both ACKs arrived, so the target's QPN is live regardless of whether
+	// the RTT itself validates.
+	p.recordTargetOutcome(target, false)
+
 	rtt := probe.CalculateRTT(result)
 
 	p.logger.Debug().
@@ -1153,6 +1251,7 @@ func (p *Prober) deliverResult(seqNum uint64, target *controller_agent.PingTarge
 func (p *Prober) cleanupStalePending() {
 	now := time.Now()
 	var stale []*probe.ProbeResult
+	var staleTargets []*controller_agent.PingTarget
 
 	p.pendingMu.Lock()
 	for seqNum, pp := range p.pending {
@@ -1164,6 +1263,7 @@ func (p *Prober) cleanupStalePending() {
 			result.Success = false
 			result.ErrorMessage = "timed out waiting for ACKs"
 			stale = append(stale, &result)
+			staleTargets = append(staleTargets, pp.target)
 			delete(p.pending, seqNum)
 		}
 	}
@@ -1173,6 +1273,9 @@ func (p *Prober) cleanupStalePending() {
 	// consumer cannot stall the probe loop.
 	for _, result := range stale {
 		p.emitResult(result)
+	}
+	for _, target := range staleTargets {
+		p.recordTargetOutcome(target, true)
 	}
 
 	if len(stale) > 0 {

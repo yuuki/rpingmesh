@@ -34,12 +34,19 @@ import (
 )
 
 // Histogram bucket boundaries in nanoseconds, covering sub-microsecond to
-// 10ms ranges typical for datacenter RDMA networks:
-//
-//	100ns, 500ns, 1us, 5us, 10us, 50us, 100us, 500us, 1ms, 5ms, 10ms
+// 10ms ranges typical for datacenter RDMA networks. Resolution is densest
+// in 1us-10us, where RoCEv2 network RTTs on modern datacenter fabrics
+// typically land: with only 1us/5us/10us boundaries, a regression within
+// that range stays in one bucket and is invisible to histogram_quantile. The ladder is a
+// superset of internal/probe's rttBucketBoundariesNs so dashboard and
+// analyzer percentiles share every boundary the analyzer uses.
 var rttBucketBoundaries = []float64{
-	100, 500, 1_000, 5_000, 10_000,
-	50_000, 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000,
+	100, 250, 500,
+	1_000, 1_500, 2_000, 2_500, 3_000, 3_500, 4_000, 4_500,
+	5_000, 6_000, 7_000, 8_000, 9_000, 10_000,
+	12_500, 15_000, 20_000, 25_000, 50_000,
+	100_000, 250_000, 500_000,
+	1_000_000, 2_500_000, 5_000_000, 10_000_000,
 }
 
 // periodicReaderInterval is the interval at which the OTLP periodic reader
@@ -161,15 +168,23 @@ func instanceID() string {
 // one Prometheus series -- rate() then mixes counters from unrelated
 // processes, corrupting every rate/quantile derived from it. See
 // docs/design/grafana-dashboards.md's "identity contract" note.
+//
+// host.name is set alongside it because some collector pipelines strip
+// service.instance.id as a "redundant" label before export and identify
+// sources by host.name instead; without host.name such a pipeline would
+// again collapse every agent onto one series.
 func buildResource(serviceName string) (*resource.Resource, error) {
+	attrs := []attribute.KeyValue{
+		semconv.ServiceName(serviceName),
+		semconv.ServiceVersion(buildinfo.Version),
+		semconv.ServiceInstanceID(instanceID()),
+	}
+	if host, err := os.Hostname(); err == nil && host != "" {
+		attrs = append(attrs, semconv.HostName(host))
+	}
 	return resource.Merge(
 		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName(serviceName),
-			semconv.ServiceVersion(buildinfo.Version),
-			semconv.ServiceInstanceID(instanceID()),
-		),
+		resource.NewWithAttributes(semconv.SchemaURL, attrs...),
 	)
 }
 

@@ -230,7 +230,7 @@ via Cgo (`CGO_ENABLED=1`).
 | `target_probe_rate_per_second` | `10` | Legacy **uniform** per-target probe-rate cap. Used as the fallback for whichever per-type cap below is `0`, so a config that only sets this keeps a single uniform rate (a target's ECMP flow labels share this budget) |
 | `tor_mesh_probe_rate_per_second` | `0`† | Per-target probe-rate cap for **ToR-mesh** targets (`0` = inherit `target_probe_rate_per_second`) |
 | `inter_tor_probe_rate_per_second` | `0`† | Per-target probe-rate cap for **inter-ToR** targets (`0` = inherit `target_probe_rate_per_second`) |
-| `pinglist_update_interval_sec` | `300` | Seconds between pinglist refreshes |
+| `pinglist_update_interval_sec` | `300` | Seconds between regular pinglist refreshes. Repeated ACK timeouts to a target (e.g. a restarted peer with a new QPN) or an empty pinglist trigger an earlier refresh, backed off from 30 s up to this interval |
 | `flow_label_rotation_period_sec` | `3600` | Period over which the rotating ~20% of each target's ECMP flow-label set is refreshed |
 | `gid_index` | `0` | GID table index on RDMA devices (0-255; see note below) |
 | `service_level` | `0` | Service Level (SL, PFC priority) applied to every Address Handle (0-7) |

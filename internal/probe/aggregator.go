@@ -40,7 +40,7 @@ type PathSummary struct {
 // rttBucketBoundariesNs are the upper bounds (nanoseconds) of the fixed
 // histogram buckets used to estimate RTT percentiles without retaining every
 // sample. They span 100ns to 10ms, the datacenter-RDMA RTT range, matching the
-// telemetry package's histogram boundaries. A value greater than the last
+// telemetry package's histogram boundaries (which are a superset of these). A value greater than the last
 // boundary falls into an implicit overflow bucket whose representative value is
 // the last boundary (percentiles are conservative upper-bound estimates). Exact
 // min/max are tracked separately, so extremes are never lost to bucketing.
@@ -48,6 +48,12 @@ var rttBucketBoundariesNs = []uint64{
 	100, 250, 500, 1_000, 2_500, 5_000, 10_000,
 	25_000, 50_000, 100_000, 250_000, 500_000,
 	1_000_000, 2_500_000, 5_000_000, 10_000_000,
+}
+
+// RTTBucketBoundariesNs returns a copy of the aggregation bucket ladder so
+// other packages (e.g. telemetry) can check their own ladders against it.
+func RTTBucketBoundariesNs() []uint64 {
+	return append([]uint64(nil), rttBucketBoundariesNs...)
 }
 
 // pathAccumulator accumulates probe outcomes for one path within one window.

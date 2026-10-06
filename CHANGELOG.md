@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `make build-zig` builds `librdmabridge.a` in ReleaseSafe (previously Debug,
+  because `preferred_optimize_mode` only applies with `--release`).
+- The RTT/delay histograms use a denser bucket ladder in 1–10 µs, where
+  RoCEv2 network RTTs typically land, and are a superset of the analyzer's
+  aggregation buckets. Dashboards keep working; quantiles become finer.
+- The OTel resource also carries `host.name`, so collector pipelines that drop
+  `service.instance.id` still keep agents on distinct series.
+
+### Fixed
+
+- Link `librdmabridge.a` with older system linkers (e.g. GNU ld 2.35 on
+  RHEL 9): always emit it through LLVM and bundle compiler-rt.
+- The agent's default `otel_collector_addr` was `grpc://localhost:4317`, which
+  the OTLP exporter cannot dial, so metrics were silently never exported
+  without an explicit setting. The default is now `localhost:4317`, and both
+  agent and controller reject an address with a URL scheme at startup.
+- After a peer agent restarts (new responder QPN), probers no longer report
+  100% loss to it until the next pinglist update (default 300 s): a streak of
+  ACK timeouts to a target triggers an early, backed-off pinglist refresh, and
+  an empty pinglist is retried early as well.
+
 ## [0.2.1] - 2026-08-24
 
 ### Changed

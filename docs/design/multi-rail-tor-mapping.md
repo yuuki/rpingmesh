@@ -112,6 +112,33 @@ None of them reproduces "same leaf"; they are fallbacks only.
   `tor_id` while it requests pinglists per device ToR, which yields empty
   ToR-meshes.
 
+## Field observations (step 1 of the plan)
+
+Facts collected with `collect_rnic_facts.py` on two production GPU
+environments with different fabric designs:
+
+- **LLDP (B2) was not usable in either.** An LLDP daemon runs on the hosts,
+  but its control socket is root/group-only, and even as root it reports no
+  neighbor on the RoCE ports (the frames are presumably consumed by NIC
+  firmware or not sent by the switch). B2 cannot be the default source.
+- **Device naming is consistent across hosts** in both environments: a given
+  device name always sits on the same rail, so `--rail-key device` is a sound
+  rail key once storage/management rails and InfiniBand ports are excluded.
+- **Subnet layouts differ:**
+  - one environment uses one /24 per rail spanning every group, so the subnet
+    identifies the rail, not the leaf;
+  - the other assigns a small per-host, per-rail subnet (routed to the host
+    port), so the subnet identifies neither.
+  B3 therefore does not hold in either environment. B4 needs a group source.
+- **No Slurm topology plugin** is configured, so `scontrol show topology` is
+  empty. Partition names may still encode groups (e.g. one partition per
+  pod), which can feed `--host-groups`.
+
+Consequence: in these environments the only inventory-free way to learn which
+RNICs share a leaf is the RTT clustering of step 2 (B5); B4 with a group list
+taken from the cabling plan or partition layout is the practical naming
+source, validated by B5.
+
 ## Verification plan
 
 All steps are read-only or use the agent's normal probing; no switch or host

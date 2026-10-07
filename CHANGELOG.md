@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-07
+
 ### Changed
 
 - Require Go 1.27.1 or later and Zig 0.17.0 (the Zig library now gets its C

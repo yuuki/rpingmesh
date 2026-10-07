@@ -487,7 +487,7 @@ Each release tag publishes Linux/amd64 `.deb`, `.rpm`, and binary-only
 installation:
 
 ```sh
-gh release download v0.2.1 --repo yuuki/rpingmesh \
+gh release download v0.3.0 --repo yuuki/rpingmesh \
     --pattern 'rpingmesh-*' --pattern checksums.txt
 sha256sum -c checksums.txt
 sudo apt install ./rpingmesh-controller_*.deb

@@ -25,8 +25,6 @@ demo them. The accompanying implementation lands `dashboards/*.json`,
 
 ## Non-Goals
 
-- No alerting rules in the first round (the metric contract is designed to make
-  them trivial to add later; see Future work).
 - No Phase-2 localization / path-tracing views — those depend on data the
   analyzer does not yet emit (`analyzer-phase2-localization.md`).
 - No dashboard-generation toolchain (Grafonnet / Foundation SDK). Committed JSON
@@ -52,9 +50,12 @@ which is exactly what a Prometheus-style backend expects.
 | `rpingmesh.analyzer.path_summaries_total` | Counter | (none) | Per-path window summaries ingested |
 | `rpingmesh.analyzer.sla_violations_total` | Counter | `source_tor`, `target_tor`, `kind` ∈ {loss, rtt} | SLA violations detected |
 
-All three histograms share the same 11 explicit bucket boundaries in
-nanoseconds: `100, 500, 1 000, 5 000, 10 000, 50 000, 100 000, 500 000,
-1 000 000, 5 000 000, 10 000 000` (plus the implicit `+Inf`). Cardinality is
+All three histograms share the same 29 explicit bucket boundaries in
+nanoseconds, dense in 1–10 µs where RoCEv2 network RTTs land: `100, 250, 500,
+1 000, 1 500, …, 10 000` (500 ns steps to 5 µs, then 1 µs steps), then
+`12 500, 15 000, 20 000, 25 000, 50 000, 100 000, 250 000, 500 000, 1 000 000,
+2 500 000, 5 000 000, 10 000 000` (plus the implicit `+Inf`); see
+`rttBucketBoundaries` in `internal/telemetry/otel_metrics.go`. Cardinality is
 deliberately ToR-level only — GID detail is confined to debug logs.
 Unset `tor_id` appears as the nonempty label `unspecified` on those
 attributes so Grafana template variables and the ToR×ToR matrix still
@@ -108,6 +109,27 @@ same fixed names:
 they are unaffected by the strategy choice. The seed script emits these exact
 names, closing the loop: exporter, dashboards, and seed all agree.
 
+**Unescaped (dotted) names.** Not every pipeline escapes dots. A collector or
+backend running in UTF-8 mode stores the OTLP names as they are
+(`rpingmesh.probe_total`, `rpingmesh.agent.self_throttle`,
+`rpingmesh.network_rtt_ns_bucket`), and on-hardware verification found a
+production VictoriaMetrics doing exactly that, which left every panel empty.
+Dashboards and alert rules therefore select metrics by regex on `__name__`,
+accepting a dot or an underscore at each position where the OTLP name has a
+dot:
+
+```
+{__name__=~"rpingmesh[._]probe_total"}
+{__name__=~"rpingmesh[._]agent[._]self_throttle"}
+{__name__=~"rpingmesh[._]network_rtt_ns_bucket", source_tor="$source_tor"}
+```
+
+The suffix contract above still matters (no `_total_total`); only the
+separator is left open. One backend must not hold both styles for the same
+series, since every aggregation would count them twice.
+`scripts/seed-demo-metrics.sh` seeds either style (`NAME_STYLE=dotted`), and
+`make obs-verify` runs every dashboard query and alert rule against it.
+
 **Identity contract: `job` and `instance`.** The name contract above is
 necessary but not sufficient: a metric name plus its `source_tor`/`target_tor`
 attributes does not uniquely identify a *series* across a real deployment with
@@ -157,7 +179,7 @@ point:
   cell), which is correct — there is no loss ratio to report when there were
   no probes.
 - A **companion "Worst ToR pairs" table** (`topk` by loss%) carrying the
-  drilldown data link. See Decision 3 for why the clickable path lives here and
+  drilldown data link. See Decision 4 for why the clickable path lives here and
   not on the matrix cells.
 - **Failure and SLA time series**: failure rate by `reason`, SLA-violation rate
   by `kind`, and an instant SLA-by-pair table (also clickable).
@@ -181,7 +203,50 @@ variable-scoped and only meaningful once a pair is chosen. Splitting keeps each
 board's queries cheap and its purpose single. A third Phase-2 localization board
 is deferred (Future work).
 
-## Decision 3: the drilldown mechanism (data links)
+## Decision 3: alerting rules
+
+`deploy/observability/alerts/rpingmesh.rules.yml` is a vmalert/Prometheus rule
+file, evaluated by the `vmalert` service of the demo stack and usable as-is by
+any Prometheus-compatible ruler that accepts regex `__name__` selectors and
+dotted label names (VictoriaMetrics, Prometheus 3+).
+
+| Alert | Severity | Signal |
+|---|---|---|
+| `RpingmeshTorPairLoss` / `…Critical` | warning / critical | ACK-timeout ratio per ToR pair > 1% for 5 min / > 10% for 3 min |
+| `RpingmeshTorPairNoSuccess` | critical | A pair is probed but nothing succeeds for 5 min (black hole) |
+| `RpingmeshSLAViolation` | warning | The analyzer flagged loss or p99-RTT SLA windows in the last 10 min |
+| `RpingmeshProbeSendErrors` | warning | An agent keeps failing to post probes (local RNIC/driver) |
+| `RpingmeshEventRingDrops` | warning | An agent dropped completion events, so its loss may be an artifact |
+| `RpingmeshAgentSelfThrottled` | warning | Self-protection held the probe rate below 1× for 15 min |
+| `RpingmeshAgentStoppedReporting` | critical | An agent reported 10–70 min ago but not in the last 10 min |
+| `RpingmeshNoTelemetry` | critical | No probe metrics at all for 15 min |
+| `RpingmeshAnalyzerNotIngesting` | warning | Agents probe but the analyzer ingests no summaries |
+
+Choices worth recording:
+
+- **Loss is timeouts, not "not success".** `invalid_rtt` is clock noise and
+  `send_error` is local, so neither counts as fabric loss; the analyzer uses
+  the same definition.
+- **No direct RTT alert.** The analyzer owns the RTT SLA
+  (`analyzer_sla_network_rtt_p99_ns`) and `RpingmeshSLAViolation` surfaces it,
+  so the threshold lives in one place instead of drifting between controller
+  config and rule files.
+- **Agent identity is normalized.** Depending on the pipeline the agent shows
+  up as `instance` (from `service.instance.id`) or `host.name` (resource
+  attributes promoted to labels). Per-agent rules build an `agent` label with
+  `label_join(..., "agent", "", "instance", "host.name")`, which yields
+  whichever one exists.
+- **Stopped agents are detected by disappearance.** A series that existed
+  10–70 minutes ago and has no sample in the last 10 minutes fires
+  `RpingmeshAgentStoppedReporting`; a fleet-wide outage is covered separately
+  by `RpingmeshNoTelemetry`.
+
+The demo stack wires vmalert with `-notifier.blackhole`; a deployment points
+`-notifier.url` at its Alertmanager. VictoriaMetrics proxies vmalert's rules
+API (`-vmalert.proxyURL`), so Grafana lists the rules and their state from the
+existing datasource.
+
+## Decision 4: the drilldown mechanism (data links)
 
 Drilldown is a Grafana **data link** from Overview → Pair Drilldown, passing
 `var-source_tor` and `var-target_tor` on the URL and preserving the time range.
@@ -267,10 +332,17 @@ The stack is validated end to end without any RDMA hardware:
    `histogram_quantile()` have ≥2 points to work with.
 3. **Assert Grafana health and provisioning** — `GET /api/health` is `ok`;
    `GET /api/search` lists both dashboards (provisioning succeeded).
-4. **Assert every panel query returns data** — replay each panel's PromQL through
-   `POST /api/ds/query` (or the datasource proxy) and assert HTTP 200 with a
-   non-empty frame. This catches name-contract drift directly: if the exporter
-   ever re-introduces a suffix, these queries return empty and the check fails.
+4. **Assert every panel query returns data** — `scripts/verify-observability.sh`
+   extracts every panel target and template variable from the committed
+   dashboard JSON and replays it against VictoriaMetrics. This catches
+   name-contract drift directly: if the exporter ever re-introduces a suffix,
+   these queries return empty and the check fails.
+5. **Assert the alert rules** — the same script evaluates every rule
+   expression against the seed and requires that exactly the alerts the seed
+   was built to trigger (loss on two degraded pairs, analyzer SLA violations)
+   return series and every other rule stays quiet, then checks that vmalert
+   loaded all rules without evaluation errors. Running it once per
+   `NAME_STYLE` covers both metric-name styles.
 
 Exact commands are in the implementation spec.
 
@@ -283,9 +355,6 @@ Exact commands are in the implementation spec.
 - **Phase-2 localization view**: a third dashboard over the analyzer's
   path/segment attribution once those metrics exist
   (`analyzer-phase2-localization.md`).
-- **Alerting rules**: the metric contract already supports the obvious alerts —
-  per-pair loss ratio, per-pair p99 breach, sustained self-throttle < 1, and any
-  event-ring drops — as Grafana or vmalert rules.
 - **Dashboards-as-code**: migrate the committed JSON to Grafonnet/Foundation SDK
   if the board count grows or duplication between Overview and Drilldown becomes
   a maintenance cost.

@@ -1,0 +1,159 @@
+# R-Pingmesh alerting rules (vmalert / Prometheus rule-file format).
+#
+# Metric names are matched with {__name__=~"rpingmesh[._]..."} so the same
+# rules work whether the OTLP pipeline escapes dots to underscores
+# (rpingmesh_probe_total, as in deploy/observability) or keeps the OTLP names
+# (rpingmesh.probe_total, as UTF-8-aware backends do). Do not store both styles
+# for the same series in one backend: the aggregations below would then count
+# them twice.
+#
+# Per-agent rules derive an `agent` label with
+#   label_join(..., "agent", "", "instance", "host.name")
+# because the agent identity reaches the backend either as `instance` (from
+# service.instance.id, e.g. the prometheus_remote_write exporter) or as
+# `host.name` (resource attributes promoted to labels). Dotted label names in
+# PromQL functions need VictoriaMetrics or Prometheus 3+.
+#
+# Thresholds are starting points; tune them per fabric. RTT is not alerted on
+# directly: the controller's analyzer owns the RTT SLA
+# (analyzer_sla_network_rtt_p99_ns), and RpingmeshSLAViolation surfaces it, so
+# the threshold lives in one place. See docs/design/grafana-dashboards.md.
+
+groups:
+  - name: rpingmesh-fabric
+    interval: 30s
+    rules:
+      # Probe loss = ACK timeouts / probes, per ToR pair. invalid_rtt
+      # (clock noise) and send errors are excluded on purpose; send errors
+      # have their own rule.
+      - alert: RpingmeshTorPairLoss
+        expr: |
+          100 * sum by (source_tor, target_tor) (rate({__name__=~"rpingmesh[._]probe_failed_total", reason="timeout"}[5m]))
+            / (sum by (source_tor, target_tor) (rate({__name__=~"rpingmesh[._]probe_total"}[5m])) > 0)
+            > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Probe loss {{ $value | printf \"%.2f\" }}% from {{ $labels.source_tor }} to {{ $labels.target_tor }}"
+          description: "More than 1% of probes between these ToRs timed out for 5 minutes. Open the ToR Pair Drilldown dashboard for this pair."
+
+      - alert: RpingmeshTorPairLossCritical
+        expr: |
+          100 * sum by (source_tor, target_tor) (rate({__name__=~"rpingmesh[._]probe_failed_total", reason="timeout"}[5m]))
+            / (sum by (source_tor, target_tor) (rate({__name__=~"rpingmesh[._]probe_total"}[5m])) > 0)
+            > 10
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Probe loss {{ $value | printf \"%.2f\" }}% from {{ $labels.source_tor }} to {{ $labels.target_tor }}"
+          description: "More than 10% of probes between these ToRs timed out for 3 minutes."
+
+      # A pair that is probed but never succeeds is a black hole (or every
+      # target's QPN is stale), which the loss ratio alone reports late.
+      - alert: RpingmeshTorPairNoSuccess
+        expr: |
+          sum by (source_tor, target_tor) (rate({__name__=~"rpingmesh[._]probe_total"}[5m])) > 0
+            unless on (source_tor, target_tor)
+          sum by (source_tor, target_tor) (rate({__name__=~"rpingmesh[._]probe_success_total"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful probes from {{ $labels.source_tor }} to {{ $labels.target_tor }}"
+          description: "Probes between these ToRs are being sent but none succeeded for 5 minutes."
+
+      # The analyzer applies the per-path loss and p99 network-RTT SLAs
+      # configured on the controller (analyzer_sla_*).
+      - alert: RpingmeshSLAViolation
+        expr: |
+          sum by (source_tor, target_tor, kind) (increase({__name__=~"rpingmesh[._]analyzer[._]sla_violations_total"}[10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.kind }} SLA violated on {{ $labels.source_tor }} -> {{ $labels.target_tor }}"
+          description: "The controller's analyzer flagged {{ $value | printf \"%.0f\" }} path windows in the last 10 minutes. Per-path GID detail is in the controller logs."
+
+  - name: rpingmesh-agents
+    interval: 30s
+    rules:
+      # Send errors point at the local RNIC/driver (e.g. address-handle or
+      # post-send failures), not the fabric.
+      - alert: RpingmeshProbeSendErrors
+        expr: |
+          sum by (agent, source_tor) (label_join(rate({__name__=~"rpingmesh[._]probe_failed_total", reason="send_error"}[5m]), "agent", "", "instance", "host.name")) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent {{ $labels.agent }} fails to send probes"
+          description: "Probe send errors for 10 minutes; check the agent log and the RNIC state on the host."
+
+      # Completion events dropped on a full Zig->Go ring make probes look
+      # lost; the agent is not draining its rings fast enough.
+      - alert: RpingmeshEventRingDrops
+        expr: |
+          sum by (agent, ring) (label_join(increase({__name__=~"rpingmesh[._]event_ring_dropped_total"}[10m]), "agent", "", "instance", "host.name")) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent {{ $labels.agent }} dropped {{ $labels.ring }} completion events"
+          description: "{{ $value | printf \"%.0f\" }} events dropped in 10 minutes; loss on this agent's paths may be an artifact."
+
+      # Emitted only when self_protection_enabled. A multiplier below 1 for
+      # 15 minutes means the agent has been shedding probe load.
+      - alert: RpingmeshAgentSelfThrottled
+        expr: |
+          max by (agent) (label_join(max_over_time({__name__=~"rpingmesh[._]agent[._]self_throttle"}[15m]), "agent", "", "instance", "host.name")) < 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent {{ $labels.agent }} has been self-throttled for 15 minutes"
+          description: "Probe rate multiplier stayed below 1 (max {{ $value }}); the host is short of CPU or memory for the agent."
+
+      # An agent that reported 10-70 minutes ago but not in the last 10
+      # minutes has stopped (crash, host down, or its OTLP export broke). The
+      # alert resolves itself after 70 minutes of silence; the fleet-level
+      # rule below still covers a total outage.
+      - alert: RpingmeshAgentStoppedReporting
+        expr: |
+          count by (agent) (label_join(last_over_time({__name__=~"rpingmesh[._]probe_total"}[1h] offset 10m), "agent", "", "instance", "host.name"))
+            unless on (agent)
+          count by (agent) (label_join(last_over_time({__name__=~"rpingmesh[._]probe_total"}[10m]), "agent", "", "instance", "host.name"))
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Agent {{ $labels.agent }} stopped reporting probe metrics"
+          description: "No probe metrics from this agent for at least 10 minutes. Check the rpingmesh-agent service on the host."
+
+  - name: rpingmesh-pipeline
+    interval: 1m
+    rules:
+      - alert: RpingmeshNoTelemetry
+        expr: |
+          absent_over_time({__name__=~"rpingmesh[._]probe_total"}[15m])
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No R-Pingmesh probe metrics in 15 minutes"
+          description: "No agent has exported probe metrics for 15 minutes; check the agents, the OTLP collector, and the metrics backend."
+
+      # Agents are probing but the analyzer ingests nothing: the controller
+      # is down, unreachable, or analysis reporting is disabled on the agents.
+      - alert: RpingmeshAnalyzerNotIngesting
+        expr: |
+          (sum(rate({__name__=~"rpingmesh[._]analyzer[._]path_summaries_total"}[10m])) or vector(0)) == 0
+            and on ()
+          sum(rate({__name__=~"rpingmesh[._]probe_total"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "R-Pingmesh analyzer is not ingesting path summaries"
+          description: "Agents are probing but the controller's analyzer received no path summaries for 10 minutes, so SLA violations are not being detected."

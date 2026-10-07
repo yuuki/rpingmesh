@@ -54,6 +54,8 @@ scope.
 
 **Ring buffer event delivery** — Zig's CQ poller thread writes `rdma_completion_event_t` into a lock-free SPSC ring buffer. Go polls via `rdma_event_ring_poll()` in a goroutine — never as a Cgo callback. This is why `EventRing` must be created *before* `Queue` and passed into `rdma_create_queue()`. The ring is shared between the Zig producer and Go consumer across `internal/rdmabridge/bridge.go` ↔ `zig/src/ring.zig`.
 
+**Event-driven waits (`cq_poll_mode`)** — In event mode the CQ poller arms the CQ (`ibv_req_notify_cq`) *before* draining it and then sleeps in `poll()` on the queue's completion channel (`zig/src/cq.zig`); after a drained batch it writes the ring's `eventfd`, and the Go consumer blocks on a dup of that fd via the netpoller (`RingWaiter` in `internal/rdmabridge/ring_waiter.go`, `newRingIdleWait` in `internal/agent/ring_wait.go`). Busy mode is the old poll-based design on both sides (~50 µs nanosleep in Zig, 100 µs timer in Go). `auto` = event with HW timestamps, busy with SW timestamps, because SW timestamps are taken at poll time and absorb wakeup latency. Keep the arm-then-drain order and keep notifying the eventfd in busy mode (a queue can fall back from event to busy at runtime while its Go consumer still waits on the fd).
+
 **40-byte BigEndian wire format** — The probe packet uses explicit BigEndian serialization (no packed structs). The format is defined in `zig/src/packet.zig` (send/recv, GRH parsing) and must stay in sync with the Go side of the bridge: `internal/rdmabridge/bridge.go` (Serialize/Deserialize across the Cgo boundary) and `internal/agent/responder.go` (interprets the decoded fields). Both sides implement independent `serialize`/`deserialize` functions. A version byte at offset 0 enables future format changes.
 
 **Sequence number format** — `high 32 bits = random agentEpoch | low 32 bits = monotonic counter`. The epoch is randomised on startup to prevent ACK misrouting after agent restarts. Defined in `internal/agent/prober.go`.
@@ -72,8 +74,8 @@ The Zig library exposes a C-ABI defined in `zig/include/rdma_bridge.h`. The Go b
 | `device.zig` | Device discovery, `ibv_open_device`, GID query, IP extraction |
 | `queue.zig` | UD QP creation, INIT→RTR→RTS, AH via `ibv_create_ah()`, HW timestamp probe |
 | `memory.zig` | Buffer allocation, `ibv_reg_mr()`, 32-slot tracking |
-| `cq.zig` | CQ polling thread, `ibv_wc_read_completion_wallclock_ns`, SW fallback |
-| `ring.zig` | Lock-free SPSC ring buffer for Zig→Go event delivery |
+| `cq.zig` | CQ poller thread (event mode via completion channel, busy-poll fallback), `ibv_wc_read_completion_wallclock_ns`, SW fallback |
+| `ring.zig` | Lock-free SPSC ring buffer for Zig→Go event delivery, eventfd consumer notification |
 | `packet.zig` | Probe/ACK BigEndian serialization, send/recv, GRH parsing |
 | `main.zig` | `@export` C-ABI entry points, thread-local error string |
 
@@ -94,7 +96,7 @@ Metrics: `NetworkRTT = (T5-T2)-(T4-T3)`, `ProberDelay = (T6-T1)-(T5-T2)`, `Respo
 
 Default config files are in `configs/`. All components use Viper (YAML + env vars + CLI flags).
 
-- `configs/agent.yaml`: `probe_interval_ms: 500`, `gid_index: 0`, `controller_addr: localhost:50051`, `otel_collector_addr: localhost:4317`
+- `configs/agent.yaml`: `probe_interval_ms: 500`, `gid_index: 0`, `cq_poll_mode: auto`, `controller_addr: localhost:50051`, `otel_collector_addr: localhost:4317`
 - `configs/controller.yaml`: `listen_addr: :50051`, `database_uri: http://localhost:4001`
 
 Configuration fields can be overridden with the `RPINGMESH_` prefix and

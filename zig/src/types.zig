@@ -84,6 +84,30 @@ pub const QueueType = enum(u8) {
     Responder = 1,
 };
 
+/// How a queue's CQ poller thread waits for completions (RDMA_CQ_POLL_* in
+/// rdma_bridge.h).
+pub const CqPollMode = enum(i32) {
+    /// Event mode with hardware timestamps, busy polling with software
+    /// timestamps. Software timestamps are taken when the poller reads the
+    /// completion, so the poller's wakeup latency becomes timestamp error;
+    /// busy polling bounds it to one ~50 us sleep. Hardware timestamps are
+    /// unaffected by when the poller runs.
+    Auto = 0,
+    /// Sleep on a completion channel until the CQ raises an event.
+    Event = 1,
+    /// Poll continuously with a ~50 us sleep between polls.
+    Busy = 2,
+
+    /// Whether a queue in this mode should use CQ events.
+    pub fn wantsEvents(self: CqPollMode, uses_sw_timestamps: bool) bool {
+        return switch (self) {
+            .Auto => !uses_sw_timestamps,
+            .Event => true,
+            .Busy => false,
+        };
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Forward declarations (ring buffer is defined in ring.zig)
 // ---------------------------------------------------------------------------
@@ -241,6 +265,21 @@ pub const UdQueue = struct {
     /// Whether the CQ poller thread should keep running. Set to false
     /// during queue destruction to signal the poller to exit.
     running: std.atomic.Value(bool),
+
+    /// Completion channel the CQ is attached to, or null when the provider
+    /// could not create one. Owned by the queue and destroyed after the CQ.
+    comp_channel: ?*c.ibv_comp_channel,
+
+    /// True when the CQ poller sleeps in poll() on comp_channel until the CQ
+    /// raises an event (ibv_req_notify_cq). False when no channel exists or
+    /// the provider refused to arm the CQ; the poller then busy-polls with a
+    /// short sleep. Written only before the poller starts or by the poller
+    /// itself.
+    uses_cq_events: bool,
+
+    /// eventfd used to wake the CQ poller out of poll() on shutdown, or -1.
+    /// stopCqPollerThread() writes it after clearing `running`.
+    wake_fd: i32,
 
     // ----- Send completion signaling (synchronous send path) -----
     //

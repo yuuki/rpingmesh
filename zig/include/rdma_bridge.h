@@ -30,6 +30,11 @@ extern "C" {
 #define RDMA_QUEUE_TYPE_SENDER    0
 #define RDMA_QUEUE_TYPE_RESPONDER 1
 
+/* CQ poller wait modes (rdma_create_queue cq_poll_mode) */
+#define RDMA_CQ_POLL_AUTO  0  /* EVENT with HW timestamps, BUSY with SW timestamps */
+#define RDMA_CQ_POLL_EVENT 1  /* sleep on a completion channel */
+#define RDMA_CQ_POLL_BUSY  2  /* poll with a ~50 us sleep between polls */
+
 /* Memory and buffer sizing */
 #define RDMA_MR_SIZE              4096
 #define RDMA_GRH_SIZE             40
@@ -89,6 +94,8 @@ typedef struct {
 typedef struct {
     uint32_t qpn;                 /* Queue Pair Number assigned by the hardware */
     uint8_t  uses_sw_timestamps;  /* 0 = hardware timestamps, 1 = software timestamps */
+    uint8_t  uses_cq_events;      /* 1 = CQ poller sleeps on a completion channel,
+                                     0 = busy polling (requested, or fallback) */
 } rdma_queue_info_t;
 
 /*
@@ -257,14 +264,27 @@ void rdma_close_device(rdma_device_t dev);
  * Creates a QP, transitions it to RTS state, allocates send/recv buffers
  * and memory regions, and starts the CQ poller thread.
  *
- * @param dev         Device handle
- * @param queue_type  RDMA_QUEUE_TYPE_SENDER or RDMA_QUEUE_TYPE_RESPONDER
- * @param ring        Event ring for completion event delivery
+ * @param dev           Device handle
+ * @param queue_type    RDMA_QUEUE_TYPE_SENDER or RDMA_QUEUE_TYPE_RESPONDER
+ * @param cq_poll_mode  RDMA_CQ_POLL_AUTO, RDMA_CQ_POLL_EVENT or RDMA_CQ_POLL_BUSY
+ * @param ring          Event ring for completion event delivery
  * @param out_queue   Receives the queue handle
- * @param out_info    Receives queue information (QPN, timestamp mode)
+ * @param out_info    Receives queue information (QPN, timestamp mode,
+ *                    CQ notification mode)
  * @return            0 on success, negative error code on failure
+ *
+ * In event mode the CQ poller thread arms the CQ with ibv_req_notify_cq(),
+ * drains it, and sleeps in poll() on a completion channel until the next
+ * completion, so an idle queue costs no CPU. In busy mode it polls with a
+ * ~50 us sleep between polls (~1% of a CPU per queue). RDMA_CQ_POLL_AUTO
+ * picks event mode for hardware timestamps and busy mode for software
+ * timestamps, which are taken when the poller reads the completion and so
+ * absorb its wakeup latency. If event mode is requested but the provider
+ * cannot create a completion channel or arm the CQ, the poller falls back
+ * to busy mode; uses_cq_events reports the mode in effect.
  */
 int32_t rdma_create_queue(rdma_device_t dev, int32_t queue_type,
+                          int32_t cq_poll_mode,
                           rdma_event_ring_t ring, rdma_queue_t* out_queue,
                           rdma_queue_info_t* out_info);
 
@@ -368,6 +388,12 @@ int32_t rdma_send_second_ack(rdma_queue_t queue,
  * A lock-free SPSC (Single Producer, Single Consumer) ring buffer for
  * delivering completion events from the Zig CQ poller thread to Go.
  * The Zig side produces events; Go polls for them.
+ *
+ * Each ring also owns a non-blocking eventfd (see rdma_event_ring_notify_fd)
+ * that the producer increments after pushing a batch of events, so the Go
+ * consumer can block in its netpoller instead of polling on a timer. This
+ * is still not a callback: Go only reads the fd and then calls
+ * rdma_event_ring_poll().
  * ========================================================================= */
 
 /*
@@ -411,6 +437,23 @@ void rdma_event_ring_destroy(rdma_event_ring_t ring);
  * @return      Total dropped event count (0 for a NULL ring)
  */
 uint64_t rdma_event_ring_drop_count(rdma_event_ring_t ring);
+
+/*
+ * rdma_event_ring_notify_fd - Get the ring's producer-notification eventfd
+ *
+ * The fd is created with EFD_NONBLOCK | EFD_CLOEXEC and is owned by the
+ * ring: it is closed by rdma_event_ring_destroy(). The producer writes 1 to
+ * it after pushing one or more events; a consumer reads it (resetting the
+ * counter) and then drains the ring with rdma_event_ring_poll(). Because
+ * the eventfd counter persists until read, a notification written while
+ * the consumer is draining is never lost. Consumers that keep the fd
+ * beyond the ring's lifetime must dup() it.
+ *
+ * @param ring  Ring handle from rdma_event_ring_create()
+ * @return      eventfd (>= 0), or -1 for a NULL ring or if eventfd creation
+ *              failed (the consumer must then fall back to timed polling)
+ */
+int32_t rdma_event_ring_notify_fd(rdma_event_ring_t ring);
 
 /* =========================================================================
  * Error Reporting

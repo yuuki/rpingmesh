@@ -235,6 +235,7 @@ via Cgo (`CGO_ENABLED=1`).
 | `gid_index` | `0` | GID table index on RDMA devices (0-255; see note below) |
 | `service_level` | `0` | Service Level (SL, PFC priority) applied to every Address Handle (0-7) |
 | `traffic_class` | `0` | GRH traffic class octet applied to every Address Handle (0-255). RoCEv2 DSCP occupies the upper 6 bits of this octet: to use DSCP value `N`, set `traffic_class = N << 2` |
+| `cq_poll_mode` | `auto` | How completions are awaited: `event` sleeps on a completion channel and an eventfd (no CPU while idle), `busy` polls the CQ every ~50 µs and the event ring every 100 µs (roughly 3% of a CPU per RDMA device), `auto` uses `event` with NIC hardware timestamps and `busy` with software timestamps (see [Event-Driven Completion Handling](#event-driven-completion-handling)) |
 | `allowed_device_names` | `[]` | Device filter (empty = all devices) |
 | `metrics_enabled` | `true` | Enable OpenTelemetry export |
 | `otel_collector_addr` | `localhost:4317` | OTLP gRPC collector endpoint |
@@ -570,6 +571,34 @@ Cgo callbacks. This avoids:
 
 The ring uses cache-line-padded atomic head/tail pointers with acquire/release
 memory ordering.
+
+### Event-Driven Completion Handling
+
+The agent's CPU cost must stay negligible next to the workloads it monitors,
+so neither side of the ring polls on a timer:
+
+- **Zig CQ poller.** Each queue's CQ is attached to a completion channel. The
+  poller arms the CQ (`ibv_req_notify_cq`), drains it, and sleeps in `poll()`
+  until the NIC raises the next completion event. Arming before draining means
+  a completion that races with the final empty poll still raises an event, so
+  none is slept through. A 100 ms `poll()` timeout re-arms and drains as a
+  safety net.
+- **Go ring consumers.** Each ring owns an `eventfd` that the poller writes
+  after a drained batch produced events. The Go consumer blocks on a dup of it
+  through the runtime netpoller (a parked goroutine, not a thread) and drains
+  the ring when woken. This is still not a Cgo callback: Go only reads the fd
+  and then calls `rdma_event_ring_poll()`.
+
+With NIC hardware timestamps, when the poller runs does not change T2–T5, so
+event mode is accuracy-neutral for NetworkRTT. Software timestamps, however,
+are taken when the poller reads a completion, so its wakeup latency becomes
+timestamp error; `cq_poll_mode: auto` therefore keeps busy mode for queues
+without hardware timestamps, such as soft-RoCE. Busy mode is the poll-based
+design on both sides: the CQ poller sleeps ~50 µs between polls and the Go
+consumer polls the ring every 100 µs. Busy mode is also the fallback when a
+provider cannot create a completion channel or arm the CQ. The
+`Prober started` / `Responder started` log lines report the mode in effect as
+`cq_events`.
 
 ### `ibv_create_ah()` for Address Handles
 

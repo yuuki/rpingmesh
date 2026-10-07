@@ -764,20 +764,35 @@ The controller-side analyzer (Phase 1) exports the following OTLP metrics under
 Analyzer metric attributes are ToR-level only, matching the agent convention;
 per-path GID detail appears only in findings logs, never as a metric attribute.
 
-Histogram bucket boundaries (nanoseconds):
+Histogram bucket boundaries (nanoseconds), dense in 1–10 µs where RoCEv2
+network RTTs typically land, and a superset of the analyzer's aggregation
+buckets:
 ```
-100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000, 10000000
+100, 250, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000, 6000,
+7000, 8000, 9000, 10000, 12500, 15000, 20000, 25000, 50000, 100000, 250000,
+500000, 1000000, 2500000, 5000000, 10000000
 ```
 
 This covers the 100 ns to 10 ms range typical of datacenter RDMA networks.
 
 ### Observability & Dashboards
 
-A ready-to-use pipeline and two provisioned Grafana dashboards live in this
-repo: OTLP metrics (above) flow through `otel-collector-contrib` into
-VictoriaMetrics and are visualized in Grafana with zero custom plugins. See
-`docs/design/grafana-dashboards.md` for the full design (metric-name
-contract, panel layout, drilldown mechanism).
+A ready-to-use pipeline, two provisioned Grafana dashboards, and alerting
+rules live in this repo: OTLP metrics (above) flow through
+`otel-collector-contrib` into VictoriaMetrics, are visualized in Grafana with
+zero custom plugins, and are evaluated by vmalert against
+`deploy/observability/alerts/rpingmesh.rules.yml` (probe loss and black-holed
+ToR pairs, analyzer SLA violations, probe send errors, event-ring drops,
+self-throttling, agents that stop reporting, and a broken telemetry or
+analyzer pipeline). See `docs/design/grafana-dashboards.md` for the full
+design (metric-name contract, panel layout, drilldown mechanism, alerts).
+
+**Both metric-name styles work:** dashboards and rules select metrics with
+`{__name__=~"rpingmesh[._]probe_total"}`, so they match the underscore names
+this stack's collector produces (`rpingmesh_probe_total`) as well as the
+unescaped OTLP names a UTF-8-aware pipeline stores (`rpingmesh.probe_total`).
+Per-agent alerts read the agent identity from `instance` or `host.name`,
+whichever the pipeline provides.
 
 **Metric name contract:** the collector's `prometheus_remote_write` exporter
 must escape `.` to `_` but must **not** append extra `_total`/unit suffixes,
@@ -795,6 +810,8 @@ Quick start:
 make obs-up        # start VictoriaMetrics + otel-collector + Grafana (localhost:3000, admin/admin)
 make obs-seed       # load synthetic demo data (no RDMA hardware required)
 open http://localhost:3000  # dashboards under the "R-Pingmesh" folder
+open http://localhost:8880  # vmalert: rule and alert state
+make obs-verify     # assert every dashboard query and alert rule against the seed
 ```
 
 `admin`/`admin` is the default Grafana credential for this local demo stack

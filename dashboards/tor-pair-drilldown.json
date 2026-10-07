@@ -13,16 +13,16 @@
       {
         "name": "source_tor", "type": "query", "label": "Source ToR",
         "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-        "definition": "label_values(rpingmesh_probe_total, source_tor)",
-        "query": { "qryType": 1, "query": "label_values(rpingmesh_probe_total, source_tor)", "refId": "source_tor" },
+        "definition": "label_values({__name__=~\"rpingmesh[._]probe_total\"}, source_tor)",
+        "query": { "qryType": 1, "query": "label_values({__name__=~\"rpingmesh[._]probe_total\"}, source_tor)", "refId": "source_tor" },
         "refresh": 2, "sort": 1, "includeAll": false, "multi": false,
         "current": {}
       },
       {
         "name": "target_tor", "type": "query", "label": "Target ToR",
         "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-        "definition": "label_values(rpingmesh_probe_total{source_tor=\"$source_tor\"}, target_tor)",
-        "query": { "qryType": 1, "query": "label_values(rpingmesh_probe_total{source_tor=\"$source_tor\"}, target_tor)", "refId": "target_tor" },
+        "definition": "label_values({__name__=~\"rpingmesh[._]probe_total\",source_tor=\"$source_tor\"}, target_tor)",
+        "query": { "qryType": 1, "query": "label_values({__name__=~\"rpingmesh[._]probe_total\",source_tor=\"$source_tor\"}, target_tor)", "refId": "target_tor" },
         "refresh": 2, "sort": 1, "includeAll": false, "multi": false,
         "current": {}
       }
@@ -36,7 +36,7 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "100 * sum(rate(rpingmesh_probe_success_total{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])) / (sum(rate(rpingmesh_probe_total{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])) > 0)",
+          "expr": "100 * sum(rate({__name__=~\"rpingmesh[._]probe_success_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])) / (sum(rate({__name__=~\"rpingmesh[._]probe_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])) > 0)",
           "range": true } ],
       "fieldConfig": { "defaults": { "unit": "percent", "decimals": 3, "color": { "mode": "thresholds" },
         "thresholds": { "mode": "absolute", "steps": [
@@ -50,7 +50,7 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "sum(rate(rpingmesh_probe_total{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
+          "expr": "sum(rate({__name__=~\"rpingmesh[._]probe_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
           "range": true } ],
       "fieldConfig": { "defaults": { "unit": "cps", "color": { "mode": "thresholds" },
         "thresholds": { "mode": "absolute", "steps": [ { "value": null, "color": "blue" } ] } },
@@ -63,7 +63,7 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(rpingmesh_network_rtt_ns_bucket{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate({__name__=~\"rpingmesh[._]network_rtt_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
           "range": true } ],
       "fieldConfig": { "defaults": { "unit": "ns", "color": { "mode": "thresholds" },
         "thresholds": { "mode": "absolute", "steps": [
@@ -77,7 +77,7 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(rpingmesh_network_rtt_ns_bucket{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate({__name__=~\"rpingmesh[._]network_rtt_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
           "range": true } ],
       "fieldConfig": { "defaults": { "unit": "ns", "color": { "mode": "thresholds" },
         "thresholds": { "mode": "absolute", "steps": [
@@ -91,7 +91,7 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "sum by (le) (rate(rpingmesh_network_rtt_ns_bucket{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
+          "expr": "sum by (le) (rate({__name__=~\"rpingmesh[._]network_rtt_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
           "format": "heatmap", "legendFormat": "{{le}}", "range": true } ],
       "options": {
         "calculate": false,
@@ -109,13 +109,13 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(rpingmesh_network_rtt_ns_bucket{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate({__name__=~\"rpingmesh[._]network_rtt_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
           "legendFormat": "p50", "range": true },
         { "refId": "B", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "histogram_quantile(0.9, sum by (le) (rate(rpingmesh_network_rtt_ns_bucket{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate({__name__=~\"rpingmesh[._]network_rtt_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
           "legendFormat": "p90", "range": true },
         { "refId": "C", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(rpingmesh_network_rtt_ns_bucket{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate({__name__=~\"rpingmesh[._]network_rtt_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
           "legendFormat": "p99", "range": true }
       ],
       "fieldConfig": { "defaults": { "unit": "ns",
@@ -128,7 +128,7 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "sum by (reason) (rate(rpingmesh_probe_failed_total{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
+          "expr": "sum by (reason) (rate({__name__=~\"rpingmesh[._]probe_failed_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
           "legendFormat": "{{reason}}", "range": true } ],
       "fieldConfig": { "defaults": { "unit": "cps",
         "custom": { "drawStyle": "line", "fillOpacity": 15, "stacking": { "mode": "normal" } } }, "overrides": [] },
@@ -140,16 +140,16 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(rpingmesh_prober_delay_ns_bucket{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate({__name__=~\"rpingmesh[._]prober_delay_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
           "legendFormat": "prober p50", "range": true },
         { "refId": "B", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(rpingmesh_prober_delay_ns_bucket{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate({__name__=~\"rpingmesh[._]prober_delay_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
           "legendFormat": "prober p99", "range": true },
         { "refId": "C", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(rpingmesh_responder_delay_ns_bucket{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate({__name__=~\"rpingmesh[._]responder_delay_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
           "legendFormat": "responder p50", "range": true },
         { "refId": "D", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(rpingmesh_responder_delay_ns_bucket{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate({__name__=~\"rpingmesh[._]responder_delay_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
           "legendFormat": "responder p99", "range": true }
       ],
       "fieldConfig": { "defaults": { "unit": "ns",
@@ -162,7 +162,7 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "sum by (kind) (rate(rpingmesh_analyzer_sla_violations_total{source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
+          "expr": "sum by (kind) (rate({__name__=~\"rpingmesh[._]analyzer[._]sla_violations_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
           "legendFormat": "{{kind}}", "range": true } ],
       "fieldConfig": { "defaults": { "unit": "cps",
         "custom": { "drawStyle": "line", "fillOpacity": 15 } }, "overrides": [] },

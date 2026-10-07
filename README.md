@@ -698,9 +698,12 @@ collector relabeling during a mixed-version window).
 ### Integer Epoch for Staleness Tracking
 
 The rqlite `rnics` table uses `last_updated_epoch INTEGER` (Unix seconds)
-instead of text-formatted timestamps. This enables efficient staleness queries
-with simple integer arithmetic (`strftime('%s','now') - 300`) and benefits from
-B-tree index scans.
+instead of text-formatted timestamps. The controller stamps it and computes
+the active/stale cutoffs (`now - 300`) from its own clock, binding them as
+query parameters, so staleness checks are plain integer comparisons that
+benefit from B-tree index scans. SQLite's `'now'` is deliberately avoided:
+rqlite rewrites it in write statements using the server's local timezone, which
+on a non-UTC host shifts it by the UTC offset.
 
 ## Observability
 

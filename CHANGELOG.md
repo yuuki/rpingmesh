@@ -25,6 +25,12 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- The controller's stale-entry cleanup deleted every registered RNIC every
+  five minutes when rqlite ran on a host whose timezone is not UTC: rqlite
+  rewrites SQLite's `'now'` in write statements using local time, so the
+  cleanup saw fresh rows as hours old. Agents then got empty or partial
+  pinglists until their next heartbeat re-registered. Activity windows are
+  now computed from the controller's clock and bound as epoch cutoffs.
 - `librdmabridge.a` is built for the baseline CPU of the target architecture
   instead of the build machine's CPU. With the ReleaseSafe build, an agent
   built on an AMD CI runner contained SSE4a instructions and crashed with

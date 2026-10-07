@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Alerting rules (`deploy/observability/alerts/rpingmesh.rules.yml`) for probe
+  loss and black-holed ToR pairs, analyzer SLA violations, probe send errors,
+  event-ring drops, agent self-throttling, agents that stop reporting, and a
+  broken telemetry or analyzer pipeline. The observability demo stack runs
+  them in vmalert, and `make obs-verify` checks that exactly the expected
+  rules fire on the seeded data.
+
+### Fixed
+
+- Dashboards showed no data on backends that store unescaped OTLP metric names
+  (`rpingmesh.probe_total`) instead of `rpingmesh_probe_total`. Dashboards and
+  alert rules now match either style, and the seed script can produce both
+  (`NAME_STYLE=dotted`).
+- `make obs-verify` now derives its queries from the committed dashboards
+  instead of a hand-maintained list, and the README and dashboard design doc
+  list the current histogram bucket ladder.
+
 ## [0.3.0] - 2026-10-07
 
 ### Changed

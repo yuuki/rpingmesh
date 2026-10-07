@@ -12,6 +12,11 @@ Grafana dashboards in `dashboards/` without any RDMA hardware. See
   analyzer and forwards them to VictoriaMetrics via `prometheus_remote_write`.
 - **Grafana** — provisioned with the VictoriaMetrics datasource and the two
   `dashboards/*.json` dashboards (zero custom plugins).
+- **vmalert** — evaluates `alerts/rpingmesh.rules.yml` against VictoriaMetrics
+  every 30 s (UI and `/api/v1/rules` on `localhost:8880`). Notifications go
+  nowhere (`-notifier.blackhole`); set `-notifier.url` to an Alertmanager in a
+  real deployment. VictoriaMetrics proxies the rules API, so Grafana can list
+  the rules from its existing datasource.
 
 ## Metric name contract
 
@@ -42,6 +47,17 @@ distinct series instead of colliding onto one and corrupting `rate()`. See
 "Identity contract" in `docs/design/grafana-dashboards.md` for the
 full rationale and verification.
 
+## Unescaped (dotted) metric names
+
+Pipelines that keep OTLP names (UTF-8 mode) store `rpingmesh.probe_total`
+instead of `rpingmesh_probe_total`, and may carry the agent identity as a
+`host.name` label instead of `instance`. The dashboards and alert rules select
+metrics with `{__name__=~"rpingmesh[._]..."}` and derive the per-agent label
+from either `instance` or `host.name`, so they work unchanged against such a
+backend. To exercise that path locally, seed with `NAME_STYLE=dotted make
+obs-seed` (after `make obs-down && make obs-up`; do not mix both styles in one
+VictoriaMetrics).
+
 ## Quick start
 
 ```bash
@@ -49,7 +65,8 @@ cd /path/to/rpingmesh
 make obs-up        # start VictoriaMetrics + otel-collector + Grafana (localhost:3000, admin/admin)
 make obs-seed       # load ~30 min of synthetic 6-ToR mesh demo data
 open http://localhost:3000  # dashboards live under the "R-Pingmesh" folder
-make obs-verify     # (optional) assert health, provisioning, and panel queries
+open http://localhost:8880  # vmalert: rules and alert state
+make obs-verify     # assert health, provisioning, every panel query, and the alert rules
 make obs-down       # stop the stack and remove volumes
 ```
 

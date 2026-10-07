@@ -509,6 +509,14 @@ particular, an agent archive still requires the host-provided `libibverbs` and
 `librdmacm` libraries, a supported RDMA device, and access to
 `/dev/infiniband/*`.
 
+The released agent binary (in both the archive and the packages) is linked
+inside an Enterprise Linux 9 container (`Dockerfile.agent-el9`), so it requires
+only glibc 2.34 or later and runs on RHEL 9-family hosts as well as newer
+distributions such as Debian 12+ and Ubuntu 22.04+. To build the same portable
+binary yourself, run `make package-build-agent-el9` (Docker with buildx
+required), or `make package archive AGENT_BUILDER=el9` to package it; a plain
+`make package-build-agent` instead inherits the build host's glibc.
+
 Use the equivalent agent package only on a Linux host with a supported
 RDMA-capable device or soft-RoCE device. The agent package declares the
 `libibverbs` and `librdmacm` runtime dependencies, but the RDMA device and

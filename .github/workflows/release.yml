@@ -63,8 +63,15 @@ jobs:
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.3
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # AGENT_BUILDER=el9 links the agent inside an Enterprise Linux 9
+      # container (Dockerfile.agent-el9) so the released binary runs on
+      # glibc >= 2.34 (RHEL 9 family) instead of inheriting this runner's
+      # newer glibc; the target fails if the floor is exceeded.
       - name: Build Linux amd64 release assets
-        run: make package archive VERSION="${GITHUB_REF_NAME#v}" NFPM_ARCH=amd64
+        run: make package archive VERSION="${GITHUB_REF_NAME#v}" NFPM_ARCH=amd64 AGENT_BUILDER=el9
 
       - name: Generate checksums
         run: |

@@ -25,6 +25,16 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `librdmabridge.a` is built for the baseline CPU of the target architecture
+  instead of the build machine's CPU. With the ReleaseSafe build, an agent
+  built on an AMD CI runner contained SSE4a instructions and crashed with
+  SIGILL on Intel hosts as soon as it processed a completion. Pass
+  `-Dcpu=native` to `zig build` for a host-tuned local build.
+- Release agent binaries are linked inside an Enterprise Linux 9 container, so
+  they run on glibc 2.34+ (RHEL 9 family) instead of requiring the newer glibc
+  of the CI runner. `make package-build-agent-el9` (or
+  `AGENT_BUILDER=el9` with `make package`/`make archive`) builds the same
+  portable binary, and the build fails if the glibc floor is exceeded.
 - Link `librdmabridge.a` with older system linkers (e.g. GNU ld 2.35 on
   RHEL 9): always emit it through LLVM and bundle compiler-rt.
 - The agent's default `otel_collector_addr` was `grpc://localhost:4317`, which

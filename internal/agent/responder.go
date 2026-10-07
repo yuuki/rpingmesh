@@ -6,7 +6,6 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -74,6 +73,7 @@ func (r *Responder) Start(ctx context.Context) error {
 
 	r.logger.Info().
 		Uint32("qpn", r.queue.Info.QPN).
+		Bool("cq_events", r.queue.Info.UsesCQEvents).
 		Msg("Responder started")
 	return nil
 }
@@ -97,22 +97,19 @@ func (r *Responder) Stop() {
 	}
 }
 
-// processLoop is the main event processing loop. It polls the event ring
+// processLoop is the main event processing loop. It drains the event ring
 // for recv completion events (incoming probes), then sends first and second
 // ACK packets back to the prober. Send completions and ACK recv events are
-// ignored since the responder only needs to react to incoming probes.
+// ignored since the responder only needs to react to incoming probes. While
+// the ring is empty the loop sleeps until the CQ poller signals new events
+// (see newRingIdleWait).
 func (r *Responder) processLoop(ctx context.Context) {
 	defer r.wg.Done()
 
-	const (
-		maxBatch  = 32
-		idleSleep = 100 * time.Microsecond
-	)
+	const maxBatch = 32
 
-	// idleTimer is reused on each empty-poll iteration to avoid allocating a
-	// new timer on every spin.
-	idleTimer := time.NewTimer(idleSleep)
-	defer idleTimer.Stop()
+	wait, release := newRingIdleWait(ctx, r.stopCh, r.ring, r.queue.Info.UsesCQEvents, r.logger)
+	defer release()
 
 	for r.running.Load() {
 		// Check for shutdown or context cancellation on every iteration.
@@ -127,21 +124,10 @@ func (r *Responder) processLoop(ctx context.Context) {
 
 		events := r.ring.Poll(maxBatch)
 		if len(events) == 0 {
-			// No events yet; wait briefly, but wake immediately on shutdown so
-			// Stop() is not delayed by the idle sleep.
-			if !idleTimer.Stop() {
-				select {
-				case <-idleTimer.C:
-				default:
-				}
-			}
-			idleTimer.Reset(idleSleep)
-			select {
-			case <-ctx.Done():
+			// wait returns false as soon as Stop() or ctx cancellation
+			// happens, so Stop() is not delayed by an idle ring.
+			if !wait() {
 				return
-			case <-r.stopCh:
-				return
-			case <-idleTimer.C:
 			}
 			continue
 		}

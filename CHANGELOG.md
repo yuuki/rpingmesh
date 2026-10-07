@@ -13,6 +13,26 @@ All notable changes to this project are documented in this file.
   them in vmalert, and `make obs-verify` checks that exactly the expected
   rules fire on the seeded data.
 
+### Changed
+
+- The agent no longer polls for RDMA completions on timers. Each queue's CQ
+  poller thread now sleeps on a completion channel (`ibv_req_notify_cq` +
+  `poll()`) and wakes the Go consumer through an `eventfd` on the event ring,
+  which the Go runtime waits on in its netpoller. Previously every RDMA device
+  cost two Zig threads waking ~10k times/s and two Go goroutines polling on
+  100 µs timers, so an 8-device host used about half a CPU regardless of
+  probe load; at the same load it now uses a few percent. NetworkRTT is
+  unchanged with NIC hardware timestamps, and ProberDelay/ResponderDelay drop
+  because completions no longer wait for the next poll.
+- New `cq_poll_mode` agent setting (`auto`, `event`, `busy`; default `auto`).
+  `auto` uses the event-driven path with NIC hardware timestamps and keeps the
+  previous polling behavior with software timestamps (for example soft-RoCE),
+  whose accuracy depends on prompt polling. Providers that cannot create a
+  completion channel or arm the CQ fall back to polling.
+- C ABI: `rdma_create_queue()` takes a `cq_poll_mode` argument,
+  `rdma_queue_info_t` gains `uses_cq_events`, and
+  `rdma_event_ring_notify_fd()` is new.
+
 ### Fixed
 
 - Dashboards showed no data on backends that store unescaped OTLP metric names

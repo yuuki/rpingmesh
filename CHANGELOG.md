@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-07
+
 ### Added
 
 - Alerting rules (`deploy/observability/alerts/rpingmesh.rules.yml`) for probe

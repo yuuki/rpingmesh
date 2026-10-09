@@ -19,7 +19,7 @@
 
 FROM almalinux:9 AS builder
 
-ARG GO_VERSION=1.27.1
+ARG GO_VERSION=1.27.2
 ARG ZIG_VERSION=0.17.0
 # Optional release version embedded via -ldflags (same as `make VERSION=...`).
 ARG VERSION=

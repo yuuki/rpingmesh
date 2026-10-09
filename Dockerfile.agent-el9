@@ -1,0 +1,75 @@
+# Dockerfile.agent-el9 - Portable release build of rpingmesh-agent.
+#
+# The agent is CGO_ENABLED=1, so the binary records the glibc symbol versions
+# of the host it was linked on. Linking on a recent distribution (e.g. Ubuntu
+# 24.04, glibc 2.39) produces a binary that refuses to start on RHEL 9-family
+# hosts (glibc 2.34), which are common on RDMA/GPU clusters. Building on an
+# Enterprise Linux 9 userland pins the glibc floor to 2.34 and the libibverbs
+# symbol versions to what EL9's rdma-core ships, so one binary runs on EL9 and
+# on any newer glibc distribution (Debian 12+, Ubuntu 22.04+).
+#
+# Usage (from the repository root; see the package-build-agent-el9 Makefile
+# target, which also runs scripts/check-glibc-compat.sh on the result):
+#
+#   docker buildx build --platform linux/amd64 -f Dockerfile.agent-el9 \
+#       --build-arg VERSION=1.2.3 --output type=local,dest=bin .
+#
+# The final stage contains only the binary, so --output writes
+# bin/rpingmesh-agent and nothing else.
+
+FROM almalinux:9 AS builder
+
+ARG GO_VERSION=1.27.1
+ARG ZIG_VERSION=0.17.0
+# Optional release version embedded via -ldflags (same as `make VERSION=...`).
+ARG VERSION=
+
+# gcc is the cgo C compiler/linker; rdma-core-devel provides the libibverbs/
+# librdmacm headers and .so links. protobuf-compiler lives in the CRB repo.
+RUN dnf install -y dnf-plugins-core \
+    && dnf config-manager --set-enabled crb \
+    && dnf install -y --setopt=install_weak_deps=False \
+        ca-certificates gcc make tar xz git \
+        rdma-core-devel libibverbs librdmacm \
+        protobuf-compiler \
+    && dnf clean all
+
+RUN set -eux; \
+    case "$(uname -m)" in \
+        x86_64) GO_ARCH=amd64; ZIG_ARCH=x86_64 ;; \
+        aarch64) GO_ARCH=arm64; ZIG_ARCH=aarch64 ;; \
+        *) echo "unsupported arch $(uname -m)"; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" | tar -xz -C /usr/local; \
+    curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" \
+        | tar -xJ -C /usr/local; \
+    ln -sf "/usr/local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig; \
+    /usr/local/go/bin/go version; \
+    zig version
+ENV GOPATH=/go
+ENV PATH="/usr/local/go/bin:/go/bin:${PATH}"
+
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest \
+    && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+WORKDIR /workspace
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY . .
+
+# Reuse the Makefile so the release binary is built exactly like a native
+# `make package-build-agent` (ReleaseSafe Zig library, version ldflags).
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    if [ -n "${VERSION}" ]; then \
+        make package-build-agent VERSION="${VERSION}"; \
+    else \
+        make package-build-agent; \
+    fi \
+    && ./scripts/check-glibc-compat.sh bin/rpingmesh-agent 2.34
+
+FROM scratch AS export
+COPY --from=builder /workspace/bin/rpingmesh-agent /rpingmesh-agent

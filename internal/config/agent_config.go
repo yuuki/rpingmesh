@@ -67,6 +67,14 @@ const (
 // place the real GID table size is known.
 const MaxGIDIndex = 255
 
+// CQ poll modes accepted by cq_poll_mode (see AgentConfig.CQPollMode).
+const (
+	CQPollModeAuto    = "auto"
+	CQPollModeEvent   = "event"
+	CQPollModeBusy    = "busy"
+	DefaultCQPollMode = CQPollModeAuto
+)
+
 // AgentConfig holds all configuration for the agent.
 type AgentConfig struct {
 	AgentID  string `mapstructure:"agent_id"`
@@ -97,7 +105,14 @@ type AgentConfig struct {
 	// Address Handle the agent's RDMA devices create (0-255; see
 	// Validate()). RoCEv2 DSCP occupies the upper 6 bits of this octet: a
 	// target DSCP value D maps to traffic_class = D << 2.
-	TrafficClass              int    `mapstructure:"traffic_class"`
+	TrafficClass int `mapstructure:"traffic_class"`
+	// CQPollMode selects how completions are awaited, by both the Zig CQ
+	// poller thread and the Go event-ring consumer of each queue: "event"
+	// sleeps on a completion channel and an eventfd (no CPU while idle),
+	// "busy" polls (the CQ every ~50us, the ring every 100us), and "auto"
+	// (default) uses event with hardware timestamps and busy with software
+	// timestamps, whose accuracy depends on prompt polling.
+	CQPollMode                string `mapstructure:"cq_poll_mode"`
 	PinglistUpdateIntervalSec uint32 `mapstructure:"pinglist_update_interval_sec"`
 	// TargetProbeRatePerSecond is the legacy uniform per-target probe rate. It
 	// is the fallback for whichever per-pinglist-type rate below is left unset
@@ -184,6 +199,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("gid_index", 0)
 	v.SetDefault("service_level", 0)
 	v.SetDefault("traffic_class", 0)
+	v.SetDefault("cq_poll_mode", DefaultCQPollMode)
 	v.SetDefault("pinglist_update_interval_sec", 300)
 	v.SetDefault("target_probe_rate_per_second", DefaultTargetProbeRatePerSecond)
 	v.SetDefault("tor_mesh_probe_rate_per_second", DefaultTorMeshProbeRatePerSecond)
@@ -263,6 +279,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		GIDIndex:                   v.GetInt("gid_index"),
 		ServiceLevel:               v.GetInt("service_level"),
 		TrafficClass:               v.GetInt("traffic_class"),
+		CQPollMode:                 v.GetString("cq_poll_mode"),
 		PinglistUpdateIntervalSec:  v.GetUint32("pinglist_update_interval_sec"),
 		TargetProbeRatePerSecond:   v.GetInt("target_probe_rate_per_second"),
 		TorMeshProbeRatePerSecond:  v.GetInt("tor_mesh_probe_rate_per_second"),
@@ -330,6 +347,14 @@ func (c *AgentConfig) Validate() error {
 	// (ibv_ah_attr.grh.traffic_class).
 	if c.TrafficClass < 0 || c.TrafficClass > 255 {
 		return fmt.Errorf("traffic_class must be between 0 and 255, got: %d", c.TrafficClass)
+	}
+
+	// An empty mode (a zero-value AgentConfig) means the default, auto.
+	switch c.CQPollMode {
+	case "", CQPollModeAuto, CQPollModeEvent, CQPollModeBusy:
+	default:
+		return fmt.Errorf("cq_poll_mode must be %q, %q or %q, got: %q",
+			CQPollModeAuto, CQPollModeEvent, CQPollModeBusy, c.CQPollMode)
 	}
 
 	// A zero or negative probe interval would make time.NewTicker panic at
@@ -440,6 +465,7 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.Int("gid-index", 0, "GID index to use for RDMA devices (0-255)")
 	flags.Int("service-level", 0, "Service Level (SL, PFC priority) for Address Handles (0-7)")
 	flags.Int("traffic-class", 0, "GRH traffic class (DSCP << 2) for Address Handles (0-255)")
+	flags.String("cq-poll-mode", DefaultCQPollMode, "CQ poller wait mode: auto, event or busy")
 	flags.Uint32("pinglist-update-interval-sec", 300, "Pinglist update interval in seconds")
 	flags.Int("target-probe-rate-per-second", DefaultTargetProbeRatePerSecond, "Legacy uniform probe rate per second per target (fallback for the per-type rates below when they are 0)")
 	flags.Int("tor-mesh-probe-rate-per-second", DefaultTorMeshProbeRatePerSecond, "Probe rate per second per ToR-mesh target (0 = inherit target-probe-rate-per-second)")

@@ -1,18 +1,20 @@
 // cq.zig - CQ polling thread and completion processing.
 //
 // This module implements the dedicated CQ poller thread that runs per queue.
-// It uses busy polling, not event-driven notification: no completion
-// channel is created, and ibv_get_cq_event()/ibv_req_notify_cq() are never
-// called. The poller instead calls pollCqCompletions() in a loop, sleeping
-// ~50 microseconds (std.Thread.sleep) between iterations when no
-// completions are found. This trades a small, bounded amount of CPU/latency
-// for simplicity and portability across providers (see the CQ creation
-// comment in queue.zig for why a completion channel was intentionally not
-// used).
+// The poller is event-driven: it arms the CQ (ibv_req_notify_cq), drains it,
+// and then sleeps in poll() on the queue's completion channel until the
+// hardware raises the next completion event. An idle agent therefore costs
+// no CPU here, and a completion is handled one interrupt/wakeup after it
+// lands instead of up to one sleep interval later.
+//
+// If the provider cannot create a completion channel or arm the CQ, the
+// poller falls back to busy polling with a ~50 microsecond sleep between
+// polls (the pre-event-driven behavior), which costs ~1% of a CPU per queue.
 //
 // For receive completions, the poller parses the GRH and probe payload, builds
 // a CompletionEvent, and pushes it into the SPSC ring buffer for consumption
-// by the Go side.
+// by the Go side. After each drained batch that produced events it signals
+// the ring's eventfd so the Go consumer can sleep instead of polling.
 //
 // For send completions, the poller extracts the timestamp and signals the
 // waiting sender thread via atomic variables on the UdQueue struct.
@@ -213,10 +215,16 @@ pub fn startCqPollerThread(queue: *types.UdQueue) !void {
 
 /// Stop the CQ poller thread and wait for it to exit.
 ///
-/// Sets queue.running to false and joins the thread. The thread exits
-/// naturally after its next sleep cycle (at most ~50 microseconds).
+/// Sets queue.running to false, wakes the poller out of poll() through
+/// wake_fd, and joins the thread. Without a wake_fd the event-mode poller
+/// still exits within CQ_EVENT_WAIT_TIMEOUT_MS; the busy-poll fallback exits
+/// after its next ~50 microsecond sleep.
 pub fn stopCqPollerThread(queue: *types.UdQueue) void {
     queue.running.store(false, .release);
+    if (queue.wake_fd >= 0) {
+        const one: u64 = 1;
+        _ = c.write(queue.wake_fd, &one, @sizeOf(u64));
+    }
 
     if (queue.cq_thread) |thread| {
         thread.join();
@@ -228,41 +236,131 @@ pub fn stopCqPollerThread(queue: *types.UdQueue) void {
 // CQ poller loop (thread entry point)
 // ---------------------------------------------------------------------------
 
+/// Upper bound on one poll() sleep in event mode. Completions never wait for
+/// this timeout -- they wake the poller through the completion channel. It
+/// is a safety net: if a provider ever failed to raise an event for an armed
+/// CQ, the poller still re-arms and drains the CQ this often. 100 ms keeps
+/// that cost at 10 wakeups/s per queue while bounding the damage well under
+/// the 1 s send/ACK timeouts used by the Go side.
+const CQ_EVENT_WAIT_TIMEOUT_MS: c_int = 100;
+
+/// Sleep between polls in the busy-poll fallback.
+const BUSY_POLL_SLEEP_NS: c_long = 50_000;
+
 /// Main loop for the CQ poller thread.
 ///
-/// Uses busy polling (no ibv_get_cq_event) for reliability across different
-/// RDMA implementations and environments (including soft-RoCE in containers).
-/// Polls the CQ every ~50 microseconds and sleeps briefly between polls to
-/// avoid burning the CPU.
-///
-/// The loop continues until queue.running is set to false.
+/// Runs the event-driven loop when the queue has a usable completion
+/// channel, otherwise the busy-poll fallback. Either loop continues until
+/// queue.running is set to false.
 fn cqPollerLoop(queue: *types.UdQueue) void {
-    log.debug("thread started for queue @{x}", .{@intFromPtr(queue)});
-    var iter: u64 = 0;
+    log.debug("thread started for queue @{x} (cq_events={})", .{ @intFromPtr(queue), queue.uses_cq_events });
+    if (queue.uses_cq_events) {
+        eventPollerLoop(queue);
+    }
+    // Event mode returns early only when re-arming failed; finish the
+    // queue's lifetime in busy-poll mode so completions keep flowing.
+    if (queue.running.load(.acquire)) {
+        busyPollerLoop(queue);
+    }
+    log.debug("@{x} exiting", .{@intFromPtr(queue)});
+}
+
+/// Event-driven poller loop.
+///
+/// Each iteration arms the CQ BEFORE draining it. Any completion that lands
+/// after the arm -- including one racing with the final empty poll --
+/// raises a channel event, so the poll() below cannot sleep through it (no
+/// lost wakeup). Completions that arrived before the arm are drained here
+/// and may also produce one spurious event, which costs a single extra
+/// wakeup that finds the CQ empty.
+///
+/// Returns when queue.running becomes false, or (after clearing
+/// queue.uses_cq_events) when the provider refuses to re-arm the CQ.
+fn eventPollerLoop(queue: *types.UdQueue) void {
+    const base_cq = c.ibv_cq_ex_to_cq(queue.recv_cq) orelse {
+        queue.uses_cq_events = false;
+        return;
+    };
+    const channel = queue.comp_channel orelse {
+        queue.uses_cq_events = false;
+        return;
+    };
+
     while (queue.running.load(.acquire)) {
-        // Poll recv CQ (handles both IBV_WC_RECV and IBV_WC_SEND opcodes
-        // since we use a single shared CQ for both directions)
-        pollCqCompletions(queue, queue.recv_cq);
+        if (c.ibv_req_notify_cq(base_cq, 0) != 0) {
+            log.warn("@{x} ibv_req_notify_cq failed; falling back to busy polling", .{@intFromPtr(queue)});
+            queue.uses_cq_events = false;
+            return;
+        }
 
-        // Also poll the send CQ if it is separate from recv CQ
+        drainCq(queue);
+
+        waitForCqEvent(queue, channel);
+    }
+}
+
+/// Sleep until the CQ raises a completion event, the shutdown eventfd is
+/// written, or CQ_EVENT_WAIT_TIMEOUT_MS elapses. A consumed CQ event is
+/// acknowledged immediately so ibv_destroy_cq() never blocks on unacked
+/// events at teardown.
+fn waitForCqEvent(queue: *types.UdQueue, channel: *c.ibv_comp_channel) void {
+    var fds = [2]c.struct_pollfd{
+        .{ .fd = channel.fd, .events = c.POLLIN, .revents = 0 },
+        // A negative fd is ignored by poll(), so a missing wake_fd only
+        // delays shutdown until the timeout.
+        .{ .fd = queue.wake_fd, .events = c.POLLIN, .revents = 0 },
+    };
+    const ready = c.poll(&fds, fds.len, CQ_EVENT_WAIT_TIMEOUT_MS);
+    if (ready <= 0) {
+        // Timeout or EINTR: the caller re-arms and drains, which is always
+        // safe.
+        return;
+    }
+    if ((fds[0].revents & c.POLLIN) != 0) {
+        var ev_cq: ?*c.ibv_cq = null;
+        var ev_ctx: ?*anyopaque = null;
+        // The channel fd is non-blocking (queue.zig createCompChannel), so a
+        // spurious readiness returns -1/EAGAIN instead of blocking.
+        if (c.ibv_get_cq_event(channel, &ev_cq, &ev_ctx) == 0) {
+            if (ev_cq) |cq_ptr| c.ibv_ack_cq_events(cq_ptr, 1);
+        }
+    }
+}
+
+/// Drain every available completion from the queue's CQ(s), then wake the
+/// Go consumer once if any event was pushed into the ring.
+///
+/// The notification is sent in busy mode too: a queue that started in event
+/// mode and fell back at runtime still has a Go consumer blocked on the
+/// eventfd, and the write costs one syscall per batch, not per poll.
+fn drainCq(queue: *types.UdQueue) void {
+    const produced_before: u64 = if (queue.event_ring) |r| r.producedCount() else 0;
+    while (true) {
+        var n = pollCqCompletions(queue, queue.recv_cq);
+        // Also poll the send CQ if it is separate from the recv CQ.
         if (queue.send_cq != queue.recv_cq) {
-            pollCqCompletions(queue, queue.send_cq);
+            n += pollCqCompletions(queue, queue.send_cq);
         }
+        if (n == 0) break;
+    }
+    if (queue.event_ring) |r| {
+        if (r.producedCount() != produced_before) r.notify();
+    }
+}
 
-        iter += 1;
-        // Print alive message every 10000 iterations (~0.5s) for debugging
-        if (iter % 10000 == 0) {
-            log.debug("@{x} alive iter={d}", .{ @intFromPtr(queue), iter });
-        }
+/// Busy-poll fallback loop, used when CQ events are unavailable.
+///
+/// Polls the CQ, then sleeps ~50 microseconds. Costs roughly 1% of a CPU
+/// per queue even when idle, which is why event mode is preferred.
+fn busyPollerLoop(queue: *types.UdQueue) void {
+    while (queue.running.load(.acquire)) {
+        drainCq(queue);
 
-        // Sleep briefly between polls to reduce CPU usage.
-        // 50 microseconds gives good responsiveness while staying efficient.
         // libc nanosleep: std.Thread.sleep was removed in Zig 0.16 (sleeping
         // now goes through std.Io, which this C-ABI library does not carry).
-        const req: types.c.struct_timespec = .{ .tv_sec = 0, .tv_nsec = 50_000 };
+        const req: types.c.struct_timespec = .{ .tv_sec = 0, .tv_nsec = BUSY_POLL_SLEEP_NS };
         _ = types.c.nanosleep(&req, null);
     }
-    log.debug("@{x} exiting after {d} iters", .{ @intFromPtr(queue), iter });
 }
 
 /// Poll a single CQ for all available completions.
@@ -279,12 +377,13 @@ fn cqPollerLoop(queue: *types.UdQueue) void {
 /// For hardware timestamp mode, the extended API (ibv_start_poll /
 /// ibv_next_poll / ibv_end_poll) is used so that wallclock timestamps can be
 /// read via ibv_wc_read_completion_wallclock_ns().
-fn pollCqCompletions(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
+///
+/// Returns the number of work completions consumed (0 when the CQ is empty).
+fn pollCqCompletions(queue: *types.UdQueue, cq: *c.ibv_cq_ex) usize {
     if (queue.uses_sw_timestamps) {
-        pollCqClassic(queue, cq);
-        return;
+        return pollCqClassic(queue, cq);
     }
-    pollCqExtended(queue, cq);
+    return pollCqExtended(queue, cq);
 }
 
 /// Classic CQ polling using ibv_poll_cq().
@@ -292,15 +391,17 @@ fn pollCqCompletions(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
 /// Converts the extended CQ handle to a base CQ, calls ibv_poll_cq() to
 /// drain up to 32 completions at once, and dispatches each to
 /// dispatchClassicWc().
-fn pollCqClassic(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
-    const base_cq = c.ibv_cq_ex_to_cq(cq) orelse return;
+fn pollCqClassic(queue: *types.UdQueue, cq: *c.ibv_cq_ex) usize {
+    const base_cq = c.ibv_cq_ex_to_cq(cq) orelse return 0;
     var wc_buf: [32]c.ibv_wc = undefined;
     const n = c.ibv_poll_cq(base_cq, 32, &wc_buf[0]);
-    if (n <= 0) return;
+    if (n <= 0) return 0;
+    const count: usize = @intCast(n);
     var i: usize = 0;
-    while (i < @as(usize, @intCast(n))) : (i += 1) {
+    while (i < count) : (i += 1) {
         dispatchClassicWc(queue, &wc_buf[i]);
     }
+    return count;
 }
 
 /// Dispatch a classic ibv_wc completion to the appropriate handler.
@@ -391,24 +492,27 @@ fn processRecvClassic(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
 ///
 /// Used only when the device supports hardware wallclock timestamps
 /// (uses_sw_timestamps == false).
-fn pollCqExtended(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
+fn pollCqExtended(queue: *types.UdQueue, cq: *c.ibv_cq_ex) usize {
     var poll_attr = std.mem.zeroes(c.ibv_poll_cq_attr);
 
     const ret_start = c.ibv_start_poll(cq, &poll_attr);
     if (ret_start != 0) {
         // ENOENT means no completions available - this is normal
-        return;
+        return 0;
     }
 
     // Process the first completion
     dispatchCompletion(queue, cq);
+    var count: usize = 1;
 
     // Process remaining completions
     while (c.ibv_next_poll(cq) == 0) {
         dispatchCompletion(queue, cq);
+        count += 1;
     }
 
     c.ibv_end_poll(cq);
+    return count;
 }
 
 /// Return the current monotonic clock time in nanoseconds (software fallback).

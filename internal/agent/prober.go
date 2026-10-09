@@ -407,6 +407,7 @@ func (p *Prober) Start(ctx context.Context) error {
 
 	p.logger.Info().
 		Uint32("qpn", p.queue.Info.QPN).
+		Bool("cq_events", p.queue.Info.UsesCQEvents).
 		Msg("Prober started")
 	return nil
 }
@@ -989,25 +990,20 @@ func (p *Prober) rateLimitWait(ctx context.Context, ptype controller_agent.Pingl
 	}
 }
 
-// ackProcessLoop continuously polls the event ring for ACK completion
-// events and matches them against pending probes. First ACKs provide T3
-// and T5; second ACKs provide T3, T4, and T6, completing the 6-timestamp
-// measurement and emitting a ProbeResult.
+// ackProcessLoop drains the event ring for ACK completion events and
+// matches them against pending probes. First ACKs provide T3 and T5; second
+// ACKs provide T3, T4, and T6, completing the 6-timestamp measurement and
+// emitting a ProbeResult. While the ring is empty the loop sleeps until the
+// CQ poller signals new events (see newRingIdleWait).
 func (p *Prober) ackProcessLoop(ctx context.Context) {
 	defer p.wg.Done()
 
-	const (
-		maxBatch  = 32
-		idleSleep = 100 * time.Microsecond
-	)
+	const maxBatch = 32
 
 	p.logger.Info().Msg("ACK process loop started")
 
-	// idleTimer is reused on each empty-poll iteration to avoid allocating
-	// a new timer on every spin. Reset is safe here because we always drain
-	// it before calling Reset (see time.Timer documentation).
-	idleTimer := time.NewTimer(idleSleep)
-	defer idleTimer.Stop()
+	wait, release := newRingIdleWait(ctx, p.stopCh, p.ring, p.queue.Info.UsesCQEvents, p.logger)
+	defer release()
 
 	for p.running.Load() {
 		// Check for shutdown or context cancellation on every iteration,
@@ -1022,23 +1018,10 @@ func (p *Prober) ackProcessLoop(ctx context.Context) {
 
 		events := p.ring.Poll(maxBatch)
 		if len(events) == 0 {
-			// No events yet; wait briefly before polling again.
-			// Select on stopCh and ctx.Done() so we exit immediately
-			// when Stop() is called rather than finishing the sleep.
-			if !idleTimer.Stop() {
-				select {
-				case <-idleTimer.C:
-				default:
-				}
-			}
-			idleTimer.Reset(idleSleep)
-			select {
-			case <-ctx.Done():
+			// wait returns false as soon as Stop() or ctx cancellation
+			// happens, so shutdown never waits for the next event.
+			if !wait() {
 				return
-			case <-p.stopCh:
-				// Stop() was called; exit without waiting for the idle sleep.
-				return
-			case <-idleTimer.C:
 			}
 			continue
 		}

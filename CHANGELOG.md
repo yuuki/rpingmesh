@@ -15,6 +15,49 @@ All notable changes to this project are documented in this file.
   from LLDP, subnets, or group/rail layout, and cross-check a mapping against
   measured RTTs. Per-probe debug logs now include `source_gid`.
 
+## [0.4.0] - 2026-10-07
+
+### Added
+
+- Alerting rules (`deploy/observability/alerts/rpingmesh.rules.yml`) for probe
+  loss and black-holed ToR pairs, analyzer SLA violations, probe send errors,
+  event-ring drops, agent self-throttling, agents that stop reporting, and a
+  broken telemetry or analyzer pipeline. The observability demo stack runs
+  them in vmalert, and `make obs-verify` checks that exactly the expected
+  rules fire on the seeded data.
+
+### Changed
+
+- The agent no longer polls for RDMA completions on timers. Each queue's CQ
+  poller thread now sleeps on a completion channel (`ibv_req_notify_cq` +
+  `poll()`) and wakes the Go consumer through an `eventfd` on the event ring,
+  which the Go runtime waits on in its netpoller. Previously every RDMA device
+  cost two Zig threads waking ~10k times/s and two Go goroutines polling on
+  100 µs timers, so an 8-device host used about half a CPU regardless of
+  probe load; at the same load it now uses a few percent. NetworkRTT is
+  unchanged with NIC hardware timestamps, and ProberDelay/ResponderDelay drop
+  because completions no longer wait for the next poll.
+- New `cq_poll_mode` agent setting (`auto`, `event`, `busy`; default `auto`).
+  `auto` uses the event-driven path with NIC hardware timestamps and keeps the
+  previous polling behavior with software timestamps (for example soft-RoCE),
+  whose accuracy depends on prompt polling. Providers that cannot create a
+  completion channel or arm the CQ fall back to polling.
+- C ABI: `rdma_create_queue()` takes a `cq_poll_mode` argument,
+  `rdma_queue_info_t` gains `uses_cq_events`, and
+  `rdma_event_ring_notify_fd()` is new.
+
+### Fixed
+
+- Dashboards showed no data on backends that store unescaped OTLP metric names
+  (`rpingmesh.probe_total`) instead of `rpingmesh_probe_total`. Dashboards and
+  alert rules now match either style, and the seed script can produce both
+  (`NAME_STYLE=dotted`).
+- `make obs-verify` now derives its queries from the committed dashboards
+  instead of a hand-maintained list, and the README and dashboard design doc
+  list the current histogram bucket ladder.
+
+## [0.3.0] - 2026-10-07
+
 ### Changed
 
 - Require Go 1.27.1 or later and Zig 0.17.0 (the Zig library now gets its C
@@ -36,6 +79,22 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- The controller's stale-entry cleanup deleted every registered RNIC every
+  five minutes when rqlite ran on a host whose timezone is not UTC: rqlite
+  rewrites SQLite's `'now'` in write statements using local time, so the
+  cleanup saw fresh rows as hours old. Agents then got empty or partial
+  pinglists until their next heartbeat re-registered. Activity windows are
+  now computed from the controller's clock and bound as epoch cutoffs.
+- `librdmabridge.a` is built for the baseline CPU of the target architecture
+  instead of the build machine's CPU. With the ReleaseSafe build, an agent
+  built on an AMD CI runner contained SSE4a instructions and crashed with
+  SIGILL on Intel hosts as soon as it processed a completion. Pass
+  `-Dcpu=native` to `zig build` for a host-tuned local build.
+- Release agent binaries are linked inside an Enterprise Linux 9 container, so
+  they run on glibc 2.34+ (RHEL 9 family) instead of requiring the newer glibc
+  of the CI runner. `make package-build-agent-el9` (or
+  `AGENT_BUILDER=el9` with `make package`/`make archive`) builds the same
+  portable binary, and the build fails if the glibc floor is exceeded.
 - Link `librdmabridge.a` with older system linkers (e.g. GNU ld 2.35 on
   RHEL 9): always emit it through LLVM and bundle compiler-rt.
 - The agent's default `otel_collector_addr` was `grpc://localhost:4317`, which

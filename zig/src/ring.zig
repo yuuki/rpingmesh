@@ -9,8 +9,12 @@
 //   - Producer writes head with .release ordering; consumer reads with .acquire
 //   - Consumer writes tail with .release ordering; producer reads with .acquire
 //   - When the ring is full, events are dropped and drop_count is incremented
+//   - A non-blocking eventfd (notify_fd) lets the consumer sleep until the
+//     producer signals new events, instead of polling on a timer. The
+//     producer calls notify() once per drained CQ batch, not per event.
 
 const std = @import("std");
+const c = @import("c");
 const last_error = @import("last_error.zig");
 
 // ---------------------------------------------------------------------------
@@ -151,6 +155,13 @@ pub const EventRing = struct {
     /// Read by Go for metrics/diagnostics.
     drop_count: std.atomic.Value(u64),
 
+    /// eventfd (EFD_NONBLOCK | EFD_CLOEXEC) written by the producer after a
+    /// batch of pushes, or -1 if eventfd creation failed. The Go consumer
+    /// blocks on a dup of this fd in its netpoller and then drains the ring;
+    /// the eventfd counter persists until read, so a notification written
+    /// while the consumer is draining cannot be lost.
+    notify_fd: i32,
+
     /// Allocate and initialize an EventRing.
     ///
     /// The requested capacity is rounded up to the next power of 2 (minimum 2).
@@ -180,6 +191,10 @@ pub const EventRing = struct {
         // Zero-initialize all buffer entries
         @memset(buffer, std.mem.zeroes(CompletionEvent));
 
+        // A missing eventfd is not fatal: the consumer falls back to timed
+        // polling when rdma_event_ring_notify_fd() returns -1.
+        const efd = c.eventfd(0, c.EFD_NONBLOCK | c.EFD_CLOEXEC);
+
         self.* = EventRing{
             .buffer = buffer,
             .head = .{},
@@ -187,15 +202,35 @@ pub const EventRing = struct {
             .capacity = cap,
             .mask = cap - 1,
             .drop_count = std.atomic.Value(u64).init(0),
+            .notify_fd = if (efd >= 0) efd else -1,
         };
 
         return self;
     }
 
-    /// Free all memory associated with the ring.
+    /// Free all memory associated with the ring and close its eventfd.
     pub fn destroy(self: *EventRing) void {
+        if (self.notify_fd >= 0) _ = c.close(self.notify_fd);
         std.heap.page_allocator.free(self.buffer);
         std.heap.page_allocator.destroy(self);
+    }
+
+    /// Total number of events ever pushed (producer side only). The CQ
+    /// poller compares this before and after draining a CQ to decide
+    /// whether to notify() the consumer.
+    pub fn producedCount(self: *EventRing) u64 {
+        return self.head.value.load(.monotonic);
+    }
+
+    /// Wake the consumer (producer side). Adds 1 to the eventfd counter.
+    /// Must be called after the pushes it announces, so the consumer sees
+    /// them once it wakes. A failed write (only EAGAIN on counter overflow,
+    /// which needs ~2^64 unread notifications) is ignored: the counter is
+    /// then already non-zero and the consumer is due to wake anyway.
+    pub fn notify(self: *EventRing) void {
+        if (self.notify_fd < 0) return;
+        const one: u64 = 1;
+        _ = c.write(self.notify_fd, &one, @sizeOf(u64));
     }
 
     /// Push a completion event into the ring (producer side).
@@ -312,6 +347,17 @@ export fn rdma_event_ring_destroy(ring_ptr: ?*EventRing) void {
 export fn rdma_event_ring_drop_count(ring_ptr: ?*EventRing) u64 {
     const r = ring_ptr orelse return 0;
     return r.getDropCount();
+}
+
+/// Get the ring's producer-notification eventfd.
+///
+/// Exported as `rdma_event_ring_notify_fd` for the C ABI. The fd stays owned
+/// by the ring (closed by rdma_event_ring_destroy); Go dup()s it before
+/// handing it to its netpoller. Returns -1 for a null ring or when eventfd
+/// creation failed at ring creation time.
+export fn rdma_event_ring_notify_fd(ring_ptr: ?*EventRing) i32 {
+    const r = ring_ptr orelse return -1;
+    return r.notify_fd;
 }
 
 // ---------------------------------------------------------------------------
@@ -508,4 +554,29 @@ test "EventRing source_gid preserved through push/poll" {
     try std.testing.expectEqualSlices(u8, &event.source_gid, &out[0].source_gid);
     try std.testing.expectEqual(@as(u32, 12345), out[0].source_qpn);
     try std.testing.expectEqual(@as(u32, 0xABCDE), out[0].flow_label);
+}
+
+test "EventRing notify makes the eventfd readable and read resets it" {
+    const r = EventRing.create(4) orelse return error.SkipZigTest;
+    defer r.destroy();
+    const fd = rdma_event_ring_notify_fd(r);
+    try std.testing.expect(fd >= 0);
+    try std.testing.expectEqual(@as(i32, -1), rdma_event_ring_notify_fd(null));
+
+    var counter: u64 = 0;
+    // Nothing signalled yet: the non-blocking read fails with EAGAIN.
+    try std.testing.expect(c.read(fd, &counter, @sizeOf(u64)) < 0);
+
+    var event = std.mem.zeroes(CompletionEvent);
+    const before = r.producedCount();
+    try std.testing.expect(r.push(&event));
+    try std.testing.expect(r.push(&event));
+    try std.testing.expectEqual(before + 2, r.producedCount());
+    r.notify();
+    r.notify();
+
+    // Notifications coalesce into one counter value; one read drains it.
+    try std.testing.expectEqual(@as(isize, 8), c.read(fd, &counter, @sizeOf(u64)));
+    try std.testing.expectEqual(@as(u64, 2), counter);
+    try std.testing.expect(c.read(fd, &counter, @sizeOf(u64)) < 0);
 }

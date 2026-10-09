@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rqlite/gorqlite"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
@@ -85,8 +86,18 @@ func newTestRegistry(conn dbConn) *RnicRegistry {
 		conn:               conn,
 		activeThresholdSec: DefaultActiveThresholdSec,
 		staleThresholdSec:  DefaultStaleThresholdSec,
+		now:                func() time.Time { return time.Unix(testNowUnix, 0) },
 	}
 }
+
+// testNowUnix is the fixed clock of newTestRegistry, so tests can assert the
+// exact epoch cutoffs bound into queries.
+const testNowUnix = int64(1_800_000_000)
+
+var (
+	wantActiveCutoff = testNowUnix - DefaultActiveThresholdSec
+	wantStaleCutoff  = testNowUnix - DefaultStaleThresholdSec
+)
 
 func testRnic(gid string) *controller_agent.RnicInfo {
 	return &controller_agent.RnicInfo{
@@ -313,8 +324,8 @@ func TestGetRNICsByToR_UsesActiveThresholdAndTorID(t *testing.T) {
 		t.Fatalf("QueryOneParameterizedContext called %d times, want 1", len(fake.queryOneParameterizedCalls))
 	}
 	args := fake.queryOneParameterizedCalls[0].Arguments
-	if args[0] != "tor-42" || args[1] != DefaultActiveThresholdSec {
-		t.Errorf("arguments = %v, want [tor-42 %d]", args, DefaultActiveThresholdSec)
+	if args[0] != "tor-42" || args[1] != wantActiveCutoff {
+		t.Errorf("arguments = %v, want [tor-42 %d]", args, wantActiveCutoff)
 	}
 }
 
@@ -341,8 +352,8 @@ func TestGetActiveRNICsInOtherToRs_UsesActiveThresholdAndExcludesToR(t *testing.
 		t.Fatalf("QueryOneParameterizedContext called %d times, want 1", len(fake.queryOneParameterizedCalls))
 	}
 	args := fake.queryOneParameterizedCalls[0].Arguments
-	if args[0] != "tor-1" || args[1] != DefaultActiveThresholdSec {
-		t.Errorf("arguments = %v, want [tor-1 %d]", args, DefaultActiveThresholdSec)
+	if args[0] != "tor-1" || args[1] != wantActiveCutoff {
+		t.Errorf("arguments = %v, want [tor-1 %d]", args, wantActiveCutoff)
 	}
 }
 
@@ -485,8 +496,8 @@ func TestCleanupStaleEntries_UsesStaleThreshold(t *testing.T) {
 		t.Fatalf("WriteOneParameterizedContext called %d times, want 1", len(fake.writeOneParameterizedCalls))
 	}
 	args := fake.writeOneParameterizedCalls[0].Arguments
-	if len(args) != 1 || args[0] != DefaultStaleThresholdSec {
-		t.Errorf("arguments = %v, want [%d]", args, DefaultStaleThresholdSec)
+	if len(args) != 1 || args[0] != wantStaleCutoff {
+		t.Errorf("arguments = %v, want [%d]", args, wantStaleCutoff)
 	}
 }
 
@@ -517,8 +528,8 @@ func TestListAllRNICs_UsesStaleThreshold(t *testing.T) {
 		t.Fatalf("QueryOneParameterizedContext called %d times, want 1", len(fake.queryOneParameterizedCalls))
 	}
 	args := fake.queryOneParameterizedCalls[0].Arguments
-	if len(args) != 1 || args[0] != DefaultStaleThresholdSec {
-		t.Errorf("arguments = %v, want [%d]", args, DefaultStaleThresholdSec)
+	if len(args) != 1 || args[0] != wantStaleCutoff {
+		t.Errorf("arguments = %v, want [%d]", args, wantStaleCutoff)
 	}
 }
 
@@ -537,5 +548,44 @@ func TestClose_ClosesUnderlyingConnection(t *testing.T) {
 	reg := newTestRegistry(&fakeConn{})
 	if err := reg.Close(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestNoStatementUsesSQLiteNow guards against SQLite's 'now': rqlite rewrites
+// it in write statements using the server's local timezone, which on a
+// non-UTC host made the stale cleanup delete every row. All windows must be
+// bound as epoch cutoffs computed from the registry clock instead.
+func TestNoStatementUsesSQLiteNow(t *testing.T) {
+	fake := &fakeConn{}
+	reg := newTestRegistry(fake)
+	ctx := context.Background()
+
+	_ = reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
+	_, _ = reg.GetRNICsByToR(ctx, "tor-1")
+	_, _ = reg.GetActiveRNICsInOtherToRs(ctx, "tor-1")
+	_, _ = reg.GetRNICInfo(ctx, "", "gid-1")
+	_, _ = reg.GetRNICInfo(ctx, "10.0.0.1", "")
+	_ = reg.CleanupStaleEntries(ctx)
+	_, _ = reg.ListAllRNICs(ctx)
+
+	var stmts []gorqlite.ParameterizedStatement
+	for _, batch := range fake.writeParameterizedCalls {
+		stmts = append(stmts, batch...)
+	}
+	stmts = append(stmts, fake.queryOneParameterizedCalls...)
+	stmts = append(stmts, fake.writeOneParameterizedCalls...)
+	if len(stmts) < 8 {
+		t.Fatalf("captured %d statements, want at least 8", len(stmts))
+	}
+	for _, st := range stmts {
+		if strings.Contains(strings.ToLower(st.Query), "'now'") {
+			t.Errorf("statement uses SQLite 'now': %s", st.Query)
+		}
+	}
+
+	// RegisterRNICs stamps rows with the same clock the cutoffs use.
+	ins := fake.writeParameterizedCalls[0][1]
+	if got := ins.Arguments[len(ins.Arguments)-1]; got != testNowUnix {
+		t.Errorf("last_updated_epoch = %v, want %d", got, testNowUnix)
 	}
 }

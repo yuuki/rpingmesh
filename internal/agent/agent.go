@@ -814,6 +814,10 @@ func (a *Agent) openDevices() error {
 	// is in [0,255], so both narrow to uint8 without loss.
 	sl := uint8(a.cfg.ServiceLevel)
 	tc := uint8(a.cfg.TrafficClass)
+	cqMode, err := rdmabridge.ParseCQPollMode(a.cfg.CQPollMode)
+	if err != nil {
+		return err
+	}
 
 	if len(a.cfg.AllowedDeviceNames) > 0 {
 		// Open only the explicitly allowed devices by name.
@@ -825,6 +829,7 @@ func (a *Agent) openDevices() error {
 					Msg("Failed to open allowed RDMA device, skipping")
 				continue
 			}
+			dev.CQPollMode = cqMode
 			a.devices = append(a.devices, dev)
 			a.logger.Info().
 				Str("device_name", dev.Info.DeviceName).
@@ -847,6 +852,7 @@ func (a *Agent) openDevices() error {
 					Msg("Failed to open RDMA device by index, skipping")
 				continue
 			}
+			dev.CQPollMode = cqMode
 			a.devices = append(a.devices, dev)
 			a.logger.Info().
 				Str("device_name", dev.Info.DeviceName).

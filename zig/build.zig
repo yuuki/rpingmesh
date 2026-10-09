@@ -13,8 +13,14 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // Use native target and ReleaseSafe optimization.
-    const target = b.standardTargetOptions(.{});
+    // Default to the host OS/arch but the *baseline* CPU model, not the
+    // build machine's CPU: the library ships inside release binaries built on
+    // CI runners, and native CPU features leak vendor-specific instructions
+    // (e.g. AMD SSE4a `insertq` from an EPYC runner traps with SIGILL on Intel
+    // Xeon hosts). Pass -Dcpu=native for a host-tuned local build.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .cpu_model = .baseline },
+    });
     const optimize = b.standardOptimizeOption(.{
         .preferred_optimize_mode = .ReleaseSafe,
     });

@@ -236,6 +236,7 @@ via Cgo (`CGO_ENABLED=1`).
 | `gid_index` | `0` | GID table index on RDMA devices (0-255; see note below) |
 | `service_level` | `0` | Service Level (SL, PFC priority) applied to every Address Handle (0-7) |
 | `traffic_class` | `0` | GRH traffic class octet applied to every Address Handle (0-255). RoCEv2 DSCP occupies the upper 6 bits of this octet: to use DSCP value `N`, set `traffic_class = N << 2` |
+| `cq_poll_mode` | `auto` | How completions are awaited: `event` sleeps on a completion channel and an eventfd (no CPU while idle), `busy` polls the CQ every ~50 µs and the event ring every 100 µs (roughly 3% of a CPU per RDMA device), `auto` uses `event` with NIC hardware timestamps and `busy` with software timestamps (see [Event-Driven Completion Handling](#event-driven-completion-handling)) |
 | `allowed_device_names` | `[]` | Device filter (empty = all devices) |
 | `metrics_enabled` | `true` | Enable OpenTelemetry export |
 | `otel_collector_addr` | `localhost:4317` | OTLP gRPC collector endpoint |
@@ -488,7 +489,7 @@ Each release tag publishes Linux/amd64 `.deb`, `.rpm`, and binary-only
 installation:
 
 ```sh
-gh release download v0.2.1 --repo yuuki/rpingmesh \
+gh release download v0.4.0 --repo yuuki/rpingmesh \
     --pattern 'rpingmesh-*' --pattern checksums.txt
 sha256sum -c checksums.txt
 sudo apt install ./rpingmesh-controller_*.deb
@@ -509,6 +510,14 @@ the manual-install instructions above to provision those pieces. In
 particular, an agent archive still requires the host-provided `libibverbs` and
 `librdmacm` libraries, a supported RDMA device, and access to
 `/dev/infiniband/*`.
+
+The released agent binary (in both the archive and the packages) is linked
+inside an Enterprise Linux 9 container (`Dockerfile.agent-el9`), so it requires
+only glibc 2.34 or later and runs on RHEL 9-family hosts as well as newer
+distributions such as Debian 12+ and Ubuntu 22.04+. To build the same portable
+binary yourself, run `make package-build-agent-el9` (Docker with buildx
+required), or `make package archive AGENT_BUILDER=el9` to package it; a plain
+`make package-build-agent` instead inherits the build host's glibc.
 
 Use the equivalent agent package only on a Linux host with a supported
 RDMA-capable device or soft-RoCE device. The agent package declares the
@@ -563,6 +572,34 @@ Cgo callbacks. This avoids:
 
 The ring uses cache-line-padded atomic head/tail pointers with acquire/release
 memory ordering.
+
+### Event-Driven Completion Handling
+
+The agent's CPU cost must stay negligible next to the workloads it monitors,
+so neither side of the ring polls on a timer:
+
+- **Zig CQ poller.** Each queue's CQ is attached to a completion channel. The
+  poller arms the CQ (`ibv_req_notify_cq`), drains it, and sleeps in `poll()`
+  until the NIC raises the next completion event. Arming before draining means
+  a completion that races with the final empty poll still raises an event, so
+  none is slept through. A 100 ms `poll()` timeout re-arms and drains as a
+  safety net.
+- **Go ring consumers.** Each ring owns an `eventfd` that the poller writes
+  after a drained batch produced events. The Go consumer blocks on a dup of it
+  through the runtime netpoller (a parked goroutine, not a thread) and drains
+  the ring when woken. This is still not a Cgo callback: Go only reads the fd
+  and then calls `rdma_event_ring_poll()`.
+
+With NIC hardware timestamps, when the poller runs does not change T2–T5, so
+event mode is accuracy-neutral for NetworkRTT. Software timestamps, however,
+are taken when the poller reads a completion, so its wakeup latency becomes
+timestamp error; `cq_poll_mode: auto` therefore keeps busy mode for queues
+without hardware timestamps, such as soft-RoCE. Busy mode is the poll-based
+design on both sides: the CQ poller sleeps ~50 µs between polls and the Go
+consumer polls the ring every 100 µs. Busy mode is also the fallback when a
+provider cannot create a completion channel or arm the CQ. The
+`Prober started` / `Responder started` log lines report the mode in effect as
+`cq_events`.
 
 ### `ibv_create_ah()` for Address Handles
 
@@ -691,9 +728,12 @@ collector relabeling during a mixed-version window).
 ### Integer Epoch for Staleness Tracking
 
 The rqlite `rnics` table uses `last_updated_epoch INTEGER` (Unix seconds)
-instead of text-formatted timestamps. This enables efficient staleness queries
-with simple integer arithmetic (`strftime('%s','now') - 300`) and benefits from
-B-tree index scans.
+instead of text-formatted timestamps. The controller stamps it and computes
+the active/stale cutoffs (`now - 300`) from its own clock, binding them as
+query parameters, so staleness checks are plain integer comparisons that
+benefit from B-tree index scans. SQLite's `'now'` is deliberately avoided:
+rqlite rewrites it in write statements using the server's local timezone, which
+on a non-UTC host shifts it by the UTC offset.
 
 ## Observability
 
@@ -725,20 +765,35 @@ The controller-side analyzer (Phase 1) exports the following OTLP metrics under
 Analyzer metric attributes are ToR-level only, matching the agent convention;
 per-path GID detail appears only in findings logs, never as a metric attribute.
 
-Histogram bucket boundaries (nanoseconds):
+Histogram bucket boundaries (nanoseconds), dense in 1–10 µs where RoCEv2
+network RTTs typically land, and a superset of the analyzer's aggregation
+buckets:
 ```
-100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000, 10000000
+100, 250, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000, 6000,
+7000, 8000, 9000, 10000, 12500, 15000, 20000, 25000, 50000, 100000, 250000,
+500000, 1000000, 2500000, 5000000, 10000000
 ```
 
 This covers the 100 ns to 10 ms range typical of datacenter RDMA networks.
 
 ### Observability & Dashboards
 
-A ready-to-use pipeline and two provisioned Grafana dashboards live in this
-repo: OTLP metrics (above) flow through `otel-collector-contrib` into
-VictoriaMetrics and are visualized in Grafana with zero custom plugins. See
-`docs/design/grafana-dashboards.md` for the full design (metric-name
-contract, panel layout, drilldown mechanism).
+A ready-to-use pipeline, two provisioned Grafana dashboards, and alerting
+rules live in this repo: OTLP metrics (above) flow through
+`otel-collector-contrib` into VictoriaMetrics, are visualized in Grafana with
+zero custom plugins, and are evaluated by vmalert against
+`deploy/observability/alerts/rpingmesh.rules.yml` (probe loss and black-holed
+ToR pairs, analyzer SLA violations, probe send errors, event-ring drops,
+self-throttling, agents that stop reporting, and a broken telemetry or
+analyzer pipeline). See `docs/design/grafana-dashboards.md` for the full
+design (metric-name contract, panel layout, drilldown mechanism, alerts).
+
+**Both metric-name styles work:** dashboards and rules select metrics with
+`{__name__=~"rpingmesh[._]probe_total"}`, so they match the underscore names
+this stack's collector produces (`rpingmesh_probe_total`) as well as the
+unescaped OTLP names a UTF-8-aware pipeline stores (`rpingmesh.probe_total`).
+Per-agent alerts read the agent identity from `instance` or `host.name`,
+whichever the pipeline provides.
 
 **Metric name contract:** the collector's `prometheus_remote_write` exporter
 must escape `.` to `_` but must **not** append extra `_total`/unit suffixes,
@@ -756,6 +811,8 @@ Quick start:
 make obs-up        # start VictoriaMetrics + otel-collector + Grafana (localhost:3000, admin/admin)
 make obs-seed       # load synthetic demo data (no RDMA hardware required)
 open http://localhost:3000  # dashboards under the "R-Pingmesh" folder
+open http://localhost:8880  # vmalert: rule and alert state
+make obs-verify     # assert every dashboard query and alert rule against the seed
 ```
 
 `admin`/`admin` is the default Grafana credential for this local demo stack

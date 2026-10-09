@@ -46,6 +46,12 @@ analysis_window_sec: 30          # per-path aggregation window length
 
 # RDMA settings
 gid_index: 0                     # GID table index to use
+# Completion wait mode: "event" sleeps on a completion channel and an eventfd
+# (no CPU while idle), "busy" polls the CQ every ~50us and the event ring
+# every 100us (roughly 3% of a CPU per RDMA device), "auto" uses event with
+# NIC hardware timestamps and busy with software timestamps (whose accuracy
+# depends on prompt polling).
+cq_poll_mode: "auto"
 allowed_device_names: []         # Empty = all devices
 
 # Telemetry

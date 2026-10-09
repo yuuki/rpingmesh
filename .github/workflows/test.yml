@@ -62,6 +62,30 @@ jobs:
       - name: Run Go unit tests (excludes ./e2e/...)
         run: go test -race $(go list ./... | grep -v '/e2e')
 
+  # Release-style portable agent build: links the agent in an Enterprise
+  # Linux 9 container and fails if the binary needs a glibc newer than the
+  # supported floor (2.34, RHEL 9 family). The binary is uploaded so it can be
+  # tried on real hardware before a release is tagged.
+  agent-el9:
+    name: agent-el9 (portable build)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build agent in EL9 container and check glibc floor
+        run: make package-build-agent-el9 NFPM_ARCH=amd64
+
+      - name: Upload portable agent binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: rpingmesh-agent-el9-linux-amd64
+          path: bin/rpingmesh-agent
+          retention-days: 14
+
   # Agent-to-Controller e2e tests: pure-Go gRPC path against a real
   # rqlite-backed Controller, no RDMA hardware needed. Runs entirely via
   # docker compose (see docker-compose.e2e-controller.yml).

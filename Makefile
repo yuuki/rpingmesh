@@ -6,7 +6,7 @@
         generate generate-proto clean test test-go test-zig test-all vet \
         test-e2e setup-colima test-e2e-controller clean-e2e-controller \
         check-nfpm package package-agent package-controller \
-        package-build-agent package-build-controller \
+        package-build-agent package-build-agent-el9 package-build-controller \
         archive archive-agent archive-controller \
         obs-up obs-down obs-seed obs-verify obs-logs help
 
@@ -41,6 +41,24 @@ GO_LDFLAGS :=
 ifdef VERSION
 GO_LDFLAGS := -X github.com/yuuki/rpingmesh/internal/buildinfo.Version=$(VERSION)
 endif
+
+# How package-agent/archive-agent produce bin/rpingmesh-agent:
+#   native - build on this host (package-build-agent); the binary inherits this
+#            host's glibc floor.
+#   el9    - build inside an Enterprise Linux 9 container
+#            (package-build-agent-el9) so the binary runs on glibc >= 2.34.
+#            Release builds use this.
+AGENT_BUILDER ?= native
+ifeq ($(AGENT_BUILDER),el9)
+AGENT_PACKAGE_BUILD := package-build-agent-el9
+else ifeq ($(AGENT_BUILDER),native)
+AGENT_PACKAGE_BUILD := package-build-agent
+else
+$(error AGENT_BUILDER must be "native" or "el9", got "$(AGENT_BUILDER)")
+endif
+
+# Oldest glibc the released agent must run on (RHEL 9 family).
+AGENT_GLIBC_FLOOR := 2.34
 
 # Default target
 all: build
@@ -200,10 +218,25 @@ package-build-agent: build-zig generate
 	CGO_ENABLED=1 GOOS=linux GOARCH=$(NFPM_ARCH) go build -ldflags "$(GO_LDFLAGS)" -o $(AGENT_BIN) ./cmd/agent/
 	@echo "==> Agent built for packaging: $(AGENT_BIN)"
 
-# Requires a Linux/CGO_ENABLED=1 build host with libibverbs-dev/librdmacm-dev
-# whose GOARCH matches $(NFPM_ARCH) (same requirement as build-agent; see
-# README.md "Building").
-package-agent: package-build-agent check-nfpm
+# Portable agent build: runs package-build-agent inside an Enterprise Linux 9
+# container (Dockerfile.agent-el9) so the binary only depends on glibc
+# <= $(AGENT_GLIBC_FLOOR) and EL9's libibverbs symbol versions, then re-checks
+# the glibc floor on the extracted binary. Needs Docker with buildx; for a
+# foreign NFPM_ARCH the Docker host must be able to emulate that platform.
+package-build-agent-el9:
+	@echo "==> Building agent in an EL9 container (linux/$(NFPM_ARCH), glibc floor $(AGENT_GLIBC_FLOOR))..."
+	@mkdir -p $(BIN_DIR)
+	docker buildx build --platform linux/$(NFPM_ARCH) -f Dockerfile.agent-el9 \
+		--build-arg VERSION=$(VERSION) \
+		--output type=local,dest=$(BIN_DIR) .
+	./scripts/check-glibc-compat.sh $(AGENT_BIN) $(AGENT_GLIBC_FLOOR)
+	@echo "==> Agent built for packaging: $(AGENT_BIN)"
+
+# With the default AGENT_BUILDER=native this requires a Linux/CGO_ENABLED=1
+# build host with libibverbs-dev/librdmacm-dev whose GOARCH matches
+# $(NFPM_ARCH) (same requirement as build-agent; see README.md "Building").
+# AGENT_BUILDER=el9 builds in a container instead (see above).
+package-agent: $(AGENT_PACKAGE_BUILD) check-nfpm
 	@echo "==> Packaging rpingmesh-agent $(NFPM_VERSION) ($(NFPM_ARCH))..."
 	@mkdir -p $(DIST_DIR)
 	nfpm package --config packaging/nfpm/nfpm-agent.yaml --packager deb --target $(DIST_DIR)/
@@ -223,7 +256,7 @@ package-controller: package-build-controller check-nfpm
 # build-host requirement as package-agent.
 archive: archive-agent archive-controller
 
-archive-agent: package-build-agent
+archive-agent: $(AGENT_PACKAGE_BUILD)
 	@echo "==> Archiving rpingmesh-agent $(NFPM_VERSION) ($(NFPM_ARCH))..."
 	@mkdir -p $(DIST_DIR)
 	@stage=$$(mktemp -d); trap 'rm -rf "$$stage"' EXIT; \
@@ -296,6 +329,8 @@ help:
 	@echo "  package-agent        Build .deb/.rpm packages for the agent only"
 	@echo "  package-controller   Build .deb/.rpm packages for the controller only"
 	@echo "  archive              Build .tar.gz binary archives for GitHub Releases"
+	@echo "  package-build-agent-el9  Build a portable agent (glibc >= $(AGENT_GLIBC_FLOOR)) in an EL9 container"
+	@echo "                       (use AGENT_BUILDER=el9 with package/archive to package it)"
 	@echo "  clean                Remove all build artifacts"
 	@echo "  obs-up               Start the observability stack (VictoriaMetrics + otel-collector + Grafana)"
 	@echo "  obs-down             Stop the observability stack and remove volumes"

@@ -593,6 +593,39 @@ func TestLoadAgentConfig_ServiceLevelAndTrafficClassDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadAgentConfig_CQPollModeDefaultIsAuto(t *testing.T) {
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.CQPollMode != CQPollModeAuto {
+		t.Errorf("CQPollMode = %q, want %q", cfg.CQPollMode, CQPollModeAuto)
+	}
+}
+
+func TestLoadAgentConfig_CQPollModeFromEnv(t *testing.T) {
+	for _, mode := range []string{CQPollModeAuto, CQPollModeEvent, CQPollModeBusy} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("RPINGMESH_CQ_POLL_MODE", mode)
+			cfg, err := LoadAgentConfig("", nil)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.CQPollMode != mode {
+				t.Errorf("CQPollMode = %q, want %q", cfg.CQPollMode, mode)
+			}
+		})
+	}
+}
+
+func TestLoadAgentConfig_InvalidCQPollMode(t *testing.T) {
+	t.Setenv("RPINGMESH_CQ_POLL_MODE", "spin")
+
+	if _, err := LoadAgentConfig("", nil); err == nil {
+		t.Fatal("expected an error for cq_poll_mode=spin, got nil")
+	}
+}
+
 func TestLoadAgentConfig_NegativeServiceLevel(t *testing.T) {
 	t.Setenv("RPINGMESH_SERVICE_LEVEL", "-1")
 
@@ -714,6 +747,22 @@ func TestAgentConfig_Validate(t *testing.T) {
 			cfg: AgentConfig{
 				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
 				ServiceLevel: 7, TrafficClass: 255,
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid cq poll mode",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				CQPollMode: "spin",
+			},
+			wantErr: true,
+		},
+		{
+			name: "busy cq poll mode",
+			cfg: AgentConfig{
+				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
+				CQPollMode: CQPollModeBusy,
 			},
 			wantErr: false,
 		},

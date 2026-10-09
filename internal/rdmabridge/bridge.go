@@ -30,6 +30,35 @@ const (
 	QueueTypeResponder = C.RDMA_QUEUE_TYPE_RESPONDER
 )
 
+// CQ poll mode constants matching RDMA_CQ_POLL_* in rdma_bridge.h. They
+// select how a queue's Zig CQ poller thread waits for completions.
+const (
+	// CQPollAuto uses CQPollEvent with hardware timestamps and CQPollBusy
+	// with software timestamps (which are taken when the poller reads the
+	// completion, so its wakeup latency would become timestamp error).
+	CQPollAuto = C.RDMA_CQ_POLL_AUTO
+	// CQPollEvent sleeps on a completion channel until the CQ raises an
+	// event: no CPU while idle.
+	CQPollEvent = C.RDMA_CQ_POLL_EVENT
+	// CQPollBusy polls with a ~50us sleep between polls (~1% of a CPU per
+	// queue).
+	CQPollBusy = C.RDMA_CQ_POLL_BUSY
+)
+
+// ParseCQPollMode maps a configuration value ("auto", "event", "busy") to
+// a CQPoll* constant. An empty string means "auto".
+func ParseCQPollMode(s string) (int, error) {
+	switch s {
+	case "", "auto":
+		return CQPollAuto, nil
+	case "event":
+		return CQPollEvent, nil
+	case "busy":
+		return CQPollBusy, nil
+	}
+	return 0, fmt.Errorf("unknown CQ poll mode %q (want auto, event or busy)", s)
+}
+
 // Protocol constants for probe packet wire format.
 const (
 	PacketVersion   = 1
@@ -52,6 +81,9 @@ type Device struct {
 	handle    C.rdma_context_t // parent context for device operations
 	devHandle C.rdma_device_t
 	Info      DeviceInfo
+	// CQPollMode is the CQPoll* mode applied to queues created on this
+	// device by CreateQueue. The zero value is CQPollAuto.
+	CQPollMode int
 }
 
 // DeviceInfo contains human-readable device metadata returned after opening.
@@ -74,6 +106,11 @@ type Queue struct {
 type QueueInfo struct {
 	QPN              uint32
 	UsesSWTimestamps bool
+	// UsesCQEvents reports whether the Zig CQ poller sleeps on a completion
+	// channel (true) or busy-polls (false), either because busy polling was
+	// selected (see CQPollMode) or because the provider lacks CQ event
+	// support. Busy polling costs ~1% of a CPU per queue.
+	UsesCQEvents bool
 }
 
 // EventRing wraps the Zig SPSC (Single Producer, Single Consumer) ring buffer
@@ -310,7 +347,8 @@ func (ring *EventRing) DropCount() uint64 {
 
 // CreateQueue creates a UD Queue Pair on this device. The queueType must be
 // QueueTypeSender or QueueTypeResponder. The ring is used by the CQ poller
-// to deliver completion events asynchronously.
+// to deliver completion events asynchronously. The CQ poller waits in the
+// device's CQPollMode; Info.UsesCQEvents reports the mode in effect.
 func (dev *Device) CreateQueue(queueType int, ring *EventRing) (*Queue, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -321,6 +359,7 @@ func (dev *Device) CreateQueue(queueType int, ring *EventRing) (*Queue, error) {
 	rc := C.rdma_create_queue(
 		dev.devHandle,
 		C.int32_t(queueType),
+		C.int32_t(dev.CQPollMode),
 		ring.handle,
 		&qHandle,
 		&cInfo,
@@ -336,6 +375,7 @@ func (dev *Device) CreateQueue(queueType int, ring *EventRing) (*Queue, error) {
 		Info: QueueInfo{
 			QPN:              uint32(cInfo.qpn),
 			UsesSWTimestamps: cInfo.uses_sw_timestamps != 0,
+			UsesCQEvents:     cInfo.uses_cq_events != 0,
 		},
 	}
 	return q, nil
@@ -457,16 +497,29 @@ func (q *Queue) SendSecondAck(targetGID [16]byte, targetQPN uint32, flowLabel ui
 // Event Poller
 // ---------------------------------------------------------------------------
 
-// StartEventPoller starts a goroutine that continuously polls the event ring
-// buffer and dispatches completion events to the provided handler function.
-// The poller runs until the context is cancelled. It sleeps briefly (100us)
-// between polls when no events are available to avoid busy-spinning.
+// StartEventPoller starts a goroutine that continuously drains the event
+// ring buffer and dispatches completion events to the provided handler
+// function. The poller runs until the context is cancelled. When the ring is
+// empty it blocks on the ring's RingWaiter if the queue's CQ poller is in
+// event mode (Info.UsesCQEvents); in busy mode, or if the ring has no
+// notification fd, it sleeps briefly (100us) between polls instead.
 func (q *Queue) StartEventPoller(ctx context.Context, handler func(CompletionEvent)) {
 	go func() {
 		const (
 			maxBatch  = 32
 			idleSleep = 100 * time.Microsecond
 		)
+		var waiter *RingWaiter
+		if q.Info.UsesCQEvents {
+			if w, err := q.ring.NewWaiter(); err == nil {
+				waiter = w
+			}
+		}
+		if waiter != nil {
+			defer waiter.Close()
+			stop := context.AfterFunc(ctx, func() { _ = waiter.Close() })
+			defer stop()
+		}
 		for {
 			select {
 			case <-ctx.Done():
@@ -476,7 +529,11 @@ func (q *Queue) StartEventPoller(ctx context.Context, handler func(CompletionEve
 
 			events := q.ring.Poll(maxBatch)
 			if len(events) == 0 {
-				time.Sleep(idleSleep)
+				if waiter == nil {
+					time.Sleep(idleSleep)
+				} else if waiter.Wait() != nil {
+					return
+				}
 				continue
 			}
 

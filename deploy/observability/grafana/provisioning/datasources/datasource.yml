@@ -9,4 +9,5 @@ datasources:
     jsonData:
       httpMethod: POST
       timeInterval: "10s"     # matches the agent periodic reader flush interval
+      manageAlerts: false     # rules live in deploy/observability/alerts (vmalert); list-only in Grafana
     editable: false

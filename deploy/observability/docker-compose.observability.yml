@@ -7,6 +7,9 @@ services:
       - "-storageDataPath=/vmdata"
       - "-retentionPeriod=7d"
       - "-httpListenAddr=:8428"
+      # Proxy /api/v1/rules and /api/v1/alerts to vmalert so Grafana's
+      # Prometheus-type datasource can list the alert rules and their state.
+      - "-vmalert.proxyURL=http://vmalert:8880"
     ports:
       - "8428:8428"
     volumes:
@@ -30,6 +33,25 @@ services:
     ports:
       - "4317:4317"   # OTLP gRPC (agent/analyzer -> collector)
       - "4318:4318"   # OTLP HTTP (optional)
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+
+  vmalert:
+    image: ${VMALERT_IMAGE:-victoriametrics/vmalert:v1.153.0}
+    command:
+      - "-datasource.url=http://victoriametrics:8428"
+      - "-rule=/etc/vmalert/rules/*.yml"
+      - "-evaluationInterval=30s"
+      - "-httpListenAddr=:8880"
+      # Demo stack: evaluate and expose alert state, but deliver
+      # notifications nowhere. Point -notifier.url at an Alertmanager in a
+      # real deployment.
+      - "-notifier.blackhole"
+    volumes:
+      - ./alerts:/etc/vmalert/rules:ro
+    ports:
+      - "8880:8880"   # vmalert UI and /api/v1/rules
     depends_on:
       victoriametrics:
         condition: service_healthy

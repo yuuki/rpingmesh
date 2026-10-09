@@ -7,5 +7,7 @@
 #include <infiniband/verbs.h>
 #include <rdma/rdma_cma.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <sys/eventfd.h>
 #include <time.h>
 #include <unistd.h>

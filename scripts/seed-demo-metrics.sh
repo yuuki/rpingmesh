@@ -2,7 +2,15 @@
 # Seed synthetic R-Pingmesh mesh metrics into VictoriaMetrics for dashboard demos.
 # Backfills ~30 min of a 6-ToR mesh so that rate()/histogram_quantile() have data.
 # Names MUST match the exporter output (translation_strategy=WithoutSuffixes).
+#
+# NAME_STYLE=dotted instead emits the OTLP names unescaped
+# (rpingmesh.probe_total, rpingmesh.agent.self_throttle, ...) with the agent
+# identity in host.name/service.name labels, as a pipeline that keeps OTLP
+# names and promotes resource attributes produces. Dashboards and alert rules
+# must work with both styles (do not seed both into one VictoriaMetrics).
 set -euo pipefail
+
+NAME_STYLE="${NAME_STYLE:-underscore}"
 
 VM_URL="${VM_URL:-http://localhost:8428}"
 WINDOW="${WINDOW:-1800}"   # seconds of backfill
@@ -117,8 +125,20 @@ gen() {
   }'
 }
 
-echo "Seeding ${WINDOW}s of mesh data (step ${STEP}s) into ${VM_URL} ..." >&2
-gen | curl -s --fail --data-binary @- "${VM_URL}/api/v1/import/prometheus"
+# dotted: rpingmesh_agent_* / rpingmesh_analyzer_* -> rpingmesh.agent.* /
+# rpingmesh.analyzer.*, any other rpingmesh_ -> rpingmesh., and the identity
+# labels job/instance -> service.name/host.name.
+style() {
+  case "$NAME_STYLE" in
+    underscore) cat ;;
+    dotted) sed -E -e 's/^rpingmesh_(agent|analyzer)_/rpingmesh.\1./' -e 's/^rpingmesh_/rpingmesh./' \
+                   -e 's/(^|[{,])job="/\1service.name="/' -e 's/(^|[{,])instance="/\1host.name="/' ;;
+    *) echo "NAME_STYLE must be underscore or dotted, got: $NAME_STYLE" >&2; exit 2 ;;
+  esac
+}
+
+echo "Seeding ${WINDOW}s of mesh data (step ${STEP}s, ${NAME_STYLE} names) into ${VM_URL} ..." >&2
+gen | style | curl -s --fail --data-binary @- "${VM_URL}/api/v1/import/prometheus"
 # flush VM in-memory buffers so queries see the data immediately
 curl -s "${VM_URL}/internal/force_flush" >/dev/null || true
 echo "Seed complete. Try: curl -s '${VM_URL}/api/v1/label/__name__/values' | tr ',' '\n' | grep rpingmesh" >&2

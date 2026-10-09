@@ -26,6 +26,13 @@ All notable changes to this project are documented in this file.
   (`system_name` or `chassis_id`), `lldpcli_path`,
   `lldp_discovery_timeout_sec`.
 
+### Changed
+
+- Require Go 1.27.2 or later, and run the controller e2e tests against rqlite
+  10.5.3.
+- Update `golang.org/x/sys` to v0.49.0, `golang.org/x/net` to v0.60.0, and
+  `github.com/mattn/go-colorable` to v0.1.16.
+
 ## [0.4.0] - 2026-10-07
 
 ### Added

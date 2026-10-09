@@ -119,10 +119,15 @@ None of them reproduces "same leaf"; they are fallbacks only.
   send the same value in both places, so they are unaffected.
 - Metrics/analysis: the prober stamps `SourceTorID` on each result; the
   metrics consumer and the analysis reporter prefer it over their default.
-- Rollout: upgrade the controller first. A new agent using `device_tor_ids`
-  against an old controller gets its RNICs registered under the agent-wide
-  `tor_id` while it requests pinglists per device ToR, which yields empty
-  ToR-meshes.
+- Rollout: upgrade the controller first. An old controller registers every
+  RNIC under the agent-wide `tor_id` and still reports success, so per-device
+  pinglist requests would match nothing and ToR-meshes would silently go
+  empty. The new controller therefore sets `per_rnic_tor_id` in the
+  registration response; an agent using per-device ToRs (`device_tor_ids` or
+  LLDP) that does not see it logs an error and falls back to `tor_id` for
+  every device until it is restarted against an upgraded controller. A
+  controller downgraded under a running agent is only reported (once, from
+  the heartbeat), since the monitors already hold per-device ToRs.
 
 ## Field observations (step 1 of the plan)
 

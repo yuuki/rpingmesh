@@ -191,6 +191,9 @@ func TestRegisterAgent_Success(t *testing.T) {
 	if !resp.GetSuccess() {
 		t.Errorf("resp.Success = false, want true; message: %s", resp.GetMessage())
 	}
+	if !resp.GetPerRnicTorId() {
+		t.Error("resp.PerRnicTorId = false, want true (agents rely on it to keep per-device ToRs)")
+	}
 	if fake.registerCalls != 1 {
 		t.Errorf("registerCalls = %d, want 1", fake.registerCalls)
 	}

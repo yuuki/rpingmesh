@@ -135,6 +135,11 @@ type Agent struct {
 	lldpQuerier lldp.Querier
 	sysfsRoot   string
 
+	// perRnicTorLossWarned records that a heartbeat found the controller no
+	// longer honoring per-RNIC ToRs, so the error is logged once, not every
+	// heartbeat.
+	perRnicTorLossWarned bool
+
 	// heartbeatStopCh and heartbeatWg control the lifecycle of the
 	// background heartbeat goroutine that periodically re-registers with
 	// the controller to keep the agent's registry entry alive.
@@ -295,6 +300,42 @@ func (a *Agent) resolveDeviceTorIDs(lldpTors []string) {
 			Int("untagged_devices", untagged).
 			Str("otel_tor_label", probe.UnspecifiedTorLabel).
 			Msg("Some devices have no ToR; they register under an empty ToR whose ToR-mesh includes other untagged RNICs")
+	}
+}
+
+// usesPerDeviceTorIDs reports whether any device's ToR differs from the
+// host-wide tor_id, i.e. whether registration depends on the controller
+// keeping each RNIC's own tor_id.
+func (a *Agent) usesPerDeviceTorIDs() bool {
+	for _, tor := range a.deviceTorIDs {
+		if tor != a.canonicalTorID {
+			return true
+		}
+	}
+	return false
+}
+
+// applyRegistrationTorSupport falls back to the host-wide tor_id for every
+// device when the controller did not keep per-RNIC ToRs (an older controller
+// overwrites them with the request-wide value and still reports success).
+// Without the fallback each device would request pinglists for a ToR under
+// which no RNIC is registered and silently get an empty ToR-mesh. It must run
+// before the cluster monitors are created, since they capture the ToR.
+func (a *Agent) applyRegistrationTorSupport(resp *controller_agent.AgentRegistrationResponse) {
+	if resp.GetPerRnicTorId() || !a.usesPerDeviceTorIDs() {
+		return
+	}
+	a.logger.Error().
+		Str("tor_id", a.canonicalTorID).
+		Msg("Controller does not support per-RNIC ToR IDs (it predates them); " +
+			"every device falls back to tor_id. Upgrade the controller, then restart the agent")
+	for i := range a.deviceTorIDs {
+		a.deviceTorIDs[i] = a.canonicalTorID
+	}
+	for _, p := range a.probers {
+		if p != nil {
+			p.SetSourceTorID(a.canonicalTorID)
+		}
 	}
 }
 
@@ -622,6 +663,7 @@ func (a *Agent) registerWithController(ctx context.Context) error {
 		resp, err := a.grpcClient.RegisterAgent(ctx, req)
 		attemptErr := registerAttemptErr(resp, err)
 		if attemptErr == nil {
+			a.applyRegistrationTorSupport(resp)
 			a.logger.Info().
 				Str("agent_id", a.cfg.AgentID).
 				Int("rnic_count", len(req.GetRnics())).
@@ -854,6 +896,14 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 				continue
 			}
 			consecutiveFailures = 0
+			if !resp.GetPerRnicTorId() && a.usesPerDeviceTorIDs() && !a.perRnicTorLossWarned {
+				// The controller was replaced by an older one while running.
+				// The monitors keep their per-device ToRs, so ToR-meshes go
+				// empty until the agent restarts (and falls back to tor_id).
+				a.perRnicTorLossWarned = true
+				a.logger.Error().
+					Msg("Controller no longer supports per-RNIC ToR IDs; ToR-mesh pinglists will be empty. Restart the agent or upgrade the controller")
+			}
 			a.logger.Debug().
 				Str("agent_id", a.cfg.AgentID).
 				Msg("Heartbeat re-registration succeeded")

@@ -10,7 +10,11 @@ All notable changes to this project are documented in this file.
   `device_tor_ids` maps each RDMA device to its leaf switch, and every device
   registers, requests pinglists, and labels metrics/analysis summaries with
   its own ToR. The controller now keeps an RNIC's own `tor_id` instead of
-  overwriting it with the agent-wide one; upgrade the controller first.
+  overwriting it with the agent-wide one and says so in the registration
+  response (`per_rnic_tor_id`); upgrade the controller first. Against an
+  older controller, an agent with per-device ToRs logs an error and falls
+  back to `tor_id` for every device instead of silently getting empty
+  ToR-meshes.
 - `scripts/topology/` tooling to collect RNIC facts, derive `device_tor_ids`
   from LLDP, subnets, or group/rail layout, and cross-check a mapping against
   measured RTTs. Per-probe debug logs now include `source_gid`.

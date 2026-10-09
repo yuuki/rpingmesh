@@ -40,6 +40,12 @@ message AgentRegistrationRequest {
 message AgentRegistrationResponse {
     bool success = 1;
     string message = 2;
+    // per_rnic_tor_id is true when the controller stored each RnicInfo.tor_id
+    // as sent. Older controllers leave it false because they overwrite every
+    // RNIC's tor_id with the request-wide one; an agent using per-device ToRs
+    // must then fall back to the request-wide ToR, or its per-device pinglist
+    // requests would never match the registry.
+    bool per_rnic_tor_id = 3;
 }
 
 // PinglistType determines what kind of pinglist to generate.

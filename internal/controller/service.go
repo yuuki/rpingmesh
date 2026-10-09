@@ -133,8 +133,9 @@ func (s *ControllerService) RegisterAgent(
 		Msg("Agent registered successfully")
 
 	return &controller_agent.AgentRegistrationResponse{
-		Success: true,
-		Message: "Successfully registered agent",
+		Success:      true,
+		Message:      "Successfully registered agent",
+		PerRnicTorId: true,
 	}, nil
 }
 

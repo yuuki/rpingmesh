@@ -22,6 +22,7 @@ import (
 	"github.com/yuuki/rpingmesh/internal/lldp"
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/internal/rdmabridge"
+	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
 // fakeDevice builds a *rdmabridge.Device carrying only the metadata the
@@ -526,6 +527,62 @@ func TestAgent_LLDPTorDiscoveryDisabled(t *testing.T) {
 	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0")}
 	if got := a.discoverLLDPTorIDs(context.Background()); got != nil {
 		t.Errorf("discoverLLDPTorIDs = %v, want nil", got)
+	}
+}
+
+// TestAgent_RegistrationTorSupport verifies that per-device ToRs survive
+// registration with a controller that keeps them, and fall back to tor_id
+// (registry, monitors, and prober results) against an older controller that
+// overwrites them, so ToR-mesh requests keep matching the registry.
+func TestAgent_RegistrationTorSupport(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		supported bool
+		want      []string
+	}{
+		{"new controller", true, []string{"leaf-a", "host-tor"}},
+		{"old controller", false, []string{"host-tor", "host-tor"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := NewAgent(&config.AgentConfig{
+				AgentID:                   "agent-1",
+				TorID:                     "host-tor",
+				DeviceTorIDs:              map[string]string{"rxe0": "leaf-a"},
+				PinglistUpdateIntervalSec: 3600,
+			})
+			if err != nil {
+				t.Fatalf("NewAgent: %v", err)
+			}
+			a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0"), fakeDevice("rxe1", "1")}
+			a.probers = []*Prober{fakeProber(1), fakeProber(1)}
+			a.responders = []*Responder{{}, {}}
+			a.resolveDeviceTorIDs(nil)
+			for i, p := range a.probers {
+				p.SetSourceTorID(a.torIDForDevice(i))
+			}
+
+			a.applyRegistrationTorSupport(&controller_agent.AgentRegistrationResponse{
+				Success: true, PerRnicTorId: tc.supported,
+			})
+			a.createClusterMonitors()
+
+			for i, rnic := range a.buildRegistrationRequest().GetRnics() {
+				if rnic.GetTorId() != tc.want[i] {
+					t.Errorf("rnic[%d] TorId = %q, want %q", i, rnic.GetTorId(), tc.want[i])
+				}
+			}
+			for i, m := range a.monitors {
+				if m.torID != tc.want[i] {
+					t.Errorf("monitor[%d].torID = %q, want %q", i, m.torID, tc.want[i])
+				}
+			}
+			for i, p := range a.probers {
+				p.emitResult(&probe.ProbeResult{})
+				if got := (<-p.resultChan).SourceTorID; got != tc.want[i] {
+					t.Errorf("prober[%d] SourceTorID = %q, want %q", i, got, tc.want[i])
+				}
+			}
+		})
 	}
 }
 

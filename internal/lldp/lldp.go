@@ -34,6 +34,10 @@ const DefaultCLIPath = "lldpcli"
 // DefaultSysfsRoot is where RDMA device → netdev links are looked up.
 const DefaultSysfsRoot = "/sys"
 
+// DefaultQueryTimeout bounds a single neighbor query, so an lldpcli stuck on
+// an unresponsive lldpd socket cannot stall agent startup.
+const DefaultQueryTimeout = 10 * time.Second
+
 // Neighbor is the LLDP neighbor seen on one local interface.
 type Neighbor struct {
 	Interface  string
@@ -77,6 +81,9 @@ func (q CLIQuerier) Neighbors(ctx context.Context) (map[string]Neighbor, error) 
 		path = DefaultCLIPath
 	}
 	cmd := exec.CommandContext(ctx, path, "-f", "json0", "show", "neighbors")
+	// Return soon after ctx expires even if a child of lldpcli keeps the
+	// output pipe open after lldpcli itself is killed.
+	cmd.WaitDelay = time.Second
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
@@ -200,13 +207,17 @@ type DiscoverOptions struct {
 	Timeout time.Duration
 	// PollInterval is the delay between queries while waiting.
 	PollInterval time.Duration
+	// QueryTimeout bounds each query (DefaultQueryTimeout when zero). A query
+	// is also cut off at Timeout, so Discover returns within
+	// max(Timeout, QueryTimeout) even if the LLDP agent hangs.
+	QueryTimeout time.Duration
 }
 
 // Discover resolves each device's ToR ID from LLDP, re-querying until every
 // device has one or opts.Timeout expires. It returns one Result per device in
 // input order; unresolved devices (including those with an empty Netdev) have
-// an empty TorID. The error is the last
-// query error, returned only when no query ever succeeded.
+// an empty TorID. The error is the last query error, returned only when no
+// query ever succeeded.
 func Discover(ctx context.Context, q Querier, devices []Device, opts DiscoverOptions) ([]Result, error) {
 	results := make([]Result, len(devices))
 	for i, d := range devices {
@@ -219,12 +230,24 @@ func Discover(ctx context.Context, q Querier, devices []Device, opts DiscoverOpt
 	if poll <= 0 {
 		poll = 2 * time.Second
 	}
+	queryTimeout := opts.QueryTimeout
+	if queryTimeout <= 0 {
+		queryTimeout = DefaultQueryTimeout
+	}
 	deadline := time.Now().Add(opts.Timeout)
 
 	var lastErr error
 	succeeded := false
 	for {
-		neighbors, err := q.Neighbors(ctx)
+		// Bound each query by queryTimeout and by the overall deadline. With
+		// no time left (Timeout 0), the single query gets queryTimeout.
+		budget := queryTimeout
+		if remaining := time.Until(deadline); remaining > 0 && remaining < budget {
+			budget = remaining
+		}
+		qctx, cancel := context.WithTimeout(ctx, budget)
+		neighbors, err := q.Neighbors(qctx)
+		cancel()
 		if err != nil {
 			lastErr = err
 		} else {

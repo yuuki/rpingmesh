@@ -214,3 +214,71 @@ func TestDiscover_ContextCancel(t *testing.T) {
 		t.Error("Discover did not stop on context cancellation")
 	}
 }
+
+// hangingQuerier blocks until its context is done, like lldpcli stuck on an
+// unresponsive lldpd socket.
+type hangingQuerier struct{}
+
+func (hangingQuerier) Neighbors(ctx context.Context) (map[string]Neighbor, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestDiscover_HangingQueryIsBounded(t *testing.T) {
+	for name, opts := range map[string]DiscoverOptions{
+		"zero timeout":        {QueryTimeout: 50 * time.Millisecond},
+		"timeout below query": {Timeout: 50 * time.Millisecond, QueryTimeout: time.Minute},
+		"query below timeout": {Timeout: 150 * time.Millisecond, QueryTimeout: 30 * time.Millisecond, PollInterval: 10 * time.Millisecond},
+	} {
+		t.Run(name, func(t *testing.T) {
+			start := time.Now()
+			_, err := Discover(context.Background(), hangingQuerier{}, []Device{{Name: "mlx5_0", Netdev: "eth0"}}, opts)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("err = %v, want deadline exceeded", err)
+			}
+			if el := time.Since(start); el > time.Second {
+				t.Errorf("Discover took %v; a hanging query must be cut off", el)
+			}
+		})
+	}
+}
+
+func writeScript(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "lldpcli")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestCLIQuerier(t *testing.T) {
+	path := writeScript(t, "cat <<'JSON'\n"+json0Sample+"\nJSON\n")
+	got, err := CLIQuerier{Path: path}.Neighbors(context.Background())
+	if err != nil {
+		t.Fatalf("Neighbors: %v", err)
+	}
+	if got["ens1f0np0"].SystemName != "leaf-a1" {
+		t.Errorf("unexpected neighbors: %+v", got)
+	}
+
+	fail := writeScript(t, "echo 'unable to connect to socket' >&2; exit 1\n")
+	if _, err := (CLIQuerier{Path: fail}).Neighbors(context.Background()); err == nil {
+		t.Error("expected an error from a failing lldpcli")
+	}
+}
+
+func TestCLIQuerier_HangIsKilled(t *testing.T) {
+	// The background sleep keeps stdout open after the shell is killed;
+	// WaitDelay must still let Neighbors return.
+	path := writeScript(t, "sleep 30 &\nsleep 30\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := (CLIQuerier{Path: path}).Neighbors(ctx); err == nil {
+		t.Error("expected an error from a hung lldpcli")
+	}
+	if el := time.Since(start); el > 5*time.Second {
+		t.Errorf("Neighbors took %v after its context expired", el)
+	}
+}

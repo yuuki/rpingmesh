@@ -17,11 +17,12 @@ type PathKey struct {
 
 // PathSummary is a window-aggregated summary of one probe path. It mirrors the
 // controller_agent.PathSummary proto but lives in the RDMA-independent probe
-// package so aggregation stays pure Go and unit-testable. SourceTorID is not
-// carried here: it is an agent-wide constant that the analysis reporter stamps
-// when translating to proto.
+// package so aggregation stays pure Go and unit-testable. SourceTorID is the
+// source ToR stamped on the path's results by the prober (empty when results
+// carry none, in which case the analysis reporter uses the agent default).
 type PathSummary struct {
 	SourceGID         [16]byte
+	SourceTorID       string
 	TargetGID         [16]byte
 	TargetTorID       string
 	TargetQPN         uint32
@@ -59,6 +60,7 @@ func RTTBucketBoundariesNs() []uint64 {
 // pathAccumulator accumulates probe outcomes for one path within one window.
 type pathAccumulator struct {
 	windowStartNs uint64
+	sourceTorID   string
 	targetTorID   string
 	targetQPN     uint32
 
@@ -76,9 +78,10 @@ type pathAccumulator struct {
 	buckets []uint64
 }
 
-func newPathAccumulator(windowStartNs uint64, targetTorID string, targetQPN uint32) *pathAccumulator {
+func newPathAccumulator(windowStartNs uint64, sourceTorID, targetTorID string, targetQPN uint32) *pathAccumulator {
 	return &pathAccumulator{
 		windowStartNs: windowStartNs,
+		sourceTorID:   sourceTorID,
 		targetTorID:   targetTorID,
 		targetQPN:     targetQPN,
 		buckets:       make([]uint64, len(rttBucketBoundariesNs)+1),
@@ -152,6 +155,7 @@ func (a *pathAccumulator) quantile(q float64) uint64 {
 func (a *pathAccumulator) summary(key PathKey, windowDurationMs uint32) PathSummary {
 	return PathSummary{
 		SourceGID:         key.SourceGID,
+		SourceTorID:       a.sourceTorID,
 		TargetGID:         key.TargetGID,
 		TargetTorID:       a.targetTorID,
 		TargetQPN:         a.targetQPN,
@@ -230,7 +234,7 @@ func (p *PathAggregator) AddResult(r *ProbeResult, recvUnixNs uint64) {
 		acc = nil
 	}
 	if acc == nil {
-		acc = newPathAccumulator(ws, r.TargetTorID, r.TargetQPN)
+		acc = newPathAccumulator(ws, r.SourceTorID, r.TargetTorID, r.TargetQPN)
 		p.paths[key] = acc
 	}
 

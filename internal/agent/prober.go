@@ -210,20 +210,26 @@ type Prober struct {
 	// every emitted ProbeResult so the per-path aggregator can key results by
 	// (source, target). Parsed once at construction; zero if the device GID is
 	// unparseable or the Prober was built without a device (test fakes).
-	sourceGID     [16]byte
-	targets       []*controller_agent.PingTarget
-	targetsMu     sync.RWMutex
-	pending       map[uint64]*pendingProbe // sequence_num -> pending probe info
-	pendingMu     sync.Mutex
-	seqCounter    atomic.Uint64
-	agentEpoch    uint32 // Random epoch prefix for sequence number collision prevention
-	resultChan    chan *probe.ProbeResult
-	running       atomic.Bool
-	stopMu        sync.Mutex    // guards stopCh (re)creation across Start/Stop
-	stopCh        chan struct{} // closed by Stop() to wake goroutines immediately
-	wg            sync.WaitGroup
-	probeInterval time.Duration
-	probeTimeout  uint32 // ms
+	sourceGID [16]byte
+	// sourceTorLabel is the metric label (probe.TorMetricLabel) of the bound
+	// device's ToR, stamped onto every emitted ProbeResult as SourceTorID so
+	// that per-RNIC ToRs survive the merge of every device's results into one
+	// stream. Set once via SetSourceTorID before Start; empty leaves
+	// SourceTorID unset, and consumers then fall back to their own default.
+	sourceTorLabel string
+	targets        []*controller_agent.PingTarget
+	targetsMu      sync.RWMutex
+	pending        map[uint64]*pendingProbe // sequence_num -> pending probe info
+	pendingMu      sync.Mutex
+	seqCounter     atomic.Uint64
+	agentEpoch     uint32 // Random epoch prefix for sequence number collision prevention
+	resultChan     chan *probe.ProbeResult
+	running        atomic.Bool
+	stopMu         sync.Mutex    // guards stopCh (re)creation across Start/Stop
+	stopCh         chan struct{} // closed by Stop() to wake goroutines immediately
+	wg             sync.WaitGroup
+	probeInterval  time.Duration
+	probeTimeout   uint32 // ms
 
 	// queueMu guards access to the queue pointer so that GetQueueInfo cannot
 	// race with Destroy() setting queue to nil.
@@ -1180,6 +1186,13 @@ func newFailedResult(seqNum uint64, target *controller_agent.PingTarget, flowLab
 	return result
 }
 
+// SetSourceTorID records the ToR of the prober's device (canonical form; empty
+// means untagged). It must be called before Start: the value is read without
+// synchronization by the probe and ACK loops.
+func (p *Prober) SetSourceTorID(torID string) {
+	p.sourceTorLabel = probe.TorMetricLabel(torID)
+}
+
 // emitResult delivers a result on resultChan without blocking. A non-blocking
 // send keeps a slow consumer from stalling the probe or ACK loops (which may
 // hold pendingMu at the call site's caller); a full channel drops the result
@@ -1189,6 +1202,9 @@ func (p *Prober) emitResult(result *probe.ProbeResult) {
 	// (source, target). Single-writer point: the result is still owned by the
 	// prober here, before any consumer sees it.
 	result.SourceGID = p.sourceGID
+	if p.sourceTorLabel != "" {
+		result.SourceTorID = p.sourceTorLabel
+	}
 	select {
 	case p.resultChan <- result:
 	default:

@@ -339,3 +339,26 @@ func TestPathAggregator_Flush(t *testing.T) {
 		t.Fatalf("Flush should return the in-progress window, got %d", len(got))
 	}
 }
+
+// TestPathAggregator_CarriesSourceTor verifies that each path keeps the
+// source ToR stamped on its results, so RNICs of one multi-rail host that sit
+// under different leaf switches report distinct source ToRs.
+func TestPathAggregator_CarriesSourceTor(t *testing.T) {
+	agg := NewPathAggregator(testWindowNs)
+
+	srcA, srcB, tgt := gid(1), gid(2), gid(9)
+	ra := validResult(srcA, tgt, "tor-t", 1, 1000)
+	ra.SourceTorID = "leaf-a"
+	rb := validResult(srcB, tgt, "tor-t", 1, 1000)
+	rb.SourceTorID = "leaf-b"
+	agg.AddResult(ra, win0Recv)
+	agg.AddResult(rb, win0Recv)
+
+	got := map[[16]byte]string{}
+	for _, s := range agg.Collect(win1Recv) {
+		got[s.SourceGID] = s.SourceTorID
+	}
+	if got[srcA] != "leaf-a" || got[srcB] != "leaf-b" {
+		t.Errorf("source ToRs = %v, want leaf-a/leaf-b", got)
+	}
+}

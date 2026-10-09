@@ -422,6 +422,7 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 	// Log GID-level detail at Debug level. This provides per-flow
 	// visibility without metric cardinality cost.
 	mc.logger.Debug().
+		Str("source_gid", probe.FormatGID(result.SourceGID)).
 		Str("target_gid", probe.FormatGID(result.TargetGID)).
 		Str("source_tor", sourceTor).
 		Str("target_tor", targetTor).
@@ -502,7 +503,9 @@ func (mc *MetricsCollector) Shutdown(ctx context.Context) error {
 // StartResultConsumer starts a goroutine that reads probe results from
 // resultChan, calculates RTT metrics via probe.CalculateRTT, and records
 // them. The goroutine runs until ctx is cancelled or resultChan is closed.
-// sourceTorID identifies the local agent's ToR switch for metric attribution.
+// sourceTorID is the default source_tor for results that do not carry their
+// own SourceTorID; the agent's probers stamp each result with their device's
+// ToR, so on multi-rail hosts with per-device ToRs the result's value wins.
 func (mc *MetricsCollector) StartResultConsumer(ctx context.Context, resultChan <-chan *probe.ProbeResult, sourceTorID string) {
 	go func() {
 		mc.logger.Info().
@@ -523,7 +526,11 @@ func (mc *MetricsCollector) StartResultConsumer(ctx context.Context, resultChan 
 
 				// Calculate RTT from the 6-timestamp probe result.
 				rtt := probe.CalculateRTT(result)
-				mc.RecordProbeResult(result, rtt, sourceTorID)
+				src := sourceTorID
+				if result != nil && result.SourceTorID != "" {
+					src = result.SourceTorID
+				}
+				mc.RecordProbeResult(result, rtt, src)
 			}
 		}
 	}()

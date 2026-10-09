@@ -311,3 +311,26 @@ func TestAnalysisReporter_BatchSplitting(t *testing.T) {
 		t.Errorf("total summaries across reports = %d, want %d", got, n)
 	}
 }
+
+// TestAnalysisReporter_PerResultSourceTorWins verifies that a source ToR
+// stamped on the results (per-device ToRs) overrides the reporter default.
+func TestAnalysisReporter_PerResultSourceTorWins(t *testing.T) {
+	fake := &fakeSender{}
+	input := make(chan *probe.ProbeResult, 4)
+	r := NewAnalysisReporter(fake, "agent-1", "host-tor", 3600, input)
+	r.Start(context.Background())
+
+	res := validProbeResult(srcGID(1), srcGID(2), "tor-b", 42)
+	res.SourceTorID = "leaf-a"
+	input <- res
+	close(input)
+	r.Wait()
+
+	summaries := fake.allSummaries()
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 summary, got %d", len(summaries))
+	}
+	if got := summaries[0].GetSourceTorId(); got != "leaf-a" {
+		t.Errorf("SourceTorId = %q, want leaf-a", got)
+	}
+}

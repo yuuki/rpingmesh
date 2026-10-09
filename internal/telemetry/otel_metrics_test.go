@@ -505,6 +505,54 @@ func TestStartResultConsumer(t *testing.T) {
 	close(resultChan)
 }
 
+// TestStartResultConsumer_PerResultSourceTor verifies that a result's own
+// SourceTorID (stamped by the prober from its device's ToR) is used as the
+// source_tor attribute instead of the consumer default.
+func TestStartResultConsumer_PerResultSourceTor(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer provider.Shutdown(context.Background())
+
+	mc, err := NewMetricsCollectorWithProvider(provider)
+	if err != nil {
+		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
+	}
+
+	resultChan := make(chan *probe.ProbeResult, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mc.StartResultConsumer(ctx, resultChan, "host-tor")
+
+	resultChan <- &probe.ProbeResult{
+		TargetTorID:  "tor-target",
+		SourceTorID:  "leaf-a",
+		Success:      false,
+		ErrorMessage: "timed out waiting for ACKs",
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var rm metricdata.ResourceMetrics
+		if err := reader.Collect(context.Background(), &rm); err != nil {
+			t.Fatalf("ManualReader.Collect: %v", err)
+		}
+		if m := findMetric(&rm, "rpingmesh.probe_total"); m != nil {
+			if sum, ok := m.Data.(metricdata.Sum[int64]); ok && len(sum.DataPoints) == 1 {
+				src, _ := sum.DataPoints[0].Attributes.Value("source_tor")
+				if got := src.AsString(); got != "leaf-a" {
+					t.Fatalf("source_tor = %q, want leaf-a", got)
+				}
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for StartResultConsumer to record a metric")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(resultChan)
+}
+
 // TestNewMetricsCollector_Construct verifies that NewMetricsCollector builds
 // a working collector without needing an actual OTLP collector: the
 // underlying gRPC client connects lazily, so no network I/O occurs until a

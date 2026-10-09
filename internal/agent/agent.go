@@ -9,6 +9,7 @@ import (
 	"net"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/agent/controller_client"
 	"github.com/yuuki/rpingmesh/internal/config"
+	"github.com/yuuki/rpingmesh/internal/lldp"
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/internal/rdmabridge"
 	"github.com/yuuki/rpingmesh/internal/telemetry"
@@ -121,6 +123,23 @@ type Agent struct {
 	// (registry storage key ""); OTel/PathSummary use probe.TorMetricLabel.
 	canonicalTorID string
 
+	// deviceTorIDs holds the canonical ToR of each opened device, parallel to
+	// devices: the device's device_tor_ids entry, else its LLDP-discovered
+	// ToR, else canonicalTorID. Filled by resolveDeviceTorIDs right after the
+	// devices are opened.
+	deviceTorIDs []string
+
+	// lldpQuerier and sysfsRoot are the LLDP discovery dependencies used when
+	// lldp_tor_discovery is enabled. NewAgent sets the production values;
+	// tests replace them.
+	lldpQuerier lldp.Querier
+	sysfsRoot   string
+
+	// perRnicTorLossWarned records that a heartbeat found the controller no
+	// longer honoring per-RNIC ToRs, so the error is logged once, not every
+	// heartbeat.
+	perRnicTorLossWarned bool
+
 	// heartbeatStopCh and heartbeatWg control the lifecycle of the
 	// background heartbeat goroutine that periodically re-registers with
 	// the controller to keep the agent's registry entry alive.
@@ -144,19 +163,189 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 		cfg:            cfg,
 		canonicalTorID: canonicalTorID,
 		logger:         log.With().Str("component", "agent").Logger(),
+		lldpQuerier:    lldp.CLIQuerier{Path: cfg.LLDPCLIPath},
+		sysfsRoot:      lldp.DefaultSysfsRoot,
 	}
 
 	// Apply optional hard runtime caps as early as possible (before any heavy
 	// allocation) so a soft memory limit governs the whole process lifetime.
 	applyRuntimeLimits(cfg, a.logger)
 
-	if a.canonicalTorID == "" {
-		a.logger.Warn().
-			Str("otel_tor_label", probe.UnspecifiedTorLabel).
-			Msg("tor_id unset; registering under an empty ToR; ToR-mesh will include other untagged agents")
+	return a, nil
+}
+
+// ToR sources reported in the "Resolved device ToR" log.
+const (
+	torSourceDeviceMap = "device_tor_ids"
+	torSourceLLDP      = "lldp"
+	torSourceAgent     = "tor_id"
+)
+
+// discoverLLDPTorIDs returns, parallel to devices, the ToR each device's LLDP
+// neighbor names when lldp_tor_discovery is enabled (nil otherwise). Devices
+// with a device_tor_ids entry are skipped, since that entry wins anyway.
+// Failures are logged and leave the affected devices empty, so they fall back
+// to tor_id; LLDP problems never stop the agent.
+func (a *Agent) discoverLLDPTorIDs(ctx context.Context) []string {
+	if !a.cfg.LLDPTorDiscovery {
+		return nil
+	}
+	field := a.cfg.LLDPTorIDField
+	if field == "" {
+		field = lldp.FieldSystemName
 	}
 
-	return a, nil
+	var targets []lldp.Device
+	var targetIdx []int
+	for i, dev := range a.devices {
+		if _, ok := a.cfg.DeviceTorID(dev.Info.DeviceName); ok {
+			continue
+		}
+		netdev, err := lldp.NetdevForRDMAPort(a.sysfsRoot, dev.Info.DeviceName,
+			dev.Info.ActivePort, dev.Info.ActiveGIDIndex)
+		if err != nil {
+			a.logger.Warn().Err(err).
+				Str("device", dev.Info.DeviceName).
+				Msg("LLDP ToR discovery: cannot find the device's netdev; using tor_id")
+		}
+		targets = append(targets, lldp.Device{Name: dev.Info.DeviceName, Netdev: netdev})
+		targetIdx = append(targetIdx, i)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	timeout := time.Duration(a.cfg.LLDPDiscoveryTimeoutSec) * time.Second
+	a.logger.Info().
+		Int("devices", len(targets)).
+		Str("field", field).
+		Dur("timeout", timeout).
+		Msg("Discovering device ToRs from LLDP neighbors")
+	results, err := lldp.Discover(ctx, a.lldpQuerier, targets, lldp.DiscoverOptions{
+		Field:   field,
+		Timeout: timeout,
+	})
+	if err != nil {
+		a.logger.Warn().Err(err).
+			Msg("LLDP ToR discovery failed (is lldpd running and its socket accessible?); using tor_id")
+	}
+
+	tors := make([]string, len(a.devices))
+	for k, r := range results {
+		tor := probe.CanonicalTorID(r.TorID)
+		ev := a.logger.Info()
+		if tor == "" || probe.IsReservedTorID(tor) {
+			ev = a.logger.Warn()
+		}
+		ev = ev.Str("device", r.Device.Name).
+			Str("netdev", r.Device.Netdev).
+			Str("neighbor_system_name", r.Neighbor.SystemName).
+			Str("neighbor_chassis_id", r.Neighbor.ChassisID).
+			Str("neighbor_port_id", r.Neighbor.PortID)
+		switch {
+		case r.Device.Netdev == "":
+			continue // already warned above
+		case tor == "":
+			ev.Msg("LLDP ToR discovery: no neighbor " + field + " on the device's netdev; using tor_id")
+		case probe.IsReservedTorID(tor):
+			ev.Msg("LLDP ToR discovery: neighbor " + field + " is the reserved untagged label; using tor_id")
+		default:
+			ev.Msg("LLDP ToR discovery: found neighbor")
+			tors[targetIdx[k]] = tor
+		}
+	}
+	return tors
+}
+
+// resolveDeviceTorIDs assigns each opened device its ToR and logs the result.
+// Precedence: the device's device_tor_ids entry, then lldpTors[i] (the
+// LLDP-discovered ToR; lldpTors may be nil), then the host-wide tor_id.
+// device_tor_ids keys that match no opened device are warned about, since a
+// typo there silently leaves that RNIC under the host-wide ToR.
+func (a *Agent) resolveDeviceTorIDs(lldpTors []string) {
+	a.deviceTorIDs = make([]string, len(a.devices))
+	matched := make(map[string]bool, len(a.cfg.DeviceTorIDs))
+	untagged := 0
+	for i, dev := range a.devices {
+		tor, source := a.canonicalTorID, torSourceAgent
+		if t, ok := a.cfg.DeviceTorID(dev.Info.DeviceName); ok {
+			tor, source = t, torSourceDeviceMap
+		} else if i < len(lldpTors) && lldpTors[i] != "" {
+			tor, source = lldpTors[i], torSourceLLDP
+		}
+		a.deviceTorIDs[i] = tor
+		for key := range a.cfg.DeviceTorIDs {
+			if strings.EqualFold(strings.TrimSpace(key), dev.Info.DeviceName) {
+				matched[key] = true
+			}
+		}
+		if tor == "" {
+			untagged++
+		}
+		a.logger.Info().
+			Str("device", dev.Info.DeviceName).
+			Str("tor_id", tor).
+			Str("source", source).
+			Msg("Resolved device ToR")
+	}
+	for key := range a.cfg.DeviceTorIDs {
+		if !matched[key] {
+			a.logger.Warn().
+				Str("device", key).
+				Msg("device_tor_ids entry matches no opened RDMA device; ignored")
+		}
+	}
+	if untagged > 0 {
+		a.logger.Warn().
+			Int("untagged_devices", untagged).
+			Str("otel_tor_label", probe.UnspecifiedTorLabel).
+			Msg("Some devices have no ToR; they register under an empty ToR whose ToR-mesh includes other untagged RNICs")
+	}
+}
+
+// usesPerDeviceTorIDs reports whether any device's ToR differs from the
+// host-wide tor_id, i.e. whether registration depends on the controller
+// keeping each RNIC's own tor_id.
+func (a *Agent) usesPerDeviceTorIDs() bool {
+	for _, tor := range a.deviceTorIDs {
+		if tor != a.canonicalTorID {
+			return true
+		}
+	}
+	return false
+}
+
+// applyRegistrationTorSupport falls back to the host-wide tor_id for every
+// device when the controller did not keep per-RNIC ToRs (an older controller
+// overwrites them with the request-wide value and still reports success).
+// Without the fallback each device would request pinglists for a ToR under
+// which no RNIC is registered and silently get an empty ToR-mesh. It must run
+// before the cluster monitors are created, since they capture the ToR.
+func (a *Agent) applyRegistrationTorSupport(resp *controller_agent.AgentRegistrationResponse) {
+	if resp.GetPerRnicTorId() || !a.usesPerDeviceTorIDs() {
+		return
+	}
+	a.logger.Error().
+		Str("tor_id", a.canonicalTorID).
+		Msg("Controller does not support per-RNIC ToR IDs (it predates them); " +
+			"every device falls back to tor_id. Upgrade the controller, then restart the agent")
+	for i := range a.deviceTorIDs {
+		a.deviceTorIDs[i] = a.canonicalTorID
+	}
+	for _, p := range a.probers {
+		if p != nil {
+			p.SetSourceTorID(a.canonicalTorID)
+		}
+	}
+}
+
+// torIDForDevice returns the canonical ToR of devices[i], falling back to the
+// host-wide tor_id when per-device ToRs have not been resolved.
+func (a *Agent) torIDForDevice(i int) string {
+	if i >= 0 && i < len(a.deviceTorIDs) {
+		return a.deviceTorIDs[i]
+	}
+	return a.canonicalTorID
 }
 
 // applyRuntimeLimits applies the optional hard runtime caps from config: a soft
@@ -204,6 +393,7 @@ func (a *Agent) Initialize(ctx context.Context) error {
 		return fmt.Errorf("no RDMA devices available")
 	}
 	a.logger.Info().Int("device_count", len(a.devices)).Msg("RDMA devices opened")
+	a.resolveDeviceTorIDs(a.discoverLLDPTorIDs(ctx))
 
 	// Step 3: Create gRPC client for controller communication.
 	a.logger.Info().
@@ -238,6 +428,7 @@ func (a *Agent) Initialize(ctx context.Context) error {
 			return fmt.Errorf("failed to create prober for device %s: %w",
 				dev.Info.DeviceName, err)
 		}
+		prober.SetSourceTorID(a.torIDForDevice(i))
 		torMeshRate := a.cfg.EffectiveTorMeshProbeRate()
 		interTorRate := a.cfg.EffectiveInterTorProbeRate()
 		if torMeshRate > 0 || interTorRate > 0 {
@@ -372,13 +563,14 @@ func (a *Agent) createClusterMonitors() {
 		a.logger.Info().
 			Str("device", dev.Info.DeviceName).
 			Str("requester_gid", requesterGID).
+			Str("tor_id", a.torIDForDevice(i)).
 			Uint32("update_interval_sec", a.cfg.PinglistUpdateIntervalSec).
 			Msg("Creating cluster monitor")
 		monitor := NewClusterMonitor(
 			a.grpcClient,
 			a.probers[i],
 			a.cfg.AgentID,
-			a.canonicalTorID,
+			a.torIDForDevice(i),
 			requesterGID,
 			a.cfg.PinglistUpdateIntervalSec,
 		)
@@ -401,7 +593,7 @@ func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRe
 			Qpn:        queueInfo.QPN,
 			IpAddress:  dev.Info.IPAddr,
 			HostName:   a.cfg.HostName,
-			TorId:      a.canonicalTorID,
+			TorId:      a.torIDForDevice(i),
 			DeviceName: dev.Info.DeviceName,
 		}
 		rnics = append(rnics, rnic)
@@ -471,6 +663,7 @@ func (a *Agent) registerWithController(ctx context.Context) error {
 		resp, err := a.grpcClient.RegisterAgent(ctx, req)
 		attemptErr := registerAttemptErr(resp, err)
 		if attemptErr == nil {
+			a.applyRegistrationTorSupport(resp)
 			a.logger.Info().
 				Str("agent_id", a.cfg.AgentID).
 				Int("rnic_count", len(req.GetRnics())).
@@ -703,6 +896,14 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 				continue
 			}
 			consecutiveFailures = 0
+			if !resp.GetPerRnicTorId() && a.usesPerDeviceTorIDs() && !a.perRnicTorLossWarned {
+				// The controller was replaced by an older one while running.
+				// The monitors keep their per-device ToRs, so ToR-meshes go
+				// empty until the agent restarts (and falls back to tor_id).
+				a.perRnicTorLossWarned = true
+				a.logger.Error().
+					Msg("Controller no longer supports per-RNIC ToR IDs; ToR-mesh pinglists will be empty. Restart the agent or upgrade the controller")
+			}
 			a.logger.Debug().
 				Str("agent_id", a.cfg.AgentID).
 				Msg("Heartbeat re-registration succeeded")

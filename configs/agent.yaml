@@ -7,6 +7,23 @@ hostname: ""        # Auto-detected if empty
 # "unspecified" is reserved (OTel/PathSummary label); the agent will not start
 # if tor_id is set to that value.
 tor_id: ""
+# Optional: per-device ToR IDs for rail-optimized multi-rail hosts, where each
+# RNIC is cabled to a different leaf switch. Unlisted devices use tor_id.
+# See docs/design/multi-rail-tor-mapping.md (scripts/topology/ can generate it).
+# device_tor_ids:
+#   mlx5_0: "leaf-a"
+#   mlx5_1: "leaf-b"
+
+# Optional: derive each device's ToR from the LLDP neighbor of its netdev
+# instead of listing device_tor_ids. Needs lldpd on the host and access to its
+# socket (root or lldpd's group); the switch must send LLDP on host ports and
+# the NIC firmware must pass LLDP frames to the host. Per device, a
+# device_tor_ids entry wins over LLDP, and LLDP wins over tor_id. Discovery
+# runs once at startup; restart the agent after re-cabling.
+lldp_tor_discovery: false
+# lldp_tor_id_field: system_name   # system_name (switch hostname) or chassis_id
+# lldpcli_path: lldpcli
+# lldp_discovery_timeout_sec: 60   # Startup wait for neighbors (0 = query once)
 
 # Controller connection
 controller_addr: "localhost:50051"

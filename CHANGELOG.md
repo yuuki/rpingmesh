@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Per-device ToR IDs for rail-optimized multi-rail hosts: the agent's
+  `device_tor_ids` maps each RDMA device to its leaf switch, and every device
+  registers, requests pinglists, and labels metrics/analysis summaries with
+  its own ToR. The controller now keeps an RNIC's own `tor_id` instead of
+  overwriting it with the agent-wide one and says so in the registration
+  response (`per_rnic_tor_id`); upgrade the controller first. Against an
+  older controller, an agent with per-device ToRs logs an error and falls
+  back to `tor_id` for every device instead of silently getting empty
+  ToR-meshes.
+- `scripts/topology/` tooling to collect RNIC facts, derive `device_tor_ids`
+  from LLDP, subnets, or group/rail layout, and cross-check a mapping against
+  measured RTTs. Per-probe debug logs now include `source_gid`.
+- Opt-in `lldp_tor_discovery`: the agent derives each device's ToR from the
+  LLDP neighbor of its RoCE netdev (via lldpd's `lldpcli`) at startup, so
+  `device_tor_ids` need not be maintained where hosts see their leaf over
+  LLDP. `device_tor_ids` entries still win, and devices without a neighbor
+  fall back to `tor_id`. Related settings: `lldp_tor_id_field`
+  (`system_name` or `chassis_id`), `lldpcli_path`,
+  `lldp_discovery_timeout_sec`.
+
 ### Changed
 
 - Require Go 1.27.2 or later, and run the controller e2e tests against rqlite

@@ -14,6 +14,13 @@ All notable changes to this project are documented in this file.
 - `scripts/topology/` tooling to collect RNIC facts, derive `device_tor_ids`
   from LLDP, subnets, or group/rail layout, and cross-check a mapping against
   measured RTTs. Per-probe debug logs now include `source_gid`.
+- Opt-in `lldp_tor_discovery`: the agent derives each device's ToR from the
+  LLDP neighbor of its RoCE netdev (via lldpd's `lldpcli`) at startup, so
+  `device_tor_ids` need not be maintained where hosts see their leaf over
+  LLDP. `device_tor_ids` entries still win, and devices without a neighbor
+  fall back to `tor_id`. Related settings: `lldp_tor_id_field`
+  (`system_name` or `chassis_id`), `lldpcli_path`,
+  `lldp_discovery_timeout_sec`.
 
 ## [0.4.0] - 2026-10-07
 

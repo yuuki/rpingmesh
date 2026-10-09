@@ -14,6 +14,17 @@ tor_id: ""
 #   mlx5_0: "leaf-a"
 #   mlx5_1: "leaf-b"
 
+# Optional: derive each device's ToR from the LLDP neighbor of its netdev
+# instead of listing device_tor_ids. Needs lldpd on the host and access to its
+# socket (root or lldpd's group); the switch must send LLDP on host ports and
+# the NIC firmware must pass LLDP frames to the host. Per device, a
+# device_tor_ids entry wins over LLDP, and LLDP wins over tor_id. Discovery
+# runs once at startup; restart the agent after re-cabling.
+lldp_tor_discovery: false
+# lldp_tor_id_field: system_name   # system_name (switch hostname) or chassis_id
+# lldpcli_path: lldpcli
+# lldp_discovery_timeout_sec: 60   # Startup wait for neighbors (0 = query once)
+
 # Controller connection
 controller_addr: "localhost:50051"
 

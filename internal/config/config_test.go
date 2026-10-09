@@ -988,3 +988,44 @@ func TestLoadAgentConfig_DeviceTorIDsRejectsInvalid(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadAgentConfig_LLDPDefaults(t *testing.T) {
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.LLDPTorDiscovery {
+		t.Error("LLDPTorDiscovery should default to false")
+	}
+	if cfg.LLDPTorIDField != "system_name" || cfg.LLDPCLIPath != "lldpcli" ||
+		cfg.LLDPDiscoveryTimeoutSec != DefaultLLDPDiscoveryTimeoutSec {
+		t.Errorf("unexpected LLDP defaults: field=%q path=%q timeout=%d",
+			cfg.LLDPTorIDField, cfg.LLDPCLIPath, cfg.LLDPDiscoveryTimeoutSec)
+	}
+}
+
+func TestLoadAgentConfig_LLDPSettings(t *testing.T) {
+	path := writeYAML(t, "agent.yaml", `lldp_tor_discovery: true
+lldp_tor_id_field: chassis_id
+lldpcli_path: /usr/sbin/lldpcli
+lldp_discovery_timeout_sec: 0
+`)
+	cfg, err := LoadAgentConfig(path, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.LLDPTorDiscovery || cfg.LLDPTorIDField != "chassis_id" ||
+		cfg.LLDPCLIPath != "/usr/sbin/lldpcli" || cfg.LLDPDiscoveryTimeoutSec != 0 {
+		t.Errorf("unexpected LLDP settings: %+v", cfg)
+	}
+	if _, ok := cfg.DeviceTorID("mlx5_0"); ok {
+		t.Error("DeviceTorID should report no entry without device_tor_ids")
+	}
+}
+
+func TestLoadAgentConfig_LLDPFieldRejectsInvalid(t *testing.T) {
+	path := writeYAML(t, "agent.yaml", "lldp_tor_id_field: port_id\n")
+	if _, err := LoadAgentConfig(path, nil); err == nil {
+		t.Error("expected a validation error, got nil")
+	}
+}

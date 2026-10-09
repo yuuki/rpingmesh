@@ -103,6 +103,18 @@ None of them reproduces "same leaf"; they are fallbacks only.
   non-empty values). Unlisted devices use `tor_id`. Each device registers,
   requests pinglists, and labels its probe results with its own ToR. Unmatched
   keys are warned about at startup.
+- Agent, LLDP (`lldp_tor_discovery: true`): at startup the agent maps each
+  RDMA device to its RoCE netdev (`ports/<port>/gid_attrs/ndevs/<gid_index>`
+  in sysfs, else the device's only PCI netdev), runs
+  `lldpcli -f json0 show neighbors`, and uses the neighbor's system name (or
+  chassis ID, `lldp_tor_id_field`) as the device's ToR. This is source B2
+  without a generated map. Precedence per device: `device_tor_ids` entry, then
+  LLDP, then `tor_id`, so a map can pin exceptions while LLDP covers the rest.
+  The agent re-queries until every device has a neighbor or
+  `lldp_discovery_timeout_sec` expires; unresolved devices fall back to
+  `tor_id` with a warning, and an LLDP failure never stops the agent.
+  Discovery runs once, so re-cabling needs an agent restart. The resolved ToR
+  and its source are logged per device ("Resolved device ToR").
 - Controller: an RNIC's own `tor_id` wins over the request-wide one. Old agents
   send the same value in both places, so they are unaffected.
 - Metrics/analysis: the prober stamps `SourceTorID` on each result; the
@@ -121,6 +133,8 @@ environments with different fabric designs:
   but its control socket is root/group-only, and even as root it reports no
   neighbor on the RoCE ports (the frames are presumably consumed by NIC
   firmware or not sent by the switch). B2 cannot be the default source.
+  `lldp_tor_discovery` is therefore opt-in, for fabrics where hosts do see
+  their leaf over LLDP.
 - **Device naming is consistent across hosts** in both environments: a given
   device name always sits on the same rail, so `--rail-key device` is a sound
   rail key once storage/management rails and InfiniBand ports are excluded.

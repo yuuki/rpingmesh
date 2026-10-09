@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/agent/controller_client"
 	"github.com/yuuki/rpingmesh/internal/config"
+	"github.com/yuuki/rpingmesh/internal/lldp"
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/internal/rdmabridge"
 	"github.com/yuuki/rpingmesh/internal/telemetry"
@@ -123,9 +124,16 @@ type Agent struct {
 	canonicalTorID string
 
 	// deviceTorIDs holds the canonical ToR of each opened device, parallel to
-	// devices: the device's device_tor_ids entry, or canonicalTorID. Filled by
-	// resolveDeviceTorIDs right after the devices are opened.
+	// devices: the device's device_tor_ids entry, else its LLDP-discovered
+	// ToR, else canonicalTorID. Filled by resolveDeviceTorIDs right after the
+	// devices are opened.
 	deviceTorIDs []string
+
+	// lldpQuerier and sysfsRoot are the LLDP discovery dependencies used when
+	// lldp_tor_discovery is enabled. NewAgent sets the production values;
+	// tests replace them.
+	lldpQuerier lldp.Querier
+	sysfsRoot   string
 
 	// heartbeatStopCh and heartbeatWg control the lifecycle of the
 	// background heartbeat goroutine that periodically re-registers with
@@ -150,6 +158,8 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 		cfg:            cfg,
 		canonicalTorID: canonicalTorID,
 		logger:         log.With().Str("component", "agent").Logger(),
+		lldpQuerier:    lldp.CLIQuerier{Path: cfg.LLDPCLIPath},
+		sysfsRoot:      lldp.DefaultSysfsRoot,
 	}
 
 	// Apply optional hard runtime caps as early as possible (before any heavy
@@ -159,16 +169,105 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 	return a, nil
 }
 
-// resolveDeviceTorIDs assigns each opened device its ToR (device_tor_ids
-// entry, else the host-wide tor_id) and logs the result. device_tor_ids keys
-// that match no opened device are warned about, since a typo there silently
-// leaves that RNIC under the host-wide ToR.
-func (a *Agent) resolveDeviceTorIDs() {
+// ToR sources reported in the "Resolved device ToR" log.
+const (
+	torSourceDeviceMap = "device_tor_ids"
+	torSourceLLDP      = "lldp"
+	torSourceAgent     = "tor_id"
+)
+
+// discoverLLDPTorIDs returns, parallel to devices, the ToR each device's LLDP
+// neighbor names when lldp_tor_discovery is enabled (nil otherwise). Devices
+// with a device_tor_ids entry are skipped, since that entry wins anyway.
+// Failures are logged and leave the affected devices empty, so they fall back
+// to tor_id; LLDP problems never stop the agent.
+func (a *Agent) discoverLLDPTorIDs(ctx context.Context) []string {
+	if !a.cfg.LLDPTorDiscovery {
+		return nil
+	}
+	field := a.cfg.LLDPTorIDField
+	if field == "" {
+		field = lldp.FieldSystemName
+	}
+
+	var targets []lldp.Device
+	var targetIdx []int
+	for i, dev := range a.devices {
+		if _, ok := a.cfg.DeviceTorID(dev.Info.DeviceName); ok {
+			continue
+		}
+		netdev, err := lldp.NetdevForRDMAPort(a.sysfsRoot, dev.Info.DeviceName,
+			dev.Info.ActivePort, dev.Info.ActiveGIDIndex)
+		if err != nil {
+			a.logger.Warn().Err(err).
+				Str("device", dev.Info.DeviceName).
+				Msg("LLDP ToR discovery: cannot find the device's netdev; using tor_id")
+		}
+		targets = append(targets, lldp.Device{Name: dev.Info.DeviceName, Netdev: netdev})
+		targetIdx = append(targetIdx, i)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	timeout := time.Duration(a.cfg.LLDPDiscoveryTimeoutSec) * time.Second
+	a.logger.Info().
+		Int("devices", len(targets)).
+		Str("field", field).
+		Dur("timeout", timeout).
+		Msg("Discovering device ToRs from LLDP neighbors")
+	results, err := lldp.Discover(ctx, a.lldpQuerier, targets, lldp.DiscoverOptions{
+		Field:   field,
+		Timeout: timeout,
+	})
+	if err != nil {
+		a.logger.Warn().Err(err).
+			Msg("LLDP ToR discovery failed (is lldpd running and its socket accessible?); using tor_id")
+	}
+
+	tors := make([]string, len(a.devices))
+	for k, r := range results {
+		tor := probe.CanonicalTorID(r.TorID)
+		ev := a.logger.Info()
+		if tor == "" || probe.IsReservedTorID(tor) {
+			ev = a.logger.Warn()
+		}
+		ev = ev.Str("device", r.Device.Name).
+			Str("netdev", r.Device.Netdev).
+			Str("neighbor_system_name", r.Neighbor.SystemName).
+			Str("neighbor_chassis_id", r.Neighbor.ChassisID).
+			Str("neighbor_port_id", r.Neighbor.PortID)
+		switch {
+		case r.Device.Netdev == "":
+			continue // already warned above
+		case tor == "":
+			ev.Msg("LLDP ToR discovery: no neighbor " + field + " on the device's netdev; using tor_id")
+		case probe.IsReservedTorID(tor):
+			ev.Msg("LLDP ToR discovery: neighbor " + field + " is the reserved untagged label; using tor_id")
+		default:
+			ev.Msg("LLDP ToR discovery: found neighbor")
+			tors[targetIdx[k]] = tor
+		}
+	}
+	return tors
+}
+
+// resolveDeviceTorIDs assigns each opened device its ToR and logs the result.
+// Precedence: the device's device_tor_ids entry, then lldpTors[i] (the
+// LLDP-discovered ToR; lldpTors may be nil), then the host-wide tor_id.
+// device_tor_ids keys that match no opened device are warned about, since a
+// typo there silently leaves that RNIC under the host-wide ToR.
+func (a *Agent) resolveDeviceTorIDs(lldpTors []string) {
 	a.deviceTorIDs = make([]string, len(a.devices))
 	matched := make(map[string]bool, len(a.cfg.DeviceTorIDs))
 	untagged := 0
 	for i, dev := range a.devices {
-		tor := a.cfg.TorIDForDevice(dev.Info.DeviceName)
+		tor, source := a.canonicalTorID, torSourceAgent
+		if t, ok := a.cfg.DeviceTorID(dev.Info.DeviceName); ok {
+			tor, source = t, torSourceDeviceMap
+		} else if i < len(lldpTors) && lldpTors[i] != "" {
+			tor, source = lldpTors[i], torSourceLLDP
+		}
 		a.deviceTorIDs[i] = tor
 		for key := range a.cfg.DeviceTorIDs {
 			if strings.EqualFold(strings.TrimSpace(key), dev.Info.DeviceName) {
@@ -181,6 +280,7 @@ func (a *Agent) resolveDeviceTorIDs() {
 		a.logger.Info().
 			Str("device", dev.Info.DeviceName).
 			Str("tor_id", tor).
+			Str("source", source).
 			Msg("Resolved device ToR")
 	}
 	for key := range a.cfg.DeviceTorIDs {
@@ -252,7 +352,7 @@ func (a *Agent) Initialize(ctx context.Context) error {
 		return fmt.Errorf("no RDMA devices available")
 	}
 	a.logger.Info().Int("device_count", len(a.devices)).Msg("RDMA devices opened")
-	a.resolveDeviceTorIDs()
+	a.resolveDeviceTorIDs(a.discoverLLDPTorIDs(ctx))
 
 	// Step 3: Create gRPC client for controller communication.
 	a.logger.Info().

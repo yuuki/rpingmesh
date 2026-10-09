@@ -226,6 +226,10 @@ via Cgo (`CGO_ENABLED=1`).
 | `hostname` | auto-detected | Hostname reported to the controller on registration (falls back to `os.Hostname()` if empty) |
 | `tor_id` | *(optional, empty)* | Top-of-Rack switch identifier. Empty/whitespace registers as an untagged virtual rack. The value `unspecified` is reserved (OTel/PathSummary label for unset ToRs) and is rejected by both the agent and the controller. See [Optional ToR rollout](#optional-tor-rollout). |
 | `device_tor_ids` | `{}` | Optional per-device ToR IDs (`device name: tor_id`) for rail-optimized multi-rail hosts whose RNICs are cabled to different leaf switches. Unlisted devices use `tor_id`; keys match device names case-insensitively; values must be non-empty. See [ToR mapping on multi-rail hosts](docs/design/multi-rail-tor-mapping.md). Upgrade the controller before agents that use it. |
+| `lldp_tor_discovery` | `false` | Derive each device's ToR from the LLDP neighbor of its RoCE netdev (`lldpcli -f json0 show neighbors`) at startup, so `device_tor_ids` need not be maintained. Per device, a `device_tor_ids` entry wins over LLDP, and LLDP wins over `tor_id`. Needs `lldpd` and access to its socket (root or lldpd's group). Devices without a neighbor fall back to `tor_id` with a warning. Restart the agent after re-cabling |
+| `lldp_tor_id_field` | `system_name` | LLDP neighbor attribute used as the ToR ID: `system_name` (switch hostname) or `chassis_id` |
+| `lldpcli_path` | `lldpcli` | lldpd client binary used for LLDP ToR discovery |
+| `lldp_discovery_timeout_sec` | `60` | How long startup waits for every device to see an LLDP neighbor (lldpd learns one only from the switch's next LLDP frame, 30 s by default); `0` queries once |
 | `controller_addr` | `localhost:50051` | Controller gRPC address |
 | `probe_interval_ms` | `500` | Milliseconds between probe rounds |
 | `target_probe_rate_per_second` | `10` | Legacy **uniform** per-target probe-rate cap. Used as the fallback for whichever per-type cap below is `0`, so a config that only sets this keeps a single uniform rate (a target's ECMP flow labels share this budget) |

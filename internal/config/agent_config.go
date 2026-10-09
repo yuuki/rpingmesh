@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"github.com/yuuki/rpingmesh/internal/lldp"
 	"github.com/yuuki/rpingmesh/internal/probe"
 )
 
@@ -75,11 +76,43 @@ const (
 	DefaultCQPollMode = CQPollModeAuto
 )
 
+// DefaultLLDPDiscoveryTimeoutSec is how long the agent waits at startup for
+// lldpd to report a neighbor on every RDMA device's netdev. lldpd learns a
+// neighbor only from the switch's next LLDP frame (sent every 30 s by
+// default), so right after boot the first query can come back empty.
+const DefaultLLDPDiscoveryTimeoutSec = 60
+
 // AgentConfig holds all configuration for the agent.
 type AgentConfig struct {
-	AgentID            string   `mapstructure:"agent_id"`
-	HostName           string   `mapstructure:"hostname"`
-	TorID              string   `mapstructure:"tor_id"`
+	AgentID  string `mapstructure:"agent_id"`
+	HostName string `mapstructure:"hostname"`
+	TorID    string `mapstructure:"tor_id"`
+	// DeviceTorIDs optionally assigns a ToR per RDMA device (device name ->
+	// ToR ID). It exists for rail-optimized multi-rail hosts, where each RNIC
+	// is cabled to a different leaf switch, so a single host-wide TorID
+	// misplaces every RNIC but one. Devices not listed use TorID. Keys are
+	// lower-cased at load time (Viper lower-cases map keys anyway) and device
+	// names are matched case-insensitively; values are canonicalized like
+	// TorID and must be non-empty (proto3 cannot tell an explicitly empty
+	// per-RNIC ToR from an unset one, so the controller would fall back to
+	// tor_id). To leave a device untagged, leave tor_id empty and do not list
+	// the device.
+	DeviceTorIDs map[string]string `mapstructure:"device_tor_ids"`
+	// LLDPTorDiscovery derives each RDMA device's ToR from the LLDP neighbor
+	// of its netdev (via lldpd's lldpcli) at startup, so rail-optimized hosts
+	// need no device_tor_ids map. Precedence per device: device_tor_ids entry,
+	// then the LLDP neighbor, then tor_id. Discovery runs once; restart the
+	// agent after re-cabling.
+	LLDPTorDiscovery bool `mapstructure:"lldp_tor_discovery"`
+	// LLDPTorIDField selects the neighbor attribute used as the ToR ID:
+	// "system_name" (default, the switch hostname) or "chassis_id".
+	LLDPTorIDField string `mapstructure:"lldp_tor_id_field"`
+	// LLDPCLIPath is the lldpcli binary to run (default "lldpcli" on PATH).
+	LLDPCLIPath string `mapstructure:"lldpcli_path"`
+	// LLDPDiscoveryTimeoutSec bounds the startup wait for every device to see
+	// a neighbor; 0 queries once. See DefaultLLDPDiscoveryTimeoutSec.
+	LLDPDiscoveryTimeoutSec uint32 `mapstructure:"lldp_discovery_timeout_sec"`
+
 	ControllerAddr     string   `mapstructure:"controller_addr"`
 	LogLevel           string   `mapstructure:"log_level"`
 	ProbeIntervalMS    uint32   `mapstructure:"probe_interval_ms"`
@@ -178,6 +211,11 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("agent_id", "")
 	v.SetDefault("hostname", "")
 	v.SetDefault("tor_id", "")
+	v.SetDefault("device_tor_ids", map[string]string{})
+	v.SetDefault("lldp_tor_discovery", false)
+	v.SetDefault("lldp_tor_id_field", lldp.FieldSystemName)
+	v.SetDefault("lldpcli_path", lldp.DefaultCLIPath)
+	v.SetDefault("lldp_discovery_timeout_sec", DefaultLLDPDiscoveryTimeoutSec)
 	v.SetDefault("controller_addr", "localhost:50051")
 	v.SetDefault("log_level", "info")
 	v.SetDefault("probe_interval_ms", 500)
@@ -257,6 +295,11 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		AgentID:                    agentID,
 		HostName:                   hostname,
 		TorID:                      v.GetString("tor_id"),
+		DeviceTorIDs:               canonicalDeviceTorIDs(v.GetStringMapString("device_tor_ids")),
+		LLDPTorDiscovery:           v.GetBool("lldp_tor_discovery"),
+		LLDPTorIDField:             v.GetString("lldp_tor_id_field"),
+		LLDPCLIPath:                v.GetString("lldpcli_path"),
+		LLDPDiscoveryTimeoutSec:    v.GetUint32("lldp_discovery_timeout_sec"),
 		ControllerAddr:             v.GetString("controller_addr"),
 		LogLevel:                   v.GetString("log_level"),
 		ProbeIntervalMS:            v.GetUint32("probe_interval_ms"),
@@ -302,6 +345,23 @@ func (c *AgentConfig) Validate() error {
 	// untagged metric series after upgrade.
 	if probe.IsReservedTorID(c.TorID) {
 		return fmt.Errorf("tor_id %q is reserved for untagged agents", probe.UnspecifiedTorLabel)
+	}
+	for dev, tor := range c.DeviceTorIDs {
+		if strings.TrimSpace(dev) == "" {
+			return fmt.Errorf("device_tor_ids has an empty device name")
+		}
+		if probe.CanonicalTorID(tor) == "" {
+			return fmt.Errorf("device_tor_ids[%s] must not be empty; omit the device to use tor_id", dev)
+		}
+		if probe.IsReservedTorID(tor) {
+			return fmt.Errorf("device_tor_ids[%s] %q is reserved for untagged agents", dev, probe.UnspecifiedTorLabel)
+		}
+	}
+
+	// An empty field (a zero-value AgentConfig) means the default, system_name.
+	if c.LLDPTorIDField != "" && !lldp.ValidField(c.LLDPTorIDField) {
+		return fmt.Errorf("lldp_tor_id_field must be %q or %q, got: %q",
+			lldp.FieldSystemName, lldp.FieldChassisID, c.LLDPTorIDField)
 	}
 
 	// GID index must be non-negative; it indexes into the RNIC's GID table.
@@ -432,6 +492,10 @@ func (c *AgentConfig) EffectiveInterTorProbeRate() int {
 func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.String("agent-id", "", "Agent ID (defaults to hostname if empty)")
 	flags.String("tor-id", "", "Top-of-Rack switch identifier")
+	flags.Bool("lldp-tor-discovery", false, "Derive each RDMA device's ToR ID from its LLDP neighbor (lldpd) at startup")
+	flags.String("lldp-tor-id-field", lldp.FieldSystemName, "LLDP neighbor attribute used as the ToR ID: system_name or chassis_id")
+	flags.String("lldpcli-path", lldp.DefaultCLIPath, "Path to the lldpd client used for LLDP ToR discovery")
+	flags.Uint32("lldp-discovery-timeout-sec", DefaultLLDPDiscoveryTimeoutSec, "Max startup wait for LLDP neighbors on every RDMA device (0 = query once)")
 	flags.String("controller-addr", "localhost:50051", "Controller gRPC address")
 	flags.String("log-level", "info", "Log level (debug, info, warn, error)")
 	flags.Uint32("probe-interval-ms", 500, "Probe interval in milliseconds")
@@ -460,4 +524,38 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.Int("max-procs", 0, "Cap runtime.GOMAXPROCS to this many cores (0 = Go default: all cores)")
 	flags.Float64("throttle-memory-ratio", DefaultThrottleMemoryRatio, "Fraction of max-memory-mb at which memory throttling engages (0-1; only when max-memory-mb > 0)")
 	flags.Float64("throttle-cpu-percent", DefaultThrottleCPUPercent, "Percentage of available CPU capacity (GOMAXPROCS cores) at which CPU throttling engages (0-100)")
+}
+
+// canonicalDeviceTorIDs lower-cases device-name keys and canonicalizes ToR
+// values so lookups in TorIDForDevice are case-insensitive and whitespace-safe.
+func canonicalDeviceTorIDs(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for dev, tor := range in {
+		out[strings.ToLower(strings.TrimSpace(dev))] = probe.CanonicalTorID(tor)
+	}
+	return out
+}
+
+// DeviceTorID returns the canonical device_tor_ids entry for an RDMA device
+// and whether one exists. Device names match case-insensitively.
+func (c *AgentConfig) DeviceTorID(deviceName string) (string, bool) {
+	name := strings.TrimSpace(deviceName)
+	for dev, tor := range c.DeviceTorIDs {
+		if strings.EqualFold(strings.TrimSpace(dev), name) {
+			return probe.CanonicalTorID(tor), true
+		}
+	}
+	return "", false
+}
+
+// TorIDForDevice returns the canonical ToR ID for an RDMA device: its
+// device_tor_ids entry when present, otherwise the host-wide tor_id.
+func (c *AgentConfig) TorIDForDevice(deviceName string) string {
+	if tor, ok := c.DeviceTorID(deviceName); ok {
+		return tor
+	}
+	return probe.CanonicalTorID(c.TorID)
 }

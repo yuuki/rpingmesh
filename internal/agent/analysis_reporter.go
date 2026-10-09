@@ -201,12 +201,16 @@ func (r *AnalysisReporter) report(ctx context.Context, summaries []probe.PathSum
 }
 
 // toProto maps an aggregator PathSummary to its proto form, stamping the
-// agent-wide source ToR (which the aggregator does not carry) and rendering
-// GIDs as canonical strings.
+// path's source ToR (falling back to the reporter's default when the results
+// carried none) and rendering GIDs as canonical strings.
 func (r *AnalysisReporter) toProto(s *probe.PathSummary) *controller_agent.PathSummary {
+	sourceTor := r.sourceTorID
+	if s.SourceTorID != "" {
+		sourceTor = s.SourceTorID
+	}
 	return &controller_agent.PathSummary{
 		SourceGid:         probe.FormatGID(s.SourceGID),
-		SourceTorId:       probe.TorMetricLabel(r.sourceTorID),
+		SourceTorId:       probe.TorMetricLabel(sourceTor),
 		TargetGid:         probe.FormatGID(s.TargetGID),
 		TargetTorId:       probe.TorMetricLabel(s.TargetTorID),
 		TargetQpn:         s.TargetQPN,

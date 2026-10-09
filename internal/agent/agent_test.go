@@ -11,13 +11,18 @@
 package agent
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/yuuki/rpingmesh/internal/config"
+	"github.com/yuuki/rpingmesh/internal/lldp"
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/internal/rdmabridge"
+	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
 // fakeDevice builds a *rdmabridge.Device carrying only the metadata the
@@ -399,5 +404,196 @@ func TestAgent_ReservedTorIDRejected(t *testing.T) {
 		if err == nil {
 			t.Errorf("NewAgent(tor_id=%q) succeeded, want reserved-id error", torID)
 		}
+	}
+}
+
+// TestAgent_PerDeviceTorIDs verifies the rail-optimized wiring: each device's
+// device_tor_ids entry (else tor_id) is used for its registered RNIC, its
+// cluster monitor's pinglist requests, and its prober's results.
+func TestAgent_PerDeviceTorIDs(t *testing.T) {
+	a, err := NewAgent(&config.AgentConfig{
+		AgentID:                   "agent-1",
+		TorID:                     "host-tor",
+		DeviceTorIDs:              map[string]string{"rxe0": "leaf-a", "RXE1": "leaf-b", "rxe9": "leaf-z"},
+		PinglistUpdateIntervalSec: 3600,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	a.devices = []*rdmabridge.Device{
+		fakeDevice("rxe0", "gid-0"),
+		fakeDevice("rxe1", "gid-1"),
+		fakeDevice("rxe2", "gid-2"),
+	}
+	a.probers = []*Prober{fakeProber(1), fakeProber(1), fakeProber(1)}
+	a.responders = []*Responder{{}, {}, {}}
+
+	a.resolveDeviceTorIDs(nil)
+	want := []string{"leaf-a", "leaf-b", "host-tor"}
+
+	req := a.buildRegistrationRequest()
+	if req.GetTorId() != "host-tor" {
+		t.Errorf("registration TorId = %q, want host-tor", req.GetTorId())
+	}
+	if len(req.GetRnics()) != len(want) {
+		t.Fatalf("rnics = %d, want %d", len(req.GetRnics()), len(want))
+	}
+	for i, rnic := range req.GetRnics() {
+		if rnic.GetTorId() != want[i] {
+			t.Errorf("rnic[%d] TorId = %q, want %q", i, rnic.GetTorId(), want[i])
+		}
+	}
+
+	a.createClusterMonitors()
+	for i, m := range a.monitors {
+		if m.torID != want[i] {
+			t.Errorf("monitor[%d].torID = %q, want %q", i, m.torID, want[i])
+		}
+	}
+
+	for i, p := range a.probers {
+		p.SetSourceTorID(a.torIDForDevice(i))
+		p.emitResult(&probe.ProbeResult{})
+		if got := (<-p.resultChan).SourceTorID; got != want[i] {
+			t.Errorf("prober[%d] result SourceTorID = %q, want %q", i, got, want[i])
+		}
+	}
+}
+
+type staticLLDPQuerier map[string]lldp.Neighbor
+
+func (q staticLLDPQuerier) Neighbors(context.Context) (map[string]lldp.Neighbor, error) {
+	return q, nil
+}
+
+// TestAgent_LLDPTorDiscovery verifies the ToR precedence with
+// lldp_tor_discovery: a device_tor_ids entry beats LLDP, an LLDP neighbor
+// beats tor_id, and devices without a usable neighbor (none, reserved label,
+// or no netdev) fall back to tor_id.
+func TestAgent_LLDPTorDiscovery(t *testing.T) {
+	sysfs := t.TempDir()
+	for dev, ndev := range map[string]string{
+		"rxe0": "eth0", "rxe1": "eth1", "rxe2": "eth2", "rxe3": "eth3",
+	} {
+		dir := filepath.Join(sysfs, "class", "infiniband", dev, "ports", "1", "gid_attrs", "ndevs")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "0"), []byte(ndev+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	a, err := NewAgent(&config.AgentConfig{
+		AgentID:          "agent-1",
+		TorID:            "host-tor",
+		DeviceTorIDs:     map[string]string{"rxe0": "pinned"},
+		LLDPTorDiscovery: true,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	a.sysfsRoot = sysfs
+	a.lldpQuerier = staticLLDPQuerier{
+		"eth0": {SystemName: "leaf-ignored"},
+		"eth1": {SystemName: " leaf-b "},
+		"eth2": {SystemName: probe.UnspecifiedTorLabel},
+		// eth3: no neighbor; rxe4: no netdev in sysfs.
+	}
+	a.devices = []*rdmabridge.Device{}
+	for i, name := range []string{"rxe0", "rxe1", "rxe2", "rxe3", "rxe4"} {
+		d := fakeDevice(name, string(rune('0'+i)))
+		d.Info.ActivePort = 1
+		a.devices = append(a.devices, d)
+	}
+
+	a.resolveDeviceTorIDs(a.discoverLLDPTorIDs(context.Background()))
+	want := []string{"pinned", "leaf-b", "host-tor", "host-tor", "host-tor"}
+	for i, w := range want {
+		if got := a.torIDForDevice(i); got != w {
+			t.Errorf("device %s ToR = %q, want %q", a.devices[i].Info.DeviceName, got, w)
+		}
+	}
+}
+
+// TestAgent_LLDPTorDiscoveryDisabled verifies that discovery is a no-op
+// unless enabled, so existing configs never run lldpcli.
+func TestAgent_LLDPTorDiscoveryDisabled(t *testing.T) {
+	a, err := NewAgent(&config.AgentConfig{AgentID: "agent-1"})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	a.lldpQuerier = nil // would panic if used
+	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0")}
+	if got := a.discoverLLDPTorIDs(context.Background()); got != nil {
+		t.Errorf("discoverLLDPTorIDs = %v, want nil", got)
+	}
+}
+
+// TestAgent_RegistrationTorSupport verifies that per-device ToRs survive
+// registration with a controller that keeps them, and fall back to tor_id
+// (registry, monitors, and prober results) against an older controller that
+// overwrites them, so ToR-mesh requests keep matching the registry.
+func TestAgent_RegistrationTorSupport(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		supported bool
+		want      []string
+	}{
+		{"new controller", true, []string{"leaf-a", "host-tor"}},
+		{"old controller", false, []string{"host-tor", "host-tor"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := NewAgent(&config.AgentConfig{
+				AgentID:                   "agent-1",
+				TorID:                     "host-tor",
+				DeviceTorIDs:              map[string]string{"rxe0": "leaf-a"},
+				PinglistUpdateIntervalSec: 3600,
+			})
+			if err != nil {
+				t.Fatalf("NewAgent: %v", err)
+			}
+			a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0"), fakeDevice("rxe1", "1")}
+			a.probers = []*Prober{fakeProber(1), fakeProber(1)}
+			a.responders = []*Responder{{}, {}}
+			a.resolveDeviceTorIDs(nil)
+			for i, p := range a.probers {
+				p.SetSourceTorID(a.torIDForDevice(i))
+			}
+
+			a.applyRegistrationTorSupport(&controller_agent.AgentRegistrationResponse{
+				Success: true, PerRnicTorId: tc.supported,
+			})
+			a.createClusterMonitors()
+
+			for i, rnic := range a.buildRegistrationRequest().GetRnics() {
+				if rnic.GetTorId() != tc.want[i] {
+					t.Errorf("rnic[%d] TorId = %q, want %q", i, rnic.GetTorId(), tc.want[i])
+				}
+			}
+			for i, m := range a.monitors {
+				if m.torID != tc.want[i] {
+					t.Errorf("monitor[%d].torID = %q, want %q", i, m.torID, tc.want[i])
+				}
+			}
+			for i, p := range a.probers {
+				p.emitResult(&probe.ProbeResult{})
+				if got := (<-p.resultChan).SourceTorID; got != tc.want[i] {
+					t.Errorf("prober[%d] SourceTorID = %q, want %q", i, got, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestProber_SetSourceTorID_UntaggedUsesLabel verifies that an untagged
+// device stamps the metric label, so consumers never fall back to a
+// different default for it.
+func TestProber_SetSourceTorID_UntaggedUsesLabel(t *testing.T) {
+	p := fakeProber(1)
+	p.SetSourceTorID("")
+	p.emitResult(&probe.ProbeResult{})
+	if got := (<-p.resultChan).SourceTorID; got != probe.UnspecifiedTorLabel {
+		t.Errorf("SourceTorID = %q, want %q", got, probe.UnspecifiedTorLabel)
 	}
 }

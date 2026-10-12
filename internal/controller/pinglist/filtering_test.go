@@ -50,7 +50,7 @@ func TestTorMesh_SameHostExclusion(t *testing.T) {
 	}
 	gen := newTestGenerator(src)
 
-	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1")
+	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateTorMeshPinglist: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestTorMesh_UnregisteredRequesterFallsBackToGID(t *testing.T) {
 	}
 	gen := newTestGenerator(src)
 
-	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1")
+	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateTorMeshPinglist: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestTorMesh_ResolveErrorDegradesGracefully(t *testing.T) {
 	}
 	gen := newTestGenerator(src)
 
-	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1")
+	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateTorMeshPinglist must not fail on a hostname-lookup error: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestTorMesh_CrossFamilyExclusion(t *testing.T) {
 			src := &fakeRnicSource{torMesh: tc.torMesh}
 			gen := newTestGenerator(src)
 
-			targets, err := gen.GenerateTorMeshPinglist(context.Background(), tc.requesterGID, "tor-1")
+			targets, err := gen.GenerateTorMeshPinglist(context.Background(), tc.requesterGID, "tor-1", "")
 			if err != nil {
 				t.Fatalf("GenerateTorMeshPinglist: %v", err)
 			}
@@ -178,7 +178,7 @@ func TestTorMesh_UnparseableGIDHandling(t *testing.T) {
 		}
 		gen := newTestGenerator(src)
 
-		targets, err := gen.GenerateTorMeshPinglist(context.Background(), "junk-gid", "tor-1")
+		targets, err := gen.GenerateTorMeshPinglist(context.Background(), "junk-gid", "tor-1", "")
 		if err != nil {
 			t.Fatalf("GenerateTorMeshPinglist: %v", err)
 		}
@@ -198,7 +198,7 @@ func TestTorMesh_UnparseableGIDHandling(t *testing.T) {
 		}
 		gen := newTestGenerator(src)
 
-		targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1")
+		targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1", "")
 		if err != nil {
 			t.Fatalf("GenerateTorMeshPinglist: %v", err)
 		}
@@ -229,7 +229,7 @@ func TestInterTor_SameHostExcludedBeforeSampling(t *testing.T) {
 	}
 	gen := newTestGenerator(src)
 
-	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1")
+	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateInterTorPinglist: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestInterTor_CrossFamilyExcludedBeforeSampling(t *testing.T) {
 	}
 	gen := newTestGenerator(src)
 
-	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1")
+	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateInterTorPinglist: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestInterTor_SamplesOnePerToRUpToSize(t *testing.T) {
 	// Cap at 2 distinct ToRs.
 	gen := NewPinglistGenerator(src, ECMPConfig{PathsAssumed: 16, CoverageProbability: 0.9, MaxFlowLabels: 64}, 2, 0)
 
-	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1")
+	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateInterTorPinglist: %v", err)
 	}

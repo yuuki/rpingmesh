@@ -23,8 +23,8 @@ func (erroringRnicSource) GetActiveRNICsInOtherToRs(_ context.Context, _ string)
 	return nil, errFakeRegistry
 }
 
-func (erroringRnicSource) ResolveHostnameByGID(_ context.Context, _ string) (string, error) {
-	return "", nil
+func (erroringRnicSource) GetRNICByGID(_ context.Context, _ string) (*controller_agent.RnicInfo, error) {
+	return nil, nil
 }
 
 func newTestGenerator(src RnicSource) *PinglistGenerator {
@@ -40,7 +40,7 @@ func newTestGenerator(src RnicSource) *PinglistGenerator {
 func TestGenerateTorMeshPinglist_Error(t *testing.T) {
 	gen := newTestGenerator(erroringRnicSource{})
 
-	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1")
+	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if !errors.Is(err, errFakeRegistry) {
 		t.Fatalf("GenerateTorMeshPinglist error = %v, want %v", err, errFakeRegistry)
 	}
@@ -67,7 +67,7 @@ func TestGenerateTorMeshPinglist_EmptyToR(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			gen := newTestGenerator(tc.src)
 
-			targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1")
+			targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1", "")
 			if err != nil {
 				t.Fatalf("GenerateTorMeshPinglist: %v", err)
 			}
@@ -92,7 +92,7 @@ func TestGenerateInterTorPinglist_Success(t *testing.T) {
 	wantCount := ComputeFlowLabelCount(16, 0.9, 64)
 	gen := newTestGenerator(src)
 
-	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1")
+	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateInterTorPinglist: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestGeneratePinglist_StampsPinglistType(t *testing.T) {
 	}
 	gen := newTestGenerator(src)
 
-	torMesh, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1")
+	torMesh, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateTorMeshPinglist: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestGeneratePinglist_StampsPinglistType(t *testing.T) {
 		}
 	}
 
-	interTor, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1")
+	interTor, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateInterTorPinglist: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestGenerateInterTorPinglist_Empty(t *testing.T) {
 	src := &fakeRnicSource{interTor: nil}
 	gen := newTestGenerator(src)
 
-	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1")
+	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateInterTorPinglist: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestGenerateInterTorPinglist_Empty(t *testing.T) {
 func TestGenerateInterTorPinglist_Error(t *testing.T) {
 	gen := newTestGenerator(erroringRnicSource{})
 
-	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1")
+	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if !errors.Is(err, errFakeRegistry) {
 		t.Fatalf("GenerateInterTorPinglist error = %v, want %v", err, errFakeRegistry)
 	}

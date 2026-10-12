@@ -38,11 +38,23 @@ type fakeConn struct {
 	// WriteOneParameterizedContext, in call order.
 	writeOneParameterizedCalls []gorqlite.ParameterizedStatement
 	writeOneParameterizedErr   error
+
+	// writeOneCalls captures every statement passed to WriteOneContext (the
+	// schema DDL); writeOneErrs returns the mapped error for a statement
+	// containing the key.
+	writeOneCalls []string
+	writeOneErrs  map[string]error
 }
 
 func (f *fakeConn) Close() {}
 
-func (f *fakeConn) WriteOneContext(_ context.Context, _ string) (gorqlite.WriteResult, error) {
+func (f *fakeConn) WriteOneContext(_ context.Context, sqlStatement string) (gorqlite.WriteResult, error) {
+	f.writeOneCalls = append(f.writeOneCalls, sqlStatement)
+	for substr, err := range f.writeOneErrs {
+		if strings.Contains(sqlStatement, substr) {
+			return gorqlite.WriteResult{Err: err}, err
+		}
+	}
 	return gorqlite.WriteResult{}, nil
 }
 
@@ -107,6 +119,7 @@ func testRnic(gid string) *controller_agent.RnicInfo {
 		HostName:   "host-1",
 		TorId:      "tor-1",
 		DeviceName: "mlx5_0",
+		PlaneId:    "rail0",
 	}
 }
 
@@ -368,38 +381,38 @@ func TestGetActiveRNICsInOtherToRs_QueryErrorPropagates(t *testing.T) {
 	}
 }
 
-// TestResolveHostnameByGID_EmptyGIDShortCircuits verifies that an empty GID
-// resolves to "" without touching the database, so callers get the
+// TestGetRNICByGID_EmptyGIDShortCircuits verifies that an empty GID
+// resolves to nil without touching the database, so callers get the
 // unregistered-fallback signal cheaply.
-func TestResolveHostnameByGID_EmptyGIDShortCircuits(t *testing.T) {
+func TestGetRNICByGID_EmptyGIDShortCircuits(t *testing.T) {
 	fake := &fakeConn{}
 	reg := newTestRegistry(fake)
 
-	hostname, err := reg.ResolveHostnameByGID(context.Background(), "")
+	info, err := reg.GetRNICByGID(context.Background(), "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if hostname != "" {
-		t.Errorf("hostname = %q, want empty", hostname)
+	if info != nil {
+		t.Errorf("info = %v, want nil", info)
 	}
 	if len(fake.queryOneParameterizedCalls) != 0 {
 		t.Errorf("made %d queries, want 0 for an empty GID", len(fake.queryOneParameterizedCalls))
 	}
 }
 
-// TestResolveHostnameByGID_NotFoundReturnsEmpty verifies that a GID with no
-// active row resolves to "" (not an error), so the generator falls back to GID
+// TestGetRNICByGID_NotFoundReturnsEmpty verifies that a GID with no
+// active row resolves to nil (not an error), so the generator falls back to GID
 // self-exclusion rather than failing the request.
-func TestResolveHostnameByGID_NotFoundReturnsEmpty(t *testing.T) {
+func TestGetRNICByGID_NotFoundReturnsEmpty(t *testing.T) {
 	fake := &fakeConn{} // fakeConn yields an empty result set
 	reg := newTestRegistry(fake)
 
-	hostname, err := reg.ResolveHostnameByGID(context.Background(), "fe80::1")
+	info, err := reg.GetRNICByGID(context.Background(), "fe80::1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if hostname != "" {
-		t.Errorf("hostname = %q, want empty for a GID with no active row", hostname)
+	if info != nil {
+		t.Errorf("info = %v, want nil for a GID with no active row", info)
 	}
 	if len(fake.queryOneParameterizedCalls) != 1 {
 		t.Fatalf("QueryOneParameterizedContext called %d times, want 1", len(fake.queryOneParameterizedCalls))
@@ -409,15 +422,15 @@ func TestResolveHostnameByGID_NotFoundReturnsEmpty(t *testing.T) {
 	}
 }
 
-// TestResolveHostnameByGID_QueryErrorPropagates verifies that a genuine query
-// failure is surfaced (not swallowed as ""), so it is distinguishable from a
+// TestGetRNICByGID_QueryErrorPropagates verifies that a genuine query
+// failure is surfaced (not swallowed as nil), so it is distinguishable from a
 // not-found result.
-func TestResolveHostnameByGID_QueryErrorPropagates(t *testing.T) {
+func TestGetRNICByGID_QueryErrorPropagates(t *testing.T) {
 	wantErr := errors.New("query failed")
 	fake := &fakeConn{queryOneParameterizedErr: wantErr}
 	reg := newTestRegistry(fake)
 
-	_, err := reg.ResolveHostnameByGID(context.Background(), "fe80::1")
+	_, err := reg.GetRNICByGID(context.Background(), "fe80::1")
 	if err == nil || !errors.Is(err, wantErr) {
 		t.Fatalf("got error %v, want wrapping %v", err, wantErr)
 	}
@@ -587,5 +600,110 @@ func TestNoStatementUsesSQLiteNow(t *testing.T) {
 	ins := fake.writeParameterizedCalls[0][1]
 	if got := ins.Arguments[len(ins.Arguments)-1]; got != testNowUnix {
 		t.Errorf("last_updated_epoch = %v, want %d", got, testNowUnix)
+	}
+}
+
+// TestRegisterRNICs_StoresPlaneID verifies that each RNIC's plane_id is
+// written to the plane_id column.
+func TestRegisterRNICs_StoresPlaneID(t *testing.T) {
+	fake := &fakeConn{}
+	reg := newTestRegistry(fake)
+
+	untagged := testRnic("gid-2")
+	untagged.PlaneId = ""
+	if err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1",
+		[]*controller_agent.RnicInfo{testRnic("gid-1"), untagged}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	stmts := fake.writeParameterizedCalls[0]
+	for i, want := range []string{"rail0", ""} {
+		ins := stmts[i+1]
+		if !strings.Contains(ins.Query, "plane_id") {
+			t.Fatalf("insert query lacks plane_id: %s", ins.Query)
+		}
+		// plane_id is bound right before last_updated_epoch.
+		if got := ins.Arguments[len(ins.Arguments)-2]; got != want {
+			t.Errorf("insert %d plane_id = %v, want %q", i, got, want)
+		}
+	}
+}
+
+// TestReadQueriesSelectPlaneID verifies that every RNIC read returns the
+// plane_id column, which the pinglist generator filters on.
+func TestReadQueriesSelectPlaneID(t *testing.T) {
+	fake := &fakeConn{}
+	reg := newTestRegistry(fake)
+	ctx := context.Background()
+
+	_, _ = reg.GetRNICsByToR(ctx, "tor-1")
+	_, _ = reg.GetActiveRNICsInOtherToRs(ctx, "tor-1")
+	_, _ = reg.GetRNICByGID(ctx, "gid-1")
+	_, _ = reg.GetRNICInfo(ctx, "10.0.0.1", "")
+	_, _ = reg.ListAllRNICs(ctx)
+
+	if len(fake.queryOneParameterizedCalls) != 5 {
+		t.Fatalf("captured %d queries, want 5", len(fake.queryOneParameterizedCalls))
+	}
+	for _, q := range fake.queryOneParameterizedCalls {
+		if !strings.Contains(q.Query, "device_name, plane_id") {
+			t.Errorf("query does not select plane_id: %s", q.Query)
+		}
+	}
+}
+
+// TestInitializeSchema_AddsPlaneColumnToLegacyTable verifies the migration
+// path for a table created before plane support: PRAGMA table_info reports no
+// plane_id column (the fake's empty result), so the column is added.
+func TestInitializeSchema_AddsPlaneColumnToLegacyTable(t *testing.T) {
+	fake := &fakeConn{}
+	reg := newTestRegistry(fake)
+
+	if err := reg.initializeSchema(); err != nil {
+		t.Fatalf("initializeSchema: %v", err)
+	}
+	if !strings.Contains(fake.writeOneCalls[0], "plane_id TEXT NOT NULL DEFAULT ''") {
+		t.Errorf("CREATE TABLE lacks plane_id: %s", fake.writeOneCalls[0])
+	}
+	if len(fake.queryOneParameterizedCalls) != 1 ||
+		!strings.Contains(fake.queryOneParameterizedCalls[0].Query, "PRAGMA table_info(rnics)") {
+		t.Fatalf("queries = %v, want one PRAGMA table_info(rnics)", fake.queryOneParameterizedCalls)
+	}
+	var alters int
+	for _, stmt := range fake.writeOneCalls {
+		if strings.Contains(stmt, "ALTER TABLE rnics ADD COLUMN plane_id TEXT NOT NULL DEFAULT ''") {
+			alters++
+		}
+	}
+	if alters != 1 {
+		t.Errorf("ALTER TABLE issued %d times, want 1; statements: %v", alters, fake.writeOneCalls)
+	}
+}
+
+// TestInitializeSchema_ToleratesConcurrentPlaneMigration verifies that a
+// "duplicate column name" failure (another controller added the column
+// between our PRAGMA and ALTER) is not a startup error.
+func TestInitializeSchema_ToleratesConcurrentPlaneMigration(t *testing.T) {
+	fake := &fakeConn{writeOneErrs: map[string]error{
+		"ALTER TABLE": errors.New("duplicate column name: plane_id"),
+	}}
+	if err := newTestRegistry(fake).initializeSchema(); err != nil {
+		t.Fatalf("initializeSchema: %v, want the duplicate column tolerated", err)
+	}
+}
+
+// TestInitializeSchema_PlaneMigrationErrorsPropagate verifies that genuine
+// migration failures stop startup instead of leaving a table whose INSERTs
+// would fail on the missing column.
+func TestInitializeSchema_PlaneMigrationErrorsPropagate(t *testing.T) {
+	alterErr := errors.New("database is locked")
+	if err := newTestRegistry(&fakeConn{writeOneErrs: map[string]error{"ALTER TABLE": alterErr}}).
+		initializeSchema(); !errors.Is(err, alterErr) {
+		t.Errorf("ALTER failure: got %v, want wrapping %v", err, alterErr)
+	}
+
+	queryErr := errors.New("query failed")
+	if err := newTestRegistry(&fakeConn{queryOneParameterizedErr: queryErr}).
+		initializeSchema(); !errors.Is(err, queryErr) {
+		t.Errorf("PRAGMA failure: got %v, want wrapping %v", err, queryErr)
 	}
 }

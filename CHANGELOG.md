@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-13
+
 ### Added
 
 - `log_format` for the agent and the controller: `console` (default,

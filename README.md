@@ -242,6 +242,7 @@ via Cgo (`CGO_ENABLED=1`).
 | `traffic_class` | `0` | GRH traffic class octet applied to every Address Handle (0-255). RoCEv2 DSCP occupies the upper 6 bits of this octet: to use DSCP value `N`, set `traffic_class = N << 2` |
 | `cq_poll_mode` | `auto` | How completions are awaited: `event` sleeps on a completion channel and an eventfd (no CPU while idle), `busy` polls the CQ every ~50 µs and the event ring every 100 µs (roughly 3% of a CPU per RDMA device), `auto` uses `event` with NIC hardware timestamps and `busy` with software timestamps (see [Event-Driven Completion Handling](#event-driven-completion-handling)) |
 | `allowed_device_names` | `[]` | Device filter (empty = all devices) |
+| `excluded_device_names` | `[]` | RDMA devices never to open (matched case-insensitively, checked before the device is opened). Applied on top of `allowed_device_names`; listing a device in both is a config error |
 | `metrics_enabled` | `true` | Enable OpenTelemetry export |
 | `otel_collector_addr` | `localhost:4317` | OTLP gRPC collector endpoint |
 | `analysis_report_enabled` | `true` | Aggregate probe results per path and report `PathSummary` batches to the controller's analyzer (best-effort; never blocks probing) |

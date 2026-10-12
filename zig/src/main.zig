@@ -52,7 +52,8 @@ comptime {
     //   ring.zig   -> rdma_event_ring_create, rdma_event_ring_poll,
     //                 rdma_event_ring_destroy, rdma_event_ring_drop_count
     //   device.zig -> rdma_init, rdma_destroy, rdma_get_device_count,
-    //                 rdma_open_device, rdma_open_device_by_name, rdma_close_device
+    //                 rdma_get_device_name, rdma_open_device,
+    //                 rdma_open_device_by_name, rdma_close_device
     //   queue.zig  -> rdma_create_queue, rdma_destroy_queue
     //   packet.zig -> rdma_send_probe, rdma_send_first_ack, rdma_send_second_ack
     _ = ring;

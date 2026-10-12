@@ -64,6 +64,9 @@ gid_index: 0                     # GID table index to use
 # depends on prompt polling).
 cq_poll_mode: "auto"
 allowed_device_names: []         # Empty = all devices
+# RDMA devices never to open (e.g. a storage-only or faulty RNIC). Applied on
+# top of allowed_device_names; a name in both lists is a config error.
+excluded_device_names: []        # Empty = exclude nothing
 
 # Telemetry
 metrics_enabled: true

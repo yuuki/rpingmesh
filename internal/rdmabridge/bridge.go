@@ -198,6 +198,21 @@ func (ctx *Context) GetDeviceCount() int {
 	return int(rc)
 }
 
+// GetDeviceName returns the name (e.g., "mlx5_0") of the device at index
+// without opening it, so callers can filter devices before allocating any
+// verbs resources.
+func (ctx *Context) GetDeviceName(index int) (string, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	var buf [64]C.char
+	rc := C.rdma_get_device_name(ctx.handle, C.int32_t(index), &buf[0], C.size_t(len(buf)))
+	if rc != 0 {
+		return "", fmt.Errorf("rdma_get_device_name(index=%d) failed: %s", index, GetLastError())
+	}
+	return cCharArrayToString(buf[:]), nil
+}
+
 // OpenDevice opens an RDMA device by its index in the device list.
 // The gidIndex specifies which GID table entry to use on the active port.
 // sl and tc are the Service Level (PFC priority, 0-7) and GRH traffic class

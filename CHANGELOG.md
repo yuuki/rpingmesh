@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-12
+
+### Added
+
+- `excluded_device_names`: RDMA devices the agent must never open (for
+  example a storage-only or faulty RNIC). Names match case-insensitively and
+  are filtered before the device is opened, so no verbs resources are
+  allocated on them. The list applies on top of `allowed_device_names`;
+  naming a device in both is a config error. Also settable via
+  `--excluded-device-names` and `RPINGMESH_EXCLUDED_DEVICE_NAMES`.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added

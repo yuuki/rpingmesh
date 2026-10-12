@@ -60,11 +60,11 @@ func (f *fakeRegistry) GetActiveRNICsInOtherToRs(_ context.Context, excludeTorID
 	return f.interTorRnics, f.interTorErr
 }
 
-// ResolveHostnameByGID reports the requester as unregistered ("") so the
+// GetRNICByGID reports the requester as unregistered (nil) so the
 // service-level tests exercise the GID self-exclusion fallback; the same-host
-// filtering itself is covered by the pinglist package's unit tests.
-func (f *fakeRegistry) ResolveHostnameByGID(_ context.Context, _ string) (string, error) {
-	return "", nil
+// and plane filtering itself is covered by the pinglist package's unit tests.
+func (f *fakeRegistry) GetRNICByGID(_ context.Context, _ string) (*controller_agent.RnicInfo, error) {
+	return nil, nil
 }
 
 func statusCode(t *testing.T, err error) codes.Code {
@@ -379,5 +379,63 @@ func TestRegisterAgent_PerRnicReservedTorID(t *testing.T) {
 	}
 	if fake.registerCalls != 0 {
 		t.Errorf("registerCalls = %d, want 0", fake.registerCalls)
+	}
+}
+
+func TestRegisterAgent_StoresPerRnicPlane(t *testing.T) {
+	fake := &fakeRegistry{}
+	svc := newTestService(fake)
+
+	resp, err := svc.RegisterAgent(context.Background(), &controller_agent.AgentRegistrationRequest{
+		AgentId:  "agent-1",
+		Hostname: "host-1",
+		TorId:    "tor-1",
+		Rnics: []*controller_agent.RnicInfo{
+			{Gid: "gid-1", PlaneId: " rail0 "},
+			{Gid: "gid-2", PlaneId: "rail1"},
+			{Gid: "gid-3"}, // older agent / no plane configured
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.GetPerRnicPlaneId() {
+		t.Error("resp.PerRnicPlaneId = false, want true (agents use it to detect plane support)")
+	}
+	for i, want := range []string{"rail0", "rail1", ""} {
+		if got := fake.lastRnics[i].GetPlaneId(); got != want {
+			t.Errorf("rnic %d plane = %q, want %q (trimmed, no request-wide fallback)", i, got, want)
+		}
+	}
+}
+
+// TestGetPinglist_ForwardsRequestPlane checks that the request's plane_id
+// restricts inter-ToR targets when the requester is not in the registry.
+func TestGetPinglist_ForwardsRequestPlane(t *testing.T) {
+	fake := &fakeRegistry{
+		interTorRnics: []*controller_agent.RnicInfo{
+			{Gid: "r0-gid", TorId: "tor-2", PlaneId: "rail0"},
+			{Gid: "r1-gid", TorId: "tor-3", PlaneId: "rail1"},
+		},
+	}
+	svc := newTestService(fake)
+
+	for plane, want := range map[string]int{"": 2, " rail1 ": 1} {
+		resp, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
+			AgentId:      "agent-1",
+			RequesterGid: "requester-gid",
+			TorId:        "tor-1",
+			PlaneId:      plane,
+			Type:         controller_agent.PinglistType_INTER_TOR,
+		})
+		if err != nil {
+			t.Fatalf("plane %q: unexpected error: %v", plane, err)
+		}
+		if got := len(resp.GetTargets()); got != want {
+			t.Errorf("plane %q: got %d targets, want %d", plane, got, want)
+		}
+		if plane != "" && resp.GetTargets()[0].GetTargetGid() != "r1-gid" {
+			t.Errorf("plane %q: target = %s, want r1-gid", plane, resp.GetTargets()[0].GetTargetGid())
+		}
 	}
 }

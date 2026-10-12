@@ -11,9 +11,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -595,5 +597,109 @@ func TestProber_SetSourceTorID_UntaggedUsesLabel(t *testing.T) {
 	p.emitResult(&probe.ProbeResult{})
 	if got := (<-p.resultChan).SourceTorID; got != probe.UnspecifiedTorLabel {
 		t.Errorf("SourceTorID = %q, want %q", got, probe.UnspecifiedTorLabel)
+	}
+}
+
+// TestAgent_PerDevicePlaneIDs verifies that each device's device_plane_ids
+// entry (else plane_id) is registered for its RNIC and sent with its cluster
+// monitor's pinglist requests, and that stale map entries are warned about.
+func TestAgent_PerDevicePlaneIDs(t *testing.T) {
+	a, err := NewAgent(&config.AgentConfig{
+		AgentID:                   "agent-1",
+		PlaneID:                   "host-plane",
+		DevicePlaneIDs:            map[string]string{"rxe0": "rail0", "RXE1": "rail1", "rxe8": "rail8", "rxe9": "rail9"},
+		ExcludedDeviceNames:       []string{"rxe9"},
+		PinglistUpdateIntervalSec: 3600,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	var logs bytes.Buffer
+	a.logger = zerolog.New(&logs)
+	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "gid-0"), fakeDevice("rxe1", "gid-1"), fakeDevice("rxe2", "gid-2")}
+	a.probers = []*Prober{fakeProber(1), fakeProber(1), fakeProber(1)}
+	a.responders = []*Responder{{}, {}, {}}
+
+	a.resolveDevicePlaneIDs()
+	want := []string{"rail0", "rail1", "host-plane"}
+
+	for i, rnic := range a.buildRegistrationRequest().GetRnics() {
+		if rnic.GetPlaneId() != want[i] {
+			t.Errorf("rnic[%d] PlaneId = %q, want %q", i, rnic.GetPlaneId(), want[i])
+		}
+	}
+	a.createClusterMonitors()
+	for i, m := range a.monitors {
+		if m.planeID != want[i] {
+			t.Errorf("monitor[%d].planeID = %q, want %q", i, m.planeID, want[i])
+		}
+	}
+	out := logs.String()
+	if !strings.Contains(out, `"device":"rxe8","message":"device_plane_ids entry matches no opened RDMA device; ignored"`) {
+		t.Errorf("missing unmatched-entry warning for rxe8; logs:\n%s", out)
+	}
+	if !strings.Contains(out, `"device":"rxe9","message":"device_plane_ids entry names a device in excluded_device_names; ignored"`) {
+		t.Errorf("missing excluded-entry warning for rxe9; logs:\n%s", out)
+	}
+}
+
+// TestAgent_NoPlaneKeepsLegacyRegistration verifies that without plane
+// settings RNICs register and request pinglists with an empty plane and no
+// plane log noise.
+func TestAgent_NoPlaneKeepsLegacyRegistration(t *testing.T) {
+	a, err := NewAgent(&config.AgentConfig{AgentID: "agent-1", PinglistUpdateIntervalSec: 3600})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	var logs bytes.Buffer
+	a.logger = zerolog.New(&logs)
+	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "gid-0")}
+	a.probers = []*Prober{fakeProber(1)}
+	a.responders = []*Responder{{}}
+
+	a.resolveDevicePlaneIDs()
+	if got := a.buildRegistrationRequest().GetRnics()[0].GetPlaneId(); got != "" {
+		t.Errorf("PlaneId = %q, want empty", got)
+	}
+	if a.usesPlanes() {
+		t.Error("usesPlanes = true, want false")
+	}
+	a.checkRegistrationPlaneSupport(&controller_agent.AgentRegistrationResponse{Success: true})
+	for _, msg := range []string{"Resolved device plane", "Device has no plane", "does not support plane_id"} {
+		if strings.Contains(logs.String(), msg) {
+			t.Errorf("unexpected %q log without plane settings:\n%s", msg, logs.String())
+		}
+	}
+}
+
+// TestAgent_RegistrationPlaneSupport verifies that an agent with planes warns
+// exactly once when the controller predates plane support, and not at all
+// against a controller that supports it.
+func TestAgent_RegistrationPlaneSupport(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		supported bool
+		warnings  int
+	}{
+		{"new controller", true, 0},
+		{"old controller", false, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := NewAgent(&config.AgentConfig{AgentID: "agent-1", PlaneID: "rail0"})
+			if err != nil {
+				t.Fatalf("NewAgent: %v", err)
+			}
+			var logs bytes.Buffer
+			a.logger = zerolog.New(&logs)
+			a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0")}
+			a.resolveDevicePlaneIDs()
+			resp := &controller_agent.AgentRegistrationResponse{Success: true, PerRnicTorId: true, PerRnicPlaneId: tc.supported}
+			for i := 0; i < 3; i++ { // initial registration + heartbeats
+				a.checkRegistrationPlaneSupport(resp)
+			}
+			if got := strings.Count(logs.String(), "does not support plane_id"); got != tc.warnings {
+				t.Errorf("plane support warnings = %d, want %d; logs:\n%s", got, tc.warnings, logs.String())
+			}
+		})
 	}
 }

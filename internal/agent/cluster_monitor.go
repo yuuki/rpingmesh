@@ -17,7 +17,7 @@ import (
 // ControllerClient defines the interface for communicating with the controller.
 // This interface allows the monitor to be tested with a mock client.
 type ControllerClient interface {
-	GetPinglist(ctx context.Context, agentID, torID, requesterGID string, ptype controller_agent.PinglistType) ([]*controller_agent.PingTarget, error)
+	GetPinglist(ctx context.Context, agentID, torID, requesterGID, planeID string, ptype controller_agent.PinglistType) ([]*controller_agent.PingTarget, error)
 }
 
 // ClusterMonitor periodically fetches pinglists from the controller
@@ -25,11 +25,14 @@ type ControllerClient interface {
 // inter-ToR pinglists, combines them, and updates the prober's target
 // list atomically.
 type ClusterMonitor struct {
-	client         ControllerClient
-	prober         *Prober
-	agentID        string
-	torID          string
-	requesterGID   string
+	client       ControllerClient
+	prober       *Prober
+	agentID      string
+	torID        string
+	requesterGID string
+	// planeID is the requesting RNIC's plane sent with every pinglist
+	// request (empty = no plane restriction). Set via SetPlaneID.
+	planeID        string
 	updateInterval time.Duration
 	running        atomic.Bool
 	stopMu         sync.Mutex // guards stopCh (re)creation across Start/Stop
@@ -87,6 +90,13 @@ func NewClusterMonitor(
 	}
 }
 
+// SetPlaneID sets the plane (rail) of the requesting RNIC, sent with every
+// pinglist request so the controller can restrict targets to that plane even
+// before the RNIC's registration is visible. Call it before Start.
+func (m *ClusterMonitor) SetPlaneID(planeID string) {
+	m.planeID = planeID
+}
+
 // Start launches the background goroutine that periodically fetches pinglists
 // from the controller. The first fetch is performed immediately without
 // waiting for the first tick. It returns nil if already running.
@@ -111,6 +121,7 @@ func (m *ClusterMonitor) Start(ctx context.Context) error {
 		Str("agent_id", m.agentID).
 		Str("tor_id", m.torID).
 		Str("requester_gid", m.requesterGID).
+		Str("plane_id", m.planeID).
 		Dur("update_interval", m.updateInterval).
 		Msg("ClusterMonitor started")
 
@@ -290,7 +301,7 @@ func qpnChanged(prev, cur map[string]uint32) bool {
 func (m *ClusterMonitor) fetchPinglists(ctx context.Context) []*controller_agent.PingTarget {
 	// Fetch ToR-mesh pinglist (targets within the same ToR).
 	torMeshTargets, torMeshErr := m.client.GetPinglist(
-		ctx, m.agentID, m.torID, m.requesterGID,
+		ctx, m.agentID, m.torID, m.requesterGID, m.planeID,
 		controller_agent.PinglistType_TOR_MESH,
 	)
 	if torMeshErr != nil {
@@ -304,7 +315,7 @@ func (m *ClusterMonitor) fetchPinglists(ctx context.Context) []*controller_agent
 
 	// Fetch inter-ToR pinglist (targets across different ToRs).
 	interTorTargets, interTorErr := m.client.GetPinglist(
-		ctx, m.agentID, m.torID, m.requesterGID,
+		ctx, m.agentID, m.torID, m.requesterGID, m.planeID,
 		controller_agent.PinglistType_INTER_TOR,
 	)
 	if interTorErr != nil {

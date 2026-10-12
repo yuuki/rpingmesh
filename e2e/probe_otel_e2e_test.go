@@ -46,7 +46,7 @@ type mockControllerClient struct {
 }
 
 func (m *mockControllerClient) GetPinglist(
-	_ context.Context, _, _, _ string, _ controller_agent.PinglistType,
+	_ context.Context, _, _, _, _ string, _ controller_agent.PinglistType,
 ) ([]*controller_agent.PingTarget, error) {
 	return m.targets, nil
 }

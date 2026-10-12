@@ -151,7 +151,7 @@ func TestMTLS_ClientWithCertificate_Succeeds(t *testing.T) {
 		t.Fatalf("RegisterAgent rejected: %s", resp.GetMessage())
 	}
 
-	if _, err := client.GetPinglist(ctx, "mtls-agent-1", "tor-1", "fe80::1", controller_agent.PinglistType_TOR_MESH); err != nil {
+	if _, err := client.GetPinglist(ctx, "mtls-agent-1", "tor-1", "fe80::1", "", controller_agent.PinglistType_TOR_MESH); err != nil {
 		t.Fatalf("GetPinglist over mtls: %v", err)
 	}
 }

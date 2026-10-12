@@ -59,6 +59,9 @@ jobs:
       - name: Run Zig unit tests
         run: make test-zig
 
+      - name: Run scripts/topology tests
+        run: make test-scripts
+
       - name: Run Go unit tests (excludes ./e2e/...)
         run: go test -race $(go list ./... | grep -v '/e2e')
 

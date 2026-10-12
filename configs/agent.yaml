@@ -14,6 +14,18 @@ tor_id: ""
 #   mlx5_0: "leaf-a"
 #   mlx5_1: "leaf-b"
 
+# Optional: network plane (rail) of the RNICs. On fabrics whose rails are not
+# routed to each other, inter-ToR and untagged pinglists then only pair RNICs
+# of the same plane (cross-plane probes can only time out). Empty = no
+# restriction. Name the rail (the largest set of mutually reachable RNICs),
+# not the leaf. Upgrade the controller first.
+# plane_id: ""
+# Per-device planes for multi-rail hosts (same rules as device_tor_ids; an
+# entry wins over plane_id):
+# device_plane_ids:
+#   mlx5_0: "isk-rail0"
+#   mlx5_1: "isk-rail1"
+
 # Optional: derive each device's ToR from the LLDP neighbor of its netdev
 # instead of listing device_tor_ids. Needs lldpd on the host and access to its
 # socket (root or lldpd's group); the switch must send LLDP on host ports and
@@ -89,3 +101,6 @@ throttle_cpu_percent: 90         # engage at 90% of available CPU capacity (GOMA
 
 # Logging
 log_level: "info"                # debug, info, warn, error
+# Log output format on stderr: "console" (human-readable, default) or "json"
+# (one zerolog JSON object per line; needed by scripts/topology/rtt_tor_check.py).
+log_format: "console"

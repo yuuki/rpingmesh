@@ -15,7 +15,7 @@ import (
 // registryClient is the subset of registry.RnicRegistry's API used directly
 // by ControllerService (RegisterRNICs) and, via the embedded
 // PinglistGenerator, its read methods (GetRNICsByToR,
-// GetActiveRNICsInOtherToRs, ResolveHostnameByGID). It is declared here, at the
+// GetActiveRNICsInOtherToRs, GetRNICByGID). It is declared here, at the
 // point of use, so that RegisterAgent and GetPinglist can be unit tested
 // against a fake instead of a real rqlite-backed registry.
 type registryClient interface {
@@ -109,6 +109,8 @@ func (s *ControllerService) RegisterAgent(
 			rnicTor = torID
 		}
 		rnic.TorId = rnicTor
+		// The plane is per RNIC only; there is no request-wide fallback.
+		rnic.PlaneId = probe.CanonicalPlaneID(rnic.GetPlaneId())
 	}
 
 	// Register all RNICs for this agent as a single atomic operation. A
@@ -133,9 +135,10 @@ func (s *ControllerService) RegisterAgent(
 		Msg("Agent registered successfully")
 
 	return &controller_agent.AgentRegistrationResponse{
-		Success:      true,
-		Message:      "Successfully registered agent",
-		PerRnicTorId: true,
+		Success:        true,
+		Message:        "Successfully registered agent",
+		PerRnicTorId:   true,
+		PerRnicPlaneId: true,
 	}, nil
 }
 
@@ -155,11 +158,13 @@ func (s *ControllerService) GetPinglist(
 	}
 
 	torID := probe.CanonicalTorID(req.GetTorId())
+	planeID := probe.CanonicalPlaneID(req.GetPlaneId())
 
 	log.Info().
 		Str("agentID", req.GetAgentId()).
 		Str("requesterGID", req.GetRequesterGid()).
 		Str("torID", torID).
+		Str("requestPlaneID", planeID).
 		Str("type", req.GetType().String()).
 		Msg("Pinglist request")
 
@@ -168,9 +173,9 @@ func (s *ControllerService) GetPinglist(
 
 	switch req.GetType() {
 	case controller_agent.PinglistType_TOR_MESH:
-		targets, err = s.pinglist.GenerateTorMeshPinglist(ctx, req.GetRequesterGid(), torID)
+		targets, err = s.pinglist.GenerateTorMeshPinglist(ctx, req.GetRequesterGid(), torID, planeID)
 	case controller_agent.PinglistType_INTER_TOR:
-		targets, err = s.pinglist.GenerateInterTorPinglist(ctx, req.GetRequesterGid(), torID)
+		targets, err = s.pinglist.GenerateInterTorPinglist(ctx, req.GetRequesterGid(), torID, planeID)
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown pinglist type: %s", req.GetType().String())
 	}

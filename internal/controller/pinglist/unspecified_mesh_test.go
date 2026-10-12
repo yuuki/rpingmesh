@@ -28,7 +28,7 @@ func TestTorMesh_EmptyToRExcludesNamed(t *testing.T) {
 	}
 	gen := newTestGenerator(src)
 
-	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "")
+	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "", "")
 	if err != nil {
 		t.Fatalf("GenerateTorMeshPinglist: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestTorMesh_EmptyToRRespectsCap(t *testing.T) {
 		PathsAssumed: 16, CoverageProbability: 0.9, MaxFlowLabels: 64,
 	}, DefaultInterTorSampleSize, 2)
 
-	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "")
+	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "", "")
 	if err != nil {
 		t.Fatalf("GenerateTorMeshPinglist: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestTorMesh_NamedToRNotCapped(t *testing.T) {
 		PathsAssumed: 16, CoverageProbability: 0.9, MaxFlowLabels: 64,
 	}, DefaultInterTorSampleSize, 2)
 
-	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1")
+	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateTorMeshPinglist: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestInterTor_EmptyRequesterOmitsUntagged(t *testing.T) {
 	}
 	gen := newTestGenerator(src)
 
-	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "")
+	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "", "")
 	if err != nil {
 		t.Fatalf("GenerateInterTorPinglist: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestInterTor_NamedRequesterMaySampleUntagged(t *testing.T) {
 	}
 	gen := newTestGenerator(src)
 
-	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::a", "tor-1")
+	targets, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::a", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateInterTorPinglist: %v", err)
 	}

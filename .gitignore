@@ -18,3 +18,6 @@ coverage.out
 # Local observability stack env overrides (copy of .env.example; may pin
 # image tags per-machine, never commit local secrets)
 /deploy/observability/.env
+
+# Python bytecode
+__pycache__/

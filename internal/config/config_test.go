@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/spf13/pflag"
+	"github.com/yuuki/rpingmesh/internal/logging"
 )
 
 // writeYAML writes content to a temp file named name inside t.TempDir() and
@@ -1088,5 +1089,189 @@ func TestLoadAgentConfig_LLDPFieldRejectsInvalid(t *testing.T) {
 	path := writeYAML(t, "agent.yaml", "lldp_tor_id_field: port_id\n")
 	if _, err := LoadAgentConfig(path, nil); err == nil {
 		t.Error("expected a validation error, got nil")
+	}
+}
+
+// --- log_format ---
+
+func TestLoadConfig_LogFormatDefaultIsConsole(t *testing.T) {
+	agentCfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("LoadAgentConfig: %v", err)
+	}
+	if agentCfg.LogFormat != logging.FormatConsole {
+		t.Errorf("agent LogFormat = %q, want %q", agentCfg.LogFormat, logging.FormatConsole)
+	}
+	ctrlCfg, err := LoadControllerConfig("", nil)
+	if err != nil {
+		t.Fatalf("LoadControllerConfig: %v", err)
+	}
+	if ctrlCfg.LogFormat != logging.FormatConsole {
+		t.Errorf("controller LogFormat = %q, want %q", ctrlCfg.LogFormat, logging.FormatConsole)
+	}
+}
+
+// TestLoadConfig_LogFormatPrecedence checks flag > env > YAML > default for
+// log_format on both binaries.
+func TestLoadConfig_LogFormatPrecedence(t *testing.T) {
+	type loader func(path string, flags *pflag.FlagSet) (string, error)
+	loaders := map[string]struct {
+		bind func(*pflag.FlagSet)
+		load loader
+	}{
+		"agent": {BindAgentFlags, func(p string, f *pflag.FlagSet) (string, error) {
+			c, err := LoadAgentConfig(p, f)
+			if err != nil {
+				return "", err
+			}
+			return c.LogFormat, nil
+		}},
+		"controller": {BindControllerFlags, func(p string, f *pflag.FlagSet) (string, error) {
+			c, err := LoadControllerConfig(p, f)
+			if err != nil {
+				return "", err
+			}
+			return c.LogFormat, nil
+		}},
+	}
+	for name, l := range loaders {
+		t.Run(name, func(t *testing.T) {
+			path := writeYAML(t, "cfg.yaml", "log_format: json\n")
+			if got, err := l.load(path, nil); err != nil || got != "json" {
+				t.Fatalf("YAML: got %q, %v; want json", got, err)
+			}
+
+			t.Setenv("RPINGMESH_LOG_FORMAT", "console")
+			if got, err := l.load(path, nil); err != nil || got != "console" {
+				t.Fatalf("env over YAML: got %q, %v; want console", got, err)
+			}
+
+			flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+			l.bind(flags)
+			if got, err := l.load(path, flags); err != nil || got != "console" {
+				t.Fatalf("unset flag must not override env: got %q, %v", got, err)
+			}
+			if err := flags.Set("log-format", "json"); err != nil {
+				t.Fatalf("flags.Set: %v", err)
+			}
+			if got, err := l.load(path, flags); err != nil || got != "json" {
+				t.Fatalf("flag over env: got %q, %v; want json", got, err)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_LogFormatRejectsInvalid(t *testing.T) {
+	t.Setenv("RPINGMESH_LOG_FORMAT", "logfmt")
+	if _, err := LoadAgentConfig("", nil); err == nil {
+		t.Error("LoadAgentConfig: expected an error for log_format=logfmt, got nil")
+	}
+	if _, err := LoadControllerConfig("", nil); err == nil {
+		t.Error("LoadControllerConfig: expected an error for log_format=logfmt, got nil")
+	}
+}
+
+// --- plane_id / device_plane_ids ---
+
+func TestLoadAgentConfig_PlaneDefaultsEmpty(t *testing.T) {
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PlaneID != "" || len(cfg.DevicePlaneIDs) != 0 {
+		t.Errorf("PlaneID = %q, DevicePlaneIDs = %v; want empty", cfg.PlaneID, cfg.DevicePlaneIDs)
+	}
+	if got := cfg.PlaneIDForDevice("mlx5_0"); got != "" {
+		t.Errorf("PlaneIDForDevice = %q, want empty (no plane restriction)", got)
+	}
+}
+
+func TestLoadAgentConfig_DevicePlaneIDs(t *testing.T) {
+	path := writeYAML(t, "agent.yaml", `plane_id: " host-plane "
+device_plane_ids:
+  mlx5_0: "rail0"
+  MLX5_1: " rail1 "
+`)
+	cfg, err := LoadAgentConfig(path, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PlaneID != "host-plane" {
+		t.Errorf("PlaneID = %q, want host-plane (trimmed)", cfg.PlaneID)
+	}
+	cases := map[string]string{
+		"mlx5_0": "rail0",
+		"mlx5_1": "rail1",      // key case and value whitespace are normalized
+		"MLX5_0": "rail0",      // device names match case-insensitively
+		"mlx5_2": "host-plane", // unlisted devices use plane_id
+	}
+	for dev, want := range cases {
+		if got := cfg.PlaneIDForDevice(dev); got != want {
+			t.Errorf("PlaneIDForDevice(%q) = %q, want %q", dev, got, want)
+		}
+	}
+}
+
+func TestLoadAgentConfig_PlaneIDPrecedence(t *testing.T) {
+	path := writeYAML(t, "agent.yaml", "plane_id: file-plane\n")
+	t.Setenv("RPINGMESH_PLANE_ID", "env-plane")
+
+	cfg, err := LoadAgentConfig(path, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PlaneID != "env-plane" {
+		t.Errorf("PlaneID = %q, want env-plane (env overrides file)", cfg.PlaneID)
+	}
+
+	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	BindAgentFlags(flags)
+	if err := flags.Set("plane-id", "flag-plane"); err != nil {
+		t.Fatalf("flags.Set: %v", err)
+	}
+	cfg, err = LoadAgentConfig(path, flags)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PlaneID != "flag-plane" {
+		t.Errorf("PlaneID = %q, want flag-plane (flag overrides env)", cfg.PlaneID)
+	}
+}
+
+func TestLoadAgentConfig_DevicePlaneIDsRejectsInvalid(t *testing.T) {
+	if _, err := LoadAgentConfig(writeYAML(t, "agent.yaml", "device_plane_ids:\n  mlx5_0: \"  \"\n"), nil); err == nil {
+		t.Error("expected a validation error for an empty device_plane_ids value, got nil")
+	}
+	cfg := &AgentConfig{
+		ProbeIntervalMS:            1,
+		FlowLabelRotationPeriodSec: 1,
+		DevicePlaneIDs:             map[string]string{" ": "rail0"},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected a validation error for an empty device_plane_ids key, got nil")
+	}
+}
+
+// TestLoadAgentConfig_DevicePlaneIDsToleratesExcludedDevices checks that a
+// fleet-wide device_plane_ids map naming a device this host excludes (or does
+// not allow) still loads; the agent only warns about such entries.
+func TestLoadAgentConfig_DevicePlaneIDsToleratesExcludedDevices(t *testing.T) {
+	path := writeYAML(t, "agent.yaml", `allowed_device_names: [mlx5_0]
+excluded_device_names: [mlx5_1]
+device_plane_ids:
+  mlx5_0: rail0
+  mlx5_1: rail1
+  mlx5_2: rail2
+`)
+	cfg, err := LoadAgentConfig(path, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.IsDeviceAllowed("MLX5_0") || cfg.IsDeviceAllowed("mlx5_2") {
+		t.Errorf("IsDeviceAllowed: mlx5_0=%v mlx5_2=%v, want true/false",
+			cfg.IsDeviceAllowed("MLX5_0"), cfg.IsDeviceAllowed("mlx5_2"))
+	}
+	if !(&AgentConfig{}).IsDeviceAllowed("anything") {
+		t.Error("IsDeviceAllowed with no allowed_device_names should be true")
 	}
 }

@@ -1,0 +1,35 @@
+{
+  "hostname": "host-b.example.internal",
+  "devices": [
+    {
+      "device": "mlx5_0",
+      "ports": [
+        {
+          "port": 1,
+          "gids": [
+            {
+              "index": 3,
+              "gid": "0000:0000:0000:0000:0000:ffff:0a00:0002",
+              "type": "RoCE v2"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "device": "mlx5_1",
+      "ports": [
+        {
+          "port": 1,
+          "gids": [
+            {
+              "index": 3,
+              "gid": "0000:0000:0000:0000:0000:ffff:0a01:0002",
+              "type": "RoCE v2"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -25,6 +25,12 @@ message RnicInfo {
     string host_name = 4;
     string tor_id = 5;
     string device_name = 6;
+    // plane_id names the isolated network plane (rail) the RNIC is attached
+    // to. On rail-optimized fabrics whose rails are not routed to each other,
+    // the controller only pairs RNICs of the same plane in inter-ToR and
+    // untagged (empty ToR) pinglists. Empty means unknown: the RNIC is then
+    // paired as before plane support existed. Older agents never set it.
+    string plane_id = 7;
 }
 
 // AgentRegistrationRequest is sent by agents to register with the controller.
@@ -46,6 +52,11 @@ message AgentRegistrationResponse {
     // must then fall back to the request-wide ToR, or its per-device pinglist
     // requests would never match the registry.
     bool per_rnic_tor_id = 3;
+    // per_rnic_plane_id is true when the controller stored each
+    // RnicInfo.plane_id and restricts pinglists to the requester's plane.
+    // Older controllers leave it false and ignore plane_id, so their
+    // pinglists may pair RNICs of different planes.
+    bool per_rnic_plane_id = 4;
 }
 
 // PinglistType determines what kind of pinglist to generate.
@@ -60,6 +71,10 @@ message PinglistRequest {
     string tor_id = 2;
     string requester_gid = 3;
     PinglistType type = 4;
+    // plane_id is the requesting RNIC's plane. The controller prefers the
+    // plane registered for requester_gid and uses this value only when that
+    // RNIC is not (yet) in the registry. Empty means no plane restriction.
+    string plane_id = 5;
 }
 
 // PingTarget describes a single probe target.

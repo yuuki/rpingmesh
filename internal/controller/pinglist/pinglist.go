@@ -4,6 +4,7 @@ import (
 	"context"
 	"hash/fnv"
 	"math/rand/v2"
+	"sort"
 
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/probe"
@@ -26,10 +27,11 @@ type RnicSource interface {
 	// samples one representative per ToR, after same-host / same-family
 	// filtering, so coverage is preserved (see GenerateInterTorPinglist).
 	GetActiveRNICsInOtherToRs(ctx context.Context, excludeTorID string) ([]*controller_agent.RnicInfo, error)
-	// ResolveHostnameByGID returns the hostname the requester GID is
-	// registered under, or "" when it is not registered (disabling same-host
-	// filtering and falling back to GID self-exclusion).
-	ResolveHostnameByGID(ctx context.Context, gid string) (string, error)
+	// GetRNICByGID returns the requester's active registry row, or nil when
+	// it is not registered. Its hostname drives same-host filtering (nil
+	// falls back to GID self-exclusion) and its plane_id the plane
+	// restriction (see resolveRequester).
+	GetRNICByGID(ctx context.Context, gid string) (*controller_agent.RnicInfo, error)
 }
 
 // DefaultUnspecifiedMeshMaxTargets is the fallback cap on ToR-mesh targets
@@ -81,33 +83,70 @@ func NewPinglistGenerator(registry RnicSource, ecmp ECMPConfig, interTorSampleSi
 	}
 }
 
+// Sources of a requester's plane, reported in pinglist logs.
+const (
+	planeSourceRegistry = "registry"
+	planeSourceRequest  = "request"
+	planeSourceNone     = "none"
+)
+
 // requesterContext bundles the per-request filtering criteria derived once for
 // a pinglist request: the hostname the requester is registered under ("" when
-// it is not registered, which disables same-host filtering) and the requester
-// GID's address family.
+// it is not registered, which disables same-host filtering), the requester
+// GID's address family, and the requester's plane ("" = no plane restriction).
 type requesterContext struct {
-	gid      string
-	hostname string
-	family   string
+	gid         string
+	hostname    string
+	family      string
+	plane       string
+	planeSource string
 }
 
-// resolveRequester derives the requester's same-host / same-family filtering
-// criteria. A hostname-lookup failure degrades to GID-based self-exclusion
-// (empty hostname) rather than failing the request: pinglist generation is
+// resolveRequester derives the requester's filtering criteria from its
+// registry row. A lookup failure degrades to GID-based self-exclusion (empty
+// hostname) rather than failing the request: pinglist generation is
 // best-effort, and self-exclusion still prevents the requester from probing
 // itself. The address family is derived directly from the requester GID string.
-func (g *PinglistGenerator) resolveRequester(ctx context.Context, requesterGID string) requesterContext {
-	hostname, err := g.registry.ResolveHostnameByGID(ctx, requesterGID)
+//
+// The plane is the one registered for requester_gid when non-empty, and
+// otherwise requestPlane (PinglistRequest.plane_id). The registry is preferred
+// because targets are classified by their registered planes too, so both
+// sides of the comparison come from the same source; the request value only
+// covers a requester that is not (yet) registered or whose row predates plane
+// support (written by an older controller and not yet refreshed by a
+// heartbeat), which would otherwise go unrestricted.
+func (g *PinglistGenerator) resolveRequester(ctx context.Context, requesterGID, requestPlane string) requesterContext {
+	rc := requesterContext{
+		gid:    requesterGID,
+		family: probe.GIDFamily(requesterGID),
+	}
+	row, err := g.registry.GetRNICByGID(ctx, requesterGID)
 	if err != nil {
 		log.Warn().Err(err).Str("requesterGID", requesterGID).
-			Msg("Failed to resolve requester hostname; falling back to GID self-exclusion only")
-		hostname = ""
+			Msg("Failed to look up requester RNIC; falling back to GID self-exclusion and the requested plane")
+		row = nil
 	}
-	return requesterContext{
-		gid:      requesterGID,
-		hostname: hostname,
-		family:   probe.GIDFamily(requesterGID),
+	if row != nil {
+		rc.hostname = row.GetHostName()
 	}
+	switch {
+	case row != nil && probe.CanonicalPlaneID(row.GetPlaneId()) != "":
+		rc.plane, rc.planeSource = probe.CanonicalPlaneID(row.GetPlaneId()), planeSourceRegistry
+	case probe.CanonicalPlaneID(requestPlane) != "":
+		rc.plane, rc.planeSource = probe.CanonicalPlaneID(requestPlane), planeSourceRequest
+	default:
+		rc.planeSource = planeSourceNone
+	}
+	return rc
+}
+
+// samePlane reports whether target may be paired with the requester under the
+// plane restriction: always when the requester's plane is unknown (empty),
+// otherwise only when the target is registered on the same plane. Targets with
+// an empty plane are excluded for a requester with a plane, since nothing says
+// they are reachable from it.
+func (rc requesterContext) samePlane(target *controller_agent.RnicInfo) bool {
+	return rc.plane == "" || probe.CanonicalPlaneID(target.GetPlaneId()) == rc.plane
 }
 
 // shouldProbe reports whether the requester should probe the given target RNIC.
@@ -136,31 +175,42 @@ func (rc requesterContext) shouldProbe(target *controller_agent.RnicInfo) bool {
 // GenerateTorMeshPinglist returns PingTargets for the RNICs in the same ToR
 // that the requester should probe: its own RNIC and every other RNIC on the
 // same host are excluded (issue #39), and cross-address-family targets are
-// dropped (issue #41). When torID is empty (untagged agents), the result is
-// additionally capped at unspecifiedMeshMax (0 = unlimited) after a shuffle
-// so an omitted fleet-wide ToR setting cannot become an N² mesh. Named
-// ToR-mesh is never capped. Each target carries deterministic 5-tuple values
-// derived from the requester-target GID pair.
+// dropped (issue #41). When torID is empty (untagged agents), targets are
+// restricted to the requester's plane (see resolveRequester; no restriction
+// when it has none) and the result is additionally capped at
+// unspecifiedMeshMax (0 = unlimited) after a shuffle so an omitted fleet-wide
+// ToR setting cannot become an N² mesh. Named ToR-mesh is neither
+// plane-restricted nor capped: RNICs under one leaf share its plane, so a ToR
+// mixing planes is a configuration error and is logged as one. Each target
+// carries deterministic 5-tuple values derived from the requester-target GID
+// pair. requestPlane is PinglistRequest.plane_id.
 func (g *PinglistGenerator) GenerateTorMeshPinglist(
 	ctx context.Context,
-	requesterGID, torID string,
+	requesterGID, torID, requestPlane string,
 ) ([]*controller_agent.PingTarget, error) {
 	rnics, err := g.registry.GetRNICsByToR(ctx, torID)
 	if err != nil {
 		return nil, err
 	}
 
-	rc := g.resolveRequester(ctx, requesterGID)
+	rc := g.resolveRequester(ctx, requesterGID, requestPlane)
+	unspecified := probe.CanonicalTorID(torID) == ""
+	if !unspecified {
+		warnMixedPlanes(torID, rnics)
+	}
 
 	targets := make([]*controller_agent.PingTarget, 0, len(rnics))
 	for _, rnic := range rnics {
 		if !rc.shouldProbe(rnic) {
 			continue
 		}
+		if unspecified && !rc.samePlane(rnic) {
+			continue
+		}
 		targets = append(targets, g.buildPingTarget(requesterGID, rnic, controller_agent.PinglistType_TOR_MESH))
 	}
 
-	if probe.CanonicalTorID(torID) == "" && g.unspecifiedMeshMax > 0 && len(targets) > g.unspecifiedMeshMax {
+	if unspecified && g.unspecifiedMeshMax > 0 && len(targets) > g.unspecifiedMeshMax {
 		eligible := len(targets)
 		rand.Shuffle(len(targets), func(i, j int) {
 			targets[i], targets[j] = targets[j], targets[i]
@@ -168,6 +218,7 @@ func (g *PinglistGenerator) GenerateTorMeshPinglist(
 		targets = targets[:g.unspecifiedMeshMax]
 		log.Warn().
 			Str("requesterGID", requesterGID).
+			Str("planeID", rc.plane).
 			Int("kept", len(targets)).
 			Int("eligible", eligible).
 			Int("cap", g.unspecifiedMeshMax).
@@ -177,6 +228,8 @@ func (g *PinglistGenerator) GenerateTorMeshPinglist(
 	log.Info().
 		Str("requesterGID", requesterGID).
 		Str("torID", torID).
+		Str("planeID", rc.plane).
+		Str("planeSource", rc.planeSource).
 		Int("targetCount", len(targets)).
 		Msg("Generated ToR-mesh pinglist")
 
@@ -186,27 +239,29 @@ func (g *PinglistGenerator) GenerateTorMeshPinglist(
 // GenerateInterTorPinglist returns PingTargets sampled from ToRs other than the
 // requester's own: at most one representative RNIC per foreign ToR, up to
 // interTorSampleSize ToRs. Same-host (issue #39, for rail-optimized fabrics
-// where a host's NICs register under different ToR IDs) and cross-address-family
-// (issue #41) RNICs are filtered out BEFORE sampling, so a foreign ToR is only
-// dropped from coverage when it has no valid representative for this requester.
-// Each target carries deterministic 5-tuple values.
+// where a host's NICs register under different ToR IDs), cross-address-family
+// (issue #41), and, when the requester has a plane, cross-plane RNICs are
+// filtered out BEFORE sampling, so a foreign ToR is only dropped from coverage
+// when it has no valid representative for this requester, and the sampled
+// ToRs are all on the requester's plane (rail). Each target carries
+// deterministic 5-tuple values. requestPlane is PinglistRequest.plane_id.
 func (g *PinglistGenerator) GenerateInterTorPinglist(
 	ctx context.Context,
-	requesterGID, torID string,
+	requesterGID, torID, requestPlane string,
 ) ([]*controller_agent.PingTarget, error) {
 	rnics, err := g.registry.GetActiveRNICsInOtherToRs(ctx, torID)
 	if err != nil {
 		return nil, err
 	}
 
-	rc := g.resolveRequester(ctx, requesterGID)
+	rc := g.resolveRequester(ctx, requesterGID, requestPlane)
 
 	// Rows arrive in random order, so picking the first valid RNIC per ToR
 	// yields a randomly-varying representative and ToR set across calls.
 	seenToRs := make(map[string]bool, g.interTorSampleSize)
 	targets := make([]*controller_agent.PingTarget, 0, g.interTorSampleSize)
 	for _, rnic := range rnics {
-		if !rc.shouldProbe(rnic) {
+		if !rc.shouldProbe(rnic) || !rc.samePlane(rnic) {
 			continue
 		}
 		if seenToRs[rnic.GetTorId()] {
@@ -222,10 +277,38 @@ func (g *PinglistGenerator) GenerateInterTorPinglist(
 	log.Info().
 		Str("requesterGID", requesterGID).
 		Str("excludeTorID", torID).
+		Str("planeID", rc.plane).
+		Str("planeSource", rc.planeSource).
 		Int("targetCount", len(targets)).
 		Msg("Generated Inter-ToR pinglist")
 
 	return targets, nil
+}
+
+// warnMixedPlanes logs a warning when the RNICs registered under one named ToR
+// report more than one non-empty plane. A leaf switch belongs to exactly one
+// plane, so this means a wrong plane_id/device_plane_ids or ToR mapping. The
+// ToR-mesh is still generated unrestricted (as without planes). RNICs with an
+// empty plane are ignored, so a partially upgraded fleet does not warn.
+func warnMixedPlanes(torID string, rnics []*controller_agent.RnicInfo) {
+	planes := make(map[string]struct{})
+	for _, rnic := range rnics {
+		if p := probe.CanonicalPlaneID(rnic.GetPlaneId()); p != "" {
+			planes[p] = struct{}{}
+		}
+	}
+	if len(planes) < 2 {
+		return
+	}
+	list := make([]string, 0, len(planes))
+	for p := range planes {
+		list = append(list, p)
+	}
+	sort.Strings(list)
+	log.Warn().
+		Str("torID", torID).
+		Strs("planeIDs", list).
+		Msg("RNICs of one ToR report different planes; check plane_id/device_plane_ids and the ToR mapping")
 }
 
 // buildPingTarget creates a PingTarget from an RnicInfo with deterministic

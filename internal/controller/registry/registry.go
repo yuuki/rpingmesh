@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rqlite/gorqlite"
@@ -129,11 +130,16 @@ func (r *RnicRegistry) initializeSchema() error {
 		tor_id TEXT NOT NULL,
 		hostname TEXT NOT NULL,
 		device_name TEXT NOT NULL,
-		last_updated_epoch INTEGER NOT NULL
+		last_updated_epoch INTEGER NOT NULL,
+		plane_id TEXT NOT NULL DEFAULT ''
 	);`
 
 	if _, err := r.conn.WriteOneContext(ctx, createTableSQL); err != nil {
 		return fmt.Errorf("failed to create rnics table: %w", err)
+	}
+
+	if err := r.migratePlaneColumn(ctx); err != nil {
+		return err
 	}
 
 	// Create each index separately to avoid multi-statement issues.
@@ -151,6 +157,54 @@ func (r *RnicRegistry) initializeSchema() error {
 	}
 
 	return nil
+}
+
+// migratePlaneColumn adds the plane_id column to an rnics table created by a
+// controller that predates plane support. CREATE TABLE IF NOT EXISTS leaves
+// such a table untouched, so the column is detected via PRAGMA table_info and
+// added with ALTER TABLE when missing. The DEFAULT ” keeps existing rows
+// (and INSERTs from an older controller sharing the database, which name
+// their columns explicitly) valid: an empty plane means "no restriction".
+// A "duplicate column name" error is tolerated, since another controller
+// sharing the rqlite cluster may have added the column concurrently.
+func (r *RnicRegistry) migratePlaneColumn(ctx context.Context) error {
+	result, err := r.conn.QueryOneParameterizedContext(ctx, gorqlite.ParameterizedStatement{
+		Query: `PRAGMA table_info(rnics);`,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to inspect rnics table: %w", err)
+	}
+	for result.Next() {
+		row, err := result.Map()
+		if err != nil {
+			return fmt.Errorf("failed to read rnics table info: %w", err)
+		}
+		if name, _ := row["name"].(string); name == "plane_id" {
+			return nil
+		}
+	}
+
+	log.Info().Msg("Migrating rnics table: adding plane_id column")
+	wr, err := r.conn.WriteOneContext(ctx, `ALTER TABLE rnics ADD COLUMN plane_id TEXT NOT NULL DEFAULT '';`)
+	if err == nil {
+		err = wr.Err
+	}
+	if err != nil && !isDuplicateColumnErr(err, wr.Err) {
+		return fmt.Errorf("failed to add plane_id column to rnics table: %w", err)
+	}
+	return nil
+}
+
+// isDuplicateColumnErr reports whether an ALTER TABLE ADD COLUMN failed only
+// because the column already exists. gorqlite reports a statement error both
+// as the call error (a summary) and as the result's Err (SQLite's message).
+func isDuplicateColumnErr(errs ...error) bool {
+	for _, err := range errs {
+		if err != nil && strings.Contains(err.Error(), "duplicate column name") {
+			return true
+		}
+	}
+	return false
 }
 
 // RegisterRNICs replaces the full set of RNIC entries registered for a
@@ -182,13 +236,22 @@ func (r *RnicRegistry) RegisterRNICs(
 		Str("agentID", agentID).
 		Int("rnicCount", len(rnics)).
 		Msg("Registering RNICs")
+	for _, rnic := range rnics {
+		log.Debug().
+			Str("agentID", agentID).
+			Str("gid", rnic.GetGid()).
+			Str("device", rnic.GetDeviceName()).
+			Str("torID", rnic.GetTorId()).
+			Str("planeID", rnic.GetPlaneId()).
+			Msg("Registering RNIC")
+	}
 
 	deleteSQL := `DELETE FROM rnics WHERE agent_id = ?;`
 
 	insertSQL := `
 	INSERT OR REPLACE INTO rnics
-	(rnic_gid, qpn, agent_id, agent_ip, rnic_ip, tor_id, hostname, device_name, last_updated_epoch)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`
+	(rnic_gid, qpn, agent_id, agent_ip, rnic_ip, tor_id, hostname, device_name, plane_id, last_updated_epoch)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
 
 	now := r.now().Unix()
 
@@ -209,6 +272,7 @@ func (r *RnicRegistry) RegisterRNICs(
 				rnic.GetTorId(),
 				rnic.GetHostName(),
 				rnic.GetDeviceName(),
+				rnic.GetPlaneId(),
 				now,
 			},
 		})
@@ -241,7 +305,7 @@ func (r *RnicRegistry) GetRNICsByToR(
 	log.Debug().Str("torID", torID).Msg("Getting RNICs by ToR")
 
 	querySQL := `
-	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
+	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id
 	FROM rnics
 	WHERE tor_id = ?
 	AND last_updated_epoch > ?;`
@@ -278,7 +342,7 @@ func (r *RnicRegistry) GetActiveRNICsInOtherToRs(
 	log.Debug().Str("excludeTorID", excludeTorID).Msg("Getting active RNICs in other ToRs")
 
 	querySQL := `
-	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
+	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id
 	FROM rnics
 	WHERE tor_id != ?
 	AND last_updated_epoch > ?
@@ -297,26 +361,21 @@ func (r *RnicRegistry) GetActiveRNICsInOtherToRs(
 	return scanRnicInfoRows(result)
 }
 
-// ResolveHostnameByGID returns the hostname the RNIC identified by gid is
-// registered under, or "" when no active entry matches (e.g. the requester has
-// not registered yet). A "" result signals the pinglist generator to fall back
-// to GID-based self-exclusion instead of same-host filtering. Genuine query
-// errors are propagated. It reuses GetRNICInfo's active-window GID lookup.
-func (r *RnicRegistry) ResolveHostnameByGID(
+// GetRNICByGID returns the active registry row of the RNIC identified by gid,
+// or (nil, nil) when gid is empty or no active entry matches (e.g. the
+// requester has not registered yet). The pinglist generator uses the row's
+// hostname for same-host filtering and its plane_id for plane restriction; a
+// nil result makes it fall back to GID-based self-exclusion and the plane
+// carried in the request. Genuine query errors are propagated. It reuses
+// GetRNICInfo's active-window GID lookup.
+func (r *RnicRegistry) GetRNICByGID(
 	ctx context.Context,
 	gid string,
-) (string, error) {
+) (*controller_agent.RnicInfo, error) {
 	if gid == "" {
-		return "", nil
+		return nil, nil
 	}
-	info, err := r.GetRNICInfo(ctx, "", gid)
-	if err != nil {
-		return "", err
-	}
-	if info == nil {
-		return "", nil
-	}
-	return info.GetHostName(), nil
+	return r.GetRNICInfo(ctx, "", gid)
 }
 
 // GetRNICInfo looks up a single RNIC by GID (primary key) or IP address.
@@ -341,7 +400,7 @@ func (r *RnicRegistry) GetRNICInfo(
 	if targetGID != "" {
 		// Query by GID (primary key) for fastest lookup.
 		querySQL := `
-		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
+		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id
 		FROM rnics
 		WHERE rnic_gid = ?
 		AND last_updated_epoch > ?
@@ -353,7 +412,7 @@ func (r *RnicRegistry) GetRNICInfo(
 	} else {
 		// Fallback to IP-based lookup.
 		querySQL := `
-		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
+		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id
 		FROM rnics
 		WHERE rnic_ip = ?
 		AND last_updated_epoch > ?
@@ -374,20 +433,11 @@ func (r *RnicRegistry) GetRNICInfo(
 		return nil, nil
 	}
 
-	var gid, ip, hostname, torID, deviceName string
-	var qpn int64
-	if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID, &deviceName); err != nil {
+	info, err := scanRnicInfo(result)
+	if err != nil {
 		return nil, fmt.Errorf("failed to scan RNIC info row: %w", err)
 	}
-
-	return &controller_agent.RnicInfo{
-		Gid:        gid,
-		Qpn:        uint32(qpn),
-		IpAddress:  ip,
-		HostName:   hostname,
-		TorId:      torID,
-		DeviceName: deviceName,
-	}, nil
+	return info, nil
 }
 
 // CleanupStaleEntries removes RNIC entries that have not been updated
@@ -422,7 +472,7 @@ func (r *RnicRegistry) ListAllRNICs(ctx context.Context) ([]*controller_agent.Rn
 	log.Debug().Msg("Listing all active RNICs")
 
 	querySQL := `
-	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name
+	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id
 	FROM rnics
 	WHERE last_updated_epoch > ?
 	ORDER BY tor_id, hostname;`
@@ -446,22 +496,32 @@ func scanRnicInfoRows(result gorqlite.QueryResult) ([]*controller_agent.RnicInfo
 	var rnics []*controller_agent.RnicInfo
 
 	for result.Next() {
-		var gid, ip, hostname, torID, deviceName string
-		var qpn int64
-
-		if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID, &deviceName); err != nil {
+		info, err := scanRnicInfo(result)
+		if err != nil {
 			return nil, fmt.Errorf("failed to scan RNIC row: %w", err)
 		}
-
-		rnics = append(rnics, &controller_agent.RnicInfo{
-			Gid:        gid,
-			Qpn:        uint32(qpn),
-			IpAddress:  ip,
-			HostName:   hostname,
-			TorId:      torID,
-			DeviceName: deviceName,
-		})
+		rnics = append(rnics, info)
 	}
 
 	return rnics, nil
+}
+
+// scanRnicInfo converts the current row of a query selecting
+// "rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id" into an
+// RnicInfo.
+func scanRnicInfo(result gorqlite.QueryResult) (*controller_agent.RnicInfo, error) {
+	var gid, ip, hostname, torID, deviceName, planeID string
+	var qpn int64
+	if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID, &deviceName, &planeID); err != nil {
+		return nil, err
+	}
+	return &controller_agent.RnicInfo{
+		Gid:        gid,
+		Qpn:        uint32(qpn),
+		IpAddress:  ip,
+		HostName:   hostname,
+		TorId:      torID,
+		DeviceName: deviceName,
+		PlaneId:    planeID,
+	}, nil
 }

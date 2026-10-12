@@ -129,6 +129,11 @@ type Agent struct {
 	// devices are opened.
 	deviceTorIDs []string
 
+	// devicePlaneIDs holds the canonical plane (rail) of each opened device,
+	// parallel to devices: its device_plane_ids entry, else plane_id. Empty
+	// means no plane restriction. Filled by resolveDevicePlaneIDs.
+	devicePlaneIDs []string
+
 	// lldpQuerier and sysfsRoot are the LLDP discovery dependencies used when
 	// lldp_tor_discovery is enabled. NewAgent sets the production values;
 	// tests replace them.
@@ -139,6 +144,10 @@ type Agent struct {
 	// longer honoring per-RNIC ToRs, so the error is logged once, not every
 	// heartbeat.
 	perRnicTorLossWarned bool
+
+	// planeSupportWarned records that the controller was found not to
+	// support plane_id, so the warning is logged once, not every heartbeat.
+	planeSupportWarned bool
 
 	// heartbeatStopCh and heartbeatWg control the lifecycle of the
 	// background heartbeat goroutine that periodically re-registers with
@@ -173,6 +182,12 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 
 	return a, nil
 }
+
+// Plane sources reported in the "Resolved device plane" log.
+const (
+	planeSourceDeviceMap = "device_plane_ids"
+	planeSourceAgent     = "plane_id"
+)
 
 // ToR sources reported in the "Resolved device ToR" log.
 const (
@@ -303,6 +318,94 @@ func (a *Agent) resolveDeviceTorIDs(lldpTors []string) {
 	}
 }
 
+// resolveDevicePlaneIDs assigns each opened device its plane (rail):
+// its device_plane_ids entry, else the host-wide plane_id (empty = none).
+// device_plane_ids keys that match no opened device are warned about, with
+// the reason when the device is excluded or not allowed, since a typo there
+// silently leaves that RNIC on the host-wide plane.
+func (a *Agent) resolveDevicePlaneIDs() {
+	a.devicePlaneIDs = make([]string, len(a.devices))
+	configured := probe.CanonicalPlaneID(a.cfg.PlaneID) != "" || len(a.cfg.DevicePlaneIDs) > 0
+	matched := make(map[string]bool, len(a.cfg.DevicePlaneIDs))
+	for i, dev := range a.devices {
+		plane := a.cfg.PlaneIDForDevice(dev.Info.DeviceName)
+		source := planeSourceAgent
+		if _, ok := a.cfg.DevicePlaneID(dev.Info.DeviceName); ok {
+			source = planeSourceDeviceMap
+		}
+		a.devicePlaneIDs[i] = plane
+		for key := range a.cfg.DevicePlaneIDs {
+			if strings.EqualFold(strings.TrimSpace(key), dev.Info.DeviceName) {
+				matched[key] = true
+			}
+		}
+		if configured {
+			a.logger.Info().
+				Str("device", dev.Info.DeviceName).
+				Str("plane_id", plane).
+				Str("source", source).
+				Msg("Resolved device plane")
+		}
+	}
+	for key := range a.cfg.DevicePlaneIDs {
+		if matched[key] {
+			continue
+		}
+		reason := "device_plane_ids entry matches no opened RDMA device; ignored"
+		switch {
+		case a.cfg.IsDeviceExcluded(key):
+			reason = "device_plane_ids entry names a device in excluded_device_names; ignored"
+		case !a.cfg.IsDeviceAllowed(key):
+			reason = "device_plane_ids entry names a device not in allowed_device_names; ignored"
+		}
+		a.logger.Warn().Str("device", key).Msg(reason)
+	}
+	if configured {
+		for i, plane := range a.devicePlaneIDs {
+			if plane == "" {
+				a.logger.Warn().
+					Str("device", a.devices[i].Info.DeviceName).
+					Msg("Device has no plane while others do; its pinglists are not plane-restricted")
+			}
+		}
+	}
+}
+
+// planeIDForDevice returns the canonical plane of devices[i], falling back to
+// the host-wide plane_id when per-device planes have not been resolved.
+func (a *Agent) planeIDForDevice(i int) string {
+	if i >= 0 && i < len(a.devicePlaneIDs) {
+		return a.devicePlaneIDs[i]
+	}
+	return probe.CanonicalPlaneID(a.cfg.PlaneID)
+}
+
+// usesPlanes reports whether any device has a plane, i.e. whether pinglists
+// depend on the controller supporting plane_id.
+func (a *Agent) usesPlanes() bool {
+	for i := range a.devices {
+		if a.planeIDForDevice(i) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// checkRegistrationPlaneSupport warns (once) when devices have planes but the
+// controller predates plane support. Nothing needs to fall back: an older
+// controller ignores plane_id, so registration and pinglists keep working,
+// but its pinglists may include cross-plane targets, which time out on
+// fabrics whose rails are not routed to each other.
+func (a *Agent) checkRegistrationPlaneSupport(resp *controller_agent.AgentRegistrationResponse) {
+	if resp.GetPerRnicPlaneId() || !a.usesPlanes() || a.planeSupportWarned {
+		return
+	}
+	a.planeSupportWarned = true
+	a.logger.Warn().
+		Msg("Controller does not support plane_id (it predates planes); pinglists are not " +
+			"restricted to each device's plane, so cross-plane targets may time out. Upgrade the controller")
+}
+
 // usesPerDeviceTorIDs reports whether any device's ToR differs from the
 // host-wide tor_id, i.e. whether registration depends on the controller
 // keeping each RNIC's own tor_id.
@@ -397,6 +500,7 @@ func (a *Agent) Initialize(ctx context.Context) error {
 	}
 	a.logger.Info().Int("device_count", len(a.devices)).Msg("RDMA devices opened")
 	a.resolveDeviceTorIDs(a.discoverLLDPTorIDs(ctx))
+	a.resolveDevicePlaneIDs()
 
 	// Step 3: Create gRPC client for controller communication.
 	a.logger.Info().
@@ -567,6 +671,7 @@ func (a *Agent) createClusterMonitors() {
 			Str("device", dev.Info.DeviceName).
 			Str("requester_gid", requesterGID).
 			Str("tor_id", a.torIDForDevice(i)).
+			Str("plane_id", a.planeIDForDevice(i)).
 			Uint32("update_interval_sec", a.cfg.PinglistUpdateIntervalSec).
 			Msg("Creating cluster monitor")
 		monitor := NewClusterMonitor(
@@ -577,6 +682,7 @@ func (a *Agent) createClusterMonitors() {
 			requesterGID,
 			a.cfg.PinglistUpdateIntervalSec,
 		)
+		monitor.SetPlaneID(a.planeIDForDevice(i))
 		a.monitors = append(a.monitors, monitor)
 	}
 }
@@ -598,6 +704,7 @@ func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRe
 			HostName:   a.cfg.HostName,
 			TorId:      a.torIDForDevice(i),
 			DeviceName: dev.Info.DeviceName,
+			PlaneId:    a.planeIDForDevice(i),
 		}
 		rnics = append(rnics, rnic)
 
@@ -606,6 +713,8 @@ func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRe
 			Uint32("qpn", rnic.Qpn).
 			Str("ip", rnic.IpAddress).
 			Str("device", rnic.DeviceName).
+			Str("tor_id", rnic.TorId).
+			Str("plane_id", rnic.PlaneId).
 			Msg("Prepared RNIC info for registration")
 	}
 
@@ -667,6 +776,7 @@ func (a *Agent) registerWithController(ctx context.Context) error {
 		attemptErr := registerAttemptErr(resp, err)
 		if attemptErr == nil {
 			a.applyRegistrationTorSupport(resp)
+			a.checkRegistrationPlaneSupport(resp)
 			a.logger.Info().
 				Str("agent_id", a.cfg.AgentID).
 				Int("rnic_count", len(req.GetRnics())).
@@ -907,6 +1017,8 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 				a.logger.Error().
 					Msg("Controller no longer supports per-RNIC ToR IDs; ToR-mesh pinglists will be empty. Restart the agent or upgrade the controller")
 			}
+			// The controller may have been replaced by an older one.
+			a.checkRegistrationPlaneSupport(resp)
 			a.logger.Debug().
 				Str("agent_id", a.cfg.AgentID).
 				Msg("Heartbeat re-registration succeeded")

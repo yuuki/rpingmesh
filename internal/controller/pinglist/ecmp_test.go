@@ -80,7 +80,10 @@ type fakeRnicSource struct {
 	// under. A GID absent from the map resolves to "" (unregistered), which
 	// exercises the GID self-exclusion fallback.
 	hostnameByGID map[string]string
-	// resolveErr, if set, is returned by ResolveHostnameByGID to exercise the
+	// planeByGID maps a requester GID to its registered plane. A GID in
+	// either map is treated as registered.
+	planeByGID map[string]string
+	// resolveErr, if set, is returned by GetRNICByGID to exercise the
 	// graceful-degradation path.
 	resolveErr error
 }
@@ -109,11 +112,16 @@ func filterRnicsByToR(rnics []*controller_agent.RnicInfo, torID string, match bo
 	return out
 }
 
-func (f *fakeRnicSource) ResolveHostnameByGID(_ context.Context, gid string) (string, error) {
+func (f *fakeRnicSource) GetRNICByGID(_ context.Context, gid string) (*controller_agent.RnicInfo, error) {
 	if f.resolveErr != nil {
-		return "", f.resolveErr
+		return nil, f.resolveErr
 	}
-	return f.hostnameByGID[gid], nil
+	host, hasHost := f.hostnameByGID[gid]
+	plane, hasPlane := f.planeByGID[gid]
+	if !hasHost && !hasPlane {
+		return nil, nil
+	}
+	return &controller_agent.RnicInfo{Gid: gid, HostName: host, PlaneId: plane}, nil
 }
 
 // TestPinglistCarriesSeedAndCount verifies that generated PingTargets carry the
@@ -134,7 +142,7 @@ func TestPinglistCarriesSeedAndCount(t *testing.T) {
 		MaxFlowLabels:       64,
 	}, DefaultInterTorSampleSize, 0)
 
-	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1")
+	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1", "")
 	if err != nil {
 		t.Fatalf("GenerateTorMeshPinglist: %v", err)
 	}

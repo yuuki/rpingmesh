@@ -3,7 +3,7 @@
 # clang, libibverbs-dev, librdmacm-dev
 
 .PHONY: all build build-zig build-go build-controller build-agent \
-        generate generate-proto clean test test-go test-zig test-all vet \
+        generate generate-proto clean test test-go test-zig test-scripts test-all vet \
         test-e2e setup-colima test-e2e-controller clean-e2e-controller \
         check-nfpm package package-agent package-controller \
         package-build-agent package-build-agent-el9 package-build-controller \
@@ -105,6 +105,12 @@ test-go:
 	@echo "==> Running Go tests..."
 	go test -v ./internal/probe/...
 	@echo "==> Tests complete"
+
+# Run the Python tests of the scripts/topology tooling (stdlib only).
+test-scripts:
+	@echo "==> Running scripts/topology tests..."
+	python3 -m unittest discover -s scripts/topology -p 'test_*.py'
+	@echo "==> Script tests complete"
 
 # Run Zig unit tests (types.zig, ring.zig, cq.zig, etc.). Pure Zig, no Go/CGO
 # involved, but still needs libibverbs/librdmacm headers on the build host

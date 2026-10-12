@@ -195,6 +195,23 @@ void rdma_destroy(rdma_context_t ctx);
 int32_t rdma_get_device_count(rdma_context_t ctx);
 
 /*
+ * rdma_get_device_name - Return the name of a device without opening it
+ *
+ * Copies the name (e.g., "mlx5_0") of the device at the given index into
+ * out_name as a NUL-terminated string, truncated to name_len - 1 bytes.
+ * No verbs resources are allocated, so callers can filter devices by name
+ * before calling rdma_open_device().
+ *
+ * @param ctx       Context handle
+ * @param index     Device index (0-based)
+ * @param out_name  Receives the NUL-terminated device name
+ * @param name_len  Size of out_name in bytes (must be > 0)
+ * @return          0 on success, negative error code on failure
+ */
+int32_t rdma_get_device_name(rdma_context_t ctx, int32_t index, char* out_name,
+                             size_t name_len);
+
+/*
  * rdma_open_device - Open an RDMA device by index
  *
  * Opens the device at the given index in the device list, queries the

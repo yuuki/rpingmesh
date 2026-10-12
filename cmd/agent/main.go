@@ -83,6 +83,7 @@ func run(cmd *cobra.Command, args []string) error {
 		Uint32("probe_interval_ms", cfg.ProbeIntervalMS).
 		Bool("metrics_enabled", cfg.MetricsEnabled).
 		Strs("allowed_devices", cfg.AllowedDeviceNames).
+		Strs("excluded_devices", cfg.ExcludedDeviceNames).
 		Int("gid_index", cfg.GIDIndex).
 		Msg("Starting rpingmesh-agent")
 

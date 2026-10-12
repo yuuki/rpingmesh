@@ -119,7 +119,11 @@ type AgentConfig struct {
 	OtelCollectorAddr  string   `mapstructure:"otel_collector_addr"`
 	MetricsEnabled     bool     `mapstructure:"metrics_enabled"`
 	AllowedDeviceNames []string `mapstructure:"allowed_device_names"`
-	GIDIndex           int      `mapstructure:"gid_index"`
+	// ExcludedDeviceNames lists RDMA devices the agent never opens, matched
+	// case-insensitively. It applies on top of AllowedDeviceNames; naming a
+	// device in both lists is rejected by Validate().
+	ExcludedDeviceNames []string `mapstructure:"excluded_device_names"`
+	GIDIndex            int      `mapstructure:"gid_index"`
 	// ServiceLevel is the Service Level (SL, PFC priority) applied to every
 	// Address Handle the agent's RDMA devices create (0-7; see Validate()).
 	ServiceLevel int `mapstructure:"service_level"`
@@ -222,6 +226,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("otel_collector_addr", "localhost:4317")
 	v.SetDefault("metrics_enabled", true)
 	v.SetDefault("allowed_device_names", []string{})
+	v.SetDefault("excluded_device_names", []string{})
 	v.SetDefault("gid_index", 0)
 	v.SetDefault("service_level", 0)
 	v.SetDefault("traffic_class", 0)
@@ -306,6 +311,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		OtelCollectorAddr:          v.GetString("otel_collector_addr"),
 		MetricsEnabled:             v.GetBool("metrics_enabled"),
 		AllowedDeviceNames:         v.GetStringSlice("allowed_device_names"),
+		ExcludedDeviceNames:        v.GetStringSlice("excluded_device_names"),
 		GIDIndex:                   v.GetInt("gid_index"),
 		ServiceLevel:               v.GetInt("service_level"),
 		TrafficClass:               v.GetInt("traffic_class"),
@@ -355,6 +361,19 @@ func (c *AgentConfig) Validate() error {
 		}
 		if probe.IsReservedTorID(tor) {
 			return fmt.Errorf("device_tor_ids[%s] %q is reserved for untagged agents", dev, probe.UnspecifiedTorLabel)
+		}
+	}
+
+	for _, dev := range c.ExcludedDeviceNames {
+		if strings.TrimSpace(dev) == "" {
+			return fmt.Errorf("excluded_device_names has an empty device name")
+		}
+	}
+	// A device both allowed and excluded is almost certainly a typo or a
+	// stale list; fail fast instead of silently picking one.
+	for _, dev := range c.AllowedDeviceNames {
+		if c.IsDeviceExcluded(dev) {
+			return fmt.Errorf("device %q is listed in both allowed_device_names and excluded_device_names", dev)
 		}
 	}
 
@@ -502,6 +521,7 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.String("otel-collector-addr", "localhost:4317", "OpenTelemetry collector address")
 	flags.Bool("metrics-enabled", true, "Enable OpenTelemetry metrics export")
 	flags.StringSlice("allowed-device-names", []string{}, "List of allowed RDMA device names (empty = all)")
+	flags.StringSlice("excluded-device-names", []string{}, "List of RDMA device names never to open (applied after allowed-device-names)")
 	flags.Int("gid-index", 0, "GID index to use for RDMA devices (0-255)")
 	flags.Int("service-level", 0, "Service Level (SL, PFC priority) for Address Handles (0-7)")
 	flags.Int("traffic-class", 0, "GRH traffic class (DSCP << 2) for Address Handles (0-255)")
@@ -537,6 +557,18 @@ func canonicalDeviceTorIDs(in map[string]string) map[string]string {
 		out[strings.ToLower(strings.TrimSpace(dev))] = probe.CanonicalTorID(tor)
 	}
 	return out
+}
+
+// IsDeviceExcluded reports whether an RDMA device is listed in
+// excluded_device_names. Device names match case-insensitively.
+func (c *AgentConfig) IsDeviceExcluded(deviceName string) bool {
+	name := strings.TrimSpace(deviceName)
+	for _, excluded := range c.ExcludedDeviceNames {
+		if strings.EqualFold(strings.TrimSpace(excluded), name) {
+			return true
+		}
+	}
+	return false
 }
 
 // DeviceTorID returns the canonical device_tor_ids entry for an RDMA device

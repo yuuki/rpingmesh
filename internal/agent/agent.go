@@ -390,6 +390,9 @@ func (a *Agent) Initialize(ctx context.Context) error {
 		return fmt.Errorf("failed to open RDMA devices: %w", err)
 	}
 	if len(a.devices) == 0 {
+		if len(a.cfg.ExcludedDeviceNames) > 0 {
+			return fmt.Errorf("no RDMA devices available (excluded_device_names: %v)", a.cfg.ExcludedDeviceNames)
+		}
 		return fmt.Errorf("no RDMA devices available")
 	}
 	a.logger.Info().Int("device_count", len(a.devices)).Msg("RDMA devices opened")
@@ -957,7 +960,8 @@ func (a *Agent) Run(ctx context.Context) error {
 
 // openDevices opens RDMA devices based on configuration. If AllowedDeviceNames
 // is configured, only those devices are opened by name. Otherwise, all available
-// devices are opened by index.
+// devices are opened by index. Devices in ExcludedDeviceNames are skipped before
+// they are opened, so no verbs resources are ever allocated on them.
 func (a *Agent) openDevices() error {
 	gidIndex := a.cfg.GIDIndex
 	// Config.Validate() guarantees ServiceLevel is in [0,7] and TrafficClass
@@ -972,6 +976,12 @@ func (a *Agent) openDevices() error {
 	if len(a.cfg.AllowedDeviceNames) > 0 {
 		// Open only the explicitly allowed devices by name.
 		for _, name := range a.cfg.AllowedDeviceNames {
+			// Unreachable after Config.Validate(), which rejects overlaps;
+			// kept so an unvalidated config still honours the exclusion.
+			if a.cfg.IsDeviceExcluded(name) {
+				a.logger.Info().Str("device_name", name).Msg("Skipping excluded RDMA device")
+				continue
+			}
 			dev, err := a.rdmaCtx.OpenDeviceByName(name, gidIndex, sl, tc)
 			if err != nil {
 				a.logger.Warn().Err(err).
@@ -995,6 +1005,24 @@ func (a *Agent) openDevices() error {
 		}
 
 		for i := 0; i < count; i++ {
+			if len(a.cfg.ExcludedDeviceNames) > 0 {
+				name, err := a.rdmaCtx.GetDeviceName(i)
+				if err != nil {
+					// Without a name the exclusion cannot be checked; skip
+					// rather than risk opening an excluded device.
+					a.logger.Warn().Err(err).
+						Int("index", i).
+						Msg("Failed to read RDMA device name, skipping")
+					continue
+				}
+				if a.cfg.IsDeviceExcluded(name) {
+					a.logger.Info().
+						Str("device_name", name).
+						Int("index", i).
+						Msg("Skipping excluded RDMA device")
+					continue
+				}
+			}
 			dev, err := a.rdmaCtx.OpenDevice(i, gidIndex, sl, tc)
 			if err != nil {
 				a.logger.Warn().Err(err).

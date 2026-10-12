@@ -989,6 +989,67 @@ func TestLoadAgentConfig_DeviceTorIDsRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestLoadAgentConfig_ExcludedDeviceNames(t *testing.T) {
+	path := writeYAML(t, "agent.yaml", `excluded_device_names:
+  - mlx5_2
+  - " MLX5_3 "
+`)
+	cfg, err := LoadAgentConfig(path, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cases := map[string]bool{
+		"mlx5_2": true,
+		"MLX5_2": true, // device names match case-insensitively
+		"mlx5_3": true, // list entries are trimmed and case-folded
+		"mlx5_0": false,
+		"":       false,
+	}
+	for dev, want := range cases {
+		if got := cfg.IsDeviceExcluded(dev); got != want {
+			t.Errorf("IsDeviceExcluded(%q) = %v, want %v", dev, got, want)
+		}
+	}
+}
+
+func TestLoadAgentConfig_ExcludedDeviceNamesDefaultEmpty(t *testing.T) {
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.ExcludedDeviceNames) != 0 {
+		t.Errorf("ExcludedDeviceNames = %v, want empty", cfg.ExcludedDeviceNames)
+	}
+	if cfg.IsDeviceExcluded("mlx5_0") {
+		t.Error("IsDeviceExcluded should be false with no exclusions")
+	}
+}
+
+func TestLoadAgentConfig_ExcludedDeviceNamesEnv(t *testing.T) {
+	t.Setenv("RPINGMESH_EXCLUDED_DEVICE_NAMES", "mlx5_4 mlx5_5")
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.IsDeviceExcluded("mlx5_4") || !cfg.IsDeviceExcluded("mlx5_5") {
+		t.Errorf("ExcludedDeviceNames = %v, want mlx5_4 and mlx5_5", cfg.ExcludedDeviceNames)
+	}
+}
+
+func TestLoadAgentConfig_ExcludedDeviceNamesRejectsInvalid(t *testing.T) {
+	for name, content := range map[string]string{
+		"empty name": "excluded_device_names: [\"  \"]\n",
+		"overlap with allowed": "allowed_device_names: [mlx5_0, mlx5_1]\n" +
+			"excluded_device_names: [MLX5_1]\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := LoadAgentConfig(writeYAML(t, "agent.yaml", content), nil); err == nil {
+				t.Error("expected a validation error, got nil")
+			}
+		})
+	}
+}
+
 func TestLoadAgentConfig_LLDPDefaults(t *testing.T) {
 	cfg, err := LoadAgentConfig("", nil)
 	if err != nil {

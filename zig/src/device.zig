@@ -94,6 +94,46 @@ pub fn getDeviceCount(ctx: *types.RdmaContext) i32 {
     return ctx.device_count;
 }
 
+/// Copy the name of the device at `index` into `out` as a NUL-terminated
+/// string, without opening the device. Lets callers filter devices by name
+/// (e.g. an exclusion list) before any verbs resources are allocated.
+/// Returns the name length (excluding the NUL); a name longer than
+/// `out.len - 1` is truncated.
+pub fn getDeviceName(ctx: *types.RdmaContext, index: i32, out: []u8) DeviceError!usize {
+    if (index < 0 or index >= ctx.device_count) {
+        types.setLastError("device index out of range");
+        return DeviceError.InvalidDeviceIndex;
+    }
+    if (out.len == 0) {
+        types.setLastError("device name buffer is empty");
+        return DeviceError.OutOfMemory;
+    }
+    const device_list = ctx.device_list orelse {
+        types.setLastError("device list is null");
+        return DeviceError.GetDeviceListFailed;
+    };
+    const dev_ptr_array: [*]?*c.ibv_device = @ptrCast(device_list);
+    const device = dev_ptr_array[@intCast(index)] orelse {
+        types.setLastError("device pointer at index is null");
+        return DeviceError.InvalidDeviceIndex;
+    };
+    const dev_name_ptr = c.ibv_get_device_name(device);
+    if (dev_name_ptr == null) {
+        types.setLastError("ibv_get_device_name() returned null");
+        return DeviceError.DeviceNotFound;
+    }
+    return copyNameZ(std.mem.sliceTo(dev_name_ptr, 0), out);
+}
+
+/// Copy `name` into `out` with a NUL terminator, truncating to fit.
+/// `out` must be non-empty. Returns the number of name bytes copied.
+fn copyNameZ(name: []const u8, out: []u8) usize {
+    const n = @min(name.len, out.len - 1);
+    @memcpy(out[0..n], name[0..n]);
+    out[n] = 0;
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 // Device open / close
 // ---------------------------------------------------------------------------
@@ -620,6 +660,29 @@ export fn rdma_get_device_count(ctx_ptr: ?*types.RdmaContext) i32 {
     return getDeviceCount(ctx);
 }
 
+/// Copy the name of the device at `index` into `out_name` (NUL-terminated,
+/// truncated to `name_len - 1` bytes) without opening the device.
+///
+/// Exported as `rdma_get_device_name` for the C ABI.
+/// @return  0 on success, -1 on failure.
+export fn rdma_get_device_name(
+    ctx_ptr: ?*types.RdmaContext,
+    index: i32,
+    out_name: ?[*]u8,
+    name_len: usize,
+) i32 {
+    const ctx = ctx_ptr orelse {
+        types.setLastError("null context");
+        return -1;
+    };
+    const buf = out_name orelse {
+        types.setLastError("null device name buffer");
+        return -1;
+    };
+    _ = getDeviceName(ctx, index, buf[0..name_len]) catch return -1;
+    return 0;
+}
+
 /// Open an RDMA device by index.
 ///
 /// Exported as `rdma_open_device` for the C ABI.
@@ -683,6 +746,18 @@ export fn rdma_close_device(dev_ptr: ?*types.RdmaDevice) void {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "copyNameZ copies and NUL-terminates" {
+    var buf: [8]u8 = @splat(0xff);
+    try std.testing.expectEqual(@as(usize, 6), copyNameZ("mlx5_0", &buf));
+    try std.testing.expectEqualStrings("mlx5_0", std.mem.sliceTo(&buf, 0));
+}
+
+test "copyNameZ truncates to fit the buffer" {
+    var buf: [4]u8 = @splat(0xff);
+    try std.testing.expectEqual(@as(usize, 3), copyNameZ("mlx5_0", &buf));
+    try std.testing.expectEqualStrings("mlx", std.mem.sliceTo(&buf, 0));
+}
 
 test "extractIPFromGID with IPv4-mapped IPv6" {
     // ::ffff:192.168.1.100

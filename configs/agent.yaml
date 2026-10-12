@@ -89,3 +89,6 @@ throttle_cpu_percent: 90         # engage at 90% of available CPU capacity (GOMA
 
 # Logging
 log_level: "info"                # debug, info, warn, error
+# Log output format on stderr: "console" (human-readable, default) or "json"
+# (one zerolog JSON object per line; needed by scripts/topology/rtt_tor_check.py).
+log_format: "console"

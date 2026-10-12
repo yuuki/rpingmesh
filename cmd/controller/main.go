@@ -9,7 +9,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -22,6 +21,7 @@ import (
 	"github.com/yuuki/rpingmesh/internal/controller/analyzer"
 	"github.com/yuuki/rpingmesh/internal/controller/pinglist"
 	"github.com/yuuki/rpingmesh/internal/controller/registry"
+	"github.com/yuuki/rpingmesh/internal/logging"
 	"github.com/yuuki/rpingmesh/internal/telemetry"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
@@ -57,27 +57,30 @@ func newRootCommand() *cobra.Command {
 // run is the main entry point for the controller. It loads configuration,
 // starts the gRPC server, and blocks until a shutdown signal is received.
 func run(cmd *cobra.Command, args []string) error {
+	// Anything logged before the configuration is resolved uses the default
+	// (console) format.
+	logging.SetupBootstrap()
+
 	// Load configuration from file, env vars, and flags.
 	cfg, err := config.LoadControllerConfig(configPath, cmd.Flags())
 	if err != nil {
 		return fmt.Errorf("failed to load configuration: %w", err)
 	}
 
-	// Set up structured logging with console writer and configured level.
-	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).
-		With().Timestamp().Logger()
-
-	level, err := zerolog.ParseLevel(cfg.LogLevel)
+	// Switch to the configured log format (console or json) and level.
+	invalidLevel, err := logging.Setup(cfg.LogFormat, cfg.LogLevel)
 	if err != nil {
-		log.Warn().Str("logLevel", cfg.LogLevel).Msg("Invalid log level, defaulting to info")
-		level = zerolog.InfoLevel
+		return fmt.Errorf("failed to set up logging: %w", err)
 	}
-	zerolog.SetGlobalLevel(level)
+	if invalidLevel {
+		log.Warn().Str("logLevel", cfg.LogLevel).Msg("Invalid log level, defaulting to info")
+	}
 
 	log.Info().
 		Str("listenAddr", cfg.ListenAddr).
 		Str("databaseURI", cfg.DatabaseURI).
 		Str("logLevel", cfg.LogLevel).
+		Str("logFormat", cfg.LogFormat).
 		Int("activeThresholdSec", cfg.ActiveThresholdSec).
 		Int("staleThresholdSec", cfg.StaleThresholdSec).
 		Int("interTorSampleSize", cfg.InterTorSampleSize).

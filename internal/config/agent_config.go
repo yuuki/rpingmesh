@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"github.com/yuuki/rpingmesh/internal/lldp"
+	"github.com/yuuki/rpingmesh/internal/logging"
 	"github.com/yuuki/rpingmesh/internal/probe"
 )
 
@@ -113,8 +114,11 @@ type AgentConfig struct {
 	// a neighbor; 0 queries once. See DefaultLLDPDiscoveryTimeoutSec.
 	LLDPDiscoveryTimeoutSec uint32 `mapstructure:"lldp_discovery_timeout_sec"`
 
-	ControllerAddr     string   `mapstructure:"controller_addr"`
-	LogLevel           string   `mapstructure:"log_level"`
+	ControllerAddr string `mapstructure:"controller_addr"`
+	LogLevel       string `mapstructure:"log_level"`
+	// LogFormat selects the log output format: "console" (default,
+	// human-readable) or "json" (one zerolog JSON object per line on stderr).
+	LogFormat          string   `mapstructure:"log_format"`
 	ProbeIntervalMS    uint32   `mapstructure:"probe_interval_ms"`
 	OtelCollectorAddr  string   `mapstructure:"otel_collector_addr"`
 	MetricsEnabled     bool     `mapstructure:"metrics_enabled"`
@@ -222,6 +226,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("lldp_discovery_timeout_sec", DefaultLLDPDiscoveryTimeoutSec)
 	v.SetDefault("controller_addr", "localhost:50051")
 	v.SetDefault("log_level", "info")
+	v.SetDefault("log_format", logging.DefaultFormat)
 	v.SetDefault("probe_interval_ms", 500)
 	v.SetDefault("otel_collector_addr", "localhost:4317")
 	v.SetDefault("metrics_enabled", true)
@@ -307,6 +312,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		LLDPDiscoveryTimeoutSec:    v.GetUint32("lldp_discovery_timeout_sec"),
 		ControllerAddr:             v.GetString("controller_addr"),
 		LogLevel:                   v.GetString("log_level"),
+		LogFormat:                  v.GetString("log_format"),
 		ProbeIntervalMS:            v.GetUint32("probe_interval_ms"),
 		OtelCollectorAddr:          v.GetString("otel_collector_addr"),
 		MetricsEnabled:             v.GetBool("metrics_enabled"),
@@ -402,6 +408,10 @@ func (c *AgentConfig) Validate() error {
 	// (ibv_ah_attr.grh.traffic_class).
 	if c.TrafficClass < 0 || c.TrafficClass > 255 {
 		return fmt.Errorf("traffic_class must be between 0 and 255, got: %d", c.TrafficClass)
+	}
+
+	if err := logging.ValidateFormat(c.LogFormat); err != nil {
+		return err
 	}
 
 	// An empty mode (a zero-value AgentConfig) means the default, auto.
@@ -517,6 +527,7 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.Uint32("lldp-discovery-timeout-sec", DefaultLLDPDiscoveryTimeoutSec, "Max startup wait for LLDP neighbors on every RDMA device (0 = query once)")
 	flags.String("controller-addr", "localhost:50051", "Controller gRPC address")
 	flags.String("log-level", "info", "Log level (debug, info, warn, error)")
+	flags.String("log-format", logging.DefaultFormat, "Log output format: console or json")
 	flags.Uint32("probe-interval-ms", 500, "Probe interval in milliseconds")
 	flags.String("otel-collector-addr", "localhost:4317", "OpenTelemetry collector address")
 	flags.Bool("metrics-enabled", true, "Enable OpenTelemetry metrics export")

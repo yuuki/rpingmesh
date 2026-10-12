@@ -9,6 +9,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"github.com/yuuki/rpingmesh/internal/logging"
 )
 
 // Default threshold values for the controller's RNIC registry. These mirror
@@ -65,9 +66,12 @@ const (
 
 // ControllerConfig holds all configuration for the controller.
 type ControllerConfig struct {
-	ListenAddr                string `mapstructure:"listen_addr"`
-	DatabaseURI               string `mapstructure:"database_uri"`
-	LogLevel                  string `mapstructure:"log_level"`
+	ListenAddr  string `mapstructure:"listen_addr"`
+	DatabaseURI string `mapstructure:"database_uri"`
+	LogLevel    string `mapstructure:"log_level"`
+	// LogFormat selects the log output format: "console" (default,
+	// human-readable) or "json" (one zerolog JSON object per line on stderr).
+	LogFormat                 string `mapstructure:"log_format"`
 	ActiveThresholdSec        int    `mapstructure:"active_threshold_sec"`
 	StaleThresholdSec         int    `mapstructure:"stale_threshold_sec"`
 	InterTorSampleSize        int    `mapstructure:"inter_tor_sample_size"`
@@ -115,6 +119,7 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 	v.SetDefault("listen_addr", ":50051")
 	v.SetDefault("database_uri", "http://localhost:4001")
 	v.SetDefault("log_level", "info")
+	v.SetDefault("log_format", logging.DefaultFormat)
 	v.SetDefault("active_threshold_sec", DefaultActiveThresholdSec)
 	v.SetDefault("stale_threshold_sec", DefaultStaleThresholdSec)
 	v.SetDefault("inter_tor_sample_size", DefaultInterTorSampleSize)
@@ -166,6 +171,7 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		ListenAddr:                v.GetString("listen_addr"),
 		DatabaseURI:               v.GetString("database_uri"),
 		LogLevel:                  v.GetString("log_level"),
+		LogFormat:                 v.GetString("log_format"),
 		ActiveThresholdSec:        v.GetInt("active_threshold_sec"),
 		StaleThresholdSec:         v.GetInt("stale_threshold_sec"),
 		InterTorSampleSize:        v.GetInt("inter_tor_sample_size"),
@@ -235,6 +241,9 @@ func (c *ControllerConfig) Validate() error {
 	if _, err := zerolog.ParseLevel(c.LogLevel); err != nil {
 		return fmt.Errorf("log_level %q is not a known level: %w", c.LogLevel, err)
 	}
+	if err := logging.ValidateFormat(c.LogFormat); err != nil {
+		return err
+	}
 
 	if c.ActiveThresholdSec <= 0 {
 		return fmt.Errorf("active_threshold_sec must be > 0, got: %d", c.ActiveThresholdSec)
@@ -303,6 +312,7 @@ func BindControllerFlags(flags *pflag.FlagSet) {
 	flags.String("listen-addr", ":50051", "Address to listen on for gRPC connections")
 	flags.String("database-uri", "http://localhost:4001", "rqlite database connection URI")
 	flags.String("log-level", "info", "Log level (debug, info, warn, error)")
+	flags.String("log-format", logging.DefaultFormat, "Log output format: console or json")
 	flags.Int("active-threshold-sec", DefaultActiveThresholdSec, "Window (seconds) within which an RNIC is considered active")
 	flags.Int("stale-threshold-sec", DefaultStaleThresholdSec, "Window (seconds) after which an inactive RNIC is removed")
 	flags.Int("inter-tor-sample-size", DefaultInterTorSampleSize, "Number of distinct ToRs sampled for inter-ToR pinglists")

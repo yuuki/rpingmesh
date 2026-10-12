@@ -1,0 +1,10 @@
+{
+  "host-a": {
+    "mlx5_0": "leaf-r0",
+    "mlx5_1": "leaf-r1"
+  },
+  "host-b": {
+    "mlx5_0": "leaf-r0",
+    "mlx5_1": "leaf-r1"
+  }
+}

@@ -169,7 +169,7 @@ configuration is changed.
    hosts? Is there one subnet per rail or per leaf (B3/B4)? Does
    `scontrol show topology` describe groups (B4)?
 2. **Baseline (untagged) with RTT clustering.** Run agents untagged with
-   `log_level: debug` for long enough that several pinglist refreshes have
+   `log_level: debug` and `log_format: json` for long enough that several pinglist refreshes have
    sampled most pairs, then run `scripts/topology/rtt_tor_check.py` without a
    mapping. Expect clearly separated RTT modes and inferred groups whose
    members share one device/rail and one host group.

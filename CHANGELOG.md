@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `log_format` for the agent and the controller: `console` (default,
+  unchanged human-readable output) or `json` (zerolog's native one JSON
+  object per line on stderr). Also settable via `--log-format` and
+  `RPINGMESH_LOG_FORMAT`; any other value fails startup. With `json`,
+  `scripts/topology/rtt_tor_check.py` reads `journalctl -o cat` output
+  directly (it found no records in console output). The tool now has
+  fixture-based tests (`make test-scripts`).
+
 ## [0.5.1] - 2026-10-12
 
 ### Added

@@ -254,6 +254,7 @@ via Cgo (`CGO_ENABLED=1`).
 | `throttle_memory_ratio` | `0.9` | Fraction of `max_memory_mb` at which memory throttling engages (`0`-`1`). Only active when `max_memory_mb > 0` |
 | `throttle_cpu_percent` | `90` | Percentage of available CPU capacity (`GOMAXPROCS` cores) at which CPU throttling engages (`0`-`100`) |
 | `log_level` | `info` | Log level: debug, info, warn, error |
+| `log_format` | `console` | Log output format on stderr: `console` (human-readable) or `json` (one zerolog JSON object per line, e.g. for log shippers or `scripts/topology/rtt_tor_check.py` over `journalctl -o cat`). Any other value fails startup |
 | `tls_mode` | `disabled` | gRPC transport security for the controller connection: `disabled` \| `tls` \| `mtls` (see [TLS/mTLS for controller-agent gRPC](#tlsmtls-for-controller-agent-grpc)) |
 | `tls_cert_file` | `""` | Client certificate file (required when `tls_mode=mtls`) |
 | `tls_key_file` | `""` | Client private key file (required when `tls_mode=mtls`) |
@@ -297,6 +298,7 @@ mistaken for the port itself being down.
 | `analyzer_window_retention` | `20` | Number of recent windows the analyzer retains in memory |
 | `otel_collector_addr` | `localhost:4317` | OTLP gRPC endpoint for analyzer metrics (`service.name=rpingmesh-analyzer`) |
 | `log_level` | `info` | Log level |
+| `log_format` | `console` | Log output format on stderr: `console` or `json` (one zerolog JSON object per line). Any other value fails startup |
 | `tls_mode` | `disabled` | gRPC transport security for the listener: `disabled` \| `tls` \| `mtls` (see [TLS/mTLS for controller-agent gRPC](#tlsmtls-for-controller-agent-grpc)) |
 | `tls_cert_file` | `""` | Server certificate file (required when `tls_mode` is `tls` or `mtls`) |
 | `tls_key_file` | `""` | Server private key file (required when `tls_mode` is `tls` or `mtls`) |

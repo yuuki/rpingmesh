@@ -33,3 +33,4 @@ otel_collector_addr: "localhost:4317"    # OTLP endpoint for analyzer metrics
 
 # Logging
 log_level: "info"                       # debug, info, warn, error
+log_format: "console"                   # console (human-readable) or json (one JSON object per line)

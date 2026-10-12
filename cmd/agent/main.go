@@ -11,13 +11,13 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 
 	"github.com/yuuki/rpingmesh/internal/agent"
 	"github.com/yuuki/rpingmesh/internal/buildinfo"
 	"github.com/yuuki/rpingmesh/internal/config"
+	"github.com/yuuki/rpingmesh/internal/logging"
 )
 
 // configPath holds the path to the agent configuration file, set via the
@@ -55,24 +55,26 @@ func newRootCommand() *cobra.Command {
 // logging, creates the agent, sets up signal handling, and runs the agent
 // lifecycle until a termination signal is received.
 func run(cmd *cobra.Command, args []string) error {
+	// Anything logged before the configuration is resolved uses the default
+	// (console) format.
+	logging.SetupBootstrap()
+
 	// Load configuration from file, environment variables, and CLI flags.
 	cfg, err := config.LoadAgentConfig(configPath, cmd.Flags())
 	if err != nil {
 		return fmt.Errorf("failed to load agent configuration: %w", err)
 	}
 
-	// Set up structured logging with console writer for human-readable output.
-	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).
-		With().Timestamp().Logger()
-
-	level, err := zerolog.ParseLevel(cfg.LogLevel)
+	// Switch to the configured log format (console or json) and level.
+	invalidLevel, err := logging.Setup(cfg.LogFormat, cfg.LogLevel)
 	if err != nil {
+		return fmt.Errorf("failed to set up logging: %w", err)
+	}
+	if invalidLevel {
 		log.Warn().
 			Str("configured_level", cfg.LogLevel).
 			Msg("Invalid log level, defaulting to info")
-		level = zerolog.InfoLevel
 	}
-	zerolog.SetGlobalLevel(level)
 
 	log.Info().
 		Str("agent_id", cfg.AgentID).
@@ -80,6 +82,7 @@ func run(cmd *cobra.Command, args []string) error {
 		Str("tor_id", cfg.TorID).
 		Str("controller_addr", cfg.ControllerAddr).
 		Str("log_level", cfg.LogLevel).
+		Str("log_format", cfg.LogFormat).
 		Uint32("probe_interval_ms", cfg.ProbeIntervalMS).
 		Bool("metrics_enabled", cfg.MetricsEnabled).
 		Strs("allowed_devices", cfg.AllowedDeviceNames).

@@ -7,10 +7,11 @@ timestamps the per-pair network RTT separates into clear modes. This script
 uses that to validate a candidate mapping (or to infer one) without trusting
 any inventory:
 
-  1. Run agents with log_level: debug for a while (an untagged run is fine:
-     every RNIC then probes a random sample of the others, refreshed on each
-     pinglist update) and collect their logs (zerolog JSON lines, e.g.
-     `journalctl -u rpingmesh-agent -o cat`).
+  1. Run agents with log_level: debug and log_format: json for a while (an
+     untagged run is fine: every RNIC then probes a random sample of the
+     others, refreshed on each pinglist update) and collect their logs (zerolog JSON lines, e.g.
+     `journalctl -u rpingmesh-agent -o cat`). The default console format
+     carries no JSON and yields no records.
   2. python3 rtt_tor_check.py --logs agent-*.log --facts facts/*.json \\
          [--mapping map.json] [--cluster-threshold-ns 5000]
 

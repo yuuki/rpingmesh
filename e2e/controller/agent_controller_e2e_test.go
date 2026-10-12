@@ -137,7 +137,7 @@ func getPinglist(
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	targets, err := client.GetPinglist(ctx, agentID, torID, requesterGID, ptype)
+	targets, err := client.GetPinglist(ctx, agentID, torID, requesterGID, "", ptype)
 	if err != nil {
 		t.Fatalf("GetPinglist(%s) failed for %s: %v", ptype, agentID, err)
 	}

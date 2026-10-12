@@ -42,7 +42,9 @@ type fakeControllerServer struct {
 	// real 10-second timeout.
 	pinglistDelay time.Duration
 	pinglistResp  *controller_agent.PinglistResponse
-	pinglistErr   error
+	// lastPinglistReq is the most recent GetPinglist request (guarded by mu).
+	lastPinglistReq *controller_agent.PinglistRequest
+	pinglistErr     error
 
 	// reportFunc, if set, handles ReportProbeAnalysis; otherwise a default
 	// accepted=true ack is returned. reportCalls counts invocations and
@@ -67,8 +69,11 @@ func (s *fakeControllerServer) RegisterAgent(
 }
 
 func (s *fakeControllerServer) GetPinglist(
-	ctx context.Context, _ *controller_agent.PinglistRequest,
+	ctx context.Context, req *controller_agent.PinglistRequest,
 ) (*controller_agent.PinglistResponse, error) {
+	s.mu.Lock()
+	s.lastPinglistReq = req
+	s.mu.Unlock()
 	if s.pinglistDelay > 0 {
 		select {
 		case <-time.After(s.pinglistDelay):
@@ -288,12 +293,18 @@ func TestGetPinglist_Success(t *testing.T) {
 	}
 	c := newTestClient(t, srv)
 
-	targets, err := c.GetPinglist(context.Background(), "agent-1", "tor-1", "fe80::1", controller_agent.PinglistType_TOR_MESH)
+	targets, err := c.GetPinglist(context.Background(), "agent-1", "tor-1", "fe80::1", "rail0", controller_agent.PinglistType_TOR_MESH)
 	if err != nil {
 		t.Fatalf("GetPinglist: %v", err)
 	}
 	if len(targets) != 2 {
 		t.Fatalf("got %d targets, want 2", len(targets))
+	}
+	srv.mu.Lock()
+	req := srv.lastPinglistReq
+	srv.mu.Unlock()
+	if req.GetPlaneId() != "rail0" || req.GetRequesterGid() != "fe80::1" || req.GetTorId() != "tor-1" {
+		t.Errorf("request = %+v, want plane rail0, requester fe80::1, tor tor-1", req)
 	}
 }
 
@@ -368,7 +379,7 @@ func TestGetPinglist_Timeout(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	targets, err := c.GetPinglist(ctx, "agent-1", "tor-1", "fe80::1", controller_agent.PinglistType_INTER_TOR)
+	targets, err := c.GetPinglist(ctx, "agent-1", "tor-1", "fe80::1", "", controller_agent.PinglistType_INTER_TOR)
 	elapsed := time.Since(start)
 
 	if err == nil {

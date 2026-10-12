@@ -80,6 +80,7 @@ func run(cmd *cobra.Command, args []string) error {
 		Str("agent_id", cfg.AgentID).
 		Str("hostname", cfg.HostName).
 		Str("tor_id", cfg.TorID).
+		Str("plane_id", cfg.PlaneID).
 		Str("controller_addr", cfg.ControllerAddr).
 		Str("log_level", cfg.LogLevel).
 		Str("log_format", cfg.LogFormat).

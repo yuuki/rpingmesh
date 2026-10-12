@@ -1170,3 +1170,108 @@ func TestLoadConfig_LogFormatRejectsInvalid(t *testing.T) {
 		t.Error("LoadControllerConfig: expected an error for log_format=logfmt, got nil")
 	}
 }
+
+// --- plane_id / device_plane_ids ---
+
+func TestLoadAgentConfig_PlaneDefaultsEmpty(t *testing.T) {
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PlaneID != "" || len(cfg.DevicePlaneIDs) != 0 {
+		t.Errorf("PlaneID = %q, DevicePlaneIDs = %v; want empty", cfg.PlaneID, cfg.DevicePlaneIDs)
+	}
+	if got := cfg.PlaneIDForDevice("mlx5_0"); got != "" {
+		t.Errorf("PlaneIDForDevice = %q, want empty (no plane restriction)", got)
+	}
+}
+
+func TestLoadAgentConfig_DevicePlaneIDs(t *testing.T) {
+	path := writeYAML(t, "agent.yaml", `plane_id: " host-plane "
+device_plane_ids:
+  mlx5_0: "rail0"
+  MLX5_1: " rail1 "
+`)
+	cfg, err := LoadAgentConfig(path, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PlaneID != "host-plane" {
+		t.Errorf("PlaneID = %q, want host-plane (trimmed)", cfg.PlaneID)
+	}
+	cases := map[string]string{
+		"mlx5_0": "rail0",
+		"mlx5_1": "rail1",      // key case and value whitespace are normalized
+		"MLX5_0": "rail0",      // device names match case-insensitively
+		"mlx5_2": "host-plane", // unlisted devices use plane_id
+	}
+	for dev, want := range cases {
+		if got := cfg.PlaneIDForDevice(dev); got != want {
+			t.Errorf("PlaneIDForDevice(%q) = %q, want %q", dev, got, want)
+		}
+	}
+}
+
+func TestLoadAgentConfig_PlaneIDPrecedence(t *testing.T) {
+	path := writeYAML(t, "agent.yaml", "plane_id: file-plane\n")
+	t.Setenv("RPINGMESH_PLANE_ID", "env-plane")
+
+	cfg, err := LoadAgentConfig(path, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PlaneID != "env-plane" {
+		t.Errorf("PlaneID = %q, want env-plane (env overrides file)", cfg.PlaneID)
+	}
+
+	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	BindAgentFlags(flags)
+	if err := flags.Set("plane-id", "flag-plane"); err != nil {
+		t.Fatalf("flags.Set: %v", err)
+	}
+	cfg, err = LoadAgentConfig(path, flags)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PlaneID != "flag-plane" {
+		t.Errorf("PlaneID = %q, want flag-plane (flag overrides env)", cfg.PlaneID)
+	}
+}
+
+func TestLoadAgentConfig_DevicePlaneIDsRejectsInvalid(t *testing.T) {
+	if _, err := LoadAgentConfig(writeYAML(t, "agent.yaml", "device_plane_ids:\n  mlx5_0: \"  \"\n"), nil); err == nil {
+		t.Error("expected a validation error for an empty device_plane_ids value, got nil")
+	}
+	cfg := &AgentConfig{
+		ProbeIntervalMS:            1,
+		FlowLabelRotationPeriodSec: 1,
+		DevicePlaneIDs:             map[string]string{" ": "rail0"},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected a validation error for an empty device_plane_ids key, got nil")
+	}
+}
+
+// TestLoadAgentConfig_DevicePlaneIDsToleratesExcludedDevices checks that a
+// fleet-wide device_plane_ids map naming a device this host excludes (or does
+// not allow) still loads; the agent only warns about such entries.
+func TestLoadAgentConfig_DevicePlaneIDsToleratesExcludedDevices(t *testing.T) {
+	path := writeYAML(t, "agent.yaml", `allowed_device_names: [mlx5_0]
+excluded_device_names: [mlx5_1]
+device_plane_ids:
+  mlx5_0: rail0
+  mlx5_1: rail1
+  mlx5_2: rail2
+`)
+	cfg, err := LoadAgentConfig(path, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.IsDeviceAllowed("MLX5_0") || cfg.IsDeviceAllowed("mlx5_2") {
+		t.Errorf("IsDeviceAllowed: mlx5_0=%v mlx5_2=%v, want true/false",
+			cfg.IsDeviceAllowed("MLX5_0"), cfg.IsDeviceAllowed("mlx5_2"))
+	}
+	if !(&AgentConfig{}).IsDeviceAllowed("anything") {
+		t.Error("IsDeviceAllowed with no allowed_device_names should be true")
+	}
+}

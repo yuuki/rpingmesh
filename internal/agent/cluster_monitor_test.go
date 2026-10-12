@@ -27,6 +27,8 @@ type mockControllerClient struct {
 	responses map[controller_agent.PinglistType][]pinglistResponse
 	callIndex map[controller_agent.PinglistType]int
 	calls     map[controller_agent.PinglistType]int
+	// lastPlaneID is the planeID of the most recent GetPinglist call.
+	lastPlaneID string
 }
 
 func newMockControllerClient() *mockControllerClient {
@@ -50,12 +52,14 @@ func (m *mockControllerClient) enqueue(ptype controller_agent.PinglistType, targ
 func (m *mockControllerClient) GetPinglist(
 	_ context.Context,
 	_, _, _ string,
+	planeID string,
 	ptype controller_agent.PinglistType,
 ) ([]*controller_agent.PingTarget, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.calls[ptype]++
+	m.lastPlaneID = planeID
 	queue := m.responses[ptype]
 	if len(queue) == 0 {
 		return nil, nil
@@ -390,5 +394,21 @@ func TestClusterMonitor_EmptyPinglist_RetriesEarly(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if got := client.callCount(controller_agent.PinglistType_TOR_MESH); got != 2 {
 		t.Errorf("GetPinglist called %d times, want 2 (no retry once targets exist)", got)
+	}
+}
+
+// TestClusterMonitor_SendsPlaneID verifies that the plane set via SetPlaneID
+// accompanies the pinglist requests.
+func TestClusterMonitor_SendsPlaneID(t *testing.T) {
+	client := newMockControllerClient()
+	monitor := newTestClusterMonitor(client, newTestProber())
+	monitor.SetPlaneID("rail3")
+
+	monitor.fetchPinglists(context.Background())
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.lastPlaneID != "rail3" {
+		t.Errorf("GetPinglist planeID = %q, want rail3", client.lastPlaneID)
 	}
 }

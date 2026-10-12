@@ -139,17 +139,19 @@ func (c *GRPCControllerClient) RegisterAgent(
 
 // GetPinglist fetches a pinglist of the specified type from the controller.
 // It builds a PinglistRequest from the provided parameters and returns the
-// list of PingTarget entries. This method signature matches the
-// agent.ControllerClient interface.
+// list of PingTarget entries. planeID is the requesting RNIC's plane (empty =
+// none); controllers that predate planes ignore it. This method signature
+// matches the agent.ControllerClient interface.
 func (c *GRPCControllerClient) GetPinglist(
 	ctx context.Context,
-	agentID, torID, requesterGID string,
+	agentID, torID, requesterGID, planeID string,
 	ptype controller_agent.PinglistType,
 ) ([]*controller_agent.PingTarget, error) {
 	req := &controller_agent.PinglistRequest{
 		AgentId:      agentID,
 		TorId:        torID,
 		RequesterGid: requesterGID,
+		PlaneId:      planeID,
 		Type:         ptype,
 	}
 
@@ -157,6 +159,7 @@ func (c *GRPCControllerClient) GetPinglist(
 		Str("agent_id", agentID).
 		Str("tor_id", torID).
 		Str("requester_gid", requesterGID).
+		Str("plane_id", planeID).
 		Str("pinglist_type", ptype.String()).
 		Msg("Requesting pinglist from controller")
 

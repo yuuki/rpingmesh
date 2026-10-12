@@ -99,6 +99,18 @@ type AgentConfig struct {
 	// tor_id). To leave a device untagged, leave tor_id empty and do not list
 	// the device.
 	DeviceTorIDs map[string]string `mapstructure:"device_tor_ids"`
+	// PlaneID names the isolated network plane (rail) this host's RNICs are
+	// attached to; DevicePlaneIDs overrides it per RDMA device (device name ->
+	// plane), which is what rail-optimized multi-rail hosts need. On fabrics
+	// whose rails are not routed to each other, the controller then pairs an
+	// RNIC only with RNICs of the same plane in inter-ToR and untagged
+	// pinglists, since cross-plane probes can never succeed. Empty (the
+	// default) means unknown and keeps the plane-agnostic behavior.
+	// DevicePlaneIDs follows the device_tor_ids rules: keys are lower-cased
+	// and matched case-insensitively, values are trimmed and must be
+	// non-empty (omit a device to use PlaneID).
+	PlaneID        string            `mapstructure:"plane_id"`
+	DevicePlaneIDs map[string]string `mapstructure:"device_plane_ids"`
 	// LLDPTorDiscovery derives each RDMA device's ToR from the LLDP neighbor
 	// of its netdev (via lldpd's lldpcli) at startup, so rail-optimized hosts
 	// need no device_tor_ids map. Precedence per device: device_tor_ids entry,
@@ -220,6 +232,8 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("hostname", "")
 	v.SetDefault("tor_id", "")
 	v.SetDefault("device_tor_ids", map[string]string{})
+	v.SetDefault("plane_id", "")
+	v.SetDefault("device_plane_ids", map[string]string{})
 	v.SetDefault("lldp_tor_discovery", false)
 	v.SetDefault("lldp_tor_id_field", lldp.FieldSystemName)
 	v.SetDefault("lldpcli_path", lldp.DefaultCLIPath)
@@ -306,6 +320,8 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		HostName:                   hostname,
 		TorID:                      v.GetString("tor_id"),
 		DeviceTorIDs:               canonicalDeviceTorIDs(v.GetStringMapString("device_tor_ids")),
+		PlaneID:                    probe.CanonicalPlaneID(v.GetString("plane_id")),
+		DevicePlaneIDs:             canonicalDevicePlaneIDs(v.GetStringMapString("device_plane_ids")),
 		LLDPTorDiscovery:           v.GetBool("lldp_tor_discovery"),
 		LLDPTorIDField:             v.GetString("lldp_tor_id_field"),
 		LLDPCLIPath:                v.GetString("lldpcli_path"),
@@ -367,6 +383,18 @@ func (c *AgentConfig) Validate() error {
 		}
 		if probe.IsReservedTorID(tor) {
 			return fmt.Errorf("device_tor_ids[%s] %q is reserved for untagged agents", dev, probe.UnspecifiedTorLabel)
+		}
+	}
+
+	// Entries naming an excluded or not-allowed device are not errors (a
+	// fleet-wide map commonly meets a per-host exclusion); the agent warns
+	// about them at startup instead (see resolveDevicePlaneIDs).
+	for dev, plane := range c.DevicePlaneIDs {
+		if strings.TrimSpace(dev) == "" {
+			return fmt.Errorf("device_plane_ids has an empty device name")
+		}
+		if probe.CanonicalPlaneID(plane) == "" {
+			return fmt.Errorf("device_plane_ids[%s] must not be empty; omit the device to use plane_id", dev)
 		}
 	}
 
@@ -521,6 +549,7 @@ func (c *AgentConfig) EffectiveInterTorProbeRate() int {
 func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.String("agent-id", "", "Agent ID (defaults to hostname if empty)")
 	flags.String("tor-id", "", "Top-of-Rack switch identifier")
+	flags.String("plane-id", "", "Network plane (rail) of this host's RNICs; restricts inter-ToR and untagged pinglists to the same plane (empty = no restriction)")
 	flags.Bool("lldp-tor-discovery", false, "Derive each RDMA device's ToR ID from its LLDP neighbor (lldpd) at startup")
 	flags.String("lldp-tor-id-field", lldp.FieldSystemName, "LLDP neighbor attribute used as the ToR ID: system_name or chassis_id")
 	flags.String("lldpcli-path", lldp.DefaultCLIPath, "Path to the lldpd client used for LLDP ToR discovery")
@@ -570,6 +599,34 @@ func canonicalDeviceTorIDs(in map[string]string) map[string]string {
 	return out
 }
 
+// canonicalDevicePlaneIDs lower-cases device-name keys and trims plane values
+// so lookups in PlaneIDForDevice are case-insensitive and whitespace-safe.
+func canonicalDevicePlaneIDs(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for dev, plane := range in {
+		out[strings.ToLower(strings.TrimSpace(dev))] = probe.CanonicalPlaneID(plane)
+	}
+	return out
+}
+
+// IsDeviceAllowed reports whether an RDMA device passes allowed_device_names
+// (an empty list allows every device). Device names match case-insensitively.
+func (c *AgentConfig) IsDeviceAllowed(deviceName string) bool {
+	if len(c.AllowedDeviceNames) == 0 {
+		return true
+	}
+	name := strings.TrimSpace(deviceName)
+	for _, allowed := range c.AllowedDeviceNames {
+		if strings.EqualFold(strings.TrimSpace(allowed), name) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsDeviceExcluded reports whether an RDMA device is listed in
 // excluded_device_names. Device names match case-insensitively.
 func (c *AgentConfig) IsDeviceExcluded(deviceName string) bool {
@@ -601,4 +658,25 @@ func (c *AgentConfig) TorIDForDevice(deviceName string) string {
 		return tor
 	}
 	return probe.CanonicalTorID(c.TorID)
+}
+
+// DevicePlaneID returns the canonical device_plane_ids entry for an RDMA
+// device and whether one exists. Device names match case-insensitively.
+func (c *AgentConfig) DevicePlaneID(deviceName string) (string, bool) {
+	name := strings.TrimSpace(deviceName)
+	for dev, plane := range c.DevicePlaneIDs {
+		if strings.EqualFold(strings.TrimSpace(dev), name) {
+			return probe.CanonicalPlaneID(plane), true
+		}
+	}
+	return "", false
+}
+
+// PlaneIDForDevice returns the canonical plane of an RDMA device: its
+// device_plane_ids entry when present, otherwise the host-wide plane_id.
+func (c *AgentConfig) PlaneIDForDevice(deviceName string) string {
+	if plane, ok := c.DevicePlaneID(deviceName); ok {
+		return plane
+	}
+	return probe.CanonicalPlaneID(c.PlaneID)
 }

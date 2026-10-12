@@ -13,6 +13,21 @@ All notable changes to this project are documented in this file.
   `scripts/topology/rtt_tor_check.py` reads `journalctl -o cat` output
   directly (it found no records in console output). The tool now has
   fixture-based tests (`make test-scripts`).
+- Plane (rail) restriction for rail-isolated fabrics: the agent's `plane_id`
+  and per-device `device_plane_ids` (same rules as `device_tor_ids`; also
+  `--plane-id` / `RPINGMESH_PLANE_ID`) give each RNIC a plane, which it
+  registers and sends with its pinglist requests. When the requester has a
+  plane, the controller samples inter-ToR targets (and ToR representatives)
+  and builds the untagged (empty ToR) mesh only from RNICs of the same plane,
+  so cross-rail probes that can never succeed no longer show up as loss.
+  Named ToR-meshes are unchanged; a ToR whose RNICs report different planes
+  is logged as a warning. The requester's plane is the one registered for
+  its GID, else the one in the request. RNICs without a plane behave exactly
+  as before, and no metric gains a plane label. The rqlite `rnics` table
+  gains a `plane_id` column, added automatically on controller startup
+  (older controllers keep working on the migrated table). **Upgrade the
+  controller first:** an older controller ignores planes; the agent detects
+  this via the new `per_rnic_plane_id` registration flag and warns once.
 
 ## [0.5.1] - 2026-10-12
 

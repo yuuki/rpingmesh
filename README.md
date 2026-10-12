@@ -226,6 +226,8 @@ via Cgo (`CGO_ENABLED=1`).
 | `hostname` | auto-detected | Hostname reported to the controller on registration (falls back to `os.Hostname()` if empty) |
 | `tor_id` | *(optional, empty)* | Top-of-Rack switch identifier. Empty/whitespace registers as an untagged virtual rack. The value `unspecified` is reserved (OTel/PathSummary label for unset ToRs) and is rejected by both the agent and the controller. See [Optional ToR rollout](#optional-tor-rollout). |
 | `device_tor_ids` | `{}` | Optional per-device ToR IDs (`device name: tor_id`) for rail-optimized multi-rail hosts whose RNICs are cabled to different leaf switches. Unlisted devices use `tor_id`; keys match device names case-insensitively; values must be non-empty. See [ToR mapping on multi-rail hosts](docs/design/multi-rail-tor-mapping.md). Upgrade the controller before agents that use it; against an older controller the agent logs an error and falls back to `tor_id` for every device. |
+| `plane_id` | *(optional, empty)* | Network plane (rail) of this host's RNICs. On fabrics whose rails are not routed to each other, the controller then pairs an RNIC only with RNICs of the same plane in inter-ToR and untagged (empty ToR) pinglists, since cross-plane probes can only time out. Empty = no restriction (previous behavior). Name the largest set of mutually reachable RNICs (the rail, e.g. `<zone>-<rail>`), not the leaf. See [policy C](docs/design/multi-rail-tor-mapping.md#c-pinglist-policy-once-rnics-have-per-leaf-tors). Upgrade the controller first; an older controller ignores the plane (the agent warns once) |
+| `device_plane_ids` | `{}` | Optional per-device planes (`device name: plane`) for multi-rail hosts, e.g. `mlx5_0: isk-rail0`. Same rules as `device_tor_ids`; an entry wins over `plane_id`. Entries naming excluded, not-allowed, or absent devices are warned about and ignored |
 | `lldp_tor_discovery` | `false` | Derive each device's ToR from the LLDP neighbor of its RoCE netdev (`lldpcli -f json0 show neighbors`) at startup, so `device_tor_ids` need not be maintained. Per device, a `device_tor_ids` entry wins over LLDP, and LLDP wins over `tor_id`. Needs `lldpd` and access to its socket (root or lldpd's group). Devices without a neighbor fall back to `tor_id` with a warning. Restart the agent after re-cabling |
 | `lldp_tor_id_field` | `system_name` | LLDP neighbor attribute used as the ToR ID: `system_name` (switch hostname) or `chassis_id` |
 | `lldpcli_path` | `lldpcli` | lldpd client binary used for LLDP ToR discovery |
@@ -719,7 +721,8 @@ new controller is live, those agents' heartbeats are rejected, but
 Their metric cell collides with untagged agents until they are renamed.
 
 `unspecified_mesh_max_targets` caps the TOR_MESH list **returned** to each
-untagged requester (after same-host / same-family filters). The controller
+untagged requester (after same-host / same-family filters and, when the
+requester has a `plane_id`, the same-plane filter). The controller
 still reads the full empty-ToR bucket from rqlite on every request.
 
 Rolling back to an old controller rejects empty `tor_id` on register/heartbeat
@@ -830,7 +833,9 @@ stack down.
 
 ### Logging
 
-Structured JSON logging via zerolog. Log levels:
+Structured logging via zerolog on stderr, human-readable by default
+(`log_format: console`) or one JSON object per line (`log_format: json`, e.g.
+for log shippers and `scripts/topology/rtt_tor_check.py`). Log levels:
 - `debug` -- Per-probe detail including GIDs, all 6 timestamps, sequence numbers
 - `info` -- Startup, registration, pinglist updates, periodic summaries
 - `warn` -- Non-critical errors (ACK send failures, unknown sequence numbers)
@@ -844,6 +849,9 @@ make test
 
 # Run Zig unit tests (requires libibverbs headers, not hardware)
 cd zig && zig build test
+
+# Run the scripts/topology Python tests (stdlib only)
+make test-scripts
 
 # Run a specific Go test
 go test -v ./internal/probe/... -run TestCalculateRTT

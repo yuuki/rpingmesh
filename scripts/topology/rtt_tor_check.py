@@ -9,7 +9,9 @@ any inventory:
 
   1. Run agents with log_level: debug and log_format: json for a while (an
      untagged run is fine: every RNIC then probes a random sample of the
-     others, refreshed on each pinglist update) and collect their logs (zerolog JSON lines, e.g.
+     others, refreshed on each pinglist update; on a rail-isolated fabric set
+     device_plane_ids so that sample stays within each rail) and collect
+     their logs (zerolog JSON lines, e.g.
      `journalctl -u rpingmesh-agent -o cat`). The default console format
      carries no JSON and yields no records.
   2. python3 rtt_tor_check.py --logs agent-*.log --facts facts/*.json \\

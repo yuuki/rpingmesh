@@ -1,8 +1,11 @@
 # ToR Mapping on Multi-Rail (Rail-Optimized) Hosts
 
 Status: mechanism implemented (`device_tor_ids`, per-RNIC ToR in the
-controller); the choice of mapping source and inter-ToR policy is pending
-on-hardware verification (see [Verification plan](#verification-plan)).
+controller). Inter-ToR policy decided: plane (rail) restriction implemented
+(`plane_id` / `device_plane_ids`, see [policy C](#c-pinglist-policy-once-rnics-have-per-leaf-tors)),
+based on the on-hardware observation that cross-rail probes always time out
+on a rail-isolated fabric. The choice of mapping source is still pending
+verification (see [Verification plan](#verification-plan)).
 
 ## Problem
 
@@ -79,13 +82,69 @@ tooling in `scripts/topology/` covers B2, B3, B4 and B5.
 ### C. Pinglist policy once RNICs have per-leaf ToRs
 
 - **ToR-mesh** becomes "same leaf, other hosts", matching the paper.
-- **Inter-ToR** samples `inter_tor_sample_size` foreign ToRs among *all*
-  leaves, so most samples cross rails. In fabrics without cross-rail
-  connectivity (rail-only designs) those probes fail by construction; in fully
-  connected fabrics they are valid but exercise paths that rail-local
-  collective traffic rarely uses. A possible follow-up is an optional
-  *plane* (rail) attribute that restricts inter-ToR sampling to the same
-  plane. Whether it is needed is a verification outcome.
+- **Inter-ToR** used to sample `inter_tor_sample_size` foreign ToRs among
+  *all* leaves, so most samples cross rails. In fabrics without cross-rail
+  connectivity those probes fail by construction; in fully connected fabrics
+  they are valid but exercise paths that rail-local collective traffic rarely
+  uses.
+
+**Decision: restrict to the requester's plane (implemented).** On a
+production rail-optimized GPU fabric whose rails are not routed to each other,
+every probe between RNICs of different rails timed out, while same-rail probes
+succeeded. With 8 rails, 7 of 8 unrestricted inter-ToR samples were therefore
+false loss, and so were 7 of 8 targets of the untagged (empty ToR) mesh, which
+samples all RNICs. An RNIC now carries an optional *plane*: the set of RNICs
+it can reach (on a rail-isolated fabric, its rail).
+
+- Agent: `plane_id` (host-wide) and `device_plane_ids` (device name → plane,
+  same rules as `device_tor_ids`: case-insensitive keys, trimmed non-empty
+  values; per-device entry wins over `plane_id`). Each RNIC registers its
+  plane (`RnicInfo.plane_id`) and sends it with its pinglist requests
+  (`PinglistRequest.plane_id`). Map entries for devices that are excluded,
+  not allowed, or absent are warned about at startup instead of failing it,
+  so one fleet-wide map can meet per-host device filters.
+- Controller: rqlite `rnics.plane_id` column (added by `ALTER TABLE` on
+  startup when an older table lacks it; `DEFAULT ''`, so an older controller
+  sharing or reusing the database keeps working). When the requester has a
+  plane, **inter-ToR** candidates and ToR representatives, and the
+  **untagged mesh** (before its cap), are limited to RNICs registered on the
+  same plane. **ToR-mesh** of a named ToR is unchanged; a leaf belongs to one
+  plane, so a ToR whose RNICs report several non-empty planes is logged as a
+  configuration error.
+- Requester plane: the plane registered for `requester_gid` when non-empty,
+  else the request's `plane_id`. The registry is preferred because targets
+  are filtered by their registered planes, so both sides of the comparison
+  come from one source and an agent cannot claim a plane it did not register.
+  The request value covers the window in which the requester is not
+  registered yet, or its row was written by an older controller and not yet
+  refreshed by a heartbeat.
+- Backward compatibility: an empty plane means "unknown" and keeps the old
+  behavior. A requester without a plane is paired with every RNIC, as before;
+  a requester with a plane is not paired with plane-less RNICs (registered by
+  older agents), since nothing says they are reachable. Old agents never send
+  a plane, so with a new controller nothing changes for them. A new agent
+  against an old controller still works (the field is ignored), but its
+  pinglists are not restricted; the controller signals support with
+  `per_rnic_plane_id` in the registration response and the agent warns once
+  when it is missing. Upgrade the controller first.
+- No metric carries the plane (cardinality); it appears in the registration
+  and pinglist logs only.
+
+**Recommended `plane_id` values.** A plane must name the *largest* set of
+RNICs that can reach each other, not the leaf: on a rail-optimized fabric
+whose rail *r* spans every group through per-rail spines, that is the rail,
+so the value must not include the group (`<group>-<rail>` would equal the
+leaf and leave inter-ToR empty). Where device names identify rails (see the
+field observations below), use `<zone>-<device>` per device, e.g.
+
+```yaml
+device_plane_ids:
+  mlx5_0: isk-rail0   # or isk-mlx5_0
+  mlx5_1: isk-rail1
+```
+
+where `<zone>` separates independent fabrics that share one controller. On a
+fully connected fabric leave the plane empty.
 
 ### D. Alternatives that avoid per-RNIC ToRs
 
@@ -169,8 +228,10 @@ configuration is changed.
    hosts? Is there one subnet per rail or per leaf (B3/B4)? Does
    `scontrol show topology` describe groups (B4)?
 2. **Baseline (untagged) with RTT clustering.** Run agents untagged with
-   `log_level: debug` and `log_format: json` for long enough that several pinglist refreshes have
-   sampled most pairs, then run `scripts/topology/rtt_tor_check.py` without a
+   `log_level: debug` and `log_format: json` (and, on a rail-isolated fabric,
+   `device_plane_ids` so the untagged mesh samples only reachable same-rail
+   RNICs) for long enough that several pinglist refreshes have sampled most
+   pairs, then run `scripts/topology/rtt_tor_check.py` without a
    mapping. Expect clearly separated RTT modes and inferred groups whose
    members share one device/rail and one host group.
 3. **Candidate maps.** Build maps with every available strategy
@@ -181,8 +242,8 @@ configuration is changed.
    (controller first). Check that the registry rows carry per-RNIC ToRs, that
    each RNIC's ToR-mesh contains only same-leaf RNICs of other hosts, that
    `source_tor`/`target_tor` series match the leaves, that intra-ToR RTT stays
-   in the low mode, and whether cross-rail inter-ToR probes succeed (decides
-   policy C).
+   in the low mode, and whether cross-rail inter-ToR probes succeed (this
+   decided policy C: they did not, so planes are configured).
 5. **Decide.** Record which source (B2/B3/B4) matched, whether a plane
    restriction is needed, and whether A3 (central topology) is worth building.
 

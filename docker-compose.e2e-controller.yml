@@ -29,6 +29,30 @@ services:
       retries: 5
       start_period: 5s
 
+  # Late-starting rqlite for the startup-ordering test (issue #66): rqlited
+  # starts only after a delay, so controller_early comes up before it.
+  rqlite_late:
+    image: rqlite/rqlite:10.5.3
+    entrypoint: ["/bin/sh", "-c", "sleep 15 && exec docker-entrypoint.sh -http-addr 0.0.0.0:4001"]
+
+  # Controller started before its rqlite is up. It must retry the connection
+  # (database_connect_timeout_sec) instead of exiting, and become reachable
+  # once rqlite_late is ready. restart: "no" makes an early exit fail the
+  # test instead of being masked by a container restart.
+  controller_early:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    environment:
+      - RPINGMESH_DATABASE_URI=http://rqlite_late:4001
+      - RPINGMESH_DATABASE_CONNECT_TIMEOUT_SEC=90
+      - RPINGMESH_LISTEN_ADDR=:50051
+      - RPINGMESH_ANALYZER_ENABLED=false
+    depends_on:
+      rqlite_late:
+        condition: service_started
+    restart: "no"
+
   # E2E test runner — simulates agent behaviour via GRPCControllerClient.
   e2e_test:
     build:
@@ -36,11 +60,14 @@ services:
       dockerfile: Dockerfile.e2e-controller
     environment:
       - CONTROLLER_ADDR=controller:50051
+      - EARLY_CONTROLLER_ADDR=controller_early:50051
       - RQLITE_URL=http://rqlite:4001
       - CGO_ENABLED=0
     depends_on:
       controller:
         condition: service_healthy
+      controller_early:
+        condition: service_started
     command: >
       go test -v -count=1 -timeout 120s ./e2e/controller/...
     restart: "no"

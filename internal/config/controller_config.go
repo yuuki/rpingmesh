@@ -29,6 +29,10 @@ const (
 	// DefaultUnspecifiedMeshMaxTargets caps ToR-mesh pinglist size for
 	// agents that omit tor_id. 0 means unlimited.
 	DefaultUnspecifiedMeshMaxTargets = 32
+	// DefaultDatabaseConnectTimeoutSec is how long (seconds) the controller
+	// keeps retrying its rqlite connection and schema initialization at
+	// startup before exiting. 0 disables retries (a single attempt).
+	DefaultDatabaseConnectTimeoutSec = 120
 
 	// DefaultEcmpPathsAssumed is the assumed ECMP fabric width (m) used by
 	// Eq.(1) to size the per-target flow-label set. It cannot be measured
@@ -68,7 +72,10 @@ const (
 type ControllerConfig struct {
 	ListenAddr  string `mapstructure:"listen_addr"`
 	DatabaseURI string `mapstructure:"database_uri"`
-	LogLevel    string `mapstructure:"log_level"`
+	// DatabaseConnectTimeoutSec bounds the startup retry of the rqlite
+	// connection (exponential backoff, 1s to 30s). 0 makes a single attempt.
+	DatabaseConnectTimeoutSec int    `mapstructure:"database_connect_timeout_sec"`
+	LogLevel                  string `mapstructure:"log_level"`
 	// LogFormat selects the log output format: "console" (default,
 	// human-readable) or "json" (one zerolog JSON object per line on stderr).
 	LogFormat                 string `mapstructure:"log_format"`
@@ -118,6 +125,7 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 	// Set defaults
 	v.SetDefault("listen_addr", ":50051")
 	v.SetDefault("database_uri", "http://localhost:4001")
+	v.SetDefault("database_connect_timeout_sec", DefaultDatabaseConnectTimeoutSec)
 	v.SetDefault("log_level", "info")
 	v.SetDefault("log_format", logging.DefaultFormat)
 	v.SetDefault("active_threshold_sec", DefaultActiveThresholdSec)
@@ -170,6 +178,7 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 	config := &ControllerConfig{
 		ListenAddr:                v.GetString("listen_addr"),
 		DatabaseURI:               v.GetString("database_uri"),
+		DatabaseConnectTimeoutSec: v.GetInt("database_connect_timeout_sec"),
 		LogLevel:                  v.GetString("log_level"),
 		LogFormat:                 v.GetString("log_format"),
 		ActiveThresholdSec:        v.GetInt("active_threshold_sec"),
@@ -236,6 +245,9 @@ func (c *ControllerConfig) Validate() error {
 	u, err := url.Parse(c.DatabaseURI)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("database_uri %q is not a valid URL", c.DatabaseURI)
+	}
+	if c.DatabaseConnectTimeoutSec < 0 {
+		return fmt.Errorf("database_connect_timeout_sec must be >= 0, got: %d", c.DatabaseConnectTimeoutSec)
 	}
 
 	if _, err := zerolog.ParseLevel(c.LogLevel); err != nil {
@@ -311,6 +323,7 @@ func (c *ControllerConfig) Validate() error {
 func BindControllerFlags(flags *pflag.FlagSet) {
 	flags.String("listen-addr", ":50051", "Address to listen on for gRPC connections")
 	flags.String("database-uri", "http://localhost:4001", "rqlite database connection URI")
+	flags.Int("database-connect-timeout-sec", DefaultDatabaseConnectTimeoutSec, "Seconds to keep retrying the rqlite connection at startup (0 = single attempt)")
 	flags.String("log-level", "info", "Log level (debug, info, warn, error)")
 	flags.String("log-format", logging.DefaultFormat, "Log output format: console or json")
 	flags.Int("active-threshold-sec", DefaultActiveThresholdSec, "Window (seconds) within which an RNIC is considered active")

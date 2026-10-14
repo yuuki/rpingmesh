@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- The controller no longer exits when rqlite is not ready at startup (for
+  example `store is not open` while rqlite and the controller start
+  together). It retries the connection and schema setup, including the
+  `plane_id` migration, with exponential backoff (1s doubling to 30s) for
+  `database_connect_timeout_sec` (default 120; also
+  `--database-connect-timeout-sec` / `RPINGMESH_DATABASE_CONNECT_TIMEOUT_SEC`;
+  `0` restores the single attempt), logging each failed attempt as a warning.
+  SIGINT/SIGTERM aborts the wait.
+- Runtime errors from the agent and the controller no longer print the full
+  flag usage after the error; usage is still printed for flag-parsing errors.
+- `rpingmesh-controller.service` now also `Wants=rqlite.service`, and the
+  README documents making a co-located rqlite unit signal readiness via
+  `/readyz`.
+
 ## [0.5.2] - 2026-10-13
 
 ### Added

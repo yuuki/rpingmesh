@@ -18,10 +18,15 @@
 Description=R-Pingmesh Controller (agent registry + pinglist distribution)
 Documentation=https://github.com/yuuki/rpingmesh
 # The controller talks to rqlite over HTTP (database_uri); if rqlite is
-# managed as a systemd unit on the same host, order after it, but don't hard
-# -require it here since database_uri may point at a remote/clustered rqlite.
+# managed as a systemd unit on the same host, order after it and pull it in,
+# but don't hard-require it here since database_uri may point at a
+# remote/clustered rqlite (Wants= on a unit that doesn't exist is a no-op).
+# rqlited accepts connections before its store is open, so After= only helps
+# if rqlite's unit signals readiness (e.g. an ExecStartPost that polls
+# /readyz; see README "Co-locating rqlite"). Independently, the controller
+# retries the connection for database_connect_timeout_sec (default 120s).
 After=network-online.target rqlite.service
-Wants=network-online.target
+Wants=network-online.target rqlite.service
 
 [Service]
 Type=simple

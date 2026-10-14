@@ -287,6 +287,7 @@ mistaken for the port itself being down.
 |-------|---------|-------------|
 | `listen_addr` | `:50051` | gRPC listen address |
 | `database_uri` | `http://localhost:4001` | rqlite connection URI |
+| `database_connect_timeout_sec` | `120` | Seconds to keep retrying the rqlite connection and schema setup at startup (backoff 1s doubling to 30s); `0` = single attempt |
 | `active_threshold_sec` | `300` | Window (seconds) within which an RNIC entry is considered active for pinglist generation |
 | `stale_threshold_sec` | `900` | Window (seconds) after which an inactive RNIC entry is considered stale and removed |
 | `inter_tor_sample_size` | `5` | Distinct ToRs sampled per inter-ToR pinglist |
@@ -460,6 +461,24 @@ sudo usermod -a -G rdma rpingmesh
 # 4. Enable and start.
 sudo systemctl daemon-reload
 sudo systemctl enable --now rpingmesh-controller.service   # or rpingmesh-agent.service
+```
+
+### Co-locating rqlite
+
+When rqlite runs on the controller host as `rqlite.service`, the controller
+unit orders itself after it (`After=`/`Wants=rqlite.service`). `rqlited`
+accepts TCP connections before its store is open and a leader is elected, so
+with a `Type=simple` rqlite unit the controller can still start too early. It
+then logs `rqlite not ready; retrying` warnings and keeps retrying for
+`database_connect_timeout_sec` (default 120s) before exiting. To make the
+ordering exact, have rqlite's unit signal readiness only once `/readyz`
+returns 200, for example with a drop-in:
+
+```ini
+# /etc/systemd/system/rqlite.service.d/readyz.conf
+[Service]
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 120); do curl -fsS -o /dev/null http://127.0.0.1:4001/readyz && exit 0; sleep 1; done; exit 1'
+TimeoutStartSec=150
 ```
 
 ### Building `.deb`/`.rpm` packages with nfpm

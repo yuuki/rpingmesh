@@ -57,6 +57,11 @@ func newRootCommand() *cobra.Command {
 // run is the main entry point for the controller. It loads configuration,
 // starts the gRPC server, and blocks until a shutdown signal is received.
 func run(cmd *cobra.Command, args []string) error {
+	// Flags parsed successfully, so any error from here on is a runtime
+	// failure: print it without the flag usage, which cobra would otherwise
+	// append and make it look like CLI misuse.
+	cmd.SilenceUsage = true
+
 	// Anything logged before the configuration is resolved uses the default
 	// (console) format.
 	logging.SetupBootstrap()
@@ -79,6 +84,7 @@ func run(cmd *cobra.Command, args []string) error {
 	log.Info().
 		Str("listenAddr", cfg.ListenAddr).
 		Str("databaseURI", cfg.DatabaseURI).
+		Int("databaseConnectTimeoutSec", cfg.DatabaseConnectTimeoutSec).
 		Str("logLevel", cfg.LogLevel).
 		Str("logFormat", cfg.LogFormat).
 		Int("activeThresholdSec", cfg.ActiveThresholdSec).
@@ -91,12 +97,18 @@ func run(cmd *cobra.Command, args []string) error {
 		Str("tlsMode", cfg.TLSMode).
 		Msg("Starting rpingmesh-controller")
 
-	// Initialize RNIC registry backed by rqlite.
+	// Initialize RNIC registry backed by rqlite. The connection is retried
+	// until database_connect_timeout_sec elapses, so the controller tolerates
+	// an rqlite node that is still starting; a shutdown signal aborts the wait.
+	connectCtx, stopConnect := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	reg, err := registry.NewRnicRegistry(
+		connectCtx,
 		cfg.DatabaseURI,
 		cfg.ActiveThresholdSec,
 		cfg.StaleThresholdSec,
+		time.Duration(cfg.DatabaseConnectTimeoutSec)*time.Second,
 	)
+	stopConnect()
 	if err != nil {
 		return fmt.Errorf("failed to initialize registry: %w", err)
 	}

@@ -5,6 +5,10 @@ listen_addr: ":50051"
 
 # Database
 database_uri: "http://localhost:4001"  # rqlite address
+# Seconds to keep retrying the rqlite connection and schema setup at startup
+# (exponential backoff from 1s up to 30s), so the controller tolerates an
+# rqlite node that is still starting. 0 = single attempt.
+database_connect_timeout_sec: 120
 
 # ECMP path coverage (R-Pingmesh Eq.(1))
 # The controller sizes each target's flow-label set so that its ECMP paths are

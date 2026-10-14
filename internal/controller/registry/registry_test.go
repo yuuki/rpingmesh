@@ -44,9 +44,12 @@ type fakeConn struct {
 	// containing the key.
 	writeOneCalls []string
 	writeOneErrs  map[string]error
+
+	// closed counts Close calls.
+	closed int
 }
 
-func (f *fakeConn) Close() {}
+func (f *fakeConn) Close() { f.closed++ }
 
 func (f *fakeConn) WriteOneContext(_ context.Context, sqlStatement string) (gorqlite.WriteResult, error) {
 	f.writeOneCalls = append(f.writeOneCalls, sqlStatement)
@@ -658,7 +661,7 @@ func TestInitializeSchema_AddsPlaneColumnToLegacyTable(t *testing.T) {
 	fake := &fakeConn{}
 	reg := newTestRegistry(fake)
 
-	if err := reg.initializeSchema(); err != nil {
+	if err := reg.initializeSchema(context.Background()); err != nil {
 		t.Fatalf("initializeSchema: %v", err)
 	}
 	if !strings.Contains(fake.writeOneCalls[0], "plane_id TEXT NOT NULL DEFAULT ''") {
@@ -686,7 +689,7 @@ func TestInitializeSchema_ToleratesConcurrentPlaneMigration(t *testing.T) {
 	fake := &fakeConn{writeOneErrs: map[string]error{
 		"ALTER TABLE": errors.New("duplicate column name: plane_id"),
 	}}
-	if err := newTestRegistry(fake).initializeSchema(); err != nil {
+	if err := newTestRegistry(fake).initializeSchema(context.Background()); err != nil {
 		t.Fatalf("initializeSchema: %v, want the duplicate column tolerated", err)
 	}
 }
@@ -697,13 +700,124 @@ func TestInitializeSchema_ToleratesConcurrentPlaneMigration(t *testing.T) {
 func TestInitializeSchema_PlaneMigrationErrorsPropagate(t *testing.T) {
 	alterErr := errors.New("database is locked")
 	if err := newTestRegistry(&fakeConn{writeOneErrs: map[string]error{"ALTER TABLE": alterErr}}).
-		initializeSchema(); !errors.Is(err, alterErr) {
+		initializeSchema(context.Background()); !errors.Is(err, alterErr) {
 		t.Errorf("ALTER failure: got %v, want wrapping %v", err, alterErr)
 	}
 
 	queryErr := errors.New("query failed")
 	if err := newTestRegistry(&fakeConn{queryOneParameterizedErr: queryErr}).
-		initializeSchema(); !errors.Is(err, queryErr) {
+		initializeSchema(context.Background()); !errors.Is(err, queryErr) {
 		t.Errorf("PRAGMA failure: got %v, want wrapping %v", err, queryErr)
+	}
+}
+
+// recordingSleep returns a retryBackoff sleep that records each requested
+// delay and returns immediately, unless ctx is already done.
+func recordingSleep(delays *[]time.Duration) func(context.Context, time.Duration) error {
+	return func(ctx context.Context, d time.Duration) error {
+		*delays = append(*delays, d)
+		return ctx.Err()
+	}
+}
+
+// TestConnectWithRetry_RetriesUntilReady verifies that transient open and
+// schema failures (rqlite still starting) are retried with doubling, capped
+// backoff, and that a connection whose schema init failed is closed.
+func TestConnectWithRetry_RetriesUntilReady(t *testing.T) {
+	notOpen := errors.New("store is not open")
+	schemaFailing := &fakeConn{writeOneErrs: map[string]error{"CREATE TABLE": errors.New("not leader")}}
+	ready := &fakeConn{}
+
+	var opens int
+	open := func() (dbConn, error) {
+		opens++
+		switch {
+		case opens <= 3:
+			return nil, notOpen
+		case opens == 4:
+			return schemaFailing, nil
+		default:
+			return ready, nil
+		}
+	}
+	var delays []time.Duration
+	conn, err := connectWithRetry(context.Background(), open, time.Minute, retryBackoff{
+		initial: time.Second, max: 3 * time.Second, sleep: recordingSleep(&delays),
+	})
+	if err != nil {
+		t.Fatalf("connectWithRetry: %v", err)
+	}
+	if conn != ready {
+		t.Fatalf("got conn %v, want the ready connection", conn)
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 3 * time.Second, 3 * time.Second}
+	if len(delays) != len(want) {
+		t.Fatalf("delays = %v, want %v", delays, want)
+	}
+	for i := range want {
+		if delays[i] != want[i] {
+			t.Errorf("delays[%d] = %v, want %v", i, delays[i], want[i])
+		}
+	}
+	if schemaFailing.closed != 1 {
+		t.Errorf("schema-failing conn closed %d times, want 1", schemaFailing.closed)
+	}
+	if ready.closed != 0 {
+		t.Errorf("ready conn closed %d times, want 0", ready.closed)
+	}
+}
+
+// TestConnectWithRetry_GivesUpAtDeadline verifies that the last error is
+// returned once the overall connect timeout elapses.
+func TestConnectWithRetry_GivesUpAtDeadline(t *testing.T) {
+	notOpen := errors.New("store is not open")
+	open := func() (dbConn, error) { return nil, notOpen }
+	// A real (short) sleep so the deadline actually passes.
+	_, err := connectWithRetry(context.Background(), open, 50*time.Millisecond, retryBackoff{
+		initial: 10 * time.Millisecond, max: 20 * time.Millisecond,
+	})
+	if !errors.Is(err, notOpen) {
+		t.Fatalf("got %v, want wrapping %v", err, notOpen)
+	}
+	if !strings.Contains(err.Error(), "gave up after") {
+		t.Errorf("error %q lacks the attempt summary", err)
+	}
+}
+
+// TestConnectWithRetry_StopsOnCancel verifies that cancelling ctx (e.g. a
+// shutdown signal while waiting for rqlite) ends the retry loop.
+func TestConnectWithRetry_StopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	notOpen := errors.New("store is not open")
+	var opens int
+	open := func() (dbConn, error) {
+		opens++
+		cancel()
+		return nil, notOpen
+	}
+	if _, err := connectWithRetry(ctx, open, time.Hour, retryBackoff{
+		initial: time.Hour, max: time.Hour,
+	}); !errors.Is(err, notOpen) {
+		t.Fatalf("got %v, want wrapping %v", err, notOpen)
+	}
+	if opens != 1 {
+		t.Errorf("opens = %d, want 1", opens)
+	}
+}
+
+// TestConnectWithRetry_ZeroTimeoutSingleAttempt verifies that a non-positive
+// timeout disables retries.
+func TestConnectWithRetry_ZeroTimeoutSingleAttempt(t *testing.T) {
+	notOpen := errors.New("store is not open")
+	var opens int
+	open := func() (dbConn, error) { opens++; return nil, notOpen }
+	var delays []time.Duration
+	if _, err := connectWithRetry(context.Background(), open, 0, retryBackoff{
+		initial: time.Second, max: time.Second, sleep: recordingSleep(&delays),
+	}); !errors.Is(err, notOpen) {
+		t.Fatalf("got %v, want wrapping %v", err, notOpen)
+	}
+	if opens != 1 || len(delays) != 0 {
+		t.Errorf("opens = %d, delays = %v; want one attempt and no wait", opens, delays)
 	}
 }

@@ -241,6 +241,26 @@ func TestControllerConfig_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "zero database connect timeout disables retries",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				DatabaseConnectTimeoutSec: 0,
+				ActiveThresholdSec:        300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+			},
+			wantErr: false,
+		},
+		{
+			name: "negative database connect timeout",
+			cfg: ControllerConfig{
+				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+				DatabaseConnectTimeoutSec: -1,
+				ActiveThresholdSec:        300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+			},
+			wantErr: true,
+		},
+		{
 			name: "non-positive active threshold",
 			cfg: ControllerConfig{
 				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",

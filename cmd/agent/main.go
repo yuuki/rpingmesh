@@ -55,6 +55,11 @@ func newRootCommand() *cobra.Command {
 // logging, creates the agent, sets up signal handling, and runs the agent
 // lifecycle until a termination signal is received.
 func run(cmd *cobra.Command, args []string) error {
+	// Flags parsed successfully, so any error from here on is a runtime
+	// failure: print it without the flag usage, which cobra would otherwise
+	// append and make it look like CLI misuse.
+	cmd.SilenceUsage = true
+
 	// Anything logged before the configuration is resolved uses the default
 	// (console) format.
 	logging.SetupBootstrap()

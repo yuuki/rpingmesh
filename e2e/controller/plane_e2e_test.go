@@ -163,14 +163,14 @@ func TestRegistryPlaneMigration(t *testing.T) {
 
 	// Opening twice also covers the already-migrated path.
 	for i := 0; i < 2; i++ {
-		reg, err := registry.NewRnicRegistry(rqliteURL(), 0, 0)
+		reg, err := registry.NewRnicRegistry(context.Background(), rqliteURL(), 0, 0, 0)
 		if err != nil {
 			t.Fatalf("NewRnicRegistry (open %d): %v", i+1, err)
 		}
 		reg.Close()
 	}
 
-	reg, err := registry.NewRnicRegistry(rqliteURL(), 0, 0)
+	reg, err := registry.NewRnicRegistry(context.Background(), rqliteURL(), 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewRnicRegistry: %v", err)
 	}

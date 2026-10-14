@@ -66,6 +66,15 @@ func (r *RnicRegistry) cutoff(windowSec int) int64 {
 	return r.now().Unix() - int64(windowSec)
 }
 
+// Startup connection retry backoff bounds. rqlited accepts TCP connections
+// before its store is open and a leader is elected, so a controller started
+// alongside rqlite (at boot, or when both units restart) can see transient
+// errors such as "store is not open" on its first attempts.
+const (
+	connectInitialBackoff = 1 * time.Second
+	connectMaxBackoff     = 30 * time.Second
+)
+
 // NewRnicRegistry creates a new RNIC registry connected to the given rqlite
 // URI. It initializes the database schema (table + indexes) before
 // returning. activeThresholdSec and staleThresholdSec configure the thresholds
@@ -74,7 +83,12 @@ func (r *RnicRegistry) cutoff(windowSec int) int64 {
 // performed by the pinglist generator, not here, because it must run after the
 // generator's same-host / same-address-family filtering so that a ToR is only
 // dropped when it has no valid target for the requester (see issues #39, #41).
-func NewRnicRegistry(dbURI string, activeThresholdSec, staleThresholdSec int) (*RnicRegistry, error) {
+//
+// Opening the connection and initializing the schema are retried with
+// exponential backoff (1s doubling up to 30s) until they succeed, ctx is
+// cancelled, or connectTimeout elapses, so the controller tolerates an rqlite
+// node that is still starting. connectTimeout <= 0 makes a single attempt.
+func NewRnicRegistry(ctx context.Context, dbURI string, activeThresholdSec, staleThresholdSec int, connectTimeout time.Duration) (*RnicRegistry, error) {
 	log.Info().Str("dbURI", dbURI).Msg("Initializing RNIC registry with rqlite")
 
 	if activeThresholdSec <= 0 {
@@ -84,24 +98,100 @@ func NewRnicRegistry(dbURI string, activeThresholdSec, staleThresholdSec int) (*
 		staleThresholdSec = DefaultStaleThresholdSec
 	}
 
-	conn, err := gorqlite.Open(dbURI)
+	open := func() (dbConn, error) {
+		conn, err := gorqlite.Open(dbURI)
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
+	}
+	conn, err := connectWithRetry(ctx, open, connectTimeout, retryBackoff{
+		initial: connectInitialBackoff,
+		max:     connectMaxBackoff,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to rqlite: %w", err)
+		return nil, err
 	}
 
-	registry := &RnicRegistry{
+	return &RnicRegistry{
 		conn:               conn,
 		activeThresholdSec: activeThresholdSec,
 		staleThresholdSec:  staleThresholdSec,
 		now:                time.Now,
+	}, nil
+}
+
+// retryBackoff bounds the exponential backoff between connection attempts.
+// sleep waits for d or until ctx is done; nil uses a timer (tests inject a
+// fake to run without real delays).
+type retryBackoff struct {
+	initial time.Duration
+	max     time.Duration
+	sleep   func(ctx context.Context, d time.Duration) error
+}
+
+func (b retryBackoff) wait(ctx context.Context, d time.Duration) error {
+	if b.sleep != nil {
+		return b.sleep(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// connectWithRetry opens a connection with open and initializes the schema on
+// it, retrying both steps together until they succeed. A connection whose
+// schema initialization fails is closed before the next attempt. It gives up
+// when timeout (> 0) elapses or ctx is cancelled, returning the last attempt's
+// error; timeout <= 0 makes exactly one attempt.
+func connectWithRetry(ctx context.Context, open func() (dbConn, error), timeout time.Duration, backoff retryBackoff) (dbConn, error) {
+	attemptOnce := func(ctx context.Context) (dbConn, error) {
+		conn, err := open()
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to rqlite: %w", err)
+		}
+		r := &RnicRegistry{conn: conn}
+		if err := r.initializeSchema(ctx); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to initialize schema: %w", err)
+		}
+		return conn, nil
 	}
 
-	if err := registry.initializeSchema(); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to initialize schema: %w", err)
+	if timeout <= 0 {
+		return attemptOnce(ctx)
 	}
 
-	return registry, nil
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	delay := backoff.initial
+	for attempt := 1; ; attempt++ {
+		conn, err := attemptOnce(ctx)
+		if err == nil {
+			if attempt > 1 {
+				log.Info().Int("attempt", attempt).Msg("Connected to rqlite")
+			}
+			return conn, nil
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("gave up after %d attempt(s) within %s: %w", attempt, timeout, err)
+		}
+		log.Warn().
+			Err(err).
+			Int("attempt", attempt).
+			Dur("retryIn", delay).
+			Msg("rqlite not ready; retrying")
+		if waitErr := backoff.wait(ctx, delay); waitErr != nil {
+			return nil, fmt.Errorf("gave up after %d attempt(s) within %s: %w", attempt, timeout, err)
+		}
+		delay = min(delay*2, backoff.max)
+	}
 }
 
 // Close closes the underlying rqlite connection.
@@ -114,12 +204,9 @@ func (r *RnicRegistry) Close() error {
 
 // initializeSchema creates the rnics table and associated indexes if they
 // do not already exist. Each index is created in a separate write call
-// because rqlite's WriteOne executes a single statement at a time. This
-// runs once at startup, before any request-scoped context exists, so it
-// uses context.Background().
-func (r *RnicRegistry) initializeSchema() error {
-	ctx := context.Background()
-
+// because rqlite's WriteOne executes a single statement at a time. ctx
+// bounds the startup connection attempt (see connectWithRetry).
+func (r *RnicRegistry) initializeSchema(ctx context.Context) error {
 	createTableSQL := `
 	CREATE TABLE IF NOT EXISTS rnics (
 		rnic_gid TEXT PRIMARY KEY,

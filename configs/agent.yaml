@@ -69,6 +69,15 @@ analysis_window_sec: 30          # per-path aggregation window length
 
 # RDMA settings
 gid_index: 0                     # GID table index to use
+# Queue selection for probes and ACKs, applied to every Address Handle. Set
+# them to match the queue (PFC priority) of the workload you want to observe,
+# and use identical values on every agent (ACKs use the responder's values).
+# traffic_class is the GRH/IP traffic class octet: DSCP << 2 plus the 2 ECN
+# bits (e.g. DSCP 26 -> 104, or 106 with ECT(0)); it selects the queue only
+# with a RoCE v2 GID. service_level (0-7) matters only with trust pcp and
+# VLAN-tagged RoCE. See README "Choosing traffic_class and service_level".
+service_level: 0
+traffic_class: 0
 # Completion wait mode: "event" sleeps on a completion channel and an eventfd
 # (no CPU while idle), "busy" polls the CQ every ~50us and the event ring
 # every 100us (roughly 3% of a CPU per RDMA device), "auto" uses event with

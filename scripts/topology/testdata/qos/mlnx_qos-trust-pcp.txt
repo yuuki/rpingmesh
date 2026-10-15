@@ -1,0 +1,18 @@
+DCBX mode: OS controlled
+Priority trust state: pcp
+Receive buffer size (bytes): 65536,131072,0,0,0,0,0,0,max_buffer_size=262144
+Cable len: 7
+PFC configuration:
+	priority    0   1   2   3   4   5   6   7
+	enabled     0   0   0   1   0   0   0   0   
+	buffer      0   0   0   1   0   0   0   0   
+tc: 0 ratelimit: unlimited, tsa: ets, bw: 50%
+	 priority:  0
+	 priority:  1
+	 priority:  2
+	 priority:  4
+	 priority:  5
+	 priority:  6
+	 priority:  7
+tc: 3 ratelimit: unlimited, tsa: ets, bw: 50%
+	 priority:  3

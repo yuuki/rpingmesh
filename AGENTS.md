@@ -21,7 +21,7 @@
 - `e2e/` contains controller and RDMA end-to-end tests.
 - `packaging/` contains nfpm definitions and systemd units.
 - `dashboards/` and `deploy/` contain the observability assets and local stack.
-- `scripts/` contains e2e, observability, release, and multi-rail topology helper scripts.
+- `scripts/` contains e2e, observability, release, and multi-rail topology and QoS facts helper scripts.
 - `docs/design/` contains design documentation.
 - `legacy/` archives the previous implementation as a separate Go module.
 

@@ -104,7 +104,7 @@ the configured thresholds, and reports them in logs and OTLP metrics.
 | `configs/` | Default agent and controller configuration |
 | `packaging/` | systemd units and nfpm package definitions |
 | `dashboards/`, `deploy/observability/` | Grafana dashboards, alert rules, local metrics stack |
-| `scripts/topology/` | Tools for building and checking multi-rail ToR maps |
+| `scripts/topology/` | Read-only tools for multi-rail ToR maps and QoS (`traffic_class`) facts |
 | `e2e/` | End-to-end tests (Docker, soft-RoCE) |
 | `docs/design/` | Design documents |
 | `legacy/` | Archived previous implementation (a separate Go module) |
@@ -436,8 +436,20 @@ right queue if the override is later removed.
   only a hint: they move only under congestion, so an idle counter does not
   prove that a priority is unused.
 
-A read-only helper that collects these facts is tracked in
-[#70](https://github.com/yuuki/rpingmesh/issues/70).
+`scripts/topology/collect_qos_facts.py` collects these facts for each RDMA
+port, together with the override from step 2 and the RoCE v2 GID indices, and
+prints one JSON object per host. It needs no privileges and changes nothing.
+Run it on every host while jobs run, then summarize the results in one place:
+
+```sh
+python3 scripts/topology/collect_qos_facts.py --interval 5 > qos-$(hostname -s).json
+python3 scripts/topology/summarize_qos_facts.py qos-*.json   # add --json for tooling
+```
+
+The summary lists the PFC-enabled priorities and the DSCPs that map to them,
+candidate `traffic_class` values, and the busiest priority. It also lists
+every port whose trust mode, PFC priorities, DSCP map, or override differs
+from the majority. It only suggests values and changes no configuration.
 
 **4. Map the queue to configuration values.**
 
@@ -467,7 +479,7 @@ capacity.
 such as the override above, that misses some RNICs (for example after devices
 are renamed), traffic on those rails silently falls back to the default
 class. Compare the override, and the probes' `traffic_class`, across hosts and
-devices.
+devices; `summarize_qos_facts.py` reports such ports as override outliers.
 
 ### Controller
 

@@ -1,0 +1,19 @@
+NIC statistics:
+     rx_packets: 1300000
+     tx_packets: 1300000
+     rx_bytes: 1200000000
+     tx_bytes: 1200000000
+     rx_prio0_bytes: 5100000
+     rx_prio0_packets: 10100
+     rx_prio0_discards: 0
+     tx_prio0_bytes: 4050000
+     tx_prio0_packets: 9050
+     rx_prio3_bytes: 700000000
+     rx_prio3_packets: 400000
+     tx_prio3_bytes: 750000000
+     tx_prio3_packets: 410000
+     rx_prio3_pause: 22
+     rx_prio3_pause_duration: 330
+     tx_prio3_pause: 5
+     tx_prio3_pause_duration: 70
+     rx_prio3_pause_transition: 11

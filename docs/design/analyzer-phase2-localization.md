@@ -1,272 +1,249 @@
-# Analyzer Phase 2 — Topology-Aware Switch/Link Fault Localization
+# Analyzer Phase 2: Topology-Aware Switch/Link Fault Localization
 
-Status: Design only (P3-H). No implementation is proposed here; this document
-specifies what a later implementation round will build on top of the Phase 1
-analyzer merged in PR #36.
+Status: design only, not implemented (tracking ID P3-H). It builds on the
+Phase 1 analyzer merged in PR #36.
 
 ## Goals
 
-- Turn the per-path SLA violations produced by Phase 1 into **actionable fault
-  localization**: identify the specific ToR switch (and, as a topology-gated
-  extension, the specific fabric link/spine) most likely responsible for a
-  correlated set of degraded paths.
-- Do this **across agents**: a single agent only sees its own probes and cannot
-  tell "my uplink is bad" from "the target ToR is bad". Localization is
-  inherently a cross-agent intersection problem, exactly as in the SIGCOMM 2024
-  R-Pingmesh paper.
-- Reuse the Phase 1 substrate unchanged where possible: the in-memory window
-  ring in `internal/controller/analyzer/analyzer.go`, the ToR-granularity OTLP
-  convention, and the `PathSummary` proto.
-- Keep all metric output at **ToR granularity** (`source_tor` / `target_tor` /
-  `suspect_tor`), consistent with the project-wide cardinality rule. GID detail
-  stays in findings logs only.
+- Turn the per-path SLA violations that Phase 1 detects into **fault
+  localization**: name the ToR switch (and, once a fabric model exists, the
+  link or spine) most likely responsible for a correlated set of degraded
+  paths.
+- Localize **across agents**. One agent sees only its own probes and cannot
+  tell "my uplink is bad" from "the target ToR is bad". As in the SIGCOMM 2024
+  R-Pingmesh paper, localization is a cross-agent intersection problem.
+- Reuse the Phase 1 substrate: the in-memory window ring in
+  `internal/controller/analyzer/analyzer.go`, the ToR-level OTLP convention,
+  and the `PathSummary` proto.
+- Keep metric output at **ToR granularity**. GID detail stays in findings logs.
 
 ## Non-Goals
 
-- No new probing mechanism, no change to the 6-timestamp protocol or the
+- No new probing mechanism. No change to the 6-timestamp protocol or to the
   agent-side `PathAggregator` windowing.
-- No claim to localize below the granularity the available topology supports.
-  With today's registry (a flat GID→ToR map) the achievable granularity is the
-  **ToR switch and its adjacent link tier**. Per-spine / per-link localization
-  is specified but explicitly gated on a topology model that does not exist yet
-  (see "Topology extension").
-- No real-time alerting/paging pipeline. Findings are emitted as structured logs
-  and OTLP metrics; downstream alerting is out of scope.
-- No historical/forensic query API. rqlite persistence is specified as an
-  optional, additive capability, not a query surface.
+- No localization finer than the topology supports. Today's registry is a flat
+  RNIC→ToR map, so the achievable granularity is the **ToR switch and its
+  adjacent links**. Per-link localization is specified but gated on a fabric
+  model that does not exist yet (see
+  [Advanced localization](#advanced-localization-set-cover-topology-gated)).
+- No alerting or paging pipeline. Findings are structured logs and OTLP
+  metrics.
+- No historical query API. rqlite persistence is optional and additive.
 
 ## Current State (verified against code)
 
-- **Phase 1 analyzer** (`internal/controller/analyzer/analyzer.go`): ingests
-  `ProbeAnalysisReport` batches via `Analyzer.Ingest`, retains the most recent
-  `WindowRetention` (default 20, `DefaultAnalyzerWindowRetention`) windows in an
-  in-memory ring of `windowBucket{windowStartUnixNs, summaries}` where
-  `summaries` is `[]*controller_agent.PathSummary`, and flags per-summary SLA
-  violations in `evaluate` (loss ratio and p99 RTT). **Important gap for Phase
-  2**: `agent_id` lives only on the `ProbeAnalysisReport` envelope and is passed
-  to `evaluate` transiently — it is **not** a field of `PathSummary` and is
-  **not** stored in the ring. So the retained ring, as-is, cannot answer "how
-  many distinct agents reported this edge" (the cross-agent confidence signal).
-  Closing this needs a controller-internal retention change (below), not a proto
-  change. It already keeps every summary of the retained windows around — the
-  comment on `windowBucket` explicitly calls this "the substrate a future Phase 2
-  cross-agent localization pass would read." Phase 2 is that pass.
-- **Retention ring** is keyed and sorted by `windowStartUnixNs`. Because agent
-  windows are wall-clock aligned (`PathAggregator.windowStart` floors to
-  multiples of `windowNs`), summaries from different agents for the same real
-  window land in the **same bucket** — this is what makes cross-agent
-  intersection possible without extra bookkeeping.
-- **`PathSummary`** (`proto/controller_agent/controller_agent.proto`) carries
-  `source_gid`, `source_tor_id`, `target_gid`, `target_tor_id`, `target_qpn`,
-  window bounds, `probe_total/success/failed`, `invalid_rtt_count`, and RTT
-  `min/max/p50/p99` in ns. RTT percentiles are agent-side estimates from a fixed
-  bucket ladder (`rttBucketBoundariesNs` in `internal/probe/aggregator.go`); the
-  raw bucket histogram is **not** currently on the wire.
-- **Topology source of truth** is the `rnics` table
-  (`internal/controller/registry/registry.go`): columns `rnic_gid, qpn,
+- **Phase 1 analyzer** (`internal/controller/analyzer/analyzer.go`).
+  `Analyzer.Ingest` receives `ProbeAnalysisReport` batches, normalizes
+  `source_tor_id`/`target_tor_id` with `probe.TorMetricLabel` (an empty ToR
+  becomes `unspecified`), retains each summary in a ring of `windowBucket`s,
+  and flags per-summary loss-ratio and p99-RTT violations in `evaluate`. The
+  ring keeps the most recent `WindowRetention` windows
+  (`analyzer_window_retention`, default 20) and at most
+  `MaxSummariesPerWindow` summaries per window (default
+  `DefaultMaxSummariesPerWindow` = 8192; not exposed as a controller config
+  key). Excess summaries are dropped with a Debug log.
+- **The ring does not record which agent sent a summary.** `agent_id` exists
+  only on the `ProbeAnalysisReport` envelope, and `windowBucket.summaries` is a
+  bare `[]*controller_agent.PathSummary`. The ring therefore cannot count
+  distinct reporting agents, which is the cross-agent confidence signal.
+  Closing this gap is a controller-internal change (see
+  [Required retention change](#required-retention-change)).
+- **Windows are shared across agents.** `PathAggregator.windowStart` floors
+  the agent's wall-clock receive time to a multiple of the window length, and
+  the ring is keyed and sorted by `window_start_unix_ns`. Summaries from
+  different agents for the same real window land in the same bucket.
+- **Reporting lag.** `AnalysisReporter` collects completed windows on a ticker
+  of period `analysis_window_sec` (default 30 s) that is not aligned to window
+  boundaries. A window therefore reaches the controller up to one window
+  length plus RPC latency after it ends.
+- **`PathSummary`** (`proto/controller_agent/controller_agent.proto`, fields
+  1–15) carries `source_gid`, `source_tor_id`, `target_gid`, `target_tor_id`,
+  `target_qpn`, window bounds, `probe_total`/`probe_success`/`probe_failed`,
+  `invalid_rtt_count`, and RTT `min`/`max`/`p50`/`p99` in ns. The source ToR
+  is the per-RNIC ToR stamped by the prober. RTT percentiles are agent-side
+  estimates from the fixed ladder `rttBucketBoundariesNs` in
+  `internal/probe/aggregator.go`; the bucket counts are not on the wire.
+- **Topology.** The registry `rnics` table
+  (`internal/controller/registry/registry.go`) has columns `rnic_gid, qpn,
   agent_id, agent_ip, rnic_ip, tor_id, hostname, device_name,
-  last_updated_epoch`. The controller therefore knows **GID→ToR** and
-  **ToR→{GIDs}** for active RNICs, and nothing about the aggregation/spine tier:
-  there is no switch table, no link table, no path→link mapping.
-- **OTLP**: `analyzer/metrics.go` exposes `rpingmesh.analyzer.path_summaries_total`
-  and `rpingmesh.analyzer.sla_violations_total{source_tor,target_tor,kind}`. The
-  P1 design reserved `rpingmesh.analyzer.suspect_tor` for Phase 2.
-- **Controller metrics wiring**: `cmd/controller/main.go setupAnalyzer` builds a
-  `service.name=rpingmesh-analyzer` meter provider and calls `analyzer.New(...)`
-  + `svc.SetAnalyzer(az)`. Phase 2 metrics register on the same meter.
+  last_updated_epoch, plane_id`. The controller knows RNIC→ToR, ToR→RNICs, and
+  each RNIC's plane (rail); inter-ToR pinglists stay within one plane. It knows
+  nothing about aggregation or spine switches: there is no switch table, link
+  table, or path→link mapping.
+- **OTLP.** `analyzer/metrics.go` registers
+  `rpingmesh.analyzer.path_summaries_total` and
+  `rpingmesh.analyzer.sla_violations_total{source_tor,target_tor,kind}`.
+  `setupAnalyzer` in `cmd/controller/main.go` creates the meter
+  `rpingmesh.analyzer` on a provider tagged `service.name=rpingmesh-analyzer`
+  and wires the analyzer with `svc.SetAnalyzer`. Phase 2 metrics register on
+  the same meter.
 
-The decisive consequence of the current state: **localization granularity is
-bounded by topology knowledge, and today that knowledge is ToR-flat.** The
-design below is split into a minimal pass that ships on the existing data and an
-advanced pass that is correct only once a fabric model is added.
+Localization granularity is bounded by topology knowledge, and that knowledge
+is ToR-flat today. The design therefore has a minimal pass that runs on
+existing data and an advanced pass that requires a fabric model.
 
 ## Design
 
 ### Overview
 
-Phase 2 adds a **localizer** that runs once a window is **closed** (see the
-grace-period policy below), reads the retained window buckets, aggregates
-per-path summaries up to **ToR-pair** granularity, applies a fault-localization
-pass, and emits ranked suspect ToRs (and, when topology permits, suspect links)
-as findings + OTLP gauges. It is a new file
-`internal/controller/analyzer/localizer.go` in the existing package.
-
-**Localize on closed windows, not per report (the arrival-race fix).** A window's
-summaries arrive **asynchronously from many agents** — each agent reports on its
-own schedule after its window elapses, and network/retry jitter spreads those
-reports out. If the localizer ran as a naive `Analyzer.Ingest` post-hook (fire
-on every report), the first report for window W would trigger localization while
-almost no agents had reported yet: `agentsReporting`, breadth fractions, and
-`EdgeStat` totals would all be **under-counted**, producing spurious suspects and
-corrupting the finding hysteresis state machine. The localizer must therefore
-operate on a window only once it is considered **complete enough**, governed by a
-watermark:
-
-- A window with aligned start `Ws` (duration `D = windowNs`) has nominal end
-  `We = Ws + D`. It is declared **closed** at `We + grace`, where
-  `grace = expectedReportLag + margin`. `expectedReportLag` is bounded by the
-  agent report cadence — agents report at each window boundary
-  (`AnalysisReporter` ticks every `windowDur`), so a report for W is expected
-  within roughly one window plus RPC latency; a safe default is
-  `grace = windowNs + fixedMargin` (e.g. one extra window + a few seconds).
-- The `Analyzer` advances a monotonic **watermark** = `maxObservedWindowStart`
-  seen across all ingested reports (windows are wall-clock aligned and shared, so
-  this is well-defined). A window `Ws` is eligible for localization once
-  `now >= We + grace` **or** the watermark has advanced by ≥2 windows past `Ws`
-  (whichever comes first) — the latter lets a busy cluster close windows promptly
-  without waiting on wall-clock when later windows are already flowing in.
-- A **sweeper** (a ticker on the analyzer, period ≈ `windowNs`) picks the oldest
-  not-yet-localized closed window from the retained ring, runs `Localize(W)`
-  exactly once, and marks it localized. `Ingest` stays a pure ingest/retain/SLA
-  path; it no longer triggers localization directly. This keeps ingest cheap and
-  decouples localization cadence from report arrival.
-- **Late arrivals** (a report for an already-localized window) are **not**
-  re-localized — the window's finding contribution is fixed once evaluated, so a
-  straggler cannot flip a decision after the fact. Such a summary is still
-  retained/counted for SLA logging and metrics, but it is dropped from
-  localization with a counter (`rpingmesh.analyzer.late_summaries_total`) so
-  chronic lateness is observable and `grace` can be tuned. (Re-opening a window
-  for late data is rejected as it would make hysteresis non-deterministic and
-  reorder-sensitive.)
-
-Retention interaction: `WindowRetention` (default 20) must comfortably exceed the
-number of windows spanned by `grace` so a window is never evicted from the ring
-before it is localized; the sweeper asserts this and logs if retention is too
-small for the configured grace.
+A new **localizer** (`internal/controller/analyzer/localizer.go`) runs once
+per **closed** window. It folds the window's summaries into ToR-pair edges,
+scores suspect ToRs, and emits ranked findings as logs and OTLP gauges.
 
 ```
 per-agent PathSummary (window W)
-        │  (already ingested + retained by Phase 1)
+        │  (ingested and retained by Phase 1)
         ▼
-window bucket W  ──► Localizer.Localize(W):
-        1. join summaries with registry topology (GID→ToR)   [already known]
-        2. fold to ToR-pair edges: loss/degraded per (S_tor,T_tor)
-        3. classify + score suspects (minimal heuristic)      [ships now]
-        4. [gated] map edges→links, run set-cover             [needs topology]
-        5. rank, apply finding hysteresis, emit logs+OTLP
+window bucket W ──► Localize(W):
+        1. fold summaries into ToR-pair edges (S_tor, T_tor)
+        2. classify and score suspects (minimal heuristic)   [ships first]
+        3. [gated] map edges to links, run set cover         [needs topology]
+        4. rank, apply finding hysteresis, emit logs + OTLP
 ```
 
-### Step 1–2: ToR-pair edge model
+### Window close and late arrivals
 
-Define an **edge** as an ordered ToR pair `(S, T)`. For a completed window,
-merge every summary whose `(source_tor_id, target_tor_id) = (S, T)` — possibly
-from many agents and many GIDs — into an `EdgeStat`:
+Agents report a window asynchronously. A localizer that ran on every
+`Ingest` call would see the first report for window W while most agents had
+not reported yet. Edge totals, breadth fractions, and `agentsReporting` would
+be under-counted, which produces spurious suspects and corrupts the
+hysteresis state. The localizer therefore runs only on closed windows:
+
+- A window with start `Ws` and duration `D` (from the summaries'
+  `window_duration_ms`) ends at `We = Ws + D`. It closes at `We + grace`.
+  Because of the reporting lag above, the default grace is one window plus a
+  fixed margin (40 s for the default 30 s window).
+- The analyzer tracks a monotonic **watermark**: the largest window start seen
+  in any report. A window also closes once the watermark is at least two
+  windows past `Ws`, so a busy cluster need not wait for the wall clock.
+- A **sweeper** goroutine (period about one window) runs `Localize(W)` exactly
+  once for the oldest closed, not-yet-localized window. `Ingest` stays a pure
+  ingest/retain/SLA path. The sweeper needs Start/Stop wiring in
+  `cmd/controller/main.go`; the Phase 1 analyzer has no goroutine today.
+- **Late summaries** for an already-localized window are retained and still
+  checked against the SLA, but they do not re-run localization. They increment
+  `rpingmesh.analyzer.late_summaries_total` so `grace` can be tuned.
+  Re-opening a window would make hysteresis order-dependent.
+
+`WindowRetention` must exceed the number of windows that `grace` spans, or a
+window can be evicted before it is localized. The sweeper logs a warning when
+retention is too small for the configured grace.
+
+### ToR-pair edge model
+
+An **edge** is an ordered ToR pair `(S, T)`. For a closed window, every
+summary with `(source_tor_id, target_tor_id) = (S, T)`, from any agent and any
+GID, merges into one `EdgeStat`:
 
 ```
 EdgeStat {
-    S, T            string          // source ToR, target ToR
-    probeTotal      uint64          // Σ probe_total
-    probeFailed     uint64          // Σ probe_failed
-    lossRatio       float64         // probeFailed / probeTotal
-    rttP99Ns        uint64          // see "Cross-agent quantile synthesis"
-    agentsReporting int             // distinct agent_id contributing
-    pathsReporting  int             // distinct (source_gid,target_gid) contributing
-    degraded        bool            // lossRatio > lossThresh OR rttP99Ns > rttThresh
+    S, T            string   // source ToR, target ToR
+    probeTotal      uint64   // Σ probe_total
+    probeFailed     uint64   // Σ probe_failed
+    lossRatio       float64  // probeFailed / probeTotal
+    rttP99Ns        uint64   // see "Cross-agent quantile synthesis"
+    agentsReporting int      // distinct agent_id
+    pathsReporting  int      // distinct (source_gid, target_gid)
+    degraded        bool     // lossRatio > SLALossRatio OR rttP99Ns > SLANetworkRTTP99Ns
 }
 ```
 
-`S == T` is the **intra-ToR** edge (ToR-mesh probes stay inside one ToR).
-`S != T` is an **inter-ToR** edge whose physical path traverses S's uplinks, one
-or more spine/agg switches, and T's downlinks.
+`S == T` is the **intra-ToR** edge (ToR-mesh probes). `S != T` is an
+**inter-ToR** edge whose path crosses S's uplinks, one or more spine or
+aggregation switches, and T's downlinks.
 
-**Required Phase 1 retention change (controller-internal, no proto change).**
-`agentsReporting` / `distinctAgents(...)` — the cross-agent confidence signal —
-cannot be computed from the ring as it exists today, because the ring stores
-bare `[]*controller_agent.PathSummary` and `PathSummary` carries no `agent_id`
-(it lives only on the `ProbeAnalysisReport` envelope; see Current State). The fix
-is entirely inside the analyzer package: change what the ring retains from
-`*PathSummary` to a small wrapper that pairs each summary with the reporting
-agent id, e.g.
+Edge folding uses the ToR IDs already on each summary, so it needs no registry
+join. Summaries whose source or target ToR is `unspecified` cannot be
+attributed to a switch and are excluded from localization. A read-only
+registry snapshot (`TopologySnapshot()`, built from `ListAllRNICs`) is still
+needed to tell a missing intra-ToR edge caused by a single-RNIC ToR from one
+caused by missing reports.
+
+The `degraded` flag reuses the Phase 1 thresholds (`Config.SLALossRatio`,
+`Config.SLANetworkRTTP99Ns`), so an edge-level verdict agrees with the
+per-path findings already logged.
+
+#### Required retention change
+
+`agentsReporting` cannot be computed from today's ring. The fix stays inside
+the analyzer package: retain a wrapper instead of the bare summary.
 
 ```go
-// controller-internal; NOT a proto message.
+// Controller-internal; not a proto message.
 type retainedSummary struct {
     AgentID string
     Summary *controller_agent.PathSummary
 }
 ```
 
-`windowBucket.summaries` becomes `[]*retainedSummary`, and `Analyzer.Ingest`
-(which already receives `report.GetAgentId()`) stamps the id when it calls
-`retainLocked`. This is a backward-compatible **internal** structural change: the
-wire `PathSummary` and `ProbeAnalysisReport` are untouched, so "no proto/schema
-change" still holds. `buildEdgeStats` then reads `AgentID` off each retained
-record to count distinct agents per edge. (It also generalizes cleanly if a
-future need arises to distinguish two agents reporting the same GID pair, though
-today `(source_gid, target_gid)` is effectively agent-unique.)
+`windowBucket.summaries` becomes `[]*retainedSummary`, and `Ingest` passes
+`report.GetAgentId()` to `retainLocked`. The wire messages do not change.
 
-Degradation reuses the Phase 1 thresholds (`Config.SLALossRatio`,
-`Config.SLANetworkRTTP99Ns`) so a window "degraded" at the edge level is
-consistent with the per-path violations already logged.
+#### Per-window summary cap
 
-### Step 3: Minimal localization — common-element heuristic (ships on current data)
+The default cap of 8192 summaries per window is too small for large fleets:
+1000 agents × 50 paths is 50,000 summaries per window. A capped window
+silently under-counts edges. Phase 2 must expose the cap as a config key and
+size it from the fleet, or count dropped summaries in a metric so a truncated
+window is visible.
 
-Intuition from the paper, reduced to what a ToR-flat topology can justify: a
-shared fabric fault makes **all edges through the faulty element** degrade
-together while edges avoiding it stay healthy. With only ToR identity we can
-reason about three shared elements a ToR participates in:
+### Minimal localization: common-element heuristic
 
-- its **down side** (ToR↔host links + the ToR switch itself), exercised by every
-  edge with that ToR as target and by its intra-ToR edge;
-- its **up side** (ToR↔spine uplinks), exercised by every inter-ToR edge with
-  that ToR as source;
-- the **spine core** between two ToRs, exercised only by that specific inter-ToR
-  edge (not attributable to a single ToR without a spine model).
+This pass runs on existing data. A shared fault degrades **every edge through
+the faulty element** while edges that avoid it stay healthy. With only ToR
+identity, a ToR takes part in three kinds of shared element:
 
-For each ToR `X` over the set of edges in the window, compute:
+- its **down side** (the switch and its host-facing links), exercised by every
+  edge that targets the ToR and by its intra-ToR edge;
+- its **up side** (uplinks to the spine), exercised by every inter-ToR edge
+  that originates at the ToR;
+- the **spine core** between two ToRs, exercised by one specific inter-ToR
+  edge. Without a spine model this cannot be pinned on a single ToR.
+
+For each ToR `X`:
 
 ```
-inboundEdges(X)   = { (S,X) : S != X, EdgeStat exists }
-outboundEdges(X)  = { (X,T) : T != X, EdgeStat exists }
-intra(X)          = EdgeStat(X,X)  (may be absent if X has <2 RNICs)
+inboundEdges(X)  = { (S,X) : S != X }
+outboundEdges(X) = { (X,T) : T != X }
+intra(X)         = EdgeStat(X,X)   (absent if X has fewer than 2 RNICs)
 
 inFrac(X)   = degradedCount(inboundEdges(X))  / |inboundEdges(X)|
 outFrac(X)  = degradedCount(outboundEdges(X)) / |outboundEdges(X)|
-intraBad(X) = intra(X) != nil AND intra(X).degraded
+intraBad(X) = intra(X) present AND intra(X).degraded
 ```
 
-Classification and suspicion score (all thresholds config-driven):
+Classification (thresholds come from config):
 
-- **DownSide/ToR fault** — `X` suspected when `inFrac(X) ≥ breadthFrac` AND
-  (`intraBad(X)` OR intra absent). Rationale: nearly everything converging on
-  `X` from distinct sources fails, and `X`'s own mesh fails too → the fault is
-  local to `X` (switch or its host-facing links), not any one source's uplink.
-- **UpSide fault** — `X` suspected when `outFrac(X) ≥ breadthFrac` AND those
-  target ToRs are **healthy when reached from other sources** (i.e. their
-  inbound-from-others is mostly healthy). Rationale: only traffic *originating*
-  at `X` is bad → `X`'s uplinks/egress.
-- **Spine/inter-ToR path fault** — a specific `(S,T)` degrades while
-  `outFrac(S)` and `inFrac(T)` are both low (S→others and others→T are healthy).
-  Not attributable to a single ToR; emitted as an inter-ToR *path* suspicion,
-  not a `suspect_tor` gauge.
+- **Down-side fault.** `inFrac(X) ≥ breadthFrac` and (`intraBad(X)` or intra
+  absent). Traffic converging on X from many sources fails, and X's own mesh
+  fails too, so the fault is local to X.
+- **Up-side fault.** `outFrac(X) ≥ breadthFrac`, and the same target ToRs are
+  mostly healthy when reached from other sources. Only traffic leaving X
+  fails, so the fault is in X's uplinks.
+- **Inter-ToR path fault.** A single `(S, T)` degrades while `outFrac(S)` and
+  `inFrac(T)` are both low. This is reported as a path suspicion, not as a
+  suspect ToR.
 
-Suspicion score for ranking (monotone in breadth, evidence volume, and severity):
+Score, used for ranking and for the hysteresis thresholds:
 
 ```
-score(X) = w_breadth * max(inFrac(X), outFrac(X))
-         + w_intra   * (intraBad(X) ? 1 : 0)
-         + w_sev     * normalizedSeverity(X)      // mean loss over degraded edges
-   weighted-down by low evidence:
-         * confidence(X)                          // = 1 - 1/(1+agentsReporting)
+score(X) = ( w_breadth * max(inFrac(X), outFrac(X))
+           + w_intra   * (intraBad(X) ? 1 : 0)
+           + w_sev     * normalizedSeverity(X) )   // mean loss over degraded edges
+           * confidence(X)                         // 1 - 1/(1 + agentsReporting)
 ```
 
-`confidence` guards against declaring a suspect from a single agent's noise: a
-ToR reached by only one agent gets a low multiplier even if that one edge is
-badly degraded. This is the cross-agent requirement made explicit.
-
-Pseudocode:
+`confidence` keeps a single agent's noise from opening a finding: a ToR seen
+by only one agent gets a low multiplier even when its one edge is badly
+degraded.
 
 ```text
 function Localize(window):
-    edges := buildEdgeStats(window.summaries, registrySnapshot)   # Step 1-2
-    tors  := distinctToRs(edges)
+    edges := buildEdgeStats(window.summaries)
     suspects := []
-    for X in tors:
-        in  := inboundEdges(edges, X)
-        out := outboundEdges(edges, X)
-        intra := intraEdge(edges, X)
-        inFrac  := degradedFraction(in)
-        outFrac := degradedFraction(out)
+    for X in distinctToRs(edges):
+        in, out, intra := inboundEdges(edges, X), outboundEdges(edges, X), intraEdge(edges, X)
+        inFrac, outFrac := degradedFraction(in), degradedFraction(out)
         intraBad := intra != nil and intra.degraded
 
         kind := NONE
@@ -278,7 +255,7 @@ function Localize(window):
             suspects.append(Suspect{
                 tor: X, kind: kind,
                 score: scoreOf(X, inFrac, outFrac, intraBad, in, out),
-                confidence: 1 - 1/(1+distinctAgents(in ∪ out)),
+                confidence: 1 - 1/(1 + distinctAgents(in ∪ out)),
                 evidence: summarize(in, out, intra),
             })
 
@@ -290,96 +267,78 @@ function Localize(window):
     return rank(suspects), pathSuspects
 ```
 
-Correctness envelope (stated honestly): this heuristic is a **screening**
-localizer. It is right when faults are ToR-local or ToR-egress-local and shows
-up as breadth; it deliberately refuses to over-claim on spine-core faults,
-reporting them as path suspicions instead. False positives are bounded by
-`breadthFrac`, `confidence`, and the finding hysteresis below.
+This heuristic is a **screening** localizer. It is reliable when a fault is
+local to a ToR or to its uplinks and shows up as breadth. It does not claim
+spine-core faults; it reports them as path suspicions. `breadthFrac`,
+`confidence`, and hysteresis bound the false-positive rate.
 
-### Advanced localization — set cover / hitting set (topology-gated)
+### Advanced localization: set cover (topology-gated)
 
-The paper's precise localization treats each probe path as a *set of traversed
-links* and finds the minimal set of components that **covers all degraded paths
-while being avoided by all healthy paths** (a hitting-set / set-cover
-formulation, in practice a greedy vote):
+The paper treats each probe path as the set of links it traverses and looks
+for the smallest set of components that covers all degraded paths and is
+avoided by all healthy paths (a hitting-set problem, solved greedily):
 
 ```text
 function LocalizeSetCover(window, fabric):
-    # fabric: switches (ToR/Agg/Spine) + links + path model
     suspectVotes := map[component]float64
     exonerated   := set[component]
-    for path in window.paths:               # per (source_gid,target_gid,flow_label class)
-        comps := fabric.componentsOn(path)  # link sequence for this ECMP class
+    for path in window.paths:               # per (source_gid, target_gid, flow-label class)
+        comps := fabric.componentsOn(path)
         if path.degraded:
             for c in comps: suspectVotes[c] += path.severity
         else:
             for c in comps: exonerated.add(c)
     candidates := { c : suspectVotes[c] > 0 and c not in exonerated }
-    return greedyMinimalCover(candidates, degradedPaths)   # fewest comps explaining all
+    return greedyMinimalCover(candidates, degradedPaths)
 ```
 
-This requires three things the current implementation does not have today:
+This needs three things the system lacks:
 
-1. **A fabric model**: switches and links as first-class entities, with tiers.
-2. **A path→component mapping**: which links a given (src RNIC, dst RNIC,
-   flow_label) actually traverses. ECMP hashing is generally not invertible
-   exactly; the paper approximates it by covering many flow labels (the current
-   implementation already rotates flow labels, sized by Eq.(1)) and by knowing
-   the tiered topology so a path's *candidate* link set is enumerable.
-3. **flow-label→path-class identity carried into the summary** so paths are
-   distinguishable at the controller. Today `PathAggregator` collapses all flow
-   labels of a (source,target) pair into one summary; per-flow-label
-   distinction would need either finer aggregation keys or a separate reporting
-   channel.
+1. **A fabric model**: switches and links as entities, with tiers.
+2. **A path→component mapping**: which links a given (source RNIC, target
+   RNIC, flow label) traverses. ECMP hashing is not invertible; the paper
+   approximates it by covering many flow labels (the prober already rotates
+   flow labels, sized by Eq. (1)) and by enumerating candidate links from the
+   tiered topology.
+3. **Flow-label identity in the summary.** `PathAggregator` keys on
+   `(source GID, target GID)` and collapses all flow labels into one summary.
+   Per-flow-label distinction needs a finer aggregation key or a separate
+   reporting channel.
 
-Recommendation: **do not build the set-cover pass in the first Phase 2 round.**
-Ship the minimal heuristic (which needs no new data), and make the fabric model
-+ path mapping a separately-scoped follow-up (see Implementation Plan). This is
-the highest-leverage sequencing: the minimal pass delivers ToR-granularity
-localization — which is exactly the metric granularity the system is allowed to
-emit anyway — without a schema migration.
+Build the minimal pass first. It delivers ToR-level localization, which is the
+granularity the system may emit as metrics, without a schema migration. The
+fabric model and set cover are a separate follow-up (P3-H.5).
 
 ### Cross-agent quantile synthesis
 
-Phase 1 ships per-agent, per-path `p50/p99` estimated from the **fixed** bucket
-ladder `rttBucketBoundariesNs`. These per-agent percentiles **cannot be
-averaged** to get a ToR-pair percentile. Two options:
+Per-agent p50/p99 values cannot be averaged into a ToR-pair percentile. Two
+signals are available:
 
-1. **Loss and "degraded" flag**: exact by summation. `probe_total` and
-   `probe_failed` add across agents with no error; the edge loss ratio is exact.
-   This alone drives the minimal heuristic correctly, because the primary fault
-   signal is loss/breadth, not the precise tail latency.
-2. **Merged RTT tail**: to get a real ToR-pair p99, the recommended approach
-   **exploits the fact that all agents already share the same fixed bucket
-   ladder**. Add one additive field to `PathSummary` carrying the per-bucket
-   counts (`repeated uint32 rtt_bucket_counts = 16;`, length =
-   `len(rttBucketBoundariesNs)+1`). The controller then sums bucket counts per
-   ToR-pair and computes an **exact bucket-resolution** merged quantile — no
-   approximation-of-an-approximation, no per-agent percentile averaging.
+1. **Loss and the `degraded` flag** are exact: `probe_total` and
+   `probe_failed` add across agents. This alone drives the minimal heuristic,
+   whose primary signal is loss breadth, not tail latency.
+2. **A merged RTT tail.** All agents share the fixed bucket ladder, so adding
+   the bucket counts to `PathSummary` lets the controller sum them per ToR pair
+   and compute an exact quantile at bucket resolution:
 
-**t-digest decision criterion.** Do NOT introduce t-digest unless *both*: (a)
-the fixed bucket resolution is demonstrably too coarse for a latency SLO the
-operator actually sets (e.g. an SLO that lands between two bucket edges near the
-tail), AND (b) operators need to reconfigure RTT resolution per deployment
-without redeploying agents. Until then, bucket-count summation is strictly
-simpler, is exact at bucket resolution, requires no mergeable-sketch code on the
-agent, and reuses a ladder that already exists. t-digest's only real advantage —
-adaptive accuracy at the extreme tail — is not worth the agent-side complexity
-for a ToR-pair screening metric. If adopted later, t-digest centroids would be
-the new additive field instead of bucket counts, merged at the controller.
+   ```proto
+   repeated uint32 rtt_bucket_counts = 16;  // len(rttBucketBoundariesNs) + 1
+   ```
 
-Phase 2's first round should adopt **option 1 for detection** and **option 2
-(bucket-count histogram, additive field) for the emitted ToR-pair p99**, and
-leave t-digest unbuilt.
+Use option 1 for detection and option 2 for the emitted ToR-pair p99.
 
-### rqlite `path_summaries` table (additive, optional persistence)
+Do not adopt t-digest unless both hold: (a) the fixed bucket resolution is
+too coarse for an SLO that operators actually set, and (b) operators need to
+change RTT resolution per deployment without redeploying agents. Until then,
+bucket-count summation is simpler, exact at bucket resolution, and reuses an
+existing ladder. If t-digest is adopted later, its centroids replace the
+bucket counts as the additive field.
 
-Localization itself runs on the **in-memory** window ring (recent windows are
-all it needs), so persistence is **not required** for Phase 2 to function. The
-table below is specified for optional forensic retention and to let a future
-standalone `rpingmesh-analyzer` binary read history. It is a **new table** — it
-does not alter `rnics` — so it is a purely additive, backward-compatible schema
-change.
+### Optional rqlite persistence
+
+Localization reads only the in-memory ring, so persistence is not required.
+A new `path_summaries` table provides forensic retention and lets a future
+standalone analyzer read history. It does not alter `rnics`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS path_summaries (
@@ -401,224 +360,184 @@ CREATE TABLE IF NOT EXISTS path_summaries (
     network_rtt_p99_ns   INTEGER NOT NULL,
     PRIMARY KEY (window_start_unix_ns, source_gid, target_gid)
 );
-CREATE INDEX IF NOT EXISTS idx_ps_window     ON path_summaries (window_start_unix_ns);
-CREATE INDEX IF NOT EXISTS idx_ps_tor_pair   ON path_summaries (source_tor_id, target_tor_id, window_start_unix_ns);
+CREATE INDEX IF NOT EXISTS idx_ps_window   ON path_summaries (window_start_unix_ns);
+CREATE INDEX IF NOT EXISTS idx_ps_tor_pair ON path_summaries (source_tor_id, target_tor_id, window_start_unix_ns);
 ```
 
-If the bucket-count histogram (field 16) is adopted, persist it as a JSON/text
-column `rtt_bucket_counts TEXT` appended to the table (again additive).
+If field 16 is adopted, add an `rtt_bucket_counts TEXT` (JSON) column.
 
-**Retention**: a periodic sweep mirroring `CleanupStaleEntries`
-(`DELETE FROM path_summaries WHERE window_start_unix_ns < (now - retentionNs)`).
-Default retention on the order of hours (e.g. 6h), config-driven
-(`analyzer_persist_retention_sec`). Localization does not read beyond the
-in-memory ring, so retention here is purely a forensic/disk-budget knob.
+**Retention.** A periodic sweep in the style of `CleanupStaleEntries` deletes
+rows older than `analyzer_persist_retention_sec` (default 6 h).
 
-**Write-rate estimate** (the reason persistence is opt-in and batched):
-`rows/s ≈ agents × pathsPerAgent × (1/windowSec)`.
-For 1000 agents × 50 paths / 30 s ≈ **1.7k rows/s**. rqlite commits go through
-Raft (an fsync per transaction), so per-row inserts are infeasible; each
-`ProbeAnalysisReport` (already batched to ≤256 summaries by
-`maxSummariesPerReport`) must be written as **one multi-row parameterized
-transaction**, giving ≈7 report-transactions/s at that scale. This is
-tolerable but is the dominant new write load on rqlite, which is why:
-persistence is **disabled by default** (`analyzer_persist_enabled: false`),
-localization never depends on it, and enabling it is an explicit operator
-decision with the write-rate documented.
+**Write rate.** `rows/s ≈ agents × pathsPerAgent / windowSec`; 1000 agents ×
+50 paths / 30 s ≈ 1.7k rows/s. rqlite commits through Raft, so per-row inserts
+are infeasible. Each `ProbeAnalysisReport` (at most 256 summaries,
+`maxSummariesPerReport` in `internal/agent/analysis_reporter.go`) is written as
+one multi-row parameterized transaction, about 7 transactions/s at that scale.
+That is the largest new write load on rqlite, so persistence is off by default
+(`analyzer_persist_enabled: false`).
 
-### Output: suspect ranking, OTLP, findings lifecycle
+### Output: ranking, OTLP, findings lifecycle
 
-**Suspect ranking** is emitted per completed window as a sorted list of
-`Suspect{tor, kind, score, confidence, evidence}` and `PathSuspect{S,T,...}`.
+Each closed window yields a ranked list of
+`Suspect{tor, kind, score, confidence, evidence}` and
+`PathSuspect{S, T, ...}`. Ranking is a total order (ties broken by ToR ID) so
+results are reproducible.
 
-**OTLP metrics** (registered on the existing `rpingmesh.analyzer` meter, ToR
-granularity only):
+New instruments on the `rpingmesh.analyzer` meter (ToR granularity only):
 
-| metric | type | attributes | meaning |
-|--------|------|-----------|---------|
-| `rpingmesh.analyzer.suspect_tor` | ObservableGauge (0/1) or Gauge | `tor`, `kind` (downside/upside) | 1 while a ToR has an open suspicion finding |
-| `rpingmesh.analyzer.suspect_tor_score` | Gauge | `tor`, `kind` | current suspicion score (0..1) for a suspected ToR |
-| `rpingmesh.analyzer.localization_runs_total` | Counter | — | closed windows processed by the localizer |
-| `rpingmesh.analyzer.late_summaries_total` | Counter | — | summaries arriving for an already-localized window (grace-tuning signal) |
-| `rpingmesh.analyzer.inter_tor_path_suspect` | Gauge (0/1) | `source_tor`, `target_tor` | spine-path suspicion that is not attributable to one ToR |
+| Metric | Type | Attributes | Meaning |
+|--------|------|------------|---------|
+| `rpingmesh.analyzer.suspect_tor` | Gauge (0/1) | `tor`, `kind` (`downside`/`upside`) | 1 while a ToR has an open finding |
+| `rpingmesh.analyzer.suspect_tor_score` | Gauge | `tor`, `kind` | current score (0..1) of a suspected ToR |
+| `rpingmesh.analyzer.inter_tor_path_suspect` | Gauge (0/1) | `source_tor`, `target_tor` | path suspicion not attributable to one ToR |
+| `rpingmesh.analyzer.localization_runs_total` | Counter | none | closed windows processed |
+| `rpingmesh.analyzer.late_summaries_total` | Counter | none | summaries that arrived after their window was localized |
 
-No GID attribute ever appears on a metric; GID-level evidence goes to findings
-logs (mirroring `logFinding` in `analyzer.go`).
+No GID appears on a metric. GID-level evidence goes to findings logs, built
+like `logFinding` in `analyzer.go`.
 
-**Findings lifecycle** (hysteresis to avoid flapping): a suspicion for a given
-`(tor, kind)` is a state machine.
+**Findings lifecycle.** Each `(tor, kind)` has a hysteresis state machine so
+one noisy window neither opens nor closes a finding:
 
 ```
-             score>=openThresh for K consecutive windows
+             score >= openThresh for K consecutive windows
    CLEARED ─────────────────────────────────────────────► OPEN
       ▲                                                     │
-      │      score<closeThresh for M consecutive windows    │
+      │      score < closeThresh for M consecutive windows  │
       └─────────────────────────────────────────────────────┘
 ```
 
-- **OPEN**: emit a Warn finding log (with GID/edge evidence and score) and set
-  the `suspect_tor` gauge to 1. Re-log at a throttled cadence while open.
-- **CLEARED**: emit a resolution log, set the gauge to 0.
-- `K` (open confirmation windows, e.g. 2–3), `M` (clear windows, e.g. 3–5),
-  `openThresh`, `closeThresh` (`closeThresh < openThresh` for hysteresis) are
-  config-driven. State lives next to the window ring in the `Analyzer` under the
-  existing mutex.
-
-This lifecycle is what makes the ToR-granularity output trustworthy: a single
-noisy window neither opens nor closes a finding.
+- **OPEN**: log a Warn finding with edge evidence and score, set
+  `suspect_tor` to 1, and re-log at a throttled cadence while open.
+- **CLEARED**: log the resolution and set the gauge to 0.
+- `K`, `M`, `openThresh`, and `closeThresh` (`closeThresh < openThresh`) come
+  from config. The state lives in the `Analyzer` under its existing mutex.
 
 ### Config additions (controller)
 
-Additive keys, defaults chosen conservatively:
-
 ```yaml
 analyzer_localization_enabled: true
-analyzer_loc_grace_sec: 40            # window-close grace = expectedReportLag + margin
-                                      # (>= agent analysis_window_sec + a few sec)
-analyzer_loc_breadth_frac: 0.6        # fraction of edges degraded to call a side "broad"
-analyzer_loc_open_score: 0.6          # score to open a suspicion
-analyzer_loc_close_score: 0.3         # score to clear (hysteresis)
-analyzer_loc_open_windows: 2          # K consecutive windows to open
-analyzer_loc_close_windows: 3         # M consecutive windows to clear
-analyzer_persist_enabled: false       # rqlite path_summaries persistence (opt-in)
-analyzer_persist_retention_sec: 21600 # 6h; only meaningful when persist enabled
+analyzer_loc_grace_sec: 40            # window-close grace; >= agent analysis_window_sec + margin
+analyzer_loc_breadth_frac: 0.6        # fraction of degraded edges that makes a side "broad"
+analyzer_loc_open_score: 0.6          # score that opens a finding
+analyzer_loc_close_score: 0.3         # score that clears it (hysteresis)
+analyzer_loc_open_windows: 2          # K
+analyzer_loc_close_windows: 3         # M
+analyzer_max_summaries_per_window: 8192  # exposes Config.MaxSummariesPerWindow
+analyzer_persist_enabled: false       # optional rqlite persistence
+analyzer_persist_retention_sec: 21600 # 6 h; used only when persistence is on
 ```
 
 ## Alternatives Considered
 
-- **Localize on the agent.** Rejected on first principles: an agent sees only
-  its own source RNICs and cannot separate "my uplink" from "the target ToR".
-  Localization is a cross-agent intersection; it must be central. (This is the
-  same conclusion the Phase 1 design reached for aggregation.)
-- **Push localization into the OTel collector (OTTL/connector).** Rejected: the
-  collector has neither the fabric topology nor the cross-agent join, and this
-  would fight the deliberate ToR-only cardinality design. Localization belongs
-  where the registry lives.
-- **Average per-agent p99s for the ToR-pair tail.** Rejected as statistically
-  invalid. Chose exact loss summation for detection + shared-bucket histogram
-  summation for the emitted tail.
-- **Adopt t-digest immediately for cross-agent quantiles.** Rejected for the
-  first round: the fixed shared bucket ladder already permits exact
-  bucket-resolution merging with far less code and no agent-side sketch. t-digest
-  is held behind an explicit criterion.
-- **Build the paper's full set-cover localizer now.** Rejected as premature: it
-  requires a fabric model, a path→link mapping, and per-flow-label summary
-  identity, none of which exist. The minimal heuristic reaches ToR granularity —
-  the granularity the system may emit — without any of that. Set-cover is
-  designed but explicitly deferred.
-- **Persist every summary to rqlite and localize from SQL.** Rejected as the
-  primary path: localization needs only recent windows already held in memory,
-  and per-summary rqlite writes do not fit Raft's fsync-per-commit model.
-  Persistence is optional, batched, and off by default.
+- **Localize on the agent.** Rejected: an agent sees only its own RNICs and
+  cannot separate its uplink from the target ToR. Localization must run where
+  all agents' data meets.
+- **Localize in the OTel collector.** Rejected: the collector has neither the
+  topology nor the cross-agent join, and doing it there would work against the
+  ToR-only cardinality design.
+- **Average per-agent p99s.** Rejected as statistically invalid. Loss
+  summation drives detection; bucket-count summation produces the tail.
+- **Adopt t-digest now.** Rejected for the first round; see the criterion in
+  [Cross-agent quantile synthesis](#cross-agent-quantile-synthesis).
+- **Build the full set-cover localizer now.** Rejected as premature: it needs
+  a fabric model, a path→link mapping, and per-flow-label summaries, none of
+  which exist.
+- **Persist every summary and localize from SQL.** Rejected: localization
+  needs only recent windows, which are already in memory, and per-summary
+  writes do not fit Raft's per-commit cost.
 
 ## Test Plan
 
-All Phase 2 logic is pure Go operating on `[]*controller_agent.PathSummary` and
-a registry snapshot, so it is **deterministic and unit-testable without RDMA**,
-matching the Phase 1 analyzer tests.
+Phase 2 logic is pure Go over retained summaries and a registry snapshot, so
+it is deterministic and testable without RDMA, like the Phase 1 tests in
+`internal/controller/analyzer/analyzer_test.go`.
 
-- **Topology fixtures**: define small deterministic clusters as fixtures — e.g.
-  4 ToRs × N RNICs, with a GID→ToR map — and hand-build `PathSummary` sets that
-  encode specific fault scenarios. Fixtures live beside `analyzer_test.go`.
-  - Scenario A (down-side/ToR fault): all inbound edges to ToR X degraded across
-    ≥3 source ToRs + intra-X degraded; assert X ranked suspect kind=downside,
-    others not suspected.
-  - Scenario B (up-side fault): all outbound edges from ToR Y degraded but the
-    same target ToRs healthy from other sources; assert Y kind=upside.
-  - Scenario C (spine path): single (S,T) degraded, S→others and others→T
-    healthy; assert **no** `suspect_tor`, one `inter_tor_path_suspect`.
-  - Scenario D (noise/no fault): random low loss below thresholds; assert no
-    suspects (guards false positives).
-  - Scenario E (single-agent noise): one agent reports a badly degraded edge to
-    X; assert low confidence keeps X below `openThresh` (no finding opens).
-- **Cross-agent aggregation**: two agents reporting summaries for the same
-  aligned window and same ToR-pair must fold into one `EdgeStat` with summed
-  totals; assert exact loss ratio and (with histogram field) exact merged p99.
-- **Window-close / late arrival** (injected clock via a `nowFn` seam, mirroring
-  `AnalysisReporter.nowFn`): a window is localized exactly once, only after
-  `We + grace`; asserting that reports trickling in before close do **not**
-  trigger localization and that the eventual single run sees the full
-  `agentsReporting`. A report arriving after the window is localized increments
-  `late_summaries_total` and does **not** re-run localization or alter the
-  already-emitted finding.
-- **Findings lifecycle**: drive K windows above `openThresh` → assert OPEN
-  finding + gauge=1; then M windows below `closeThresh` → assert CLEARED +
-  gauge=0; assert a single dip below threshold does not close (hysteresis).
-- **Determinism**: ranking must be a total order (stable tie-break on ToR id) so
-  tests are reproducible.
-- **Metrics**: assert `suspect_tor` / `suspect_tor_score` carry only
-  `tor`/`kind` attributes (cardinality regression guard), reusing the pattern in
-  the Phase 1 metrics tests.
-- **rqlite persistence** (only if that PR is built): unit-test the multi-row
-  batch insert and the retention sweep against the `dbConn` fake already used by
-  the registry tests; assert one transaction per report.
-- **e2e (RDMA-free, controller path)**: extend the existing
-  `e2e/probe_analysis_e2e_test.go` style — a pseudo-agent posts crafted
-  `ProbeAnalysisReport`s encoding Scenario A across "multiple agents"; assert the
-  controller opens a suspect-ToR finding and emits the gauge end-to-end.
+- **Topology fixtures.** Small clusters (for example 4 ToRs × N RNICs) with
+  hand-built summaries per fault scenario:
+  - A, down-side fault: all inbound edges to X degraded from at least 3 source
+    ToRs, and intra-X degraded. Expect X with `kind=downside` and no other
+    suspect.
+  - B, up-side fault: all outbound edges from Y degraded while the same
+    targets are healthy from other sources. Expect Y with `kind=upside`.
+  - C, spine path: one `(S, T)` degraded; S→others and others→T healthy.
+    Expect no `suspect_tor` and one `inter_tor_path_suspect`.
+  - D, noise: low loss below thresholds. Expect no suspects.
+  - E, single-agent noise: one agent reports a badly degraded edge to X.
+    Expect `confidence` to keep X below `openThresh`.
+- **Cross-agent aggregation.** Two agents reporting the same window and ToR
+  pair fold into one `EdgeStat` with summed totals and an exact loss ratio
+  (and, with field 16, an exact merged p99).
+- **Window close and late arrival.** With an injected clock (a `nowFn` seam
+  like `AnalysisReporter.nowFn`): a window is localized exactly once, only
+  after it closes; reports arriving before close do not trigger localization;
+  the single run sees the full `agentsReporting`. A report after localization
+  increments `late_summaries_total` and changes no finding.
+- **Unspecified ToR.** Summaries with an `unspecified` ToR never produce a
+  suspect.
+- **Findings lifecycle.** K windows above `openThresh` open a finding (gauge
+  1); M windows below `closeThresh` clear it (gauge 0); a single dip does not
+  clear it.
+- **Metric cardinality.** `suspect_tor` and `suspect_tor_score` carry only
+  `tor` and `kind`. The analyzer has no metric tests yet; use an SDK
+  `ManualReader` as `internal/telemetry/otel_metrics_test.go` does.
+- **Persistence** (only if built): multi-row insert and retention sweep
+  against the registry's `fakeConn` (`registry_test.go`); one transaction per
+  report.
+- **e2e (RDMA-free).** Extend `e2e/controller/analysis_e2e_test.go`: a
+  pseudo-agent posts Scenario A as several agents. That stack runs no OTLP
+  collector, so the test needs an observable signal for an opened finding (see
+  [Open Questions](#open-questions)).
 
 ## Implementation Plan (PR breakdown)
 
-Each PR is independently reviewable/mergeable. Ordering maximizes value-per-risk
-and keeps the schema-free work first.
+Each PR is independently mergeable. Work that needs no schema change comes
+first.
 
-1. **P3-H.1 — Retained-record change + edge model + minimal localizer (no
-   proto/schema change).** First, the controller-internal retention change: swap
-   `windowBucket.summaries` from `[]*controller_agent.PathSummary` to
-   `[]*retainedSummary` (agent id + summary), stamped in `Analyzer.Ingest` — this
-   is the prerequisite that makes cross-agent `agentsReporting` computable and
-   must land within this PR before the localizer can use it. Then
-   `internal/controller/analyzer/localizer.go`: `EdgeStat`, edge folding from the
-   retained window buckets, the common-element heuristic, ranking. `Analyzer`
-   gains a **window-close sweeper** (a ticker + monotonic watermark) that runs
-   `Localize(W)` exactly once per window after `We + grace`, instead of a
-   per-report hook — this is what prevents localizing on a partially-reported
-   window (under-counted `agentsReporting`/breadth). Late summaries for an
-   already-localized window are counted (`late_summaries_total`) but not
-   re-localized. `analyzer_loc_grace_sec` config + a retention-vs-grace assertion.
-   Registry gains a read-only `TopologySnapshot()` (GID→ToR, ToR→GIDs) built
-   from `ListAllRNICs`. Findings logged only (no metrics yet). Fixtures +
-   Scenarios A–E as unit tests (Scenario E specifically exercises the
-   distinct-agent count off the new retained record). This PR delivers working
-   ToR-granularity localization with zero wire/schema migration.
-2. **P3-H.2 — Findings lifecycle + OTLP.** Add the hysteresis state machine and
-   the `suspect_tor` / `suspect_tor_score` / `inter_tor_path_suspect` /
-   `localization_runs_total` instruments on the existing analyzer meter. Config
-   keys for thresholds/windows. Lifecycle + metrics-cardinality tests. e2e
-   controller-path test.
-3. **P3-H.3 — Cross-agent exact tail (additive proto field).** Add
-   `repeated uint32 rtt_bucket_counts = 16;` to `PathSummary`; have
-   `pathAccumulator` expose its buckets and `analysis_reporter.toProto` populate
-   the field; controller sums buckets per ToR-pair for an exact merged p99. Fully
-   backward compatible (old agents simply omit the field; controller falls back
-   to loss-only detection + max(p99)). Aggregation/merge unit tests.
-4. **P3-H.4 (optional) — rqlite persistence.** `path_summaries` table +
-   batched multi-row insert on ingest + retention sweep, all behind
-   `analyzer_persist_enabled` (default false). Registry-fake unit tests.
-5. **P3-H.5 (deferred / separate track) — Fabric topology model + set-cover.**
-   New registry tables (switches, links) + a path→component mapping + per-flow
-   summary identity + the set-cover localizer. Large; specified here but
-   sequenced after H.1–H.3 prove out and only if per-link granularity is
-   actually required. Explicitly gated on operator-provided topology.
+1. **P3-H.1: retention change, edge model, minimal localizer.** Retain
+   `retainedSummary` (agent ID + summary) in the ring. Add `localizer.go` with
+   `EdgeStat`, edge folding, the common-element heuristic, and ranking. Add
+   the window-close sweeper with the watermark, the late-summary counter,
+   `analyzer_loc_grace_sec`, the retention-vs-grace check, and a configurable
+   per-window cap. Add `TopologySnapshot()` to the registry. Findings are
+   logged only. Scenarios A–E as unit tests (E exercises the distinct-agent
+   count).
+2. **P3-H.2: findings lifecycle and OTLP.** Hysteresis state machine, the
+   `suspect_tor`, `suspect_tor_score`, `inter_tor_path_suspect`, and
+   `localization_runs_total` instruments, and their config keys. Lifecycle and
+   cardinality tests; controller e2e test.
+3. **P3-H.3: exact cross-agent tail.** Add `rtt_bucket_counts = 16` to
+   `PathSummary`; expose the buckets from `pathAccumulator` and populate the
+   field in `AnalysisReporter.toProto`. The controller sums buckets per ToR
+   pair. Old agents omit the field; the controller then falls back to
+   loss-only detection and `max(p99)`.
+4. **P3-H.4 (optional): rqlite persistence.** `path_summaries` table, batched
+   insert on ingest, retention sweep, all behind `analyzer_persist_enabled`.
+5. **P3-H.5 (separate track): fabric model and set cover.** Switch and link
+   tables, a path→component mapping, per-flow-label summary identity, and the
+   set-cover localizer. Start only after H.1–H.3 prove out, only if per-link
+   granularity is required, and only with an operator-provided topology.
 
 ## Open Questions
 
-- **Topology source for the advanced pass.** Per-link localization needs a
-  fabric model (spine/agg switches + links) that the agents cannot discover.
-  Would this come from an operator-provided topology file, an SNMP/LLDP feed, or
-  a controller config? This is a product decision that gates P3-H.5. *(User
-  input needed.)*
-- **Is ToR granularity sufficient for the operational goal?** If ToR-level
-  suspects satisfy the on-call workflow, H.5 may never be needed. *(User input
+- **Topology source for set cover.** Agents cannot discover spine and
+  aggregation switches. Should the fabric model come from an operator file,
+  an LLDP/SNMP feed, or controller config? This gates P3-H.5. *(User input
   needed.)*
-- **Enable rqlite persistence by default?** Given the ≈1.7k rows/s at 1000
-  agents and Raft's fsync-per-commit, the recommendation is off-by-default. If
-  forensic history is a hard requirement, an external TSDB/OLAP sink (rather than
-  rqlite) may be the better target. *(User input needed.)*
-- **`breadthFrac` / threshold defaults** are first guesses; they should be tuned
-  against a real cluster's normal-noise floor before trusting auto-opened
-  findings.
-- **Window alignment across agents** assumes agent clocks are reasonably
-  synchronized (windows are wall-clock floored). Large clock skew would scatter
-  the same real window across adjacent buckets and weaken cross-agent
-  intersection. Is NTP-level sync a safe assumption in the target fleet?
+- **Is ToR granularity enough?** If ToR-level suspects satisfy the on-call
+  workflow, H.5 may never be needed. *(User input needed.)*
+- **Persistence target.** At about 1.7k rows/s for 1000 agents, rqlite
+  persistence stays off by default. If forensic history is a hard requirement,
+  an external TSDB or OLAP sink may fit better. *(User input needed.)*
+- **e2e signal for an opened finding.** The controller e2e stack has no OTLP
+  collector. `ProbeAnalysisAck` carries only `accepted` and `sla_violations`,
+  and it is returned before the window closes, so it cannot report a
+  localization result. Options: run a collector in that stack, assert on
+  controller logs, or add a diagnostic RPC.
+- **Threshold defaults.** `breadthFrac` and the score thresholds are first
+  guesses; tune them against a real cluster's noise floor before trusting
+  auto-opened findings.
+- **Clock sync.** Window alignment assumes agent clocks are roughly
+  synchronized. Large skew scatters one real window across adjacent buckets
+  and weakens the intersection. Is NTP-level sync safe to assume?

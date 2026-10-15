@@ -240,8 +240,8 @@ via Cgo (`CGO_ENABLED=1`).
 | `pinglist_update_interval_sec` | `300` | Seconds between regular pinglist refreshes. Repeated ACK timeouts to a target (e.g. a restarted peer with a new QPN) or an empty pinglist trigger an earlier refresh, backed off from 30 s up to this interval |
 | `flow_label_rotation_period_sec` | `3600` | Period over which the rotating ~20% of each target's ECMP flow-label set is refreshed |
 | `gid_index` | `0` | GID table index on RDMA devices (0-255; see note below) |
-| `service_level` | `0` | Service Level (SL, PFC priority) applied to every Address Handle (0-7) |
-| `traffic_class` | `0` | GRH traffic class octet applied to every Address Handle (0-255). RoCEv2 DSCP occupies the upper 6 bits of this octet: to use DSCP value `N`, set `traffic_class = N << 2` |
+| `service_level` | `0` | Service Level (SL, PFC priority) applied to every Address Handle (0-7). With `trust dscp` it does not select the queue |
+| `traffic_class` | `0` | GRH traffic class octet applied to every Address Handle (0-255). RoCEv2 DSCP occupies the upper 6 bits of this octet: to use DSCP value `N`, set `traffic_class = N << 2`. See [Choosing `traffic_class` and `service_level`](#choosing-traffic_class-and-service_level) |
 | `cq_poll_mode` | `auto` | How completions are awaited: `event` sleeps on a completion channel and an eventfd (no CPU while idle), `busy` polls the CQ every ~50 µs and the event ring every 100 µs (roughly 3% of a CPU per RDMA device), `auto` uses `event` with NIC hardware timestamps and `busy` with software timestamps (see [Event-Driven Completion Handling](#event-driven-completion-handling)) |
 | `allowed_device_names` | `[]` | Device filter (empty = all devices) |
 | `excluded_device_names` | `[]` | RDMA devices never to open (matched case-insensitively, checked before the device is opened). Applied on top of `allowed_device_names`; listing a device in both is a config error |
@@ -280,6 +280,99 @@ a specific error identifying the device, port, and GID table size (e.g.
 `gid_index=100 is invalid or not present on device mlx5_0 port 1 (GID table
 size 3)`), rather than a generic "no usable GID found" message that could be
 mistaken for the port itself being down.
+
+#### Choosing `traffic_class` and `service_level`
+
+Probes only see what the workload sees if they travel in the **same queue
+(switch/NIC priority)** as the traffic they represent, e.g. NCCL collectives.
+A probe in a different priority does not experience that queue's PFC pauses,
+queueing or loss. With the defaults (`traffic_class: 0`, `service_level: 0`)
+probes usually land in a lossy default queue even when the workload uses a
+lossless one. Matching the workload's queue is the point (service-aware
+probing); note that in a lossless queue probes see pause-induced latency
+rather than congestion drops.
+
+**Prerequisites.**
+
+- DSCP selects the queue only for **RoCE v2** (the DSCP lives in the IP
+  header). This guidance assumes `gid_index` points at a RoCE v2 GID; the
+  default `0` is often the RoCE v1 entry (see the `gid_index` note above).
+- Use **identical values on every agent.** The responder sends its ACKs
+  through Address Handles built from its *own* `traffic_class` /
+  `service_level`, so mismatched configs make probes and ACKs travel in
+  different queues.
+- The values are agent-wide and static (see
+  [Limitations](#limitations-and-future-work)); changing them requires an agent
+  restart.
+
+**1. Do not rely on finding the workload's setting on the host.** NCCL often
+runs in user containers, and `NCCL_IB_TC` / `NCCL_IB_SL` may be set in the
+image, the job script or the container's `/etc/nccl.conf`, none of which is
+visible from the host. If nothing sets it, NCCL uses traffic class `0`
+(unless the communicator's traffic class is configured), and newer NCCL has a
+separate `NCCL_IB_FIFO_TC` for its control messages that follows
+`NCCL_IB_TC` by default. NCCL does not use RDMA CM, so the RDMA CM
+`default_roce_tos` setting does not affect it.
+
+**2. Check for a NIC-level traffic class override.** NVIDIA's MLNX_OFED/DOCA
+mlx5 driver can force a traffic class, shown in
+`/sys/class/infiniband/<dev>/tc/<port>/traffic_class` (e.g.
+`Global tclass=106`); inbox drivers may not expose this file. When it is set,
+the workload is effectively in that class. NVIDIA documents the feature for RC
+QPs, while rpingmesh probes are UD and set the traffic class per Address
+Handle (rdma-core's mlx5 provider copies it into the UD send's address
+vector). Whether the override also applies to UD has **not been verified**
+([#71](https://github.com/yuuki/rpingmesh/issues/71)), so do not rely on it:
+set `traffic_class` explicitly to the same value. This also keeps probes in
+the right queue if the override is later removed.
+
+**3. Determine the queue empirically.** This works regardless of containers:
+
+- Trust mode (`dscp` / `pcp`), the DSCP → priority map and the PFC-enabled
+  priorities: `mlnx_qos -i <netdev>` (MLNX_OFED tool), or with iproute2
+  where the driver supports it: `dcb apptrust show dev <netdev>`,
+  `dcb app show dev <netdev> dscp-prio`, `dcb pfc show dev <netdev> prio-pfc`.
+- Per-priority port byte counters, sampled twice while jobs run:
+  `ethtool -S <netdev> | grep -E '(rx|tx)_prio[0-7]_bytes'`. They count all
+  traffic in that priority, not only RoCE.
+- Per-priority PFC pause counters (e.g. `(rx|tx)_prio<N>_pause`) are a hint
+  only: they move only during congestion, so their absence does not prove a
+  priority is unused.
+
+[#70](https://github.com/yuuki/rpingmesh/issues/70) tracks a read-only helper
+that collects these facts.
+
+**4. Map to config values.**
+
+- `traffic_class` = `DSCP << 2` for a DSCP that maps to the workload's
+  (lossless) priority, e.g. DSCP 26 → `104`. The low 2 bits are ECN:
+  `104` is Not-ECT and `106` is the same DSCP with ECT(0). They can be treated
+  differently: where a queue uses WRED/ECN, Not-ECT packets may be dropped
+  where ECT packets would be CE-marked. Prefer the value the workload actually
+  emits on the wire (e.g. an override value such as `106` verbatim), and
+  verify the observed ECN rather than assuming how the NIC sets it.
+- `service_level`: with `trust dscp` (typical for RoCE v2 without VLANs) SL
+  does not select the queue; use `0`. Only with `trust pcp` and VLAN-tagged
+  RoCE does SL map to the PCP; then use the lossless priority.
+- Confirm with the network team that the switches classify the chosen DSCP
+  into the same lossless queue and do not re-mark it.
+
+**5. Overhead.** Per target and probe there is one probe and two ACKs, each a
+40-byte payload (roughly 110 bytes on the wire with Ethernet, IP, UDP, BTH,
+DETH and ICRC headers). The per-target cadence is
+`min(1000 / probe_interval_ms, per-target rate cap)` probes per second; ECMP
+flow labels share that budget (see
+[`flow_label` for ECMP Path Coverage](#flow_label-for-ecmp-path-coverage)). At
+the defaults (`500` ms, cap `10`) that is 2 probes/s, i.e. about 6 packets/s
+per target across both directions. A host sends this for each of its targets
+and also answers every peer that targets it, so the aggregate is about
+`targets × 6` packets/s per RNIC: negligible relative to line rate, PFC and
+buffer capacity.
+
+**Pitfall.** If the workload's traffic class comes from per-device setup (such
+as the override above) that misses some RNICs, e.g. after devices are renamed,
+the traffic on those rails silently falls back to the default class. Compare
+the override (and the probes' `traffic_class`) across hosts and devices.
 
 ### Controller (`configs/controller.yaml`)
 
@@ -975,7 +1068,9 @@ sudo rdma link add rxe0 type rxe netdev eth0
   implement PFC or DSCP-based queuing, so the `sl`/`traffic_class` values
   are carried on the wire but their real-world effect (priority-queue
   placement) cannot be verified in that environment — only on real RDMA
-  hardware with a PFC/DSCP-aware fabric.
+  hardware with a PFC/DSCP-aware fabric. See
+  [Choosing `traffic_class` and `service_level`](#choosing-traffic_class-and-service_level)
+  for how to pick values that match the workload's queue.
 
 - **No automatic recovery from RDMA device runtime failures.** If an RDMA
   device fails or is removed after the agent has started, there is no

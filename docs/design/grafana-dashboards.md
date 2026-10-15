@@ -71,6 +71,72 @@ render (one `unspecified`×`unspecified` cell for an all-untagged mesh).
 If an agent later receives a real ToR ID, PathAggregator may keep the
 previous target ToR until the current aggregation window closes.
 
+### Estimating the series count
+
+The agent's probe-metric series count follows from the label tuples it can
+emit. `source_rdma_device` and `source_netdev` are 1:1 and each RNIC has one
+ToR, so `source_tor` adds no extra combinations once the source RNIC is known.
+Per agent (one `instance` / `host.name`), the number of distinct
+`(source RNIC, target_tor)` tuples is
+
+```
+P_agent = Σ_{r ∈ RNICs on the host} T(r)
+```
+
+where `T(r)` is the number of distinct `target_tor` values RNIC `r` has
+probed: its own ToR (ToR-mesh) plus the foreign ToRs in its inter-ToR
+pinglists (same plane only when `plane_id` is set). The controller samples up
+to `inter_tor_sample_size` (default 5) foreign ToRs per refresh, so at any
+moment `T(r) ≤ 1 + inter_tor_sample_size`. The OTel SDK uses cumulative
+temporality and keeps every attribute set it has seen for the life of the
+process, so as samples rotate the long-run bound is `T(r) ≤` the number of
+ToRs in the RNIC's plane. Untagged RNICs all see `target_tor="unspecified"`,
+so `T(r) = 1` for an all-untagged fabric.
+
+Each tuple becomes the following Prometheus series after OTLP → Prometheus
+conversion (29 explicit bucket boundaries → 30 `_bucket` series including
+`+Inf`, plus `_sum` and `_count`):
+
+| Metric | Prometheus series per tuple |
+|---|---|
+| 3 histograms (`network_rtt_ns`, `prober_delay_ns`, `responder_delay_ns`) | 3 × (30 + 2) = 96 |
+| `probe_total`, `probe_success_total` | 2 |
+| `probe_failed_total` | `R` = number of `reason` values seen (0–4) |
+| **Total** | **98 + R ≤ 102** |
+
+```
+series_agent ≤ P_agent × 102
+series_fleet = Σ_agents series_agent
+```
+
+Before `source_rdma_device` / `source_netdev` were added, the tuple was
+`(source_tor, target_tor)`, i.e. RNICs of a host that share a ToR collapsed
+into one tuple. The growth factor is therefore *RNICs per host ÷ distinct
+source ToRs per host*: 1 when every RNIC has its own ToR, up to the RNIC count
+when all RNICs share one ToR (or are untagged).
+
+Worked examples (fleet totals use the upper bound `R = 4`):
+
+| Fabric | `T(r)` | `P_agent` before → after | Fleet series before → after |
+|---|---|---|---|
+| **A.** 128 hosts × 8 RNICs, rail-optimized: 8 planes × 4 leaves (32 ToRs), each RNIC on its own leaf | 1 own + 3 foreign in the plane = 4 | 32 → 32 | 417,792 → 417,792 (×1) |
+| **B.** 64 hosts × 2 RNICs, both RNICs of a host on the same ToR, 8 ToRs, no planes | 1 own + up to 7 foreign = 8 (long-run) | 8 → 16 | 52,224 → 104,448 (×2) |
+| **C.** 128 hosts × 8 RNICs, no `tor_id` (all untagged) | 1 (`unspecified`) | 1 → 8 | 13,056 → 104,448 (×8) |
+
+Arithmetic for A: `P_agent = 8 × 4 = 32`, `series_agent = 32 × 102 = 3,264`,
+fleet `= 3,264 × 128 = 417,792`. In B the instantaneous `T(r)` is
+`1 + 5 = 6` with the default sample size; 8 is the bound once sampling has
+visited every foreign ToR. Histogram buckets dominate (96 of 102 series per
+tuple), so reducing bucket boundaries is the main lever if the total is too
+high; dropping the source-RNIC labels only helps in cases like B and C.
+
+To check the real count in Prometheus:
+
+```promql
+count by (__name__) ({__name__=~"rpingmesh_.*", job="rpingmesh-agent"})
+count by (instance) ({__name__=~"rpingmesh_.*", job="rpingmesh-agent"})
+```
+
 Resource attribution: the agent meter is created on a provider with
 `service.name = rpingmesh-agent`; the analyzer's with `rpingmesh-analyzer`.
 After the OTLP → Prometheus conversion these become the `job` label on every

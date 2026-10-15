@@ -721,7 +721,8 @@ is deferred.
 
 OpenTelemetry histogram attributes use ToR IDs (`source_tor`, `target_tor`)
 and the local RNIC (`source_rdma_device`, `source_netdev`, bounded by the RNICs
-per host) rather than individual GIDs. In a large fabric with thousands of RNICs, using
+per host) rather than individual GIDs. See "Estimating the series count" in
+`docs/design/grafana-dashboards.md` for the formula and worked examples. In a large fabric with thousands of RNICs, using
 GIDs as metric labels would cause cardinality explosion. Per-GID detail is
 available in structured debug logs. Agents that omit `tor_id` emit the label
 `unspecified` for both source and target when the peer is also untagged.

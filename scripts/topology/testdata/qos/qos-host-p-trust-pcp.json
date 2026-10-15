@@ -1,0 +1,139 @@
+{
+ "collected_at": "2026-01-01T00:00:00Z",
+ "devices": [
+  {
+   "device": "mlx5_0",
+   "ports": [
+    {
+     "counters": {
+      "interval_s": 5,
+      "prio": {
+       "0": {
+        "rx_bytes": 100000,
+        "rx_packets": 100,
+        "tx_bytes": 50000,
+        "tx_packets": 50
+       },
+       "3": {
+        "rx_bytes": 300000000,
+        "rx_pause": 2,
+        "tx_bytes": 300000000,
+        "tx_pause": 0
+       }
+      },
+      "raw": {
+       "after": [],
+       "before": []
+      },
+      "status": "ok"
+     },
+     "link_layer": "Ethernet",
+     "netdev": "eth0",
+     "port": 1,
+     "qos": {
+      "dscp_prio": null,
+      "pfc_enabled": [
+       3
+      ],
+      "raw": {
+       "mlnx_qos": {
+        "cmd": "mlnx_qos -i eth0",
+        "status": "ok",
+        "stdout": "(omitted in fixture)"
+       }
+      },
+      "sources": {
+       "pfc_enabled": "mlnx_qos",
+       "trust": "mlnx_qos"
+      },
+      "trust": "pcp"
+     },
+     "rocev2_gids": [
+      {
+       "gid": "0000:0000:0000:0000:0000:ffff:0a00:0001",
+       "index": 3,
+       "ndev": "eth0",
+       "type": "RoCE v2"
+      }
+     ],
+     "state": "4: ACTIVE",
+     "tc_override": {
+      "raw": null,
+      "status": "absent",
+      "tclass": null
+     }
+    }
+   ]
+  },
+  {
+   "device": "mlx5_1",
+   "ports": [
+    {
+     "counters": {
+      "interval_s": 5,
+      "prio": {
+       "0": {
+        "rx_bytes": 100000,
+        "rx_packets": 100,
+        "tx_bytes": 50000,
+        "tx_packets": 50
+       },
+       "3": {
+        "rx_bytes": 300000000,
+        "rx_pause": 2,
+        "tx_bytes": 300000000,
+        "tx_pause": 0
+       }
+      },
+      "raw": {
+       "after": [],
+       "before": []
+      },
+      "status": "ok"
+     },
+     "link_layer": "Ethernet",
+     "netdev": "eth1",
+     "port": 1,
+     "qos": {
+      "dscp_prio": null,
+      "pfc_enabled": [
+       3
+      ],
+      "raw": {
+       "mlnx_qos": {
+        "cmd": "mlnx_qos -i eth1",
+        "status": "ok",
+        "stdout": "(omitted in fixture)"
+       }
+      },
+      "sources": {
+       "pfc_enabled": "mlnx_qos",
+       "trust": "mlnx_qos"
+      },
+      "trust": "pcp"
+     },
+     "rocev2_gids": [
+      {
+       "gid": "0000:0000:0000:0000:0000:ffff:0a01:0001",
+       "index": 3,
+       "ndev": "eth1",
+       "type": "RoCE v2"
+      }
+     ],
+     "state": "4: ACTIVE",
+     "tc_override": {
+      "raw": null,
+      "status": "absent",
+      "tclass": null
+     }
+    }
+   ]
+  }
+ ],
+ "hostname": "host-p.example.internal",
+ "tools": {
+  "dcb": true,
+  "ethtool": true,
+  "mlnx_qos": true
+ }
+}

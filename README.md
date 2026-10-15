@@ -339,8 +339,20 @@ the right queue if the override is later removed.
   only: they move only during congestion, so their absence does not prove a
   priority is unused.
 
-[#70](https://github.com/yuuki/rpingmesh/issues/70) tracks a read-only helper
-that collects these facts.
+`scripts/topology/collect_qos_facts.py` collects these facts per RDMA port
+(plus the override from step 2 and the RoCE v2 GID indices) as one JSON object
+per host. It needs no privileges and changes nothing; run it on each host while
+jobs run, then summarize centrally:
+
+```sh
+python3 scripts/topology/collect_qos_facts.py --interval 5 > qos-$(hostname -s).json
+python3 scripts/topology/summarize_qos_facts.py qos-*.json   # --json for tooling
+```
+
+The summary lists the PFC-enabled priorities and the DSCPs mapping to them,
+candidate `traffic_class` values, the busiest priority, and every port whose
+trust mode, PFC priorities, DSCP map or override differs from the majority. It
+only suggests values; it does not change any configuration.
 
 **4. Map to config values.**
 
@@ -372,7 +384,8 @@ buffer capacity.
 **Pitfall.** If the workload's traffic class comes from per-device setup (such
 as the override above) that misses some RNICs, e.g. after devices are renamed,
 the traffic on those rails silently falls back to the default class. Compare
-the override (and the probes' `traffic_class`) across hosts and devices.
+the override (and the probes' `traffic_class`) across hosts and devices;
+`summarize_qos_facts.py` lists such ports as override outliers.
 
 ### Controller (`configs/controller.yaml`)
 

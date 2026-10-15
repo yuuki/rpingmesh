@@ -119,13 +119,13 @@ Worked examples (fleet totals use the upper bound `R = 4`):
 
 | Fabric | `T(r)` | `P_agent` before → after | Fleet series before → after |
 |---|---|---|---|
-| **A.** 128 hosts × 8 RNICs, rail-optimized: 8 planes × 4 leaves (32 ToRs), each RNIC on its own leaf | 1 own + 3 foreign in the plane = 4 | 32 → 32 | 417,792 → 417,792 (×1) |
-| **B.** 64 hosts × 2 RNICs, both RNICs of a host on the same ToR, 8 ToRs, no planes | 1 own + up to 7 foreign = 8 (long-run) | 8 → 16 | 52,224 → 104,448 (×2) |
-| **C.** 128 hosts × 8 RNICs, no `tor_id` (all untagged) | 1 (`unspecified`) | 1 → 8 | 13,056 → 104,448 (×8) |
+| **A.** 60 hosts × 6 RNICs, rail-optimized: 6 planes × 3 leaves (18 ToRs), each RNIC on its own leaf | 1 own + 2 foreign in the plane = 3 | 18 → 18 | 110,160 → 110,160 (×1) |
+| **B.** 40 hosts × 2 RNICs, both RNICs of a host on the same ToR, 10 ToRs, no planes | 1 own + up to 9 foreign = 10 (long-run) | 10 → 20 | 40,800 → 81,600 (×2) |
+| **C.** 300 hosts × 6 RNICs, no `tor_id` (all untagged) | 1 (`unspecified`) | 1 → 6 | 30,600 → 183,600 (×6) |
 
-Arithmetic for A: `P_agent = 8 × 4 = 32`, `series_agent = 32 × 102 = 3,264`,
-fleet `= 3,264 × 128 = 417,792`. In B the instantaneous `T(r)` is
-`1 + 5 = 6` with the default sample size; 8 is the bound once sampling has
+Arithmetic for A: `P_agent = 6 × 3 = 18`, `series_agent = 18 × 102 = 1,836`,
+fleet `= 1,836 × 60 = 110,160`. In B the instantaneous `T(r)` is
+`1 + 5 = 6` with the default sample size; 10 is the bound once sampling has
 visited every foreign ToR. Histogram buckets dominate (96 of 102 series per
 tuple), so reducing bucket boundaries is the main lever if the total is too
 high; dropping the source-RNIC labels only helps in cases like B and C.
@@ -187,7 +187,7 @@ names, closing the loop: exporter, dashboards, and seed all agree.
 backend running in UTF-8 mode stores the OTLP names as they are
 (`rpingmesh.probe_total`, `rpingmesh.agent.self_throttle`,
 `rpingmesh.network_rtt_ns_bucket`), and on-hardware verification found a
-production VictoriaMetrics doing exactly that, which left every panel empty.
+VictoriaMetrics deployment doing exactly that, which left every panel empty.
 Dashboards and alert rules therefore select metrics by regex on `__name__`,
 accepting a dot or an underscore at each position where the OTLP name has a
 dot:

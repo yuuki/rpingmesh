@@ -89,11 +89,11 @@ tooling in `scripts/topology/` covers B2, B3, B4 and B5.
   uses.
 
 **Decision: restrict to the requester's plane (implemented).** On a
-production rail-optimized GPU fabric whose rails are not routed to each other,
-every probe between RNICs of different rails timed out, while same-rail probes
-succeeded. With 8 rails, 7 of 8 unrestricted inter-ToR samples were therefore
-false loss, and so were 7 of 8 targets of the untagged (empty ToR) mesh, which
-samples all RNICs. An RNIC now carries an optional *plane*: the set of RNICs
+rail-optimized fabric whose rails are not routed to each other, every probe
+between RNICs of different rails times out, while same-rail probes succeed.
+With N rails, (N-1)/N of unrestricted inter-ToR samples are therefore false
+loss, and so are (N-1)/N of the targets of the untagged (empty ToR) mesh,
+which samples all RNICs. An RNIC now carries an optional *plane*: the set of RNICs
 it can reach (on a rail-isolated fabric, its rail).
 
 - Agent: `plane_id` (host-wide) and `device_plane_ids` (device name → plane,
@@ -135,12 +135,12 @@ RNICs that can reach each other, not the leaf: on a rail-optimized fabric
 whose rail *r* spans every group through per-rail spines, that is the rail,
 so the value must not include the group (`<group>-<rail>` would equal the
 leaf and leave inter-ToR empty). Where device names identify rails (see the
-field observations below), use `<zone>-<device>` per device, e.g.
+[observations](#observations-step-1-of-the-plan) below), use `<zone>-<device>` per device, e.g.
 
 ```yaml
 device_plane_ids:
-  mlx5_0: isk-rail0   # or isk-mlx5_0
-  mlx5_1: isk-rail1
+  mlx5_0: zone-a-rail0   # or zone-a-mlx5_0
+  mlx5_1: zone-a-rail1
 ```
 
 where `<zone>` separates independent fabrics that share one controller. On a
@@ -188,31 +188,25 @@ None of them reproduces "same leaf"; they are fallbacks only.
   controller downgraded under a running agent is only reported (once, from
   the heartbeat), since the monitors already hold per-device ToRs.
 
-## Field observations (step 1 of the plan)
+## Observations (step 1 of the plan)
 
-Facts collected with `collect_rnic_facts.py` on two production GPU
-environments with different fabric designs:
+Facts collected with `collect_rnic_facts.py` on rail-optimized fabrics of
+different designs:
 
-- **LLDP (B2) was not usable in either.** An LLDP daemon runs on the hosts,
-  but its control socket is root/group-only, and even as root it reports no
-  neighbor on the RoCE ports (the frames are presumably consumed by NIC
-  firmware or not sent by the switch). B2 cannot be the default source.
-  `lldp_tor_discovery` is therefore opt-in, for fabrics where hosts do see
-  their leaf over LLDP.
-- **Device naming is consistent across hosts** in both environments: a given
-  device name always sits on the same rail, so `--rail-key device` is a sound
-  rail key once storage/management rails and InfiniBand ports are excluded.
-- **Subnet layouts differ:**
-  - one environment uses one /24 per rail spanning every group, so the subnet
-    identifies the rail, not the leaf;
-  - the other assigns a small per-host, per-rail subnet (routed to the host
-    port), so the subnet identifies neither.
-  B3 therefore does not hold in either environment. B4 needs a group source.
-- **No Slurm topology plugin** is configured, so `scontrol show topology` is
-  empty. Partition names may still encode groups (e.g. one partition per
-  pod), which can feed `--host-groups`.
+- **LLDP (B2) was not usable.** Hosts reported no LLDP neighbor on their RoCE
+  ports (the frames may be consumed by NIC firmware or not sent by the
+  switch), so B2 cannot be the default source. `lldp_tor_discovery` is
+  therefore opt-in, for fabrics where hosts do see their leaf over LLDP.
+- **Device naming was consistent across hosts:** a given device name always
+  sat on the same rail, so `--rail-key device` is a sound rail key once
+  storage/management rails and InfiniBand ports are excluded.
+- **Subnets did not identify the leaf** (a subnet spanned a whole rail, or was
+  smaller than a leaf), so B3 does not hold there. B4 needs a group source.
+- **No Slurm topology plugin** was configured, so `scontrol show topology`
+  was empty and B4 needs an external group list (e.g. from the cabling plan
+  or the scheduler's partition layout, fed to `--host-groups`).
 
-Consequence: in these environments the only inventory-free way to learn which
+Consequence: on such fabrics the only inventory-free way to learn which
 RNICs share a leaf is the RTT clustering of step 2 (B5); B4 with a group list
 taken from the cabling plan or partition layout is the practical naming
 source, validated by B5.

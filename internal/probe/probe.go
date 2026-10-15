@@ -63,6 +63,14 @@ type ProbeResult struct {
 	TargetHostname string
 	TargetTorID    string
 	SourceTorID    string
+	// SourceRdmaDevice and SourceNetdev name the local RNIC that sent this
+	// probe: its RDMA device (e.g. "mlx5_0") and the netdev bound to the
+	// probing port/GID (e.g. "ens1f0"). Both are stamped by the Prober so they
+	// survive the fan-in of every device's results, and become the
+	// source_rdma_device / source_netdev metric attributes. Empty when
+	// unknown (test fakes, or a netdev that could not be resolved).
+	SourceRdmaDevice string
+	SourceNetdev     string
 }
 
 // RTTResult contains calculated RTT metrics from a probe.

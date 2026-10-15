@@ -39,12 +39,12 @@ which is exactly what a Prometheus-style backend expects.
 
 | Instrument (OTLP name) | Type | Labels | Meaning |
 |---|---|---|---|
-| `rpingmesh.network_rtt_ns` | Int64 Histogram | `source_tor`, `target_tor` | Network RTT `(T5-T2)-(T4-T3)` |
-| `rpingmesh.prober_delay_ns` | Int64 Histogram | `source_tor`, `target_tor` | Prober-side delay `(T6-T1)-(T5-T2)` |
-| `rpingmesh.responder_delay_ns` | Int64 Histogram | `source_tor`, `target_tor` | Responder-side delay `T4-T3` |
-| `rpingmesh.probe_total` | Counter | `source_tor`, `target_tor` | Probes attempted |
-| `rpingmesh.probe_success_total` | Counter | `source_tor`, `target_tor` | Probes with a valid RTT |
-| `rpingmesh.probe_failed_total` | Counter | `source_tor`, `target_tor`, `reason` | Failures; `reason` ∈ {timeout, send_error, invalid_rtt, unknown} |
+| `rpingmesh.network_rtt_ns` | Int64 Histogram | `source_tor`, `target_tor`, `source_rdma_device`, `source_netdev` | Network RTT `(T5-T2)-(T4-T3)` |
+| `rpingmesh.prober_delay_ns` | Int64 Histogram | `source_tor`, `target_tor`, `source_rdma_device`, `source_netdev` | Prober-side delay `(T6-T1)-(T5-T2)` |
+| `rpingmesh.responder_delay_ns` | Int64 Histogram | `source_tor`, `target_tor`, `source_rdma_device`, `source_netdev` | Responder-side delay `T4-T3` |
+| `rpingmesh.probe_total` | Counter | `source_tor`, `target_tor`, `source_rdma_device`, `source_netdev` | Probes attempted |
+| `rpingmesh.probe_success_total` | Counter | `source_tor`, `target_tor`, `source_rdma_device`, `source_netdev` | Probes with a valid RTT |
+| `rpingmesh.probe_failed_total` | Counter | `source_tor`, `target_tor`, `source_rdma_device`, `source_netdev`, `reason` | Failures; `reason` ∈ {timeout, send_error, invalid_rtt, unknown} |
 | `rpingmesh.agent.self_throttle` | Float64 ObservableGauge | (none) | Self-protection rate multiplier, 1.0 = unthrottled, floor 0.1 |
 | `rpingmesh.event_ring_dropped_total` | ObservableCounter | `ring` ∈ {prober, responder} | Completion events dropped on a full ring |
 | `rpingmesh.analyzer.path_summaries_total` | Counter | (none) | Per-path window summaries ingested |
@@ -56,7 +56,15 @@ nanoseconds, dense in 1–10 µs where RoCEv2 network RTTs land: `100, 250, 500,
 `12 500, 15 000, 20 000, 25 000, 50 000, 100 000, 250 000, 500 000, 1 000 000,
 2 500 000, 5 000 000, 10 000 000` (plus the implicit `+Inf`); see
 `rttBucketBoundaries` in `internal/telemetry/otel_metrics.go`. Cardinality is
-deliberately ToR-level only — GID detail is confined to debug logs.
+deliberately ToR-level plus the local (source) RNIC: `source_rdma_device` (e.g.
+`mlx5_0`) and `source_netdev` (e.g. `ens1f0`, the netdev bound to the probing
+port/GID) map 1:1, so they multiply series only by the RNICs per host. They let
+a multi-rail host's RNICs that share a ToR be told apart, and join with RDMA
+hardware counters and node_exporter `node_network_*{device=...}`. Names that
+cannot be resolved (e.g. a bonded RNIC's netdev) appear as `unspecified`.
+Destination-RNIC identity and GID detail are confined to debug logs. Queries
+that should stay ToR-level must aggregate with `sum by (source_tor,
+target_tor)` (as every bundled dashboard and alert does).
 Unset `tor_id` appears as the nonempty label `unspecified` on those
 attributes so Grafana template variables and the ToR×ToR matrix still
 render (one `unspecified`×`unspecified` cell for an all-untagged mesh).

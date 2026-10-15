@@ -8,6 +8,7 @@ import (
 
 	"github.com/yuuki/rpingmesh/internal/buildinfo"
 	"github.com/yuuki/rpingmesh/internal/probe"
+	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
@@ -331,6 +332,94 @@ func TestRecordProbeResult_EmptyTorMapped(t *testing.T) {
 	tgt, ok := totalSum.DataPoints[0].Attributes.Value("target_tor")
 	if !ok || tgt.AsString() != probe.UnspecifiedTorLabel {
 		t.Errorf("target_tor = %q, want %s", tgt.AsString(), probe.UnspecifiedTorLabel)
+	}
+}
+
+// TestRecordProbeResult_SourceRnicAttributes verifies that every probe metric
+// carries the source_rdma_device / source_netdev attributes from the result,
+// that an empty name maps to the "unspecified" label, and that results from
+// two local RNICs on the same ToR pair stay in separate series.
+func TestRecordProbeResult_SourceRnicAttributes(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer provider.Shutdown(context.Background())
+
+	mc, err := NewMetricsCollectorWithProvider(provider)
+	if err != nil {
+		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
+	}
+
+	ok := &probe.ProbeResult{
+		TargetTorID: "leaf-b", Success: true,
+		T1: 100, T2: 200, T3: 1000, T4: 1100, T5: 1500, T6: 1700,
+		SourceRdmaDevice: "mlx5_0", SourceNetdev: "ens1f0",
+	}
+	mc.RecordProbeResult(ok, probe.CalculateRTT(ok), "leaf-a")
+	mc.RecordProbeResult(&probe.ProbeResult{
+		TargetTorID: "leaf-b", ErrorMessage: "timed out waiting for ACKs",
+		SourceRdmaDevice: "mlx5_1",
+	}, nil, "leaf-a")
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("ManualReader.Collect: %v", err)
+	}
+
+	type rnic struct{ device, netdev string }
+	attrsOf := func(set attribute.Set) rnic {
+		dev, okDev := set.Value("source_rdma_device")
+		nd, okNd := set.Value("source_netdev")
+		if !okDev || !okNd {
+			t.Fatalf("missing source RNIC attributes in %v", set.ToSlice())
+		}
+		return rnic{dev.AsString(), nd.AsString()}
+	}
+	want0 := rnic{"mlx5_0", "ens1f0"}
+	want1 := rnic{"mlx5_1", probe.UnspecifiedTorLabel}
+
+	// probe_total: one series per source RNIC.
+	total := findMetric(&rm, "rpingmesh.probe_total")
+	if total == nil {
+		t.Fatal("rpingmesh.probe_total metric not found")
+	}
+	totalSum := total.Data.(metricdata.Sum[int64])
+	got := map[rnic]int64{}
+	for _, dp := range totalSum.DataPoints {
+		got[attrsOf(dp.Attributes)] += dp.Value
+	}
+	if len(got) != 2 || got[want0] != 1 || got[want1] != 1 {
+		t.Errorf("probe_total series = %v, want one each for %v and %v", got, want0, want1)
+	}
+
+	for _, name := range []string{"rpingmesh.probe_success_total", "rpingmesh.probe_failed_total"} {
+		m := findMetric(&rm, name)
+		if m == nil {
+			t.Fatalf("%s metric not found", name)
+		}
+		sum := m.Data.(metricdata.Sum[int64])
+		if len(sum.DataPoints) != 1 {
+			t.Fatalf("%s = %+v, want a single data point", name, sum)
+		}
+		want := want0
+		if name == "rpingmesh.probe_failed_total" {
+			want = want1
+		}
+		if g := attrsOf(sum.DataPoints[0].Attributes); g != want {
+			t.Errorf("%s source RNIC = %v, want %v", name, g, want)
+		}
+	}
+	for _, name := range []string{"rpingmesh.network_rtt_ns", "rpingmesh.prober_delay_ns", "rpingmesh.responder_delay_ns"} {
+		m := findMetric(&rm, name)
+		if m == nil {
+			t.Fatalf("%s metric not found", name)
+		}
+		hist := m.Data.(metricdata.Histogram[int64])
+		if len(hist.DataPoints) != 1 {
+			t.Fatalf("%s = %+v, want a single data point", name, hist)
+		}
+		if g := attrsOf(hist.DataPoints[0].Attributes); g != want0 {
+			t.Errorf("%s source RNIC = %v, want %v", name, g, want0)
+		}
 	}
 }
 

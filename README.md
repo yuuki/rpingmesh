@@ -720,7 +720,8 @@ is deferred.
 ### ToR-Level Metric Cardinality
 
 OpenTelemetry histogram attributes use ToR IDs (`source_tor`, `target_tor`)
-rather than individual GIDs. In a large fabric with thousands of RNICs, using
+and the local RNIC (`source_rdma_device`, `source_netdev`, bounded by the RNICs
+per host) rather than individual GIDs. In a large fabric with thousands of RNICs, using
 GIDs as metric labels would cause cardinality explosion. Per-GID detail is
 available in structured debug logs. Agents that omit `tor_id` emit the label
 `unspecified` for both source and target when the peer is also untagged.
@@ -780,8 +781,11 @@ The agent exports the following OTLP metrics:
 | `rpingmesh.probe_total` | Counter | | Total probe attempts |
 | `rpingmesh.agent.self_throttle` | Gauge | | Self-protection rate multiplier (`1.0` = unthrottled, down to `0.1`); emitted only when `self_protection_enabled` |
 
-The probe metrics carry two attributes: `source_tor` and `target_tor`. The
-`self_throttle` gauge is attribute-free (a single process-wide value).
+The probe metrics carry `source_tor` and `target_tor`, plus the local RNIC
+that sent the probe: `source_rdma_device` (RDMA device, e.g. `mlx5_0`) and
+`source_netdev` (its netdev, e.g. `ens1f0`). Either is `unspecified` when it
+cannot be resolved. `probe_failed_total` adds `reason`. The `self_throttle`
+gauge is attribute-free (a single process-wide value).
 
 The controller-side analyzer (Phase 1) exports the following OTLP metrics under
 `service.name=rpingmesh-analyzer`:

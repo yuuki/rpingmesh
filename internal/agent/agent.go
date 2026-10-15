@@ -129,6 +129,13 @@ type Agent struct {
 	// devices are opened.
 	deviceTorIDs []string
 
+	// deviceNetdevs holds the netdev bound to each opened device's active
+	// port/GID, parallel to devices ("" when it cannot be resolved). Used by
+	// LLDP ToR discovery and stamped onto probe results as the source_netdev
+	// metric attribute. Filled by resolveDeviceNetdevs right after the devices
+	// are opened.
+	deviceNetdevs []string
+
 	// devicePlaneIDs holds the canonical plane (rail) of each opened device,
 	// parallel to devices: its device_plane_ids entry, else plane_id. Empty
 	// means no plane restriction. Filled by resolveDevicePlaneIDs.
@@ -216,8 +223,7 @@ func (a *Agent) discoverLLDPTorIDs(ctx context.Context) []string {
 		if _, ok := a.cfg.DeviceTorID(dev.Info.DeviceName); ok {
 			continue
 		}
-		netdev, err := lldp.NetdevForRDMAPort(a.sysfsRoot, dev.Info.DeviceName,
-			dev.Info.ActivePort, dev.Info.ActiveGIDIndex)
+		netdev, err := a.netdevForDevice(i)
 		if err != nil {
 			a.logger.Warn().Err(err).
 				Str("device", dev.Info.DeviceName).
@@ -270,6 +276,43 @@ func (a *Agent) discoverLLDPTorIDs(ctx context.Context) []string {
 		}
 	}
 	return tors
+}
+
+// resolveDeviceNetdevs resolves, parallel to devices, the netdev bound to
+// each device's active port/GID. Resolution is best-effort: a device without
+// an unambiguous netdev (e.g. a bonded RNIC) keeps "" and is logged, and its
+// probe metrics then carry the "unspecified" source_netdev label.
+func (a *Agent) resolveDeviceNetdevs() {
+	a.deviceNetdevs = make([]string, len(a.devices))
+	for i, dev := range a.devices {
+		netdev, err := lldp.NetdevForRDMAPort(a.sysfsRoot, dev.Info.DeviceName,
+			dev.Info.ActivePort, dev.Info.ActiveGIDIndex)
+		if err != nil {
+			a.logger.Warn().Err(err).
+				Str("device", dev.Info.DeviceName).
+				Msg("Cannot resolve the device's netdev; source_netdev metric label will be unspecified")
+			continue
+		}
+		a.deviceNetdevs[i] = netdev
+		a.logger.Info().
+			Str("device", dev.Info.DeviceName).
+			Str("netdev", netdev).
+			Msg("Resolved device netdev")
+	}
+}
+
+// netdevForDevice returns the netdev of devices[i]: the value cached by
+// resolveDeviceNetdevs when it has run, else a fresh sysfs lookup.
+func (a *Agent) netdevForDevice(i int) (string, error) {
+	if i < len(a.deviceNetdevs) {
+		if netdev := a.deviceNetdevs[i]; netdev != "" {
+			return netdev, nil
+		}
+		return "", fmt.Errorf("no netdev resolved for RDMA device %s", a.devices[i].Info.DeviceName)
+	}
+	dev := a.devices[i]
+	return lldp.NetdevForRDMAPort(a.sysfsRoot, dev.Info.DeviceName,
+		dev.Info.ActivePort, dev.Info.ActiveGIDIndex)
 }
 
 // resolveDeviceTorIDs assigns each opened device its ToR and logs the result.
@@ -499,6 +542,7 @@ func (a *Agent) Initialize(ctx context.Context) error {
 		return fmt.Errorf("no RDMA devices available")
 	}
 	a.logger.Info().Int("device_count", len(a.devices)).Msg("RDMA devices opened")
+	a.resolveDeviceNetdevs()
 	a.resolveDeviceTorIDs(a.discoverLLDPTorIDs(ctx))
 	a.resolveDevicePlaneIDs()
 
@@ -536,6 +580,9 @@ func (a *Agent) Initialize(ctx context.Context) error {
 				dev.Info.DeviceName, err)
 		}
 		prober.SetSourceTorID(a.torIDForDevice(i))
+		if i < len(a.deviceNetdevs) {
+			prober.SetSourceNetdev(a.deviceNetdevs[i])
+		}
 		torMeshRate := a.cfg.EffectiveTorMeshProbeRate()
 		interTorRate := a.cfg.EffectiveInterTorProbeRate()
 		if torMeshRate > 0 || interTorRate > 0 {

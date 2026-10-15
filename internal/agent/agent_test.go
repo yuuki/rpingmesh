@@ -518,6 +518,51 @@ func TestAgent_LLDPTorDiscovery(t *testing.T) {
 	}
 }
 
+// TestAgent_ResolveDeviceNetdevs verifies that every opened device gets its
+// netdev resolved from sysfs regardless of LLDP settings, that a device
+// without one keeps "" (and LLDP discovery then reports an error for it),
+// and that the prober stamps the device and netdev onto its results.
+func TestAgent_ResolveDeviceNetdevs(t *testing.T) {
+	sysfs := t.TempDir()
+	dir := filepath.Join(sysfs, "class", "infiniband", "rxe0", "ports", "1", "gid_attrs", "ndevs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "0"), []byte("eth0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := NewAgent(&config.AgentConfig{AgentID: "agent-1"})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	a.sysfsRoot = sysfs
+	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0"), fakeDevice("rxe1", "1")}
+	for _, d := range a.devices {
+		d.Info.ActivePort = 1
+	}
+
+	a.resolveDeviceNetdevs()
+	want := []string{"eth0", ""}
+	for i, w := range want {
+		if got := a.deviceNetdevs[i]; got != w {
+			t.Errorf("device %s netdev = %q, want %q", a.devices[i].Info.DeviceName, got, w)
+		}
+	}
+	if _, err := a.netdevForDevice(1); err == nil {
+		t.Error("netdevForDevice(1) error = nil, want an error for the unresolved netdev")
+	}
+
+	p := fakeProber(1)
+	p.sourceRdmaDevice = a.devices[0].Info.DeviceName
+	p.SetSourceNetdev(a.deviceNetdevs[0])
+	p.emitResult(&probe.ProbeResult{})
+	got := <-p.resultChan
+	if got.SourceRdmaDevice != "rxe0" || got.SourceNetdev != "eth0" {
+		t.Errorf("result source RNIC = (%q, %q), want (rxe0, eth0)", got.SourceRdmaDevice, got.SourceNetdev)
+	}
+}
+
 // TestAgent_LLDPTorDiscoveryDisabled verifies that discovery is a no-op
 // unless enabled, so existing configs never run lldpcli.
 func TestAgent_LLDPTorDiscoveryDisabled(t *testing.T) {

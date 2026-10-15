@@ -83,13 +83,13 @@ groups:
       # post-send failures), not the fabric.
       - alert: RpingmeshProbeSendErrors
         expr: |
-          sum by (agent, source_tor) (label_join(rate({__name__=~"rpingmesh[._]probe_failed_total", reason="send_error"}[5m]), "agent", "", "instance", "host.name")) > 0
+          sum by (agent, source_tor, source_rdma_device, source_netdev) (label_join(rate({__name__=~"rpingmesh[._]probe_failed_total", reason="send_error"}[5m]), "agent", "", "instance", "host.name")) > 0
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Agent {{ $labels.agent }} fails to send probes"
-          description: "Probe send errors for 10 minutes; check the agent log and the RNIC state on the host."
+          summary: "Agent {{ $labels.agent }} fails to send probes on {{ $labels.source_rdma_device }} ({{ $labels.source_netdev }})"
+          description: "Probe send errors for 10 minutes; check the agent log and the state of RNIC {{ $labels.source_rdma_device }} on the host."
 
       # Completion events dropped on a full Zig->Go ring make probes look
       # lost; the agent is not draining its rings fast enough.

@@ -107,7 +107,7 @@ uppercase, underscore-separated field names (for example,
 ## Development Patterns
 
 - Logging: `github.com/rs/zerolog` (not standard `log`). GID-level probe detail goes to Debug logs only — never as OTel metric attributes (cardinality).
-- OTel metric attributes: `source_tor` and `target_tor` only (ToR-level aggregation, not per-GID).
+- OTel metric attributes: `source_tor` and `target_tor` (ToR-level aggregation, not per-GID), plus the local RNIC on agent probe metrics (`source_rdma_device`, `source_netdev`; bounded by the RNICs per host). Never add destination-RNIC identity (GID, IP, host, netdev) as an attribute.
 - gRPC client: use `grpc.NewClient()` (not the deprecated `grpc.Dial`).
 - C-ABI types: no `bool` — use `uint8_t` (0/1). GIDs are always `rdma_gid_t` (16-byte binary); string conversion only at display/config boundaries.
 - ECMP path diversity: controlled via `flow_label` in `ibv_ah_attr.grh.flow_label`. The `source_port` field in `PingTarget` is metadata only — RoCEv2 UD UDP source port is driver-generated and cannot be set directly.

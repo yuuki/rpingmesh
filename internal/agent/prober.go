@@ -217,19 +217,25 @@ type Prober struct {
 	// stream. Set once via SetSourceTorID before Start; empty leaves
 	// SourceTorID unset, and consumers then fall back to their own default.
 	sourceTorLabel string
-	targets        []*controller_agent.PingTarget
-	targetsMu      sync.RWMutex
-	pending        map[uint64]*pendingProbe // sequence_num -> pending probe info
-	pendingMu      sync.Mutex
-	seqCounter     atomic.Uint64
-	agentEpoch     uint32 // Random epoch prefix for sequence number collision prevention
-	resultChan     chan *probe.ProbeResult
-	running        atomic.Bool
-	stopMu         sync.Mutex    // guards stopCh (re)creation across Start/Stop
-	stopCh         chan struct{} // closed by Stop() to wake goroutines immediately
-	wg             sync.WaitGroup
-	probeInterval  time.Duration
-	probeTimeout   uint32 // ms
+	// sourceRdmaDevice and sourceNetdev identify the bound RNIC on emitted
+	// ProbeResults (source_rdma_device / source_netdev metric attributes).
+	// sourceRdmaDevice is taken from the device at construction; sourceNetdev
+	// is set once via SetSourceNetdev before Start. Empty when unknown.
+	sourceRdmaDevice string
+	sourceNetdev     string
+	targets          []*controller_agent.PingTarget
+	targetsMu        sync.RWMutex
+	pending          map[uint64]*pendingProbe // sequence_num -> pending probe info
+	pendingMu        sync.Mutex
+	seqCounter       atomic.Uint64
+	agentEpoch       uint32 // Random epoch prefix for sequence number collision prevention
+	resultChan       chan *probe.ProbeResult
+	running          atomic.Bool
+	stopMu           sync.Mutex    // guards stopCh (re)creation across Start/Stop
+	stopCh           chan struct{} // closed by Stop() to wake goroutines immediately
+	wg               sync.WaitGroup
+	probeInterval    time.Duration
+	probeTimeout     uint32 // ms
 
 	// queueMu guards access to the queue pointer so that GetQueueInfo cannot
 	// race with Destroy() setting queue to nil.
@@ -362,6 +368,7 @@ func NewProber(device *rdmabridge.Device, ring *rdmabridge.EventRing, probeInter
 		ring:                       ring,
 		device:                     device,
 		sourceGID:                  sourceGID,
+		sourceRdmaDevice:           device.Info.DeviceName,
 		pending:                    make(map[uint64]*pendingProbe),
 		agentEpoch:                 rand.Uint32(),
 		resultChan:                 make(chan *probe.ProbeResult, resultChanSize),
@@ -1193,6 +1200,13 @@ func (p *Prober) SetSourceTorID(torID string) {
 	p.sourceTorLabel = probe.TorMetricLabel(torID)
 }
 
+// SetSourceNetdev records the netdev bound to the prober's device port/GID
+// (empty when it could not be resolved). Like SetSourceTorID, it must be
+// called before Start.
+func (p *Prober) SetSourceNetdev(netdev string) {
+	p.sourceNetdev = netdev
+}
+
 // emitResult delivers a result on resultChan without blocking. A non-blocking
 // send keeps a slow consumer from stalling the probe or ACK loops (which may
 // hold pendingMu at the call site's caller); a full channel drops the result
@@ -1205,6 +1219,8 @@ func (p *Prober) emitResult(result *probe.ProbeResult) {
 	if p.sourceTorLabel != "" {
 		result.SourceTorID = p.sourceTorLabel
 	}
+	result.SourceRdmaDevice = p.sourceRdmaDevice
+	result.SourceNetdev = p.sourceNetdev
 	select {
 	case p.resultChan <- result:
 	default:

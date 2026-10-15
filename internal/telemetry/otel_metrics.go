@@ -98,6 +98,21 @@ func probeFailureReason(result *probe.ProbeResult, rtt *probe.RTTResult) string 
 	return reasonInvalidRTT
 }
 
+// unspecifiedDeviceLabel is the source_rdma_device / source_netdev metric
+// label for a result whose source RNIC name is unknown (e.g. a netdev that
+// could not be resolved). It matches probe.UnspecifiedTorLabel so every
+// "unknown" label value reads the same in dashboards.
+const unspecifiedDeviceLabel = probe.UnspecifiedTorLabel
+
+// deviceMetricLabel returns name, or unspecifiedDeviceLabel when it is empty,
+// so the attribute is always present with a fixed, non-empty value.
+func deviceMetricLabel(name string) string {
+	if name = strings.TrimSpace(name); name != "" {
+		return name
+	}
+	return unspecifiedDeviceLabel
+}
+
 // defaultServiceName is the OTel resource service.name used when
 // NewMetricsCollector is called without a WithServiceName option.
 const defaultServiceName = "rpingmesh-agent"
@@ -395,12 +410,21 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 
 	ctx := context.Background()
 
-	// Build low-cardinality attribute set: ToR IDs only.
-	// NEVER use GIDs as metric attributes to avoid cardinality explosion.
-	attrs := metric.WithAttributes(
+	sourceRdmaDevice := deviceMetricLabel(result.SourceRdmaDevice)
+	sourceNetdev := deviceMetricLabel(result.SourceNetdev)
+
+	// Build low-cardinality attribute set: ToR IDs plus the local (source)
+	// RNIC. The source RNIC labels are bounded by the RNICs on this host,
+	// and device and netdev map 1:1, so together they multiply series only
+	// by the local RNIC count. NEVER use GIDs or any destination-RNIC
+	// identity as metric attributes to avoid cardinality explosion.
+	attrSet := []attribute.KeyValue{
 		attribute.String("source_tor", sourceTor),
 		attribute.String("target_tor", targetTor),
-	)
+		attribute.String("source_rdma_device", sourceRdmaDevice),
+		attribute.String("source_netdev", sourceNetdev),
+	}
+	attrs := metric.WithAttributes(attrSet...)
 
 	// Always increment total probe count.
 	mc.probeTotal.Add(ctx, 1, attrs)
@@ -412,11 +436,9 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		mc.responderDelay.Record(ctx, rtt.ResponderDelay, attrs)
 		mc.probeSuccess.Add(ctx, 1, attrs)
 	} else {
-		mc.probeFailed.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("source_tor", sourceTor),
-			attribute.String("target_tor", targetTor),
-			attribute.String("reason", probeFailureReason(result, rtt)),
-		))
+		failedAttrs := append(attrSet[:len(attrSet):len(attrSet)],
+			attribute.String("reason", probeFailureReason(result, rtt)))
+		mc.probeFailed.Add(ctx, 1, metric.WithAttributes(failedAttrs...))
 	}
 
 	// Log GID-level detail at Debug level. This provides per-flow
@@ -426,6 +448,8 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		Str("target_gid", probe.FormatGID(result.TargetGID)).
 		Str("source_tor", sourceTor).
 		Str("target_tor", targetTor).
+		Str("source_rdma_device", sourceRdmaDevice).
+		Str("source_netdev", sourceNetdev).
 		Str("target_ip", result.TargetIP).
 		Uint32("flow_label", result.FlowLabel).
 		Uint64("seq", result.SequenceNum).

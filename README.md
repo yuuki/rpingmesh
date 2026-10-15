@@ -852,7 +852,8 @@ whole round and slows the other type as well. With the shipped configuration,
 the 1 probe/s inter-ToR cap binds against the 500 ms interval: an RNIC with
 inter-ToR targets completes a round about once per second, and its ToR-mesh
 targets are then also probed about once per second. Removing this coupling
-would require a separate send loop per type.
+would require a separate send loop per type; see
+[#77](https://github.com/yuuki/rpingmesh/issues/77).
 
 ### Staleness in the registry
 
@@ -929,7 +930,8 @@ acceptable; GIDs and other destination-RNIC identities are not.
   `inter_tor_sample_size` remote ToRs.
 - **Probe types share one send loop.** A binding per-type rate cap also slows
   the other pinglist type; see
-  [Per-pinglist-type probe rates](#per-pinglist-type-probe-rates).
+  [Per-pinglist-type probe rates](#per-pinglist-type-probe-rates) and
+  [#77](https://github.com/yuuki/rpingmesh/issues/77).
 - **One SL and traffic class per agent.** `service_level` and `traffic_class`
   apply to every address handle on every device; a target cannot use a
   different priority. Soft-RoCE carries these values on the wire but does not

@@ -71,11 +71,11 @@ func TestIsReservedTorID(t *testing.T) {
 
 func TestCanonicalPlaneID(t *testing.T) {
 	for in, want := range map[string]string{
-		"":            "",
-		"   ":         "",
-		"rail0":       "rail0",
-		" isk-rail3 ": "isk-rail3",
-		"Rail0":       "Rail0", // case is preserved
+		"":               "",
+		"   ":            "",
+		"rail0":          "rail0",
+		" zone-a-rail3 ": "zone-a-rail3",
+		"Rail0":          "Rail0", // case is preserved
 	} {
 		if got := CanonicalPlaneID(in); got != want {
 			t.Errorf("CanonicalPlaneID(%q) = %q, want %q", in, got, want)

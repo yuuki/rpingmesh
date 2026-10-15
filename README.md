@@ -334,8 +334,8 @@ pinglist comes back empty or when every probe to a target keeps timing out
 | Key | Default | Description |
 |-----|---------|-------------|
 | `gid_index` | `0` | GID table index (0–255) |
-| `service_level` | `0` | Service Level (PFC priority, 0–7) of every Address Handle |
-| `traffic_class` | `0` | GRH traffic class (0–255) of every Address Handle. DSCP is the upper 6 bits: set `N << 2` for DSCP `N` |
+| `service_level` | `0` | Service Level (PFC priority, 0–7) of every address handle; does not select the queue with `trust dscp` |
+| `traffic_class` | `0` | GRH traffic class (0–255) of every address handle: DSCP in the upper 6 bits, ECN in the lower 2 |
 | `cq_poll_mode` | `auto` | `event`, `busy`, or `auto`; see [Event-driven completion handling](#event-driven-completion-handling) |
 | `allowed_device_names` | `[]` | Devices to open; empty opens all |
 | `excluded_device_names` | `[]` | Devices never to open. A device in both lists is a configuration error |
@@ -345,6 +345,9 @@ entry at index 0 and the RoCE v2 entry at a higher index; check with
 `ibv_devinfo -d <dev> -v`. Validation rejects only values outside 0–255. If the
 index does not resolve to a usable GID on a device, the agent exits with an
 error that names the device, port, and GID table size.
+
+To choose `service_level` and `traffic_class`, see
+[Choosing `traffic_class` and `service_level`](#choosing-traffic_class-and-service_level).
 
 **Telemetry and analysis**
 
@@ -379,6 +382,92 @@ self-protection disabled.
 | `tls_cert_file`, `tls_key_file` | `""` | Client certificate and key (`mtls`) |
 | `tls_ca_file` | `""` | CA that signed the controller's certificate (`tls`, `mtls`) |
 | `tls_server_name` | `""` | Name to verify instead of the host in `controller_addr`; needed when that is an IP address |
+
+### Choosing `traffic_class` and `service_level`
+
+Probes observe what a workload (for example, NCCL collectives) observes only
+if they travel in the same switch and NIC priority queue. A probe in another
+priority does not see that queue's PFC pauses, queueing, or loss. With the
+defaults (`traffic_class: 0`, `service_level: 0`), probes usually land in a
+lossy default queue even when the workload uses a lossless one. In a lossless
+queue, probes see pause-induced latency rather than congestion drops.
+
+Before choosing values:
+
+- DSCP selects the queue only for RoCE v2, because DSCP is carried in the IP
+  header. Make sure `gid_index` points at a RoCE v2 GID; index 0 is often the
+  RoCE v1 entry.
+- Use identical values on every agent. A responder sends its ACKs through
+  address handles built from its own `traffic_class` and `service_level`, so
+  mismatched values put probes and ACKs in different queues.
+- The values apply to the whole agent and take effect only after a restart.
+
+**1. Do not rely on the workload's configuration.** NCCL often runs in user
+containers, where `NCCL_IB_TC` and `NCCL_IB_SL` may be set in the image, the
+job script, or the container's `/etc/nccl.conf`, none of which the host can
+see. If nothing sets it, NCCL uses traffic class `0` unless the communicator
+configures one. Newer NCCL versions also have `NCCL_IB_FIFO_TC` for control
+messages, which follows `NCCL_IB_TC` by default. NCCL does not use the RDMA
+CM, so the RDMA CM `default_roce_tos` setting does not affect it.
+
+**2. Check for a NIC-level override.** NVIDIA's MLNX_OFED/DOCA mlx5 driver can
+force a traffic class, shown in
+`/sys/class/infiniband/<dev>/tc/<port>/traffic_class` (for example
+`Global tclass=106`); inbox drivers may not expose this file. When it is set,
+the workload effectively uses that class. NVIDIA documents the override for
+RC QPs, whereas R-Pingmesh probes are UD and set the traffic class per address
+handle (rdma-core's mlx5 provider copies it into the UD address vector).
+Whether the override also applies to UD
+[has not been verified](https://github.com/yuuki/rpingmesh/issues/71), so set
+`traffic_class` explicitly to the same value. This also keeps probes in the
+right queue if the override is later removed.
+
+**3. Determine the queue empirically.** This works regardless of containers:
+
+- Trust mode (`dscp` or `pcp`), DSCP-to-priority map, and PFC-enabled
+  priorities: `mlnx_qos -i <netdev>` (MLNX_OFED), or, where the driver
+  supports it, `dcb apptrust show dev <netdev>`,
+  `dcb app show dev <netdev> dscp-prio`, and
+  `dcb pfc show dev <netdev> prio-pfc`.
+- Per-priority byte counters, sampled twice while jobs run:
+  `ethtool -S <netdev> | grep -E '(rx|tx)_prio[0-7]_bytes'`. They count all
+  traffic in a priority, not only RoCE.
+- Per-priority PFC pause counters (for example `(rx|tx)_prio<N>_pause`) are
+  only a hint: they move only under congestion, so an idle counter does not
+  prove that a priority is unused.
+
+A read-only helper that collects these facts is tracked in
+[#70](https://github.com/yuuki/rpingmesh/issues/70).
+
+**4. Map the queue to configuration values.**
+
+- `traffic_class` is `DSCP << 2` plus the two ECN bits, for a DSCP that maps
+  to the workload's priority. For DSCP 26, `104` is Not-ECT and `106` is
+  ECT(0). Where a queue uses WRED/ECN, Not-ECT packets may be dropped where
+  ECT packets would be CE-marked. Prefer the value the workload emits on the
+  wire (for example an override value such as `106`), and verify the observed
+  ECN bits instead of assuming how the NIC sets them.
+- `service_level` does not select the queue with `trust dscp`, which is typical
+  for RoCE v2 without VLANs; leave it at `0`. Only with `trust pcp` and
+  VLAN-tagged RoCE does SL map to the PCP; then use the lossless priority.
+- Confirm with the network team that switches classify the chosen DSCP into
+  the same queue and do not re-mark it.
+
+**5. Overhead.** Each probe causes three packets (the probe and two ACKs),
+each with a 40-byte payload, or about 110 bytes on the wire including
+Ethernet, IP, UDP, BTH, DETH, and ICRC headers. A target receives at most
+`min(1000 / probe_interval_ms, per-target cap)` probes per second, shared by
+its flow labels; at the default 500 ms interval that is 2 probes/s, or about
+6 packets/s per target across both directions. An RNIC sends this for each of
+its targets and also answers every peer that targets it, so its load is about
+`targets × 6` packets/s, which is negligible next to line rate and PFC buffer
+capacity.
+
+**Pitfall.** If the workload's traffic class comes from per-device setup,
+such as the override above, that misses some RNICs (for example after devices
+are renamed), traffic on those rails silently falls back to the default
+class. Compare the override, and the probes' `traffic_class`, across hosts and
+devices.
 
 ### Controller
 
@@ -845,7 +934,8 @@ acceptable; GIDs and other destination-RNIC identities are not.
   apply to every address handle on every device; a target cannot use a
   different priority. Soft-RoCE carries these values on the wire but does not
   implement PFC or DSCP queuing, so their effect can be verified only on real
-  hardware.
+  hardware. See
+  [Choosing `traffic_class` and `service_level`](#choosing-traffic_class-and-service_level).
 - **Self-protection is coarse.** It reacts only to the agent's own CPU and
   memory use, with static thresholds and a four-step multiplier, and never
   stops probing.

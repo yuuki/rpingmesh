@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Agent probe metrics (`rpingmesh.network_rtt_ns`, `prober_delay_ns`,
+  `responder_delay_ns`, `probe_total`, `probe_success_total`,
+  `probe_failed_total`) now carry the local RNIC that sent the probe:
+  `source_rdma_device` (e.g. `mlx5_0`) and `source_netdev` (e.g. `ens1f0`, the
+  netdev bound to the probing port/GID, resolved from sysfs at startup for
+  every device). Either is `unspecified` when it cannot be resolved (e.g. a
+  bonded RNIC). RNICs of a multi-rail host that share a ToR no longer collapse
+  into one series. Series grow by at most the RNICs per host; queries that
+  aggregate with `sum by (source_tor, target_tor)` (all bundled dashboards and
+  alerts) are unchanged. See "Estimating the series count" in
+  `docs/design/grafana-dashboards.md`.
+- The `RpingmeshProbeSendErrors` alert is grouped by source RNIC and names the
+  device in its summary.
+
 ### Fixed
 
 - The controller no longer exits when rqlite is not ready at startup (for

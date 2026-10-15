@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/yuuki/rpingmesh/internal/agent"
+	"github.com/yuuki/rpingmesh/internal/lldp"
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/internal/rdmabridge"
 	"github.com/yuuki/rpingmesh/internal/telemetry"
@@ -141,6 +142,14 @@ func TestProbeToOTelMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProber: %v", err)
 	}
+	// Resolve the prober's netdev the way the agent does at startup, so the
+	// source_netdev attribute is checked against a real sysfs binding.
+	proberNetdev, err := lldp.NetdevForRDMAPort(lldp.DefaultSysfsRoot, proberDev.Info.DeviceName,
+		proberDev.Info.ActivePort, proberDev.Info.ActiveGIDIndex)
+	if err != nil {
+		t.Fatalf("resolve prober netdev: %v", err)
+	}
+	prober.SetSourceNetdev(proberNetdev)
 	// Destroy (not defer) because we need controlled shutdown order.
 
 	responder, err := agent.NewResponder(responderDev, responderRing)
@@ -371,10 +380,12 @@ func TestProbeToOTelMetrics(t *testing.T) {
 		}
 	}
 
-	// Verify ToR attributes are present on probe_total.
+	// Verify ToR and source RNIC attributes are present on probe_total.
 	assertCounterHasAttributes(t, rm, "rpingmesh.probe_total", map[string]string{
-		"source_tor": sourceTorID,
-		"target_tor": targetTorID,
+		"source_tor":         sourceTorID,
+		"target_tor":         targetTorID,
+		"source_rdma_device": proberDeviceName,
+		"source_netdev":      expectedNetdevs[proberDeviceName],
 	})
 }
 

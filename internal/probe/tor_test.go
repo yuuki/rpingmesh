@@ -74,7 +74,7 @@ func TestCanonicalPlaneID(t *testing.T) {
 		"":            "",
 		"   ":         "",
 		"rail0":       "rail0",
-		" isk-rail3 ": "isk-rail3",
+		" zone-a-rail3 ": "zone-a-rail3",
 		"Rail0":       "Rail0", // case is preserved
 	} {
 		if got := CanonicalPlaneID(in); got != want {

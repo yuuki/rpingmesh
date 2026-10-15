@@ -23,8 +23,8 @@ tor_id: ""
 # Per-device planes for multi-rail hosts (same rules as device_tor_ids; an
 # entry wins over plane_id):
 # device_plane_ids:
-#   mlx5_0: "isk-rail0"
-#   mlx5_1: "isk-rail1"
+#   mlx5_0: "zone-a-rail0"
+#   mlx5_1: "zone-a-rail1"
 
 # Optional: derive each device's ToR from the LLDP neighbor of its netdev
 # instead of listing device_tor_ids. Needs lldpd on the host and access to its

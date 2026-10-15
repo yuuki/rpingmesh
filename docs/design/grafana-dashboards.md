@@ -187,7 +187,7 @@ names, closing the loop: exporter, dashboards, and seed all agree.
 backend running in UTF-8 mode stores the OTLP names as they are
 (`rpingmesh.probe_total`, `rpingmesh.agent.self_throttle`,
 `rpingmesh.network_rtt_ns_bucket`), and on-hardware verification found a
-production VictoriaMetrics doing exactly that, which left every panel empty.
+VictoriaMetrics deployment doing exactly that, which left every panel empty.
 Dashboards and alert rules therefore select metrics by regex on `__name__`,
 accepting a dot or an underscore at each position where the OTLP name has a
 dot:

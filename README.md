@@ -321,8 +321,10 @@ mlx5 driver can force a traffic class, shown in
 the workload is effectively in that class. NVIDIA documents the feature for RC
 QPs, while rpingmesh probes are UD and set the traffic class per Address
 Handle (rdma-core's mlx5 provider copies it into the UD send's address
-vector). Whether the override also applies to UD has **not been verified**
-([#71](https://github.com/yuuki/rpingmesh/issues/71)), so do not rely on it:
+vector). The driver source applies the override only to connected QPs, but
+whether it also applies to UD on the wire has **not been verified**
+([#71](https://github.com/yuuki/rpingmesh/issues/71),
+[runbook](docs/design/ud-tclass-verification.md)), so do not rely on it:
 set `traffic_class` explicitly to the same value. This also keeps probes in
 the right queue if the override is later removed.
 

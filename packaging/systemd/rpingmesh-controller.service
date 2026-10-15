@@ -1,13 +1,13 @@
 # rpingmesh-controller.service - R-Pingmesh controller (pure Go, CGO_ENABLED=0).
 #
 # The controller has no RDMA/CGO dependency (see README.md
-# "Prerequisites"/"Building"), so this unit is hardened much more tightly
+# "Prerequisites"/"Build"), so this unit is hardened much more tightly
 # than rpingmesh-agent.service: no device access, no elevated capabilities,
 # no writable filesystem paths are needed at runtime (config and, if
 # tls_mode != disabled, TLS certificate/key/CA files are only ever read).
 #
 # Install layout assumed by this unit (see the nfpm packaging definitions in
-# packaging/nfpm/ and the "Deployment (systemd)" section of README.md):
+# packaging/nfpm/ and the "Deployment" section of README.md):
 #   /usr/bin/rpingmesh-controller       - binary
 #   /etc/rpingmesh/controller.yaml      - config (edit before enabling)
 #   /etc/rpingmesh/controller.env       - optional environment overrides
@@ -23,7 +23,7 @@ Documentation=https://github.com/yuuki/rpingmesh
 # remote/clustered rqlite (Wants= on a unit that doesn't exist is a no-op).
 # rqlited accepts connections before its store is open, so After= only helps
 # if rqlite's unit signals readiness (e.g. an ExecStartPost that polls
-# /readyz; see README "Co-locating rqlite"). Independently, the controller
+# /readyz; see README "Running rqlite on the controller host"). Independently, the controller
 # retries the connection for database_connect_timeout_sec (default 120s).
 After=network-online.target rqlite.service
 Wants=network-online.target rqlite.service

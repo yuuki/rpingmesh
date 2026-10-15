@@ -2,7 +2,7 @@
 # the Zig rdma_bridge static library; see README.md "Architecture").
 #
 # Install layout assumed by this unit (see the nfpm packaging definitions in
-# packaging/nfpm/ and the "Deployment (systemd)" section of README.md):
+# packaging/nfpm/ and the "Deployment" section of README.md):
 #   /usr/bin/rpingmesh-agent            - binary
 #   /etc/rpingmesh/agent.yaml           - config (edit before enabling)
 #   /etc/rpingmesh/agent.env            - optional environment overrides
@@ -42,7 +42,7 @@
 #     it when present. If installing manually (not via the .deb/.rpm) or if
 #     your distribution uses a different group (or ACLs) for
 #     /dev/infiniband, create/adjust that group yourself and update
-#     SupplementaryGroups accordingly -- see the "Deployment (systemd)"
+#     SupplementaryGroups accordingly -- see the "Deployment"
 #     section of README.md.
 #
 # What this unit deliberately does NOT grant, and why:

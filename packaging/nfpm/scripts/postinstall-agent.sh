@@ -6,7 +6,7 @@
 # It deliberately does NOT enable or start the service: agent.yaml ships
 # only as an .example because controller_addr is host-specific, so an
 # unconfigured service would just crash-loop. See README.md
-# "Deployment (systemd)" for the manual enable/start steps.
+# "Deployment" for the manual enable/start steps.
 set -e
 
 if ! getent group rpingmesh >/dev/null 2>&1; then

@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-10-16
+
 ### Added
 
 - Agent probe metrics (`rpingmesh.network_rtt_ns`, `prober_delay_ns`,
@@ -35,6 +37,13 @@ All notable changes to this project are documented in this file.
 - `rpingmesh-controller.service` now also `Wants=rqlite.service`, and the
   README documents making a co-located rqlite unit signal readiness via
   `/readyz`.
+- The agent paces ToR-mesh and inter-ToR probes independently. Previously a
+  binding per-type cap (the shipped 1 probe/s inter-ToR cap) also slowed
+  ToR-mesh targets to ~1 probe/s. Each type now runs at
+  `min(cap, 1s/probe_interval_ms)` per target times the self-protection
+  multiplier, so the multiplier also takes effect for caps above the
+  `probe_interval_ms` ceiling. A pinglist update abandons the stale passes.
+  (#77)
 
 ## [0.5.2] - 2026-10-13
 

@@ -41,7 +41,12 @@ lldp_tor_discovery: false
 controller_addr: "localhost:50051"
 
 # Probing settings
-probe_interval_ms: 500           # Probe interval in milliseconds
+# Minimum interval between two probes to the same target, i.e. a per-target
+# ceiling of 1000 / probe_interval_ms probes/sec that applies on top of the caps
+# below. At 500 ms ToR-mesh targets get min(2, 10) = 2 probes/s and inter-ToR
+# targets min(2, 1) = 1 probe/s; set 100 to reach the full 10:1 ratio (5x the
+# ToR-mesh probe traffic). The two types are paced independently.
+probe_interval_ms: 500
 # Per-target probe-rate caps (probes/sec PER TARGET; a target's ECMP flow labels
 # share this budget, they do not multiply it). R-Pingmesh probes the ToR-mesh
 # more aggressively than inter-ToR, so the two pinglist types have separate caps.

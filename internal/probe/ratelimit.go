@@ -30,6 +30,17 @@ func (r *RateLimiter) Enabled() bool {
 	return r.minInterval > 0
 }
 
+// Delay returns how long, relative to now, the caller would have to wait before
+// the next send without reserving it: it is what Reserve would return, but it
+// leaves the schedule untouched. A scheduler choosing among several limiters
+// uses it to find the earliest one ready, then calls Reserve on that one only.
+func (r *RateLimiter) Delay(now time.Time) time.Duration {
+	if r.minInterval <= 0 || !now.Before(r.next) {
+		return 0
+	}
+	return r.next.Sub(now)
+}
+
 // Reserve returns how long the caller should wait, relative to now, before
 // performing the next send, and advances the internal schedule so that the
 // following Reserve accounts for this send. When rate limiting is disabled it

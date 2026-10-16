@@ -338,10 +338,25 @@ func TestClusterMonitor_RefreshHint_TriggersEarlyRefresh(t *testing.T) {
 	prober.refreshHint <- struct{}{}
 	waitForCalls(t, client, controller_agent.PinglistType_TOR_MESH, 2, 2*time.Second)
 
-	prober.targetsMu.RLock()
-	defer prober.targetsMu.RUnlock()
-	if len(prober.targets) != 1 || prober.targets[0].GetTargetQpn() != 11 {
-		t.Errorf("prober targets after early refresh = %v, want the refreshed QPN 11", prober.targets)
+	// The mock counts the ToR-mesh call when it is made, but the monitor
+	// still fetches the inter-ToR list before it calls UpdateTargets, so
+	// wait for the refreshed targets instead of reading them right away.
+	refreshed := func() (bool, []*controller_agent.PingTarget) {
+		prober.targetsMu.RLock()
+		defer prober.targetsMu.RUnlock()
+		ok := len(prober.targets) == 1 && prober.targets[0].GetTargetQpn() == 11
+		return ok, prober.targets
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ok, targets := refreshed()
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("prober targets after early refresh = %v, want the refreshed QPN 11", targets)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

@@ -6,7 +6,6 @@
 package agent
 
 import (
-	"context"
 	"sync"
 	"testing"
 	"time"
@@ -175,12 +174,6 @@ func TestPerTypeRateLimit_LockOrderRace(t *testing.T) {
 	p := &Prober{logger: zerolog.Nop()}
 	p.UpdateTargets(typedTargets(controller_agent.PinglistType_TOR_MESH, "tor", 4))
 
-	// A pre-cancelled context makes rateLimitWait return immediately on any
-	// non-zero reservation instead of sleeping, so the reader still hits the
-	// rateMu-guarded Reserve every iteration without slowing the test.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
 	var wg sync.WaitGroup
 	const iters = 500
 
@@ -205,14 +198,20 @@ func TestPerTypeRateLimit_LockOrderRace(t *testing.T) {
 		}
 	}()
 
-	// Reader: the send path's rate check (rateMu only). A cancelled context
-	// makes any non-zero wait return immediately without a real sleep.
+	// Reader: the probe loop's limiter check and reservation (rateMu only).
+	// Neither sleeps, so the reader runs at full speed.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iters; i++ {
-			p.rateLimitWait(ctx, controller_agent.PinglistType_TOR_MESH)
-			p.rateLimitWait(ctx, controller_agent.PinglistType_INTER_TOR)
+			now := time.Now()
+			for _, ptype := range []controller_agent.PinglistType{
+				controller_agent.PinglistType_TOR_MESH,
+				controller_agent.PinglistType_INTER_TOR,
+			} {
+				p.sendDelay(ptype, now)
+				p.reserveSend(ptype, now)
+			}
 		}
 	}()
 

@@ -557,7 +557,7 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.String("controller-addr", "localhost:50051", "Controller gRPC address")
 	flags.String("log-level", "info", "Log level (debug, info, warn, error)")
 	flags.String("log-format", logging.DefaultFormat, "Log output format: console or json")
-	flags.Uint32("probe-interval-ms", 500, "Probe interval in milliseconds")
+	flags.Uint32("probe-interval-ms", 500, "Minimum interval in milliseconds between two probes to the same target (per-target rate ceiling)")
 	flags.String("otel-collector-addr", "localhost:4317", "OpenTelemetry collector address")
 	flags.Bool("metrics-enabled", true, "Enable OpenTelemetry metrics export")
 	flags.StringSlice("allowed-device-names", []string{}, "List of allowed RDMA device names (empty = all)")

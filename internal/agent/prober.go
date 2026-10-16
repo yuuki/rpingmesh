@@ -224,6 +224,7 @@ type Prober struct {
 	sourceRdmaDevice string
 	sourceNetdev     string
 	targets          []*controller_agent.PingTarget
+	targetsGen       uint64 // bumped by UpdateTargets; guarded by targetsMu
 	targetsMu        sync.RWMutex
 	pending          map[uint64]*pendingProbe // sequence_num -> pending probe info
 	pendingMu        sync.Mutex
@@ -256,9 +257,8 @@ type Prober struct {
 	// ToR-mesh more aggressively than inter-ToR). Each limiter's aggregate rate
 	// is pps * (number of targets of that type), recomputed on every
 	// UpdateTargets so the configured per-target cadence survives pinglist
-	// churn -- exactly as the single aggregate limiter did before, but scoped
-	// per type. sendProbes selects the limiter matching each target's
-	// PinglistType.
+	// churn. The probe loop schedules each type from its own limiter (see
+	// probeLoop), so one type's cap never paces the other type.
 	rateMu       sync.Mutex
 	torMeshRate  perTypeRate
 	interTorRate perTypeRate
@@ -284,11 +284,11 @@ type Prober struct {
 	// labelRotation tracks the next flow-label index for each target, keyed by
 	// target GID string, so successive probes to a target use successive labels
 	// (round-robin over its set). It is accessed ONLY from the probe-loop
-	// goroutine (sendProbes), so it needs no lock; stale keys are pruned there.
+	// goroutine (sendProbe, nextSend), so it needs no lock; stale keys are pruned there.
 	labelRotation map[string]uint32
 
 	// labelCache memoizes each target's generated flow-label set so it is built
-	// once per (epoch, seed, count) rather than on every probe tick. Same GID
+	// once per (epoch, seed, count) rather than on every probe. Same GID
 	// key, same goroutine confinement, and pruned alongside labelRotation.
 	labelCache map[string]*labelSet
 
@@ -392,7 +392,8 @@ func NewProber(device *rdmabridge.Device, ring *rdmabridge.EventRing, probeInter
 }
 
 // Start begins the prober's two background goroutines:
-//   - probeLoop: sends probes to all targets on the configured interval
+//   - probeLoop: sends probes to all targets, pacing each pinglist type
+//     independently
 //   - ackProcessLoop: polls the event ring for ACK completions
 //
 // Both goroutines run until Stop() is called or the context is cancelled.
@@ -421,7 +422,7 @@ func (p *Prober) Start(ctx context.Context) error {
 
 // Stop signals both background goroutines to exit and waits for them
 // to finish. It is safe to call Stop multiple times. Closing stopCh
-// wakes goroutines immediately instead of waiting for the next ticker
+// wakes goroutines immediately instead of waiting for the next send slot
 // or sleep to fire.
 func (p *Prober) Stop() {
 	// Always Wait, even when running is already false. A loop that
@@ -470,9 +471,9 @@ func (p *Prober) SetPerTypeRateLimit(torMeshPPS, interTorPPS float64) {
 
 	p.rateMu.Lock()
 	p.torMeshRate.pps = torMeshPPS
-	p.torMeshRate.limiter.SetRate(scaledRate(torMeshPPS, nTorMesh, p.rateMultiplier))
+	p.torMeshRate.limiter.SetRate(scaledRate(torMeshPPS, nTorMesh, p.rateMultiplier, p.probeInterval))
 	p.interTorRate.pps = interTorPPS
-	p.interTorRate.limiter.SetRate(scaledRate(interTorPPS, nInterTor, p.rateMultiplier))
+	p.interTorRate.limiter.SetRate(scaledRate(interTorPPS, nInterTor, p.rateMultiplier, p.probeInterval))
 	p.rateMu.Unlock()
 
 	p.logger.Info().
@@ -507,8 +508,8 @@ func (p *Prober) SetRateMultiplier(mult float64) {
 
 	p.rateMu.Lock()
 	p.rateMultiplier = mult
-	p.torMeshRate.limiter.SetRate(scaledRate(p.torMeshRate.pps, nTorMesh, mult))
-	p.interTorRate.limiter.SetRate(scaledRate(p.interTorRate.pps, nInterTor, mult))
+	p.torMeshRate.limiter.SetRate(scaledRate(p.torMeshRate.pps, nTorMesh, mult, p.probeInterval))
+	p.interTorRate.limiter.SetRate(scaledRate(p.interTorRate.pps, nInterTor, mult, p.probeInterval))
 	p.rateMu.Unlock()
 
 	p.logger.Debug().
@@ -527,16 +528,36 @@ func clampRateMultiplier(mult float64) float64 {
 	return mult
 }
 
-// scaledRate computes a pinglist type's aggregate limiter rate: the per-target
-// pps times the number of targets of that type, scaled by the self-protection
-// throttle multiplier. A non-positive multiplier (the zero value of a
-// struct-literal Prober, or an unset throttle) is treated as 1.0 so throttling
-// is opt-in and never silently disables the limiter; multiplying by an exact
-// 1.0 is bit-identical to the un-throttled pps*n, so unthrottled behavior is
-// unchanged. A pps of 0 yields 0, which RateLimiter.SetRate reads as disabled.
-func scaledRate(pps float64, n int, mult float64) float64 {
+// scaledRate computes a pinglist type's aggregate limiter rate: the effective
+// per-target rate times the number of targets of that type, scaled by the
+// self-protection throttle multiplier.
+//
+// The effective per-target rate is min(pps, 1s/interval). The probe loop never
+// sends a target more than one probe per interval, so a pps above that ceiling
+// cannot be reached; clamping it here makes the limiter spread each pass evenly
+// over the interval and, more importantly, makes the multiplier scale the rate
+// that is actually achieved (otherwise a 0.5 throttle on a cap above the
+// ceiling would change nothing). A non-positive pps means "no cap", so the
+// ceiling alone applies. A non-positive interval (a struct-literal Prober in
+// tests) has no ceiling, which reproduces the plain pps*n.
+//
+// A non-positive multiplier (the zero value of a struct-literal Prober, or an
+// unset throttle) is treated as 1.0 so throttling is opt-in and never silently
+// disables the limiter; multiplying by an exact 1.0 is bit-identical to the
+// un-throttled value. A result of 0 (no targets, or no cap and no interval)
+// is read by RateLimiter.SetRate as disabled.
+func scaledRate(pps float64, n int, mult float64, interval time.Duration) float64 {
 	if mult <= 0 {
 		mult = 1.0
+	}
+	if interval > 0 {
+		ceiling := float64(time.Second) / float64(interval)
+		if pps <= 0 || pps > ceiling {
+			pps = ceiling
+		}
+	}
+	if pps <= 0 {
+		return 0
 	}
 	return pps * float64(n) * mult
 }
@@ -626,6 +647,7 @@ func (p *Prober) UpdateTargets(targets []*controller_agent.PingTarget) {
 	p.targetsMu.Lock()
 	defer p.targetsMu.Unlock()
 	p.targets = targets
+	p.targetsGen++
 
 	// A new pinglist may carry fresh QPNs for previously failing targets, so
 	// timeout streaks restart from zero against the new list.
@@ -646,12 +668,8 @@ func (p *Prober) UpdateTargets(targets []*controller_agent.PingTarget) {
 	// targetsMu -> rateMu.
 	nTorMesh, nInterTor := countTargetsByType(targets)
 	p.rateMu.Lock()
-	if p.torMeshRate.pps > 0 {
-		p.torMeshRate.limiter.SetRate(scaledRate(p.torMeshRate.pps, nTorMesh, p.rateMultiplier))
-	}
-	if p.interTorRate.pps > 0 {
-		p.interTorRate.limiter.SetRate(scaledRate(p.interTorRate.pps, nInterTor, p.rateMultiplier))
-	}
+	p.torMeshRate.limiter.SetRate(scaledRate(p.torMeshRate.pps, nTorMesh, p.rateMultiplier, p.probeInterval))
+	p.interTorRate.limiter.SetRate(scaledRate(p.interTorRate.pps, nInterTor, p.rateMultiplier, p.probeInterval))
 	p.rateMu.Unlock()
 
 	p.logger.Info().
@@ -720,14 +738,47 @@ func (p *Prober) recordTargetOutcome(target *controller_agent.PingTarget, timedO
 	}
 }
 
-// probeLoop runs on a ticker at probeInterval, sending one probe packet
-// to each target on every tick. It also periodically cleans up stale
-// pending probes that never received their ACK responses.
+// sendPass is the probe loop's progress through one pinglist type's targets:
+// a snapshot of that type's targets, the index of the next one to probe, and
+// the earliest time the following pass may start. Each type has its own pass,
+// so the types advance independently (see probeLoop).
+type sendPass struct {
+	ptype     controller_agent.PinglistType
+	targets   []*controller_agent.PingTarget
+	next      int
+	notBefore time.Time
+}
+
+func (ps *sendPass) active() bool { return ps.next < len(ps.targets) }
+
+// probeLoop sends one probe to every target per pass, with one pass per
+// pinglist type, and also periodically cleans up stale pending probes that
+// never received their ACK responses.
+//
+// The two types are scheduled independently but from this single goroutine:
+// each iteration sends the probe whose type limiter is ready soonest. A type
+// whose cap binds therefore delays only its own sends, never the other type's
+// (issue #77: with a shared round, a 1 probe/s inter-ToR cap dragged ToR-mesh
+// probing down to 1 probe/s as well). The sends must stay on one goroutine:
+// the Zig send path waits for its completion through a single per-queue slot,
+// so concurrent SendProbe calls on one queue would steal each other's
+// completions.
+//
+// Pacing: each type's limiter runs at scaledRate, i.e. min(cap, 1s/interval)
+// per target times the multiplier, so sends are spread evenly. A pass also
+// starts at most once per probeInterval, which keeps the one-probe-per-target-
+// per-interval ceiling even when a limiter is disabled.
 func (p *Prober) probeLoop(ctx context.Context) {
 	defer p.wg.Done()
 
-	ticker := time.NewTicker(p.probeInterval)
-	defer ticker.Stop()
+	passes := [...]sendPass{
+		{ptype: controller_agent.PinglistType_TOR_MESH},
+		{ptype: controller_agent.PinglistType_INTER_TOR},
+	}
+	var seenGen uint64
+
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
 
 	lastCleanup := time.Now()
 
@@ -743,163 +794,230 @@ func (p *Prober) probeLoop(ctx context.Context) {
 			// race a sibling still in SendProbe.
 			return
 		case <-p.stopCh:
-			// Stop() was called; exit immediately without waiting for
-			// the next ticker fire, which could be up to probeInterval away.
-			return
-		case <-ticker.C:
-			p.sendProbes(ctx)
-
-			// Clean up stale pending probes on a wall-clock cadence so the
-			// sweep frequency does not depend on the probe interval.
-			if time.Since(lastCleanup) >= stalePendingCleanupPeriod {
-				p.cleanupStalePending()
-				lastCleanup = time.Now()
-			}
-		}
-	}
-}
-
-// sendProbes reads the current target list and sends one probe to each target.
-// It checks for shutdown (ctx cancellation or Stop) before each target so that
-// Stop() is not blocked for up to probeSendTimeoutMS * len(targets); each
-// SendProbe can block for up to probeSendTimeoutMS, so without these checks a
-// large target list could delay shutdown by many seconds.
-func (p *Prober) sendProbes(ctx context.Context) {
-	p.targetsMu.RLock()
-	targets := make([]*controller_agent.PingTarget, len(p.targets))
-	copy(targets, p.targets)
-	p.targetsMu.RUnlock()
-
-	if len(targets) == 0 {
-		return
-	}
-
-	// The rotation epoch selects which of each target's rotating labels are in
-	// effect this round; computed once per round so all targets share it.
-	rotationEpoch := p.flowLabelRotationEpoch(time.Now())
-
-	// Prune round-robin state for targets no longer in the pinglist so the map
-	// cannot grow without bound as targets churn. Confined to this goroutine.
-	p.pruneLabelRotation(targets)
-
-	for _, target := range targets {
-		// Abort the batch promptly on shutdown instead of walking the entire
-		// target list while blocking on SendProbe for each one.
-		select {
-		case <-ctx.Done():
-			return
-		case <-p.stopCh:
 			return
 		default:
 		}
 
+		now := time.Now()
+
+		// Clean up stale pending probes on a wall-clock cadence so the
+		// sweep frequency does not depend on the probe rate.
+		if now.Sub(lastCleanup) >= stalePendingCleanupPeriod {
+			p.cleanupStalePending()
+			lastCleanup = now
+		}
+
+		pass, wait := p.nextSend(passes[:], &seenGen, now)
+		if pass == nil || wait > 0 {
+			// Sleep until the next send is due (or the next pass may start),
+			// waking for shutdown. Bound the sleep so the stale-pending sweep
+			// keeps its cadence under a heavy throttle.
+			if wait > stalePendingCleanupPeriod {
+				wait = stalePendingCleanupPeriod
+			}
+			timer.Reset(wait)
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.stopCh:
+				// Stop() was called; exit immediately without waiting for
+				// the next send slot.
+				return
+			case <-timer.C:
+			}
+			continue
+		}
+
+		target := pass.targets[pass.next]
+		pass.next++
+		p.reserveSend(pass.ptype, now)
 		if target == nil {
 			continue
 		}
+		p.sendProbe(target, p.flowLabelRotationEpoch(now))
+	}
+}
 
-		// Apply the optional send-rate limit for this target's pinglist type,
-		// spacing sends across targets of the same type. The wait is
-		// interruptible so Stop() is not delayed by the limiter.
-		if !p.rateLimitWait(ctx, target.GetPinglistType()) {
-			return
+// nextSend returns the pass whose next probe may be sent soonest and how long
+// until then. A zero wait means the probe at pass.next may be sent now; a
+// positive wait means the caller should sleep and ask again (rates and
+// targets may change meanwhile). It returns a nil pass when neither type has a
+// pass that can start, with wait set to when one can.
+//
+// It first restarts every finished pass whose notBefore has passed with a fresh
+// snapshot of that type's targets. After UpdateTargets it abandons the rest of
+// the current passes, so probes are not sent to targets that were just removed
+// and new targets are reached without waiting for a stale pass to finish.
+// Called only from the probe-loop goroutine, which owns passes and seenGen.
+func (p *Prober) nextSend(passes []sendPass, seenGen *uint64, now time.Time) (*sendPass, time.Duration) {
+	p.targetsMu.RLock()
+	gen := p.targetsGen
+	var targets []*controller_agent.PingTarget
+	if gen != *seenGen {
+		targets = p.targets
+	}
+	for i := range passes {
+		ps := &passes[i]
+		if gen != *seenGen {
+			ps.targets, ps.next = nil, 0
 		}
+		if !ps.active() && !now.Before(ps.notBefore) {
+			ps.targets = targetsOfType(p.targets, ps.ptype)
+			ps.next = 0
+			ps.notBefore = now.Add(p.probeInterval)
+		}
+	}
+	p.targetsMu.RUnlock()
 
-		// Generate a globally-unique sequence number:
-		// high 32 bits = random agent epoch, low 32 bits = monotonic counter.
-		counter := uint64(p.seqCounter.Add(1))
-		seqNum := (uint64(p.agentEpoch) << 32) | (counter & 0xFFFFFFFF)
+	if gen != *seenGen {
+		// Prune round-robin state for targets no longer in the pinglist so the
+		// label maps cannot grow without bound as targets churn.
+		p.pruneLabelRotation(targets)
+		*seenGen = gen
+	}
 
-		// Parse the target GID string into a [16]byte for the RDMA layer. Do
-		// this BEFORE registering the pending entry so a malformed target never
-		// leaves an orphaned entry behind.
-		targetGID, err := probe.ParseGID(target.GetTargetGid())
-		if err != nil {
-			p.logger.Error().Err(err).
-				Str("target_gid", target.GetTargetGid()).
-				Uint64("seq", seqNum).
-				Msg("Failed to parse target GID, skipping target")
+	var best *sendPass
+	bestWait := time.Duration(-1)
+	soonestStart := time.Duration(-1)
+	for i := range passes {
+		ps := &passes[i]
+		if !ps.active() {
+			if w := ps.notBefore.Sub(now); soonestStart < 0 || w < soonestStart {
+				soonestStart = w
+			}
 			continue
 		}
-
-		// Pick the flow label for this probe: round-robin across the target's
-		// ECMP label set so successive probes to a target exercise successive
-		// paths. Labels share the target's probe budget (the rate limiter is
-		// per-target, unaffected by the set size), trading coverage speed for
-		// bounded probe amplification.
-		flowLabel := p.nextFlowLabel(target, rotationEpoch)
-
-		// Register the pending entry BEFORE sending. SendProbe blocks until the
-		// send completion (T2), and on a low-latency RNIC an ACK can reach
-		// ackProcessLoop before SendProbe returns. Registering first guarantees
-		// the ACK handlers find the entry instead of dropping the ACK as an
-		// "unknown sequence number" and letting the probe falsely time out. The
-		// send-side timestamps are applied after the send via ApplySend, and
-		// Complete() requires them, so the ACK handlers cannot finalize (and
-		// delete) the entry before this send path records T1/T2.
-		pp := &pendingProbe{
-			target:    target,
-			meas:      probe.NewPendingMeasurement(),
-			createdAt: time.Now(),
-			flowLabel: flowLabel,
+		w := p.sendDelay(ps.ptype, now)
+		if best == nil || w < bestWait {
+			best, bestWait = ps, w
 		}
-		p.pendingMu.Lock()
-		p.pending[seqNum] = pp
-		p.pendingMu.Unlock()
+	}
+	if best == nil {
+		return nil, soonestStart
+	}
+	if soonestStart >= 0 && soonestStart < bestWait {
+		// A finished pass may restart before the active pass's next slot;
+		// wake up for it so its first probe is not delayed.
+		return nil, soonestStart
+	}
+	return best, bestWait
+}
 
-		// Send the probe packet. SendProbe is synchronous: it posts the
-		// packet and waits for the send completion within the timeout. The
-		// per-send flow label reaches ibv_ah_attr.grh.flow_label via a fresh
-		// AH created in the Zig bridge, so no per-QP/AH state needs updating.
-		result := p.queue.SendProbe(
-			targetGID,
-			target.GetTargetQpn(),
-			seqNum,
-			flowLabel,
-			p.probeTimeout,
-		)
-
-		if result.Error != nil {
-			// The send failed, so no ACK will ever complete this probe. Remove
-			// the pending entry and emit a failed result so the loss is counted
-			// in probe_failed_total rather than vanishing until the stale sweep.
-			p.pendingMu.Lock()
-			delete(p.pending, seqNum)
-			p.pendingMu.Unlock()
-
-			p.logger.Error().Err(result.Error).
-				Str("target_gid", target.GetTargetGid()).
-				Uint32("target_qpn", target.GetTargetQpn()).
-				Uint64("seq", seqNum).
-				Uint32("flow_label", flowLabel).
-				Msg("Failed to send probe packet")
-			p.emitResult(newFailedResult(seqNum, target, flowLabel, fmt.Sprintf("probe send failed: %v", result.Error)))
+// targetsOfType returns the non-nil targets of the given pinglist type, using
+// the same classification as countTargetsByType (anything but INTER_TOR is
+// ToR-mesh).
+func targetsOfType(targets []*controller_agent.PingTarget, ptype controller_agent.PinglistType) []*controller_agent.PingTarget {
+	wantInter := ptype == controller_agent.PinglistType_INTER_TOR
+	var out []*controller_agent.PingTarget
+	for _, t := range targets {
+		if t == nil {
 			continue
 		}
+		if (t.GetPinglistType() == controller_agent.PinglistType_INTER_TOR) == wantInter {
+			out = append(out, t)
+		}
+	}
+	return out
+}
 
-		// Apply the send-side timestamps T1/T2 now that the send completed. If
-		// both ACKs already arrived while the send was in progress, this is the
-		// call that finally completes the measurement; finalize it here rather
-		// than losing it.
+// sendProbe sends one probe to target, registering its pending entry, and
+// emits a failed result if the send fails.
+func (p *Prober) sendProbe(target *controller_agent.PingTarget, rotationEpoch uint64) {
+	// Generate a globally-unique sequence number:
+	// high 32 bits = random agent epoch, low 32 bits = monotonic counter.
+	counter := uint64(p.seqCounter.Add(1))
+	seqNum := (uint64(p.agentEpoch) << 32) | (counter & 0xFFFFFFFF)
+
+	// Parse the target GID string into a [16]byte for the RDMA layer. Do
+	// this BEFORE registering the pending entry so a malformed target never
+	// leaves an orphaned entry behind.
+	targetGID, err := probe.ParseGID(target.GetTargetGid())
+	if err != nil {
+		p.logger.Error().Err(err).
+			Str("target_gid", target.GetTargetGid()).
+			Uint64("seq", seqNum).
+			Msg("Failed to parse target GID, skipping target")
+		return
+	}
+
+	// Pick the flow label for this probe: round-robin across the target's
+	// ECMP label set so successive probes to a target exercise successive
+	// paths. Labels share the target's probe budget (the rate limiter is
+	// per-target, unaffected by the set size), trading coverage speed for
+	// bounded probe amplification.
+	flowLabel := p.nextFlowLabel(target, rotationEpoch)
+
+	// Register the pending entry BEFORE sending. SendProbe blocks until the
+	// send completion (T2), and on a low-latency RNIC an ACK can reach
+	// ackProcessLoop before SendProbe returns. Registering first guarantees
+	// the ACK handlers find the entry instead of dropping the ACK as an
+	// "unknown sequence number" and letting the probe falsely time out. The
+	// send-side timestamps are applied after the send via ApplySend, and
+	// Complete() requires them, so the ACK handlers cannot finalize (and
+	// delete) the entry before this send path records T1/T2.
+	pp := &pendingProbe{
+		target:    target,
+		meas:      probe.NewPendingMeasurement(),
+		createdAt: time.Now(),
+		flowLabel: flowLabel,
+	}
+	p.pendingMu.Lock()
+	p.pending[seqNum] = pp
+	p.pendingMu.Unlock()
+
+	// Send the probe packet. SendProbe is synchronous: it posts the
+	// packet and waits for the send completion within the timeout. The
+	// per-send flow label reaches ibv_ah_attr.grh.flow_label via a fresh
+	// AH created in the Zig bridge, so no per-QP/AH state needs updating.
+	result := p.queue.SendProbe(
+		targetGID,
+		target.GetTargetQpn(),
+		seqNum,
+		flowLabel,
+		p.probeTimeout,
+	)
+
+	if result.Error != nil {
+		// The send failed, so no ACK will ever complete this probe. Remove
+		// the pending entry and emit a failed result so the loss is counted
+		// in probe_failed_total rather than vanishing until the stale sweep.
 		p.pendingMu.Lock()
-		var finalized *probe.ProbeResult
-		if cur, ok := p.pending[seqNum]; ok {
-			cur.meas.ApplySend(result.T1NS, result.T2NS)
-			finalized = p.finalizeIfCompleteLocked(seqNum, cur)
-		}
+		delete(p.pending, seqNum)
 		p.pendingMu.Unlock()
-		if finalized != nil {
-			p.deliverResult(seqNum, target, finalized)
-		}
 
-		p.logger.Debug().
+		p.logger.Error().Err(result.Error).
 			Str("target_gid", target.GetTargetGid()).
 			Uint32("target_qpn", target.GetTargetQpn()).
 			Uint64("seq", seqNum).
 			Uint32("flow_label", flowLabel).
-			Uint64("t1_ns", result.T1NS).
-			Uint64("t2_ns", result.T2NS).
-			Msg("Probe sent, awaiting ACKs")
+			Msg("Failed to send probe packet")
+		p.emitResult(newFailedResult(seqNum, target, flowLabel, fmt.Sprintf("probe send failed: %v", result.Error)))
+		return
 	}
+
+	// Apply the send-side timestamps T1/T2 now that the send completed. If
+	// both ACKs already arrived while the send was in progress, this is the
+	// call that finally completes the measurement; finalize it here rather
+	// than losing it.
+	p.pendingMu.Lock()
+	var finalized *probe.ProbeResult
+	if cur, ok := p.pending[seqNum]; ok {
+		cur.meas.ApplySend(result.T1NS, result.T2NS)
+		finalized = p.finalizeIfCompleteLocked(seqNum, cur)
+	}
+	p.pendingMu.Unlock()
+	if finalized != nil {
+		p.deliverResult(seqNum, target, finalized)
+	}
+
+	p.logger.Debug().
+		Str("target_gid", target.GetTargetGid()).
+		Uint32("target_qpn", target.GetTargetQpn()).
+		Uint64("seq", seqNum).
+		Uint32("flow_label", flowLabel).
+		Uint64("t1_ns", result.T1NS).
+		Uint64("t2_ns", result.T2NS).
+		Msg("Probe sent, awaiting ACKs")
 }
 
 // nextFlowLabel returns the flow label to use for the next probe to target and
@@ -922,7 +1040,7 @@ func (p *Prober) nextFlowLabel(target *controller_agent.PingTarget, rotationEpoc
 // cachedLabelsForTarget returns the target's flow-label set, regenerating it
 // only when the rotation epoch or the target's seed/count changes. Without this
 // cache, generateFlowLabels would rebuild a (potentially thousands-entry) set
-// on every probe tick for every target, stalling the send loop. The multi-label
+// on every probe, stalling the send loop. The multi-label
 // set is expensive to build; the legacy single-label case is trivial and
 // bypasses the cache. Called only from the probe-loop goroutine, so the
 // unsynchronized map access is safe.
@@ -971,30 +1089,22 @@ func (p *Prober) pruneLabelRotation(targets []*controller_agent.PingTarget) {
 	}
 }
 
-// rateLimitWait blocks for the duration required by the configured send-rate
-// limit for the given pinglist type before the next probe of that type may be
-// sent. It returns false if the wait was interrupted by ctx cancellation or
-// Stop(), in which case the caller should abandon the current send batch. When
-// rate limiting is disabled for the type it returns true immediately.
-func (p *Prober) rateLimitWait(ctx context.Context, ptype controller_agent.PinglistType) bool {
+// sendDelay reports how long until the limiter for the given pinglist type
+// allows the next send, without reserving it. Zero means the limiter allows a
+// send now (or is disabled).
+func (p *Prober) sendDelay(ptype controller_agent.PinglistType, now time.Time) time.Duration {
 	p.rateMu.Lock()
-	wait := p.rateForType(ptype).limiter.Reserve(time.Now())
+	defer p.rateMu.Unlock()
+	return p.rateForType(ptype).limiter.Delay(now)
+}
+
+// reserveSend books a send slot on the limiter for the given pinglist type, so
+// the type's following send is spaced one limiter interval later. The probe
+// loop calls it only once sendDelay has reported zero for that type.
+func (p *Prober) reserveSend(ptype controller_agent.PinglistType, now time.Time) {
+	p.rateMu.Lock()
+	p.rateForType(ptype).limiter.Reserve(now)
 	p.rateMu.Unlock()
-
-	if wait <= 0 {
-		return true
-	}
-
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-p.stopCh:
-		return false
-	case <-timer.C:
-		return true
-	}
 }
 
 // ackProcessLoop drains the event ring for ACK completion events and

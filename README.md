@@ -423,11 +423,13 @@ force a traffic class, shown in
 `Global tclass=106`); inbox drivers may not expose this file. When it is set,
 the workload effectively uses that class. NVIDIA documents the override for
 RC QPs, whereas R-Pingmesh probes are UD and set the traffic class per address
-handle (rdma-core's mlx5 provider copies it into the UD address vector).
-Whether the override also applies to UD
-[has not been verified](https://github.com/yuuki/rpingmesh/issues/71), so set
-`traffic_class` explicitly to the same value. This also keeps probes in the
-right queue if the override is later removed.
+handle (rdma-core's mlx5 provider copies it into the UD address vector). The
+driver source applies the override only to connected QPs, but whether it also
+applies to UD on the wire
+[has not been verified](https://github.com/yuuki/rpingmesh/issues/71)
+([runbook](docs/design/ud-tclass-verification.md)), so set `traffic_class`
+explicitly to the same value. This also keeps probes in the right queue if the
+override is later removed.
 
 **3. Determine the queue empirically.** This works regardless of containers:
 

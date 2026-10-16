@@ -122,6 +122,13 @@ message PingTarget {
     // target_netdev is the target RNIC's netdev (RnicInfo.netdev), used only
     // as an optional destination metric label. Empty when unknown.
     string target_netdev = 13;
+    // sampled marks a target the controller picked by random sampling that
+    // changes across pinglist refreshes: every inter-ToR target, and the
+    // targets of an untagged ToR-mesh that exceeded
+    // unspecified_mesh_max_targets. Agents keep sampled targets out of the
+    // optional destination-RNIC metric labels by default, because their
+    // identities would otherwise accumulate as ever-new series.
+    bool sampled = 14;
 }
 
 // PinglistResponse contains the list of targets to probe.

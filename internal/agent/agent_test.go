@@ -717,10 +717,10 @@ func TestTargetRnicLabels(t *testing.T) {
 		want        telemetry.TargetRnicLabels
 	}{
 		{"", "", telemetry.TargetRnicLabels{}},
-		{config.MetricsTargetRnicLabelsOff, config.MetricsTargetRnicLabelsScopeAll, telemetry.TargetRnicLabels{IncludeInterTor: true}},
-		{config.MetricsTargetRnicLabelsCounters, config.MetricsTargetRnicLabelsScopeTorMesh, telemetry.TargetRnicLabels{Enabled: true}},
+		{config.MetricsTargetRnicLabelsOff, config.MetricsTargetRnicLabelsScopeAll, telemetry.TargetRnicLabels{IncludeSampled: true}},
+		{config.MetricsTargetRnicLabelsCounters, config.MetricsTargetRnicLabelsScopeStable, telemetry.TargetRnicLabels{Enabled: true}},
 		{config.MetricsTargetRnicLabelsAll, config.MetricsTargetRnicLabelsScopeAll,
-			telemetry.TargetRnicLabels{Enabled: true, Histograms: true, IncludeInterTor: true}},
+			telemetry.TargetRnicLabels{Enabled: true, Histograms: true, IncludeSampled: true}},
 	}
 	for _, tc := range cases {
 		got := targetRnicLabels(&config.AgentConfig{
@@ -734,20 +734,29 @@ func TestTargetRnicLabels(t *testing.T) {
 }
 
 // TestFillTargetMetadata_CopiesTargetRnicIdentity verifies that probe results
-// carry the target RNIC's device, netdev and pinglist type from the
-// PingTarget, which the optional destination metric labels read.
+// carry the target RNIC's device and netdev from the PingTarget, and that a
+// target counts as sampled when the controller flagged it or it is inter-ToR
+// (an older controller sets neither sampled nor, before the agent stamps it,
+// the inter-ToR type).
 func TestFillTargetMetadata_CopiesTargetRnicIdentity(t *testing.T) {
 	result := newFailedResult(1, &controller_agent.PingTarget{
 		TargetHostname:   "host-b",
 		TargetDeviceName: "mlx5_1",
 		TargetNetdev:     "ens2f0",
-		PinglistType:     controller_agent.PinglistType_INTER_TOR,
 	}, 0, "send failed")
-
 	if result.TargetHostname != "host-b" || result.TargetRdmaDevice != "mlx5_1" ||
-		result.TargetNetdev != "ens2f0" || result.PinglistType != controller_agent.PinglistType_INTER_TOR {
-		t.Errorf("result target identity = (%q, %q, %q, %v), want (host-b, mlx5_1, ens2f0, INTER_TOR)",
-			result.TargetHostname, result.TargetRdmaDevice, result.TargetNetdev, result.PinglistType)
+		result.TargetNetdev != "ens2f0" || result.TargetSampled {
+		t.Errorf("result target identity = (%q, %q, %q, sampled=%v), want (host-b, mlx5_1, ens2f0, sampled=false)",
+			result.TargetHostname, result.TargetRdmaDevice, result.TargetNetdev, result.TargetSampled)
+	}
+
+	for name, target := range map[string]*controller_agent.PingTarget{
+		"flagged":   {Sampled: true},
+		"inter_tor": {PinglistType: controller_agent.PinglistType_INTER_TOR},
+	} {
+		if !newFailedResult(1, target, 0, "send failed").TargetSampled {
+			t.Errorf("%s target: TargetSampled = false, want true", name)
+		}
 	}
 }
 

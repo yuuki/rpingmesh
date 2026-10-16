@@ -37,6 +37,12 @@ func TestTorMesh_EmptyToRExcludesNamed(t *testing.T) {
 	if !equalStrings(got, want) {
 		t.Errorf("untagged ToR-mesh = %v, want %v (self/same-host excluded, named ToRs omitted)", got, want)
 	}
+	// Below the cap the whole untagged mesh is kept, so it is stable.
+	for _, tgt := range targets {
+		if tgt.GetSampled() {
+			t.Errorf("uncapped untagged target %s: Sampled = true, want false", tgt.GetTargetGid())
+		}
+	}
 }
 
 func TestTorMesh_EmptyToRRespectsCap(t *testing.T) {
@@ -54,6 +60,11 @@ func TestTorMesh_EmptyToRRespectsCap(t *testing.T) {
 	}
 	if len(targets) != 2 {
 		t.Fatalf("got %d targets, want 2 (unspecified mesh cap)", len(targets))
+	}
+	for _, tgt := range targets {
+		if !tgt.GetSampled() {
+			t.Errorf("capped untagged target %s: Sampled = false, want true", tgt.GetTargetGid())
+		}
 	}
 	seen := map[string]bool{}
 	for _, tgt := range targets {

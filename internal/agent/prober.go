@@ -1289,7 +1289,8 @@ func fillTargetMetadata(result *probe.ProbeResult, seqNum uint64, flowLabel uint
 	result.TargetTorID = target.GetTargetTorId()
 	result.TargetRdmaDevice = target.GetTargetDeviceName()
 	result.TargetNetdev = target.GetTargetNetdev()
-	result.PinglistType = target.GetPinglistType()
+	result.TargetSampled = target.GetSampled() ||
+		target.GetPinglistType() == controller_agent.PinglistType_INTER_TOR
 	if parsedGID, err := probe.ParseGID(target.GetTargetGid()); err == nil {
 		result.TargetGID = parsedGID
 	}

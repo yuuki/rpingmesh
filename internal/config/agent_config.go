@@ -81,9 +81,9 @@ const (
 // Values accepted by metrics_target_rnic_labels_scope (see
 // AgentConfig.MetricsTargetRnicLabelsScope).
 const (
-	MetricsTargetRnicLabelsScopeTorMesh = "tor_mesh"
+	MetricsTargetRnicLabelsScopeStable  = "stable"
 	MetricsTargetRnicLabelsScopeAll     = "all"
-	DefaultMetricsTargetRnicLabelsScope = MetricsTargetRnicLabelsScopeTorMesh
+	DefaultMetricsTargetRnicLabelsScope = MetricsTargetRnicLabelsScopeStable
 )
 
 // CQ poll modes accepted by cq_poll_mode (see AgentConfig.CQPollMode).
@@ -157,9 +157,9 @@ type AgentConfig struct {
 	// only, "all" also to the RTT histograms.
 	MetricsTargetRnicLabels string `mapstructure:"metrics_target_rnic_labels"`
 	// MetricsTargetRnicLabelsScope limits which targets get their real
-	// identity: "tor_mesh" (default) labels only ToR-mesh targets, whose set
-	// is stable, and gives inter-ToR targets a fixed "_inter_tor" value;
-	// "all" labels inter-ToR targets too.
+	// identity: "stable" (default) labels only targets whose set is stable
+	// across pinglist refreshes and gives sampled targets (inter-ToR, capped
+	// untagged ToR-mesh) a fixed "_sampled" value; "all" labels them too.
 	MetricsTargetRnicLabelsScope string `mapstructure:"metrics_target_rnic_labels_scope"`
 	// MetricsCardinalityLimit caps the attribute sets each metric instrument
 	// keeps; extra sets fold into one otel.metric.overflow series. 0 keeps
@@ -488,7 +488,7 @@ func (c *AgentConfig) Validate() error {
 	}
 
 	// Empty values (a zero-value AgentConfig) mean the defaults, off and
-	// tor_mesh.
+	// stable.
 	switch c.MetricsTargetRnicLabels {
 	case "", MetricsTargetRnicLabelsOff, MetricsTargetRnicLabelsCounters, MetricsTargetRnicLabelsAll:
 	default:
@@ -497,10 +497,10 @@ func (c *AgentConfig) Validate() error {
 			c.MetricsTargetRnicLabels)
 	}
 	switch c.MetricsTargetRnicLabelsScope {
-	case "", MetricsTargetRnicLabelsScopeTorMesh, MetricsTargetRnicLabelsScopeAll:
+	case "", MetricsTargetRnicLabelsScopeStable, MetricsTargetRnicLabelsScopeAll:
 	default:
 		return fmt.Errorf("metrics_target_rnic_labels_scope must be %q or %q, got: %q",
-			MetricsTargetRnicLabelsScopeTorMesh, MetricsTargetRnicLabelsScopeAll,
+			MetricsTargetRnicLabelsScopeStable, MetricsTargetRnicLabelsScopeAll,
 			c.MetricsTargetRnicLabelsScope)
 	}
 	// A negative limit would disable the OTel SDK's cardinality cap entirely;

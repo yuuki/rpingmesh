@@ -655,9 +655,9 @@ func TestLoadAgentConfig_MetricsTargetRnicLabelsDefaults(t *testing.T) {
 	if cfg.MetricsTargetRnicLabels != MetricsTargetRnicLabelsOff {
 		t.Errorf("MetricsTargetRnicLabels = %q, want %q", cfg.MetricsTargetRnicLabels, MetricsTargetRnicLabelsOff)
 	}
-	if cfg.MetricsTargetRnicLabelsScope != MetricsTargetRnicLabelsScopeTorMesh {
+	if cfg.MetricsTargetRnicLabelsScope != MetricsTargetRnicLabelsScopeStable {
 		t.Errorf("MetricsTargetRnicLabelsScope = %q, want %q",
-			cfg.MetricsTargetRnicLabelsScope, MetricsTargetRnicLabelsScopeTorMesh)
+			cfg.MetricsTargetRnicLabelsScope, MetricsTargetRnicLabelsScopeStable)
 	}
 	if cfg.MetricsCardinalityLimit != 0 {
 		t.Errorf("MetricsCardinalityLimit = %d, want 0", cfg.MetricsCardinalityLimit)

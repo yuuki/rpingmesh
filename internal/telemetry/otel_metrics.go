@@ -5,7 +5,8 @@
 // Design principle: metric attributes use ToR-level cardinality
 // (source_tor, target_tor) plus the local source RNIC to avoid metric
 // cardinality explosion. Destination-RNIC labels (target_hostname,
-// target_rdma_device, target_netdev) are opt-in via WithTargetRnicLabels.
+// target_rdma_device, target_netdev) are opt-in via WithTargetRnicLabels and
+// go to separate rpingmesh.target_rnic.* instruments.
 // GID-level details are emitted as structured log fields at Debug level via
 // zerolog.
 package telemetry
@@ -22,7 +23,6 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/buildinfo"
 	"github.com/yuuki/rpingmesh/internal/probe"
-	"github.com/yuuki/rpingmesh/proto/controller_agent"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/metric"
@@ -108,27 +108,36 @@ func probeFailureReason(result *probe.ProbeResult, rtt *probe.RTTResult) string 
 // "unknown" label value reads the same in dashboards.
 const unspecifiedDeviceLabel = probe.UnspecifiedTorLabel
 
-// outOfScopeTargetLabel is the value of every destination-RNIC label on an
-// inter-ToR probe when TargetRnicLabels.IncludeInterTor is false. Keeping the
-// attribute keys present with a fixed value gives every series of a metric
-// the same label set, while inter-ToR targets (whose representatives the
-// controller re-samples on every pinglist refresh) cannot churn series.
-const outOfScopeTargetLabel = "_inter_tor"
+// sampledTargetLabel is the value of every destination-RNIC label on a probe
+// to a sampled target (see probe.ProbeResult.TargetSampled) when
+// TargetRnicLabels.IncludeSampled is false. Keeping the attribute keys
+// present with a fixed value gives every series of a metric the same label
+// set, while targets the controller re-samples on every pinglist refresh
+// cannot churn series.
+const sampledTargetLabel = "_sampled"
 
-// TargetRnicLabels selects the optional destination-RNIC metric attributes
-// (target_hostname, target_rdma_device, target_netdev). The zero value
-// disables them, keeping the default ToR-level cardinality.
+// targetRnicMetricPrefix prefixes the instruments that carry the
+// destination-RNIC labels. They are separate from the default ToR-level
+// instruments so that when they reach the OTel SDK cardinality limit, only
+// they fold into the otel.metric.overflow series; the ToR-level series that
+// dashboards and alerts use are never affected.
+const targetRnicMetricPrefix = "rpingmesh.target_rnic."
+
+// TargetRnicLabels selects the optional destination-RNIC metrics, which
+// carry target_hostname, target_rdma_device and target_netdev on top of the
+// default attributes. The zero value disables them.
 type TargetRnicLabels struct {
-	// Enabled adds the labels to the probe counters (probe_total,
-	// probe_success, probe_failed), enough to localize loss to an RNIC.
+	// Enabled records rpingmesh.target_rnic.probe_total, probe_success_total
+	// and probe_failed_total, enough to localize loss to an RNIC.
 	Enabled bool
-	// Histograms also adds them to the three RTT histograms, which cost
-	// ~33 series per label set each. Ignored unless Enabled is set.
+	// Histograms also records the three RTT histograms under the same
+	// prefix, which cost ~33 series per label set each. Ignored unless
+	// Enabled is set.
 	Histograms bool
-	// IncludeInterTor labels inter-ToR targets with their real identity too.
-	// When false, inter-ToR probes carry outOfScopeTargetLabel instead,
-	// because their sampled targets change on every pinglist refresh.
-	IncludeInterTor bool
+	// IncludeSampled labels sampled targets (inter-ToR, capped untagged
+	// ToR-mesh) with their real identity too. When false they carry
+	// sampledTargetLabel, because they change on every pinglist refresh.
+	IncludeSampled bool
 }
 
 // deviceMetricLabel returns name, or unspecifiedDeviceLabel when it is empty,
@@ -183,8 +192,10 @@ func WithCardinalityLimit(limit int) Option {
 }
 
 // MetricsCollector collects and exports R-Pingmesh probe metrics via OTLP.
-// All recorded metrics use ToR-level attributes (source_tor, target_tor) to
-// maintain low cardinality. GID-level detail is emitted only in debug logs.
+// The default instruments use ToR-level attributes (source_tor, target_tor)
+// plus the local RNIC to maintain low cardinality; destination-RNIC detail
+// goes only to the opt-in target instruments. GID-level detail is emitted
+// only in debug logs.
 type MetricsCollector struct {
 	meterProvider    *sdkmetric.MeterProvider
 	meter            metric.Meter
@@ -196,8 +207,23 @@ type MetricsCollector struct {
 	probeTotal       metric.Int64Counter
 	eventRingDropped metric.Int64ObservableCounter
 	selfThrottle     metric.Float64ObservableGauge
+	// target holds the rpingmesh.target_rnic.* instruments; nil unless
+	// WithTargetRnicLabels enabled them.
+	target           *targetInstruments
 	targetRnicLabels TargetRnicLabels
 	logger           zerolog.Logger
+}
+
+// targetInstruments are the destination-RNIC-labelled counterparts of the
+// default probe instruments. The histograms are nil unless
+// TargetRnicLabels.Histograms is set.
+type targetInstruments struct {
+	networkRTT     metric.Int64Histogram
+	proberDelay    metric.Int64Histogram
+	responderDelay metric.Int64Histogram
+	probeSuccess   metric.Int64Counter
+	probeFailed    metric.Int64Counter
+	probeTotal     metric.Int64Counter
 }
 
 // instanceID returns a value suitable for the OTel resource's
@@ -277,18 +303,17 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 		return nil, err
 	}
 
-	mc, err := registerInstruments(provider)
+	mc, err := registerInstruments(provider, options)
 	if err != nil {
 		return nil, err
 	}
-	mc.targetRnicLabels = options.targetRnicLabels
 
 	mc.logger.Info().
 		Str("collector_addr", collectorAddr).
 		Dur("flush_interval", periodicReaderInterval).
 		Bool("target_rnic_labels", options.targetRnicLabels.Enabled).
 		Bool("target_rnic_labels_histograms", options.targetRnicLabels.Histograms).
-		Bool("target_rnic_labels_inter_tor", options.targetRnicLabels.IncludeInterTor).
+		Bool("target_rnic_labels_sampled", options.targetRnicLabels.IncludeSampled).
 		Int("cardinality_limit", options.cardinalityLimit).
 		Msg("MetricsCollector initialized")
 
@@ -344,17 +369,13 @@ func NewMetricsCollectorWithProvider(provider *sdkmetric.MeterProvider, opts ...
 	for _, opt := range opts {
 		opt(&options)
 	}
-	mc, err := registerInstruments(provider)
-	if err != nil {
-		return nil, err
-	}
-	mc.targetRnicLabels = options.targetRnicLabels
-	return mc, nil
+	return registerInstruments(provider, options)
 }
 
 // registerInstruments creates histogram and counter instruments on the given
-// provider's meter and returns a MetricsCollector with all instruments wired up.
-func registerInstruments(provider *sdkmetric.MeterProvider) (*MetricsCollector, error) {
+// provider's meter and returns a MetricsCollector with all instruments wired
+// up, including the target instruments that options enable.
+func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOptions) (*MetricsCollector, error) {
 	meter := provider.Meter("rpingmesh.agent")
 
 	// Register histogram instruments with explicit bucket boundaries
@@ -445,6 +466,14 @@ func registerInstruments(provider *sdkmetric.MeterProvider) (*MetricsCollector, 
 		return nil, err
 	}
 
+	var target *targetInstruments
+	if options.targetRnicLabels.Enabled {
+		target, err = registerTargetInstruments(meter, options.targetRnicLabels.Histograms)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &MetricsCollector{
 		meterProvider:    provider,
 		meter:            meter,
@@ -456,16 +485,61 @@ func registerInstruments(provider *sdkmetric.MeterProvider) (*MetricsCollector, 
 		probeTotal:       probeTotal,
 		eventRingDropped: eventRingDropped,
 		selfThrottle:     selfThrottle,
+		target:           target,
+		targetRnicLabels: options.targetRnicLabels,
 		logger:           log.With().Str("component", "telemetry").Logger(),
 	}, nil
 }
 
+// registerTargetInstruments creates the rpingmesh.target_rnic.* counters
+// and, when withHistograms is set, the matching RTT histograms.
+func registerTargetInstruments(meter metric.Meter, withHistograms bool) (*targetInstruments, error) {
+	var t targetInstruments
+	var err error
+	counters := []struct {
+		dst  *metric.Int64Counter
+		name string
+		desc string
+	}{
+		{&t.probeTotal, "probe_total", "Total number of probes recorded, per target RNIC"},
+		{&t.probeSuccess, "probe_success_total", "Total number of successful probes with valid RTT, per target RNIC"},
+		{&t.probeFailed, "probe_failed_total", "Total number of failed probes or probes with invalid RTT, per target RNIC"},
+	}
+	for _, c := range counters {
+		if *c.dst, err = meter.Int64Counter(targetRnicMetricPrefix+c.name,
+			metric.WithDescription(c.desc), metric.WithUnit("{probe}")); err != nil {
+			return nil, err
+		}
+	}
+	if !withHistograms {
+		return &t, nil
+	}
+	histograms := []struct {
+		dst  *metric.Int64Histogram
+		name string
+		desc string
+	}{
+		{&t.networkRTT, "network_rtt_ns", "Network round-trip time in nanoseconds, per target RNIC"},
+		{&t.proberDelay, "prober_delay_ns", "Prober-side processing delay in nanoseconds, per target RNIC"},
+		{&t.responderDelay, "responder_delay_ns", "Responder-side processing delay in nanoseconds, per target RNIC"},
+	}
+	for _, h := range histograms {
+		if *h.dst, err = meter.Int64Histogram(targetRnicMetricPrefix+h.name,
+			metric.WithDescription(h.desc), metric.WithUnit("ns"),
+			metric.WithExplicitBucketBoundaries(rttBucketBoundaries...)); err != nil {
+			return nil, err
+		}
+	}
+	return &t, nil
+}
+
 // RecordProbeResult records metrics for a single completed probe.
 // It uses ToR-level attributes (source_tor, target_tor) and the local source
-// RNIC for metric dimensions to keep cardinality low, plus the destination
-// RNIC when enabled via WithTargetRnicLabels (see targetRnicAttributes).
-// GID-level details are logged at Debug level for troubleshooting without
-// inflating metric series count.
+// RNIC for metric dimensions to keep cardinality low. When enabled via
+// WithTargetRnicLabels it also records the rpingmesh.target_rnic.*
+// instruments with the destination RNIC (see recordTargetRnic). GID-level
+// details are logged at Debug level for troubleshooting without inflating
+// metric series count.
 //
 // If result.Success is true and rtt.Valid is true, the RTT histograms and
 // success counter are incremented. Otherwise, the failure counter is
@@ -488,39 +562,37 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 	// Build low-cardinality attribute set: ToR IDs plus the local (source)
 	// RNIC. The source RNIC labels are bounded by the RNICs on this host,
 	// and device and netdev map 1:1, so together they multiply series only
-	// by the local RNIC count. NEVER use GIDs as metric attributes, and add
-	// destination-RNIC identity only when explicitly enabled, to avoid
-	// cardinality explosion.
+	// by the local RNIC count. NEVER use GIDs or any destination-RNIC
+	// identity as attributes of these instruments to avoid cardinality
+	// explosion; that goes only to the opt-in target instruments.
 	attrSet := []attribute.KeyValue{
 		attribute.String("source_tor", sourceTor),
 		attribute.String("target_tor", targetTor),
 		attribute.String("source_rdma_device", sourceRdmaDevice),
 		attribute.String("source_netdev", sourceNetdev),
 	}
-	histAttrSet := attrSet
-	counterAttrSet := attrSet
-	if mc.targetRnicLabels.Enabled {
-		counterAttrSet = append(attrSet[:len(attrSet):len(attrSet)], mc.targetRnicAttributes(result)...)
-		if mc.targetRnicLabels.Histograms {
-			histAttrSet = counterAttrSet
-		}
-	}
-	counterAttrs := metric.WithAttributes(counterAttrSet...)
+	attrs := metric.WithAttributes(attrSet...)
 
 	// Always increment total probe count.
-	mc.probeTotal.Add(ctx, 1, counterAttrs)
+	mc.probeTotal.Add(ctx, 1, attrs)
 
-	if result.Success && rtt != nil && rtt.Valid {
+	success := result.Success && rtt != nil && rtt.Valid
+	var reason string
+	if success {
 		// Record RTT histogram values for successful probes.
-		histAttrs := metric.WithAttributes(histAttrSet...)
-		mc.networkRTT.Record(ctx, rtt.NetworkRTT, histAttrs)
-		mc.proberDelay.Record(ctx, rtt.ProberDelay, histAttrs)
-		mc.responderDelay.Record(ctx, rtt.ResponderDelay, histAttrs)
-		mc.probeSuccess.Add(ctx, 1, counterAttrs)
+		mc.networkRTT.Record(ctx, rtt.NetworkRTT, attrs)
+		mc.proberDelay.Record(ctx, rtt.ProberDelay, attrs)
+		mc.responderDelay.Record(ctx, rtt.ResponderDelay, attrs)
+		mc.probeSuccess.Add(ctx, 1, attrs)
 	} else {
-		failedAttrs := append(counterAttrSet[:len(counterAttrSet):len(counterAttrSet)],
-			attribute.String("reason", probeFailureReason(result, rtt)))
+		reason = probeFailureReason(result, rtt)
+		failedAttrs := append(attrSet[:len(attrSet):len(attrSet)],
+			attribute.String("reason", reason))
 		mc.probeFailed.Add(ctx, 1, metric.WithAttributes(failedAttrs...))
+	}
+
+	if mc.target != nil {
+		mc.recordTargetRnic(ctx, attrSet, result, rtt, success, reason)
 	}
 
 	// Log GID-level detail at Debug level. This provides per-flow
@@ -546,22 +618,41 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		Msg("Probe result recorded")
 }
 
-// targetRnicAttributes returns the destination-RNIC attributes for result:
-// target_hostname, target_rdma_device and target_netdev. An unknown value
-// (e.g. a target registered by an older agent that does not report its
-// netdev) becomes unspecifiedDeviceLabel. Inter-ToR targets get
-// outOfScopeTargetLabel for all three unless IncludeInterTor is set.
-func (mc *MetricsCollector) targetRnicAttributes(result *probe.ProbeResult) []attribute.KeyValue {
-	host, device, netdev := outOfScopeTargetLabel, outOfScopeTargetLabel, outOfScopeTargetLabel
-	if mc.targetRnicLabels.IncludeInterTor || result.PinglistType != controller_agent.PinglistType_INTER_TOR {
+// recordTargetRnic records one probe on the rpingmesh.target_rnic.*
+// instruments. Their attributes are baseAttrs (the default instruments'
+// attributes) plus target_hostname, target_rdma_device and target_netdev.
+// An unknown value (e.g. a target registered by an older agent that does not
+// report its netdev) becomes unspecifiedDeviceLabel. Sampled targets get
+// sampledTargetLabel for all three unless IncludeSampled is set.
+func (mc *MetricsCollector) recordTargetRnic(ctx context.Context, baseAttrs []attribute.KeyValue,
+	result *probe.ProbeResult, rtt *probe.RTTResult, success bool, reason string) {
+	host, device, netdev := sampledTargetLabel, sampledTargetLabel, sampledTargetLabel
+	if mc.targetRnicLabels.IncludeSampled || !result.TargetSampled {
 		host = deviceMetricLabel(result.TargetHostname)
 		device = deviceMetricLabel(result.TargetRdmaDevice)
 		netdev = deviceMetricLabel(result.TargetNetdev)
 	}
-	return []attribute.KeyValue{
+	attrSet := make([]attribute.KeyValue, 0, len(baseAttrs)+4)
+	attrSet = append(attrSet, baseAttrs...)
+	attrSet = append(attrSet,
 		attribute.String("target_hostname", host),
 		attribute.String("target_rdma_device", device),
 		attribute.String("target_netdev", netdev),
+	)
+	attrs := metric.WithAttributes(attrSet...)
+
+	t := mc.target
+	t.probeTotal.Add(ctx, 1, attrs)
+	if !success {
+		attrSet = append(attrSet, attribute.String("reason", reason))
+		t.probeFailed.Add(ctx, 1, metric.WithAttributes(attrSet...))
+		return
+	}
+	t.probeSuccess.Add(ctx, 1, attrs)
+	if t.networkRTT != nil {
+		t.networkRTT.Record(ctx, rtt.NetworkRTT, attrs)
+		t.proberDelay.Record(ctx, rtt.ProberDelay, attrs)
+		t.responderDelay.Record(ctx, rtt.ResponderDelay, attrs)
 	}
 }
 

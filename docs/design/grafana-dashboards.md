@@ -70,8 +70,10 @@ ladder is a superset of the analyzer's own bucket ladder
   port/GID) map 1:1, so together they multiply series only by the RNICs per
   host. They distinguish a multi-rail host's RNICs that share a ToR and join
   with RDMA hardware counters and node_exporter `node_network_*{device=...}`.
-- Destination-RNIC identity and GIDs never become attributes; they appear
-  only in debug logs.
+- GIDs never become attributes; they appear only in debug logs.
+  Destination-RNIC identity (`target_hostname`, `target_rdma_device`,
+  `target_netdev`) is off by default and opt-in through
+  `metrics_target_rnic_labels`; see "Optional destination-RNIC labels" below.
 - Empty values are exported as the non-empty label `unspecified`: an unset
   `tor_id`, and a device or netdev that cannot be resolved (e.g. a bonded
   RNIC's netdev). Template variables and the ToR × ToR matrix therefore still
@@ -142,6 +144,31 @@ fleet `= 1,836 × 60 = 110,160`. In B the instantaneous `T(r)` is
 visited every foreign ToR. Histogram buckets dominate (96 of 102 series per
 tuple), so fewer bucket boundaries is the main lever if the total is too
 high. Dropping the source-RNIC labels only helps in cases like B and C.
+
+### Optional destination-RNIC labels
+
+`metrics_target_rnic_labels: counters` turns the counter tuple into
+`(source RNIC, target RNIC)` for ToR-mesh targets; `all` does the same for the
+histograms. With the default `metrics_target_rnic_labels_scope: tor_mesh`,
+inter-ToR probes keep one `_inter_tor` value per `target_tor`, so the inter-ToR
+part of the count is unchanged. Let `M(r)` be the number of ToR-mesh targets of
+RNIC `r` (the other RNICs on its ToR, excluding its own host):
+
+```
+counters: series_agent ≤ P_agent × 102 + Σ_r (M(r) − 1) × (2 + R)
+all:      series_agent ≤ P_agent × 102 + Σ_r (M(r) − 1) × (98 + R)
+```
+
+For fabric A (each leaf holds 20 RNICs of one rail, so `M(r) = 19`):
+`counters` adds `6 × 18 × 6 = 648` series per agent (+35%), `all` adds
+`6 × 18 × 102 = 11,016` (×7). With `scope: all`, inter-ToR targets add their
+own term, and because the controller re-samples them on every refresh the
+long-run bound becomes every RNIC in the plane.
+
+The SDK keeps at most `metrics_cardinality_limit` (default 2000) attribute sets
+per instrument. `probe_failed_total` holds one set per tuple and `reason`, so
+raise the limit if `Σ_r (T(r) + M(r)) × R` can exceed it; otherwise the excess
+is folded into one `otel.metric.overflow="true"` series.
 
 To check the real count in Prometheus:
 

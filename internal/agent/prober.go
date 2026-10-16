@@ -1287,6 +1287,9 @@ func fillTargetMetadata(result *probe.ProbeResult, seqNum uint64, flowLabel uint
 	result.TargetIP = target.GetTargetIp()
 	result.TargetHostname = target.GetTargetHostname()
 	result.TargetTorID = target.GetTargetTorId()
+	result.TargetRdmaDevice = target.GetTargetDeviceName()
+	result.TargetNetdev = target.GetTargetNetdev()
+	result.PinglistType = target.GetPinglistType()
 	if parsedGID, err := probe.ParseGID(target.GetTargetGid()); err == nil {
 		result.TargetGID = parsedGID
 	}

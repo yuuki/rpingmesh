@@ -362,6 +362,9 @@ To choose `service_level` and `traffic_class`, see
 |-----|---------|-------------|
 | `metrics_enabled` | `true` | Export OTLP metrics |
 | `otel_collector_addr` | `localhost:4317` | OTLP/gRPC collector as `host:port`, without a URL scheme |
+| `metrics_target_rnic_labels` | `off` | Add destination-RNIC labels (`target_hostname`, `target_rdma_device`, `target_netdev`) to probe metrics: `off`, `counters` (probe counters only), or `all` (counters and RTT histograms). See [Metrics](#metrics) before enabling |
+| `metrics_target_rnic_labels_scope` | `tor_mesh` | `tor_mesh` labels only ToR-mesh targets and gives inter-ToR targets the value `_inter_tor`; `all` labels inter-ToR targets too |
+| `metrics_cardinality_limit` | `0` | Maximum attribute sets per metric instrument; extra sets fold into one `otel.metric.overflow="true"` series. `0` keeps the OTel SDK default (2000) |
 | `analysis_report_enabled` | `true` | Send per-path summaries to the controller's analyzer. Reporting is best-effort and never blocks probing |
 | `analysis_window_sec` | `30` | Per-path aggregation window |
 | `log_level` | `info` | `debug`, `info`, `warn`, or `error` |
@@ -707,6 +710,8 @@ Probe metrics carry these attributes:
   (for example `mlx5_0` and `ens1f0`), or `unspecified` when unknown.
 - `reason` (on `probe_failed_total` only): `timeout`, `send_error`,
   `invalid_rtt`, or `unknown`.
+- `target_hostname`, `target_rdma_device`, `target_netdev` (opt-in, see
+  below): the destination RNIC, or `unspecified` when unknown.
 
 Analyzer metrics, exported by the controller with
 `service.name=rpingmesh-analyzer`:
@@ -716,10 +721,34 @@ Analyzer metrics, exported by the controller with
 | `rpingmesh.analyzer.path_summaries_total` | Counter | — | Ingested per-path window summaries |
 | `rpingmesh.analyzer.sla_violations_total` | Counter | `source_tor`, `target_tor`, `kind` (`loss`, `rtt`) | Detected SLA violations |
 
-No metric carries a GID or any other identity of the destination RNIC, because
-a fabric with thousands of RNICs would produce an unbounded number of series.
-Per-probe detail, including GIDs, flow labels, and all six timestamps, is
-logged at `debug` level instead. "Estimating the series count" in
+By default no metric carries a GID or any other identity of the destination
+RNIC, because a fabric with thousands of RNICs would produce an unbounded number
+of series. Per-probe detail, including GIDs, flow labels, and all six
+timestamps, is logged at `debug` level instead.
+
+`metrics_target_rnic_labels` opts in to the destination RNIC's host, RDMA
+device, and netdev as labels, which localizes loss or latency to one remote
+RNIC:
+
+- `counters` labels `probe_total`, `probe_success_total`, and
+  `probe_failed_total`, which is enough to find the RNIC behind a loss. The
+  RTT histograms stay at the default labels.
+- `all` labels the RTT histograms too. Each label set costs about 100
+  histogram series, so use it on small fabrics or for a time-boxed
+  investigation.
+- With the default `metrics_target_rnic_labels_scope: tor_mesh`, only
+  ToR-mesh targets get their identity; inter-ToR probes carry `_inter_tor` in
+  all three labels. The controller re-samples inter-ToR targets on every
+  pinglist refresh, and the OTel SDK keeps every attribute set it has seen,
+  so labelling them would grow the series count over time.
+- `target_netdev` needs a controller and target agents that report netdevs
+  (this release or later); otherwise it is `unspecified`.
+- The OTel SDK caps each instrument at 2000 attribute sets per agent by
+  default. Raise `metrics_cardinality_limit` if an agent's RNICs probe more
+  targets than that, or the excess folds into an `otel.metric.overflow` series.
+
+All bundled dashboards and alerts aggregate the destination labels away, so
+they are unchanged. "Estimating the series count" in
 [`docs/design/grafana-dashboards.md`](docs/design/grafana-dashboards.md) shows
 how to size the metric volume.
 

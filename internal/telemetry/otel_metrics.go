@@ -2,9 +2,12 @@
 // R-Pingmesh agent. It records probe RTT measurements and success/failure
 // counts as OTLP metrics exported to a configured collector.
 //
-// Design principle: metric attributes use ToR-level cardinality only
-// (source_tor, target_tor) to avoid metric cardinality explosion. GID-level
-// details are emitted as structured log fields at Debug level via zerolog.
+// Design principle: metric attributes use ToR-level cardinality
+// (source_tor, target_tor) plus the local source RNIC to avoid metric
+// cardinality explosion. Destination-RNIC labels (target_hostname,
+// target_rdma_device, target_netdev) are opt-in via WithTargetRnicLabels.
+// GID-level details are emitted as structured log fields at Debug level via
+// zerolog.
 package telemetry
 
 import (
@@ -19,6 +22,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/buildinfo"
 	"github.com/yuuki/rpingmesh/internal/probe"
+	"github.com/yuuki/rpingmesh/proto/controller_agent"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/metric"
@@ -104,6 +108,29 @@ func probeFailureReason(result *probe.ProbeResult, rtt *probe.RTTResult) string 
 // "unknown" label value reads the same in dashboards.
 const unspecifiedDeviceLabel = probe.UnspecifiedTorLabel
 
+// outOfScopeTargetLabel is the value of every destination-RNIC label on an
+// inter-ToR probe when TargetRnicLabels.IncludeInterTor is false. Keeping the
+// attribute keys present with a fixed value gives every series of a metric
+// the same label set, while inter-ToR targets (whose representatives the
+// controller re-samples on every pinglist refresh) cannot churn series.
+const outOfScopeTargetLabel = "_inter_tor"
+
+// TargetRnicLabels selects the optional destination-RNIC metric attributes
+// (target_hostname, target_rdma_device, target_netdev). The zero value
+// disables them, keeping the default ToR-level cardinality.
+type TargetRnicLabels struct {
+	// Enabled adds the labels to the probe counters (probe_total,
+	// probe_success, probe_failed), enough to localize loss to an RNIC.
+	Enabled bool
+	// Histograms also adds them to the three RTT histograms, which cost
+	// ~33 series per label set each. Ignored unless Enabled is set.
+	Histograms bool
+	// IncludeInterTor labels inter-ToR targets with their real identity too.
+	// When false, inter-ToR probes carry outOfScopeTargetLabel instead,
+	// because their sampled targets change on every pinglist refresh.
+	IncludeInterTor bool
+}
+
 // deviceMetricLabel returns name, or unspecifiedDeviceLabel when it is empty,
 // so the attribute is always present with a fixed, non-empty value.
 func deviceMetricLabel(name string) string {
@@ -122,7 +149,9 @@ type Option func(*collectorOptions)
 
 // collectorOptions holds the configurable parameters applied via Option.
 type collectorOptions struct {
-	serviceName string
+	serviceName      string
+	targetRnicLabels TargetRnicLabels
+	cardinalityLimit int
 }
 
 // WithServiceName overrides the OTel resource service.name reported by the
@@ -131,6 +160,25 @@ type collectorOptions struct {
 func WithServiceName(serviceName string) Option {
 	return func(o *collectorOptions) {
 		o.serviceName = serviceName
+	}
+}
+
+// WithTargetRnicLabels enables the optional destination-RNIC metric
+// attributes described by labels. Without it they are never recorded.
+func WithTargetRnicLabels(labels TargetRnicLabels) Option {
+	return func(o *collectorOptions) {
+		o.targetRnicLabels = labels
+	}
+}
+
+// WithCardinalityLimit caps the number of attribute sets each instrument
+// keeps per collection cycle; label sets beyond it are folded into a single
+// otel.metric.overflow=true series. Zero or a negative value keeps the OTel
+// SDK default (2000, or OTEL_GO_X_CARDINALITY_LIMIT). Only NewMetricsCollector
+// applies it, since it is a MeterProvider setting.
+func WithCardinalityLimit(limit int) Option {
+	return func(o *collectorOptions) {
+		o.cardinalityLimit = limit
 	}
 }
 
@@ -148,6 +196,7 @@ type MetricsCollector struct {
 	probeTotal       metric.Int64Counter
 	eventRingDropped metric.Int64ObservableCounter
 	selfThrottle     metric.Float64ObservableGauge
+	targetRnicLabels TargetRnicLabels
 	logger           zerolog.Logger
 }
 
@@ -219,7 +268,11 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 		opt(&options)
 	}
 
-	provider, err := NewMeterProvider(ctx, collectorAddr, options.serviceName)
+	var providerOpts []sdkmetric.Option
+	if options.cardinalityLimit > 0 {
+		providerOpts = append(providerOpts, sdkmetric.WithCardinalityLimit(options.cardinalityLimit))
+	}
+	provider, err := NewMeterProvider(ctx, collectorAddr, options.serviceName, providerOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -228,10 +281,15 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 	if err != nil {
 		return nil, err
 	}
+	mc.targetRnicLabels = options.targetRnicLabels
 
 	mc.logger.Info().
 		Str("collector_addr", collectorAddr).
 		Dur("flush_interval", periodicReaderInterval).
+		Bool("target_rnic_labels", options.targetRnicLabels.Enabled).
+		Bool("target_rnic_labels_histograms", options.targetRnicLabels.Histograms).
+		Bool("target_rnic_labels_inter_tor", options.targetRnicLabels.IncludeInterTor).
+		Int("cardinality_limit", options.cardinalityLimit).
 		Msg("MetricsCollector initialized")
 
 	return mc, nil
@@ -244,7 +302,7 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 // the controller-side analyzer (service.name="rpingmesh-analyzer"), which
 // registers its own instruments on the returned provider. The caller owns the
 // provider's lifecycle (Shutdown).
-func NewMeterProvider(ctx context.Context, collectorAddr, serviceName string) (*sdkmetric.MeterProvider, error) {
+func NewMeterProvider(ctx context.Context, collectorAddr, serviceName string, opts ...sdkmetric.Option) (*sdkmetric.MeterProvider, error) {
 	// Create OTLP gRPC exporter targeting the collector.
 	exporter, err := otlpmetricgrpc.New(
 		ctx,
@@ -263,7 +321,7 @@ func NewMeterProvider(ctx context.Context, collectorAddr, serviceName string) (*
 
 	// Create a MeterProvider with a periodic reader that flushes metrics
 	// to the collector at a fixed interval.
-	provider := sdkmetric.NewMeterProvider(
+	providerOpts := append([]sdkmetric.Option{
 		sdkmetric.WithResource(res),
 		sdkmetric.WithReader(
 			sdkmetric.NewPeriodicReader(
@@ -271,15 +329,27 @@ func NewMeterProvider(ctx context.Context, collectorAddr, serviceName string) (*
 				sdkmetric.WithInterval(periodicReaderInterval),
 			),
 		),
-	)
+	}, opts...)
+	provider := sdkmetric.NewMeterProvider(providerOpts...)
 	return provider, nil
 }
 
 // NewMetricsCollectorWithProvider creates a MetricsCollector using the given
 // MeterProvider. This is intended for testing where the caller supplies a
 // provider backed by a ManualReader for in-memory metric verification.
-func NewMetricsCollectorWithProvider(provider *sdkmetric.MeterProvider) (*MetricsCollector, error) {
-	return registerInstruments(provider)
+// WithServiceName and WithCardinalityLimit are ignored here: the caller
+// configures its own provider.
+func NewMetricsCollectorWithProvider(provider *sdkmetric.MeterProvider, opts ...Option) (*MetricsCollector, error) {
+	var options collectorOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+	mc, err := registerInstruments(provider)
+	if err != nil {
+		return nil, err
+	}
+	mc.targetRnicLabels = options.targetRnicLabels
+	return mc, nil
 }
 
 // registerInstruments creates histogram and counter instruments on the given
@@ -391,9 +461,11 @@ func registerInstruments(provider *sdkmetric.MeterProvider) (*MetricsCollector, 
 }
 
 // RecordProbeResult records metrics for a single completed probe.
-// It uses only ToR-level attributes (source_tor, target_tor) for metric
-// dimensions to keep cardinality low. GID-level details are logged at
-// Debug level for troubleshooting without inflating metric series count.
+// It uses ToR-level attributes (source_tor, target_tor) and the local source
+// RNIC for metric dimensions to keep cardinality low, plus the destination
+// RNIC when enabled via WithTargetRnicLabels (see targetRnicAttributes).
+// GID-level details are logged at Debug level for troubleshooting without
+// inflating metric series count.
 //
 // If result.Success is true and rtt.Valid is true, the RTT histograms and
 // success counter are incremented. Otherwise, the failure counter is
@@ -416,27 +488,37 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 	// Build low-cardinality attribute set: ToR IDs plus the local (source)
 	// RNIC. The source RNIC labels are bounded by the RNICs on this host,
 	// and device and netdev map 1:1, so together they multiply series only
-	// by the local RNIC count. NEVER use GIDs or any destination-RNIC
-	// identity as metric attributes to avoid cardinality explosion.
+	// by the local RNIC count. NEVER use GIDs as metric attributes, and add
+	// destination-RNIC identity only when explicitly enabled, to avoid
+	// cardinality explosion.
 	attrSet := []attribute.KeyValue{
 		attribute.String("source_tor", sourceTor),
 		attribute.String("target_tor", targetTor),
 		attribute.String("source_rdma_device", sourceRdmaDevice),
 		attribute.String("source_netdev", sourceNetdev),
 	}
-	attrs := metric.WithAttributes(attrSet...)
+	histAttrSet := attrSet
+	counterAttrSet := attrSet
+	if mc.targetRnicLabels.Enabled {
+		counterAttrSet = append(attrSet[:len(attrSet):len(attrSet)], mc.targetRnicAttributes(result)...)
+		if mc.targetRnicLabels.Histograms {
+			histAttrSet = counterAttrSet
+		}
+	}
+	counterAttrs := metric.WithAttributes(counterAttrSet...)
 
 	// Always increment total probe count.
-	mc.probeTotal.Add(ctx, 1, attrs)
+	mc.probeTotal.Add(ctx, 1, counterAttrs)
 
 	if result.Success && rtt != nil && rtt.Valid {
 		// Record RTT histogram values for successful probes.
-		mc.networkRTT.Record(ctx, rtt.NetworkRTT, attrs)
-		mc.proberDelay.Record(ctx, rtt.ProberDelay, attrs)
-		mc.responderDelay.Record(ctx, rtt.ResponderDelay, attrs)
-		mc.probeSuccess.Add(ctx, 1, attrs)
+		histAttrs := metric.WithAttributes(histAttrSet...)
+		mc.networkRTT.Record(ctx, rtt.NetworkRTT, histAttrs)
+		mc.proberDelay.Record(ctx, rtt.ProberDelay, histAttrs)
+		mc.responderDelay.Record(ctx, rtt.ResponderDelay, histAttrs)
+		mc.probeSuccess.Add(ctx, 1, counterAttrs)
 	} else {
-		failedAttrs := append(attrSet[:len(attrSet):len(attrSet)],
+		failedAttrs := append(counterAttrSet[:len(counterAttrSet):len(counterAttrSet)],
 			attribute.String("reason", probeFailureReason(result, rtt)))
 		mc.probeFailed.Add(ctx, 1, metric.WithAttributes(failedAttrs...))
 	}
@@ -462,6 +544,25 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		Bool("success", result.Success).
 		Str("error", result.ErrorMessage).
 		Msg("Probe result recorded")
+}
+
+// targetRnicAttributes returns the destination-RNIC attributes for result:
+// target_hostname, target_rdma_device and target_netdev. An unknown value
+// (e.g. a target registered by an older agent that does not report its
+// netdev) becomes unspecifiedDeviceLabel. Inter-ToR targets get
+// outOfScopeTargetLabel for all three unless IncludeInterTor is set.
+func (mc *MetricsCollector) targetRnicAttributes(result *probe.ProbeResult) []attribute.KeyValue {
+	host, device, netdev := outOfScopeTargetLabel, outOfScopeTargetLabel, outOfScopeTargetLabel
+	if mc.targetRnicLabels.IncludeInterTor || result.PinglistType != controller_agent.PinglistType_INTER_TOR {
+		host = deviceMetricLabel(result.TargetHostname)
+		device = deviceMetricLabel(result.TargetRdmaDevice)
+		netdev = deviceMetricLabel(result.TargetNetdev)
+	}
+	return []attribute.KeyValue{
+		attribute.String("target_hostname", host),
+		attribute.String("target_rdma_device", device),
+		attribute.String("target_netdev", netdev),
+	}
 }
 
 // RegisterEventRingDropCallback registers an OTel callback that reports the

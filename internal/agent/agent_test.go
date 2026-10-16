@@ -24,6 +24,7 @@ import (
 	"github.com/yuuki/rpingmesh/internal/lldp"
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/internal/rdmabridge"
+	"github.com/yuuki/rpingmesh/internal/telemetry"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
@@ -685,6 +686,68 @@ func TestAgent_PerDevicePlaneIDs(t *testing.T) {
 	}
 	if !strings.Contains(out, `"device":"rxe9","message":"device_plane_ids entry names a device in excluded_device_names; ignored"`) {
 		t.Errorf("missing excluded-entry warning for rxe9; logs:\n%s", out)
+	}
+}
+
+// TestAgent_RegistersDeviceNetdevs verifies that each RNIC registers the
+// netdev resolved for its device, and an empty netdev when it is unresolved.
+func TestAgent_RegistersDeviceNetdevs(t *testing.T) {
+	a, err := NewAgent(&config.AgentConfig{AgentID: "agent-1", PinglistUpdateIntervalSec: 3600})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "gid-0"), fakeDevice("rxe1", "gid-1")}
+	a.probers = []*Prober{fakeProber(1), fakeProber(1)}
+	a.responders = []*Responder{{}, {}}
+	a.deviceNetdevs = []string{"eth0", ""}
+
+	want := []string{"eth0", ""}
+	for i, rnic := range a.buildRegistrationRequest().GetRnics() {
+		if rnic.GetNetdev() != want[i] {
+			t.Errorf("rnic[%d] Netdev = %q, want %q", i, rnic.GetNetdev(), want[i])
+		}
+	}
+}
+
+// TestTargetRnicLabels verifies the mapping from the
+// metrics_target_rnic_labels(_scope) settings to telemetry.TargetRnicLabels.
+func TestTargetRnicLabels(t *testing.T) {
+	cases := []struct {
+		mode, scope string
+		want        telemetry.TargetRnicLabels
+	}{
+		{"", "", telemetry.TargetRnicLabels{}},
+		{config.MetricsTargetRnicLabelsOff, config.MetricsTargetRnicLabelsScopeAll, telemetry.TargetRnicLabels{IncludeInterTor: true}},
+		{config.MetricsTargetRnicLabelsCounters, config.MetricsTargetRnicLabelsScopeTorMesh, telemetry.TargetRnicLabels{Enabled: true}},
+		{config.MetricsTargetRnicLabelsAll, config.MetricsTargetRnicLabelsScopeAll,
+			telemetry.TargetRnicLabels{Enabled: true, Histograms: true, IncludeInterTor: true}},
+	}
+	for _, tc := range cases {
+		got := targetRnicLabels(&config.AgentConfig{
+			MetricsTargetRnicLabels:      tc.mode,
+			MetricsTargetRnicLabelsScope: tc.scope,
+		})
+		if got != tc.want {
+			t.Errorf("targetRnicLabels(%q, %q) = %+v, want %+v", tc.mode, tc.scope, got, tc.want)
+		}
+	}
+}
+
+// TestFillTargetMetadata_CopiesTargetRnicIdentity verifies that probe results
+// carry the target RNIC's device, netdev and pinglist type from the
+// PingTarget, which the optional destination metric labels read.
+func TestFillTargetMetadata_CopiesTargetRnicIdentity(t *testing.T) {
+	result := newFailedResult(1, &controller_agent.PingTarget{
+		TargetHostname:   "host-b",
+		TargetDeviceName: "mlx5_1",
+		TargetNetdev:     "ens2f0",
+		PinglistType:     controller_agent.PinglistType_INTER_TOR,
+	}, 0, "send failed")
+
+	if result.TargetHostname != "host-b" || result.TargetRdmaDevice != "mlx5_1" ||
+		result.TargetNetdev != "ens2f0" || result.PinglistType != controller_agent.PinglistType_INTER_TOR {
+		t.Errorf("result target identity = (%q, %q, %q, %v), want (host-b, mlx5_1, ens2f0, INTER_TOR)",
+			result.TargetHostname, result.TargetRdmaDevice, result.TargetNetdev, result.PinglistType)
 	}
 }
 

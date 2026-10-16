@@ -69,6 +69,23 @@ const (
 // place the real GID table size is known.
 const MaxGIDIndex = 255
 
+// Values accepted by metrics_target_rnic_labels (see
+// AgentConfig.MetricsTargetRnicLabels).
+const (
+	MetricsTargetRnicLabelsOff      = "off"
+	MetricsTargetRnicLabelsCounters = "counters"
+	MetricsTargetRnicLabelsAll      = "all"
+	DefaultMetricsTargetRnicLabels  = MetricsTargetRnicLabelsOff
+)
+
+// Values accepted by metrics_target_rnic_labels_scope (see
+// AgentConfig.MetricsTargetRnicLabelsScope).
+const (
+	MetricsTargetRnicLabelsScopeTorMesh = "tor_mesh"
+	MetricsTargetRnicLabelsScopeAll     = "all"
+	DefaultMetricsTargetRnicLabelsScope = MetricsTargetRnicLabelsScopeTorMesh
+)
+
 // CQ poll modes accepted by cq_poll_mode (see AgentConfig.CQPollMode).
 const (
 	CQPollModeAuto    = "auto"
@@ -130,11 +147,25 @@ type AgentConfig struct {
 	LogLevel       string `mapstructure:"log_level"`
 	// LogFormat selects the log output format: "console" (default,
 	// human-readable) or "json" (one zerolog JSON object per line on stderr).
-	LogFormat          string   `mapstructure:"log_format"`
-	ProbeIntervalMS    uint32   `mapstructure:"probe_interval_ms"`
-	OtelCollectorAddr  string   `mapstructure:"otel_collector_addr"`
-	MetricsEnabled     bool     `mapstructure:"metrics_enabled"`
-	AllowedDeviceNames []string `mapstructure:"allowed_device_names"`
+	LogFormat         string `mapstructure:"log_format"`
+	ProbeIntervalMS   uint32 `mapstructure:"probe_interval_ms"`
+	OtelCollectorAddr string `mapstructure:"otel_collector_addr"`
+	MetricsEnabled    bool   `mapstructure:"metrics_enabled"`
+	// MetricsTargetRnicLabels adds destination-RNIC attributes
+	// (target_hostname, target_rdma_device, target_netdev) to probe metrics:
+	// "off" (default) adds none, "counters" adds them to the probe counters
+	// only, "all" also to the RTT histograms.
+	MetricsTargetRnicLabels string `mapstructure:"metrics_target_rnic_labels"`
+	// MetricsTargetRnicLabelsScope limits which targets get their real
+	// identity: "tor_mesh" (default) labels only ToR-mesh targets, whose set
+	// is stable, and gives inter-ToR targets a fixed "_inter_tor" value;
+	// "all" labels inter-ToR targets too.
+	MetricsTargetRnicLabelsScope string `mapstructure:"metrics_target_rnic_labels_scope"`
+	// MetricsCardinalityLimit caps the attribute sets each metric instrument
+	// keeps; extra sets fold into one otel.metric.overflow series. 0 keeps
+	// the OTel SDK default (2000).
+	MetricsCardinalityLimit int      `mapstructure:"metrics_cardinality_limit"`
+	AllowedDeviceNames      []string `mapstructure:"allowed_device_names"`
 	// ExcludedDeviceNames lists RDMA devices the agent never opens, matched
 	// case-insensitively. It applies on top of AllowedDeviceNames; naming a
 	// device in both lists is rejected by Validate().
@@ -244,6 +275,9 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("probe_interval_ms", 500)
 	v.SetDefault("otel_collector_addr", "localhost:4317")
 	v.SetDefault("metrics_enabled", true)
+	v.SetDefault("metrics_target_rnic_labels", DefaultMetricsTargetRnicLabels)
+	v.SetDefault("metrics_target_rnic_labels_scope", DefaultMetricsTargetRnicLabelsScope)
+	v.SetDefault("metrics_cardinality_limit", 0)
 	v.SetDefault("allowed_device_names", []string{})
 	v.SetDefault("excluded_device_names", []string{})
 	v.SetDefault("gid_index", 0)
@@ -316,46 +350,49 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	}
 
 	config := &AgentConfig{
-		AgentID:                    agentID,
-		HostName:                   hostname,
-		TorID:                      v.GetString("tor_id"),
-		DeviceTorIDs:               canonicalDeviceTorIDs(v.GetStringMapString("device_tor_ids")),
-		PlaneID:                    probe.CanonicalPlaneID(v.GetString("plane_id")),
-		DevicePlaneIDs:             canonicalDevicePlaneIDs(v.GetStringMapString("device_plane_ids")),
-		LLDPTorDiscovery:           v.GetBool("lldp_tor_discovery"),
-		LLDPTorIDField:             v.GetString("lldp_tor_id_field"),
-		LLDPCLIPath:                v.GetString("lldpcli_path"),
-		LLDPDiscoveryTimeoutSec:    v.GetUint32("lldp_discovery_timeout_sec"),
-		ControllerAddr:             v.GetString("controller_addr"),
-		LogLevel:                   v.GetString("log_level"),
-		LogFormat:                  v.GetString("log_format"),
-		ProbeIntervalMS:            v.GetUint32("probe_interval_ms"),
-		OtelCollectorAddr:          v.GetString("otel_collector_addr"),
-		MetricsEnabled:             v.GetBool("metrics_enabled"),
-		AllowedDeviceNames:         v.GetStringSlice("allowed_device_names"),
-		ExcludedDeviceNames:        v.GetStringSlice("excluded_device_names"),
-		GIDIndex:                   v.GetInt("gid_index"),
-		ServiceLevel:               v.GetInt("service_level"),
-		TrafficClass:               v.GetInt("traffic_class"),
-		CQPollMode:                 v.GetString("cq_poll_mode"),
-		PinglistUpdateIntervalSec:  v.GetUint32("pinglist_update_interval_sec"),
-		TargetProbeRatePerSecond:   v.GetInt("target_probe_rate_per_second"),
-		TorMeshProbeRatePerSecond:  v.GetInt("tor_mesh_probe_rate_per_second"),
-		InterTorProbeRatePerSecond: v.GetInt("inter_tor_probe_rate_per_second"),
-		FlowLabelRotationPeriodSec: v.GetUint32("flow_label_rotation_period_sec"),
-		AnalysisReportEnabled:      v.GetBool("analysis_report_enabled"),
-		AnalysisWindowSec:          v.GetUint32("analysis_window_sec"),
-		TLSMode:                    v.GetString("tls_mode"),
-		TLSCertFile:                v.GetString("tls_cert_file"),
-		TLSKeyFile:                 v.GetString("tls_key_file"),
-		TLSCAFile:                  v.GetString("tls_ca_file"),
-		TLSServerName:              v.GetString("tls_server_name"),
-		SelfProtectionEnabled:      v.GetBool("self_protection_enabled"),
-		WatchdogIntervalSec:        v.GetUint32("watchdog_interval_sec"),
-		MaxMemoryMB:                v.GetInt("max_memory_mb"),
-		MaxProcs:                   v.GetInt("max_procs"),
-		ThrottleMemoryRatio:        v.GetFloat64("throttle_memory_ratio"),
-		ThrottleCPUPercent:         v.GetFloat64("throttle_cpu_percent"),
+		AgentID:                      agentID,
+		HostName:                     hostname,
+		TorID:                        v.GetString("tor_id"),
+		DeviceTorIDs:                 canonicalDeviceTorIDs(v.GetStringMapString("device_tor_ids")),
+		PlaneID:                      probe.CanonicalPlaneID(v.GetString("plane_id")),
+		DevicePlaneIDs:               canonicalDevicePlaneIDs(v.GetStringMapString("device_plane_ids")),
+		LLDPTorDiscovery:             v.GetBool("lldp_tor_discovery"),
+		LLDPTorIDField:               v.GetString("lldp_tor_id_field"),
+		LLDPCLIPath:                  v.GetString("lldpcli_path"),
+		LLDPDiscoveryTimeoutSec:      v.GetUint32("lldp_discovery_timeout_sec"),
+		ControllerAddr:               v.GetString("controller_addr"),
+		LogLevel:                     v.GetString("log_level"),
+		LogFormat:                    v.GetString("log_format"),
+		ProbeIntervalMS:              v.GetUint32("probe_interval_ms"),
+		OtelCollectorAddr:            v.GetString("otel_collector_addr"),
+		MetricsEnabled:               v.GetBool("metrics_enabled"),
+		MetricsTargetRnicLabels:      v.GetString("metrics_target_rnic_labels"),
+		MetricsTargetRnicLabelsScope: v.GetString("metrics_target_rnic_labels_scope"),
+		MetricsCardinalityLimit:      v.GetInt("metrics_cardinality_limit"),
+		AllowedDeviceNames:           v.GetStringSlice("allowed_device_names"),
+		ExcludedDeviceNames:          v.GetStringSlice("excluded_device_names"),
+		GIDIndex:                     v.GetInt("gid_index"),
+		ServiceLevel:                 v.GetInt("service_level"),
+		TrafficClass:                 v.GetInt("traffic_class"),
+		CQPollMode:                   v.GetString("cq_poll_mode"),
+		PinglistUpdateIntervalSec:    v.GetUint32("pinglist_update_interval_sec"),
+		TargetProbeRatePerSecond:     v.GetInt("target_probe_rate_per_second"),
+		TorMeshProbeRatePerSecond:    v.GetInt("tor_mesh_probe_rate_per_second"),
+		InterTorProbeRatePerSecond:   v.GetInt("inter_tor_probe_rate_per_second"),
+		FlowLabelRotationPeriodSec:   v.GetUint32("flow_label_rotation_period_sec"),
+		AnalysisReportEnabled:        v.GetBool("analysis_report_enabled"),
+		AnalysisWindowSec:            v.GetUint32("analysis_window_sec"),
+		TLSMode:                      v.GetString("tls_mode"),
+		TLSCertFile:                  v.GetString("tls_cert_file"),
+		TLSKeyFile:                   v.GetString("tls_key_file"),
+		TLSCAFile:                    v.GetString("tls_ca_file"),
+		TLSServerName:                v.GetString("tls_server_name"),
+		SelfProtectionEnabled:        v.GetBool("self_protection_enabled"),
+		WatchdogIntervalSec:          v.GetUint32("watchdog_interval_sec"),
+		MaxMemoryMB:                  v.GetInt("max_memory_mb"),
+		MaxProcs:                     v.GetInt("max_procs"),
+		ThrottleMemoryRatio:          v.GetFloat64("throttle_memory_ratio"),
+		ThrottleCPUPercent:           v.GetFloat64("throttle_cpu_percent"),
 	}
 
 	if err := config.Validate(); err != nil {
@@ -448,6 +485,28 @@ func (c *AgentConfig) Validate() error {
 	default:
 		return fmt.Errorf("cq_poll_mode must be %q, %q or %q, got: %q",
 			CQPollModeAuto, CQPollModeEvent, CQPollModeBusy, c.CQPollMode)
+	}
+
+	// Empty values (a zero-value AgentConfig) mean the defaults, off and
+	// tor_mesh.
+	switch c.MetricsTargetRnicLabels {
+	case "", MetricsTargetRnicLabelsOff, MetricsTargetRnicLabelsCounters, MetricsTargetRnicLabelsAll:
+	default:
+		return fmt.Errorf("metrics_target_rnic_labels must be %q, %q or %q, got: %q",
+			MetricsTargetRnicLabelsOff, MetricsTargetRnicLabelsCounters, MetricsTargetRnicLabelsAll,
+			c.MetricsTargetRnicLabels)
+	}
+	switch c.MetricsTargetRnicLabelsScope {
+	case "", MetricsTargetRnicLabelsScopeTorMesh, MetricsTargetRnicLabelsScopeAll:
+	default:
+		return fmt.Errorf("metrics_target_rnic_labels_scope must be %q or %q, got: %q",
+			MetricsTargetRnicLabelsScopeTorMesh, MetricsTargetRnicLabelsScopeAll,
+			c.MetricsTargetRnicLabelsScope)
+	}
+	// A negative limit would disable the OTel SDK's cardinality cap entirely;
+	// 0 already means "SDK default", so reject negatives as likely typos.
+	if c.MetricsCardinalityLimit < 0 {
+		return fmt.Errorf("metrics_cardinality_limit must be >= 0, got: %d", c.MetricsCardinalityLimit)
 	}
 
 	// A zero or negative probe interval would make time.NewTicker panic at

@@ -326,6 +326,7 @@ func (g *PinglistGenerator) buildPingTarget(requesterGID string, rnic *controlle
 		TargetHostname:   rnic.GetHostName(),
 		TargetTorId:      rnic.GetTorId(),
 		TargetDeviceName: rnic.GetDeviceName(),
+		TargetNetdev:     rnic.GetNetdev(),
 		PinglistType:     ptype,
 		// FlowLabel is the legacy base label (low 20 bits of the seed), kept
 		// for backward compatibility and used verbatim when FlowLabelCount<=1.

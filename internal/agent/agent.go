@@ -301,6 +301,17 @@ func (a *Agent) resolveDeviceNetdevs() {
 	}
 }
 
+// registeredNetdevForDevice returns the netdev reported to the controller
+// for devices[i]: the value cached by resolveDeviceNetdevs, or "" when it is
+// unknown. Unlike netdevForDevice it never falls back to sysfs, so the
+// registration agrees with the source_netdev label this agent records.
+func (a *Agent) registeredNetdevForDevice(i int) string {
+	if i < len(a.deviceNetdevs) {
+		return a.deviceNetdevs[i]
+	}
+	return ""
+}
+
 // netdevForDevice returns the netdev of devices[i]: the value cached by
 // resolveDeviceNetdevs when it has run, else a fresh sysfs lookup.
 func (a *Agent) netdevForDevice(i int) (string, error) {
@@ -752,6 +763,7 @@ func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRe
 			TorId:      a.torIDForDevice(i),
 			DeviceName: dev.Info.DeviceName,
 			PlaneId:    a.planeIDForDevice(i),
+			Netdev:     a.registeredNetdevForDevice(i),
 		}
 		rnics = append(rnics, rnic)
 
@@ -1243,7 +1255,9 @@ func (a *Agent) createMetricsCollector(ctx context.Context) {
 	a.logger.Info().
 		Str("collector_addr", a.cfg.OtelCollectorAddr).
 		Msg("Creating metrics collector")
-	mc, err := telemetry.NewMetricsCollector(ctx, a.cfg.OtelCollectorAddr)
+	mc, err := telemetry.NewMetricsCollector(ctx, a.cfg.OtelCollectorAddr,
+		telemetry.WithTargetRnicLabels(targetRnicLabels(a.cfg)),
+		telemetry.WithCardinalityLimit(a.cfg.MetricsCardinalityLimit))
 	if err != nil {
 		a.logger.Warn().Err(err).
 			Msg("Failed to create metrics collector, continuing without metrics")
@@ -1264,6 +1278,18 @@ func (a *Agent) createMetricsCollector(ctx context.Context) {
 	}); err != nil {
 		a.logger.Warn().Err(err).
 			Msg("Failed to register event ring drop count callback")
+	}
+}
+
+// targetRnicLabels maps the metrics_target_rnic_labels and
+// metrics_target_rnic_labels_scope settings onto telemetry.TargetRnicLabels.
+// Empty values (a zero-value config) mean the defaults, off and tor_mesh.
+func targetRnicLabels(cfg *config.AgentConfig) telemetry.TargetRnicLabels {
+	mode := cfg.MetricsTargetRnicLabels
+	return telemetry.TargetRnicLabels{
+		Enabled:         mode == config.MetricsTargetRnicLabelsCounters || mode == config.MetricsTargetRnicLabelsAll,
+		Histograms:      mode == config.MetricsTargetRnicLabelsAll,
+		IncludeInterTor: cfg.MetricsTargetRnicLabelsScope == config.MetricsTargetRnicLabelsScopeAll,
 	}
 }
 

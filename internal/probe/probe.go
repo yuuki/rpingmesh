@@ -28,6 +28,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
 // Sanity bounds for RTT validation. Values exceeding these thresholds
@@ -71,6 +73,14 @@ type ProbeResult struct {
 	// unknown (test fakes, or a netdev that could not be resolved).
 	SourceRdmaDevice string
 	SourceNetdev     string
+	// TargetRdmaDevice and TargetNetdev name the target RNIC, copied from
+	// the PingTarget (empty when the controller or target agent does not
+	// know them). PinglistType records whether the target came from the
+	// ToR-mesh or the inter-ToR pinglist. All three exist only for the
+	// optional destination-RNIC metric labels.
+	TargetRdmaDevice string
+	TargetNetdev     string
+	PinglistType     controller_agent.PinglistType
 }
 
 // RTTResult contains calculated RTT metrics from a probe.

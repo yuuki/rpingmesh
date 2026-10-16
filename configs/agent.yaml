@@ -97,6 +97,15 @@ excluded_device_names: []        # Empty = exclude nothing
 # Telemetry
 metrics_enabled: true
 otel_collector_addr: "localhost:4317"
+# Destination-RNIC labels (target_hostname, target_rdma_device, target_netdev)
+# on probe metrics: "off", "counters" (probe counters only), or "all" (also the
+# RTT histograms). They multiply series by the targets per RNIC; see README.
+metrics_target_rnic_labels: "off"
+# "tor_mesh" labels only ToR-mesh targets (inter-ToR get "_inter_tor");
+# "all" labels inter-ToR targets too, whose sampled set rotates over time.
+metrics_target_rnic_labels_scope: "tor_mesh"
+# Max attribute sets per metric instrument (0 = OTel SDK default, 2000).
+metrics_cardinality_limit: 0
 
 # Self-protection (opt-in)
 # When enabled, a watchdog samples this process's CPU/memory every

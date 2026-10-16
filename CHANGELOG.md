@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in destination-RNIC labels on agent probe metrics: `target_hostname`,
+  `target_rdma_device`, and `target_netdev`. `metrics_target_rnic_labels`
+  selects `off` (default), `counters` (`probe_total`, `probe_success_total`,
+  `probe_failed_total`), or `all` (also the RTT histograms).
+  `metrics_target_rnic_labels_scope` (default `tor_mesh`) labels only ToR-mesh
+  targets and gives inter-ToR targets `_inter_tor`, because their sampled set
+  rotates on every pinglist refresh. Defaults leave every series unchanged.
+- `metrics_cardinality_limit` sets the OTel SDK's per-instrument attribute-set
+  cap (default: the SDK's 2000).
+- Agents register each RNIC's netdev (`RnicInfo.netdev`), the controller stores
+  it in a new `rnics.netdev` column (added automatically to existing tables),
+  and pinglists carry it as `PingTarget.target_netdev`.
+
 ## [0.5.3] - 2026-10-16
 
 ### Added

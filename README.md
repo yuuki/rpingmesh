@@ -1,6 +1,12 @@
 # R-Pingmesh
 
 [![Tests](https://github.com/yuuki/rpingmesh/actions/workflows/test.yml/badge.svg)](https://github.com/yuuki/rpingmesh/actions/workflows/test.yml)
+[![Release](https://img.shields.io/github/v/release/yuuki/rpingmesh)](https://github.com/yuuki/rpingmesh/releases)
+[![Go Reference](https://pkg.go.dev/badge/github.com/yuuki/rpingmesh.svg)](https://pkg.go.dev/github.com/yuuki/rpingmesh)
+[![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/rpingmesh)](https://goreportcard.com/report/github.com/yuuki/rpingmesh)
+[![Go version](https://img.shields.io/github/go-mod/go-version/yuuki/rpingmesh)](go.mod)
+[![Zig](https://img.shields.io/badge/Zig-0.17.0-F7A41D?logo=zig&logoColor=white)](https://ziglang.org)
+[![License: MIT](https://img.shields.io/github/license/yuuki/rpingmesh)](LICENSE)
 
 R-Pingmesh measures the health of RDMA over Converged Ethernet (RoCEv2) fabrics
 by probing between every RDMA NIC (RNIC) and reporting latency and loss. It is

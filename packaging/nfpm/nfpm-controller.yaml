@@ -14,7 +14,7 @@
 #
 # Requires bin/rpingmesh-controller to already be built (`make
 # build-controller`; pure Go, CGO_ENABLED=0, builds on any platform/arch --
-# see README.md "Building").
+# see README.md "Deployment").
 
 name: "rpingmesh-controller"
 arch: "${NFPM_ARCH}"

@@ -19,10 +19,10 @@ make build-zig       # Build zig/zig-out/lib/librdmabridge.a only (requires Zig 
 make generate-proto  # Regenerate protobuf Go bindings
 make build-controller  # CGO_ENABLED=0, no Zig link
 make build-agent       # CGO_ENABLED=1, links librdmabridge.a
-make clean           # Remove bin/ and zig-out/ .zig-cache/
+make clean           # Remove bin/, dist/, zig/zig-out/, zig/.zig-cache/
 ```
 
-After modifying `.proto` files: run `make generate-proto` (there is no eBPF; `make generate-bpf` does not exist here).
+After modifying `.proto` files: run `make generate-proto`. Generated `*.pb.go` files are not committed, so a fresh checkout also needs it before `build-controller`/`build-agent`. There is no eBPF code and no `make generate-bpf`.
 After modifying Zig source in `zig/src/`: run `make build-zig` before `make build-agent`.
 
 ### Testing
@@ -32,23 +32,25 @@ make test                                       # go test -v ./internal/probe/..
 go test -v ./internal/probe/... -run TestName  # Run a specific test
 go test -race ./internal/probe/...             # Run with race detector
 make vet                                        # go vet ./...
-make test-all                                   # go test on all packages except ./e2e/... (Linux, full CGO/RDMA build env)
+make test-zig                                   # zig build test (needs libibverbs headers, not hardware)
+make test-scripts                               # Python tests for scripts/topology/
+make test-all                                   # test-zig + go test on all packages except ./e2e/... (Linux, full Cgo/RDMA build env)
 ```
 
-The `internal/probe/` package is the only package guaranteed to have tests that run without RDMA hardware; other packages may or may not have tests depending on what has been added. `make test-all` runs everything except `./e2e/...`, which requires either live infrastructure (`test-e2e-controller`) or RDMA hardware/soft-RoCE (`test-e2e`) and is exercised via those dedicated targets instead. Tests requiring actual RDMA devices or soft-RoCE must be run on Linux with the appropriate hardware.
+`make test` covers only `internal/probe/`. `internal/rdmabridge`, `internal/agent`, and `cmd/agent` need Cgo, libibverbs, and `librdmabridge.a` (the Linux environment of `make test-all`); the other packages are pure Go and can be tested anywhere with `go test`, but are not part of `make test`. `./e2e/...` is excluded from `test-all`; run it with `make test-e2e-controller` (Docker + rqlite) or `make test-e2e` (privileged Docker with soft-RoCE; on macOS run `make setup-colima` once).
 
 ## Architecture
 
 R-Pingmesh is a clean-room redesign of the SIGCOMM 2024 R-Pingmesh system. It
 keeps the paper's core concepts (6-timestamp probing, UD QP per RNIC,
-ToR-mesh/inter-ToR pinglists, ECMP via flow_label) but replaces the Go/Cgo RDMA
-data-path with a Zig static library. The Phase 1 Analyzer is implemented;
+ToR-mesh/inter-ToR pinglists, ECMP via flow_label) but implements the RDMA
+data path as a Zig static library. The Phase 1 Analyzer is implemented;
 topology-aware Phase 2 fault localization and eBPF service tracing are out of
 scope.
 
 **Components:**
 - **Controller** (pure Go, `CGO_ENABLED=0`): manages agent registry in rqlite, distributes pinglists via gRPC.
-- **Agent** (Go + Cgo, `CGO_ENABLED=1`): opens RDMA devices via the Zig bridge, runs the Prober and Responder, fetches pinglists from the controller, exports OTel metrics.
+- **Agent** (Go + Cgo, `CGO_ENABLED=1`): opens RDMA devices via the Zig bridge and runs one Prober, Responder, and ClusterMonitor per device, plus a shared metrics exporter, analysis reporter, and optional watchdog (`internal/agent/agent.go`).
 
 ### Key Design Choices Requiring Cross-File Understanding
 
@@ -56,7 +58,7 @@ scope.
 
 **Event-driven waits (`cq_poll_mode`)** — In event mode the CQ poller arms the CQ (`ibv_req_notify_cq`) *before* draining it and then sleeps in `poll()` on the queue's completion channel (`zig/src/cq.zig`); after a drained batch it writes the ring's `eventfd`, and the Go consumer blocks on a dup of that fd via the netpoller (`RingWaiter` in `internal/rdmabridge/ring_waiter.go`, `newRingIdleWait` in `internal/agent/ring_wait.go`). Busy mode is the old poll-based design on both sides (~50 µs nanosleep in Zig, 100 µs timer in Go). `auto` = event with HW timestamps, busy with SW timestamps, because SW timestamps are taken at poll time and absorb wakeup latency. Keep the arm-then-drain order and keep notifying the eventfd in busy mode (a queue can fall back from event to busy at runtime while its Go consumer still waits on the fd).
 
-**40-byte BigEndian wire format** — The probe packet uses explicit BigEndian serialization (no packed structs). The format is defined in `zig/src/packet.zig` (send/recv, GRH parsing) and must stay in sync with the Go side of the bridge: `internal/rdmabridge/bridge.go` (Serialize/Deserialize across the Cgo boundary) and `internal/agent/responder.go` (interprets the decoded fields). Both sides implement independent `serialize`/`deserialize` functions. A version byte at offset 0 enables future format changes.
+**40-byte BigEndian wire format** — The probe packet uses explicit BigEndian serialization (no packed structs). Zig (`serializeProbePacket`/`deserializeProbePacket` in `zig/src/packet.zig`) and Go (`SerializeProbePacket`/`DeserializeProbePacket` in `internal/rdmabridge/bridge.go`) implement it independently, and `internal/agent/responder.go` interprets the decoded fields; keep all three in sync. A version byte at offset 0 enables future format changes.
 
 **Sequence number format** — `high 32 bits = random agentEpoch | low 32 bits = monotonic counter`. The epoch is randomised on startup to prevent ACK misrouting after agent restarts. Defined in `internal/agent/prober.go`.
 
@@ -73,11 +75,13 @@ The Zig library exposes a C-ABI defined in `zig/include/rdma_bridge.h`. The Go b
 | `types.zig` | Core types: `RdmaContext`, `RdmaDevice`, `UdQueue`, GID as `[16]u8` |
 | `device.zig` | Device discovery, `ibv_open_device`, GID query, IP extraction |
 | `queue.zig` | UD QP creation, INIT→RTR→RTS, AH via `ibv_create_ah()`, HW timestamp probe |
-| `memory.zig` | Buffer allocation, `ibv_reg_mr()`, 32-slot tracking |
-| `cq.zig` | CQ poller thread (event mode via completion channel, busy-poll fallback), `ibv_wc_read_completion_wallclock_ns`, SW fallback |
+| `memory.zig` | Buffer allocation, `ibv_reg_mr()`, send/recv slot tracking (32 each) |
+| `cq.zig` | CQ poller thread (event mode via completion channel, busy-poll fallback), GRH parsing, `ibv_wc_read_completion_wallclock_ns`, SW fallback |
 | `ring.zig` | Lock-free SPSC ring buffer for Zig→Go event delivery, eventfd consumer notification |
-| `packet.zig` | Probe/ACK BigEndian serialization, send/recv, GRH parsing |
-| `main.zig` | `@export` C-ABI entry points, thread-local error string |
+| `packet.zig` | Probe/ACK BigEndian serialization, probe and ACK sends |
+| `main.zig` | C-ABI entry points (`export fn`), test entry |
+| `last_error.zig` | Thread-local last-error string returned by `rdma_get_last_error()` |
+| `c.h` | C headers translated into the `c` module by `build.zig` (TranslateC; Zig 0.16+ has no `@cImport`) |
 
 ### 6-Timestamp Protocol
 
@@ -94,7 +98,7 @@ Metrics: `NetworkRTT = (T5-T2)-(T4-T3)`, `ProberDelay = (T6-T1)-(T5-T2)`, `Respo
 
 ## Configuration
 
-Default config files are in `configs/`. All components use Viper (YAML + env vars + CLI flags).
+Default config files are in `configs/`. Both binaries use Viper with precedence CLI flag > env var > YAML > default; without `--config` they search `.`, `$HOME/.rpingmesh`, and `/etc/rpingmesh`. README.md documents every key.
 
 - `configs/agent.yaml`: `probe_interval_ms: 500`, `gid_index: 0`, `cq_poll_mode: auto`, `controller_addr: localhost:50051`, `otel_collector_addr: localhost:4317`
 - `configs/controller.yaml`: `listen_addr: :50051`, `database_uri: http://localhost:4001`
@@ -117,7 +121,7 @@ uppercase, underscore-separated field names (for example,
 ## Requirements
 
 - Go 1.27.2+
-- Zig 0.17.0 (the version verified in e2e/CI; see `build.zig`, `Dockerfile.e2e`, `docker-compose.e2e.yml`)
+- Zig 0.17.0 (pinned in `mise.toml`, `.github/workflows/`, `Dockerfile.e2e`, `docker-compose.e2e.yml`)
 - protoc, protoc-gen-go, protoc-gen-go-grpc
 - libibverbs-dev, librdmacm-dev (Linux only; for agent build and RDMA testing)
 - rqlite (for controller and integration tests)

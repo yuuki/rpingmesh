@@ -88,3 +88,30 @@ func TestRateLimiter_NoCreditAccumulation(t *testing.T) {
 		t.Fatalf("post-idle Reserve wait = %v, want 1ms", w)
 	}
 }
+
+// TestRateLimiter_DelayDoesNotReserve verifies that Delay reports the same wait
+// Reserve would, without advancing the schedule.
+func TestRateLimiter_DelayDoesNotReserve(t *testing.T) {
+	var r RateLimiter
+	now := time.Unix(100, 0)
+	if w := r.Delay(now); w != 0 {
+		t.Fatalf("disabled limiter Delay = %v, want 0", w)
+	}
+
+	r.SetRate(1000) // 1ms between sends
+	if w := r.Delay(now); w != 0 {
+		t.Fatalf("Delay before any send = %v, want 0", w)
+	}
+	_ = r.Reserve(now)
+	for i := 0; i < 3; i++ {
+		if w := r.Delay(now); w != time.Millisecond {
+			t.Fatalf("Delay #%d = %v, want 1ms (Delay must not advance the schedule)", i, w)
+		}
+	}
+	if w := r.Delay(now.Add(time.Millisecond)); w != 0 {
+		t.Fatalf("Delay at the reserved slot = %v, want 0", w)
+	}
+	if w := r.Reserve(now); w != time.Millisecond {
+		t.Fatalf("Reserve after Delay = %v, want 1ms", w)
+	}
+}

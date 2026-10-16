@@ -13,7 +13,7 @@
 #   nfpm package --config packaging/nfpm/nfpm-agent.yaml --packager rpm --target dist/
 #
 # Requires bin/rpingmesh-agent to already be built (`make build-agent`,
-# Linux/CGO_ENABLED=1 host only -- see README.md "Building").
+# Linux/CGO_ENABLED=1 host only -- see README.md "Deployment").
 
 name: "rpingmesh-agent"
 arch: "${NFPM_ARCH}"
@@ -31,7 +31,7 @@ homepage: "https://github.com/yuuki/rpingmesh"
 license: "MIT"
 
 # libibverbs/librdmacm are dynamically linked (see README.md
-# "Building"); package names differ across distros, hence the per-packager
+# "Getting Started"); package names differ across distros, hence the per-packager
 # overrides below instead of a single top-level `depends`.
 overrides:
   deb:
@@ -63,7 +63,7 @@ contents:
   # host-specific controller_addr (and typically a real tor_id in production),
   # so auto-installing it as the live systemd config would point every host
   # at localhost. Operators copy this to agent.yaml and edit it (see the
-  # "Deployment (systemd)" section of README.md).
+  # "Deployment" section of README.md).
   - src: configs/agent.yaml
     dst: /etc/rpingmesh/agent.yaml.example
     file_info:

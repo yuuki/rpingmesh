@@ -7,7 +7,6 @@
 package agent
 
 import (
-	"context"
 	"sync"
 	"testing"
 	"time"
@@ -117,9 +116,6 @@ func TestSetRateMultiplier_LockOrderRace(t *testing.T) {
 	p.UpdateTargets(typedTargets(controller_agent.PinglistType_TOR_MESH, "tor", 4))
 	p.SetPerTypeRateLimit(10, 2)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // pre-cancelled so rateLimitWait returns immediately
-
 	var wg sync.WaitGroup
 	const iters = 500
 	mults := []float64{1.0, 0.5, 0.25, 0.1}
@@ -152,8 +148,14 @@ func TestSetRateMultiplier_LockOrderRace(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iters; i++ {
-			p.rateLimitWait(ctx, controller_agent.PinglistType_TOR_MESH)
-			p.rateLimitWait(ctx, controller_agent.PinglistType_INTER_TOR)
+			now := time.Now()
+			for _, ptype := range []controller_agent.PinglistType{
+				controller_agent.PinglistType_TOR_MESH,
+				controller_agent.PinglistType_INTER_TOR,
+			} {
+				p.sendDelay(ptype, now)
+				p.reserveSend(ptype, now)
+			}
 		}
 	}()
 

@@ -37,20 +37,49 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
-// Histogram bucket boundaries in nanoseconds, covering sub-microsecond to
-// 10ms ranges typical for datacenter RDMA networks. Resolution is densest
-// in 1us-10us, where RoCEv2 network RTTs on modern datacenter fabrics
-// typically land: with only 1us/5us/10us boundaries, a regression within
-// that range stays in one bucket and is invisible to histogram_quantile. The ladder is a
-// superset of internal/probe's rttBucketBoundariesNs so dashboard and
-// analyzer percentiles share every boundary the analyzer uses.
-var rttBucketBoundaries = []float64{
-	100, 250, 500,
-	1_000, 1_500, 2_000, 2_500, 3_000, 3_500, 4_000, 4_500,
+// networkRTTBucketBoundaries are the explicit bucket boundaries (ns) of the
+// network RTT histograms. They are sized from production RoCEv2 leaf-spine
+// distributions, where 99.99% of samples fall in 2-25us (a few us on the same
+// leaf, up to ~10us cross-leaf, tens of us across a remote deep-buffer tier):
+// resolution is densest there, so a regression within that range moves
+// between buckets and shows up in histogram_quantile. Explicit-bucket
+// histograms export every bucket of every series, including empty ones, so
+// boundaries where no samples land are dropped. The tail keeps coarse
+// boundaries up to 10ms so congestion (e.g. PFC pause storms) still has a
+// magnitude instead of collapsing into +Inf, and keeps 500us, the default
+// analyzer_sla_network_rtt_p99_ns, so the fraction of samples above the SLA
+// threshold can be read off one bucket.
+//
+// These boundaries are independent of internal/probe's rttBucketBoundariesNs:
+// the analyzer aggregates inside the agent from its own ladder and never reads
+// the exported histograms.
+var networkRTTBucketBoundaries = []float64{
+	2_000, 2_500, 3_000, 3_500, 4_000,
 	5_000, 6_000, 7_000, 8_000, 9_000, 10_000,
 	12_500, 15_000, 20_000, 25_000, 50_000,
-	100_000, 250_000, 500_000,
-	1_000_000, 2_500_000, 5_000_000, 10_000_000,
+	100_000, 500_000, 1_000_000, 10_000_000,
+}
+
+// delayBucketBoundaries are the explicit bucket boundaries (ns) of the prober
+// and responder delay histograms. These are host-side processing delays
+// (completion polling, Go scheduling, ACK posting); in production they fall in
+// 25us-2.5ms with p50s of roughly 45-120us, two orders of magnitude above
+// network RTT, so they get their own ladder instead of the RTT one.
+var delayBucketBoundaries = []float64{
+	25_000, 50_000, 75_000, 100_000, 150_000, 250_000,
+	500_000, 1_000_000, 2_500_000, 10_000_000,
+}
+
+// IsNetworkRTTBucketBoundary reports whether ns is an explicit bucket
+// boundary of rpingmesh.network_rtt_ns. The controller uses it to warn when
+// its analyzer SLA threshold cannot be read off a single histogram bucket.
+func IsNetworkRTTBucketBoundary(ns uint64) bool {
+	for _, b := range networkRTTBucketBoundaries {
+		if uint64(b) == ns {
+			return true
+		}
+	}
+	return false
 }
 
 // periodicReaderInterval is the interval at which the OTLP periodic reader
@@ -161,6 +190,7 @@ type collectorOptions struct {
 	serviceName      string
 	targetRnicLabels TargetRnicLabels
 	cardinalityLimit int
+	delayTargetTor   bool
 }
 
 // WithServiceName overrides the OTel resource service.name reported by the
@@ -177,6 +207,19 @@ func WithServiceName(serviceName string) Option {
 func WithTargetRnicLabels(labels TargetRnicLabels) Option {
 	return func(o *collectorOptions) {
 		o.targetRnicLabels = labels
+	}
+}
+
+// WithDelayTargetTor attaches target_tor to rpingmesh.prober_delay_ns and
+// rpingmesh.responder_delay_ns. By default they carry only the source labels:
+// the prober delay is time spent on the probing host, and the responder delay
+// split by target_tor is still an average over every host behind that ToR, so
+// target_tor would multiply their series by the ToRs probed for little
+// information. rpingmesh.network_rtt_ns and the probe counters always carry
+// target_tor; the rpingmesh.target_rnic.* histograms always carry it too.
+func WithDelayTargetTor(enabled bool) Option {
+	return func(o *collectorOptions) {
+		o.delayTargetTor = enabled
 	}
 }
 
@@ -212,7 +255,10 @@ type MetricsCollector struct {
 	// WithTargetRnicLabels enabled them.
 	target           *targetInstruments
 	targetRnicLabels TargetRnicLabels
-	logger           zerolog.Logger
+	// delayTargetTor keeps target_tor on the default delay histograms (see
+	// WithDelayTargetTor).
+	delayTargetTor bool
+	logger         zerolog.Logger
 }
 
 // targetInstruments are the destination-RNIC-labelled counterparts of the
@@ -283,7 +329,8 @@ func buildResource(serviceName string) (*resource.Resource, error) {
 // to the given gRPC collector address (e.g., "localhost:4317"). It sets up:
 //   - An OTLP gRPC exporter (insecure) targeting collectorAddr
 //   - A MeterProvider with a periodic reader flushing every 10 seconds
-//   - Histogram instruments for network RTT, prober delay, responder delay
+//   - Histogram instruments for network RTT, prober delay, responder delay,
+//     with separate bucket ladders for RTT and the two delays
 //   - Counter instruments for probe success, failure, and total counts
 //
 // By default the OTel resource reports service.name="rpingmesh-agent"; pass
@@ -316,6 +363,7 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 		Bool("target_rnic_labels_histograms", options.targetRnicLabels.Histograms).
 		Bool("target_rnic_labels_sampled", options.targetRnicLabels.IncludeSampled).
 		Int("cardinality_limit", options.cardinalityLimit).
+		Bool("delay_target_tor", options.delayTargetTor).
 		Msg("MetricsCollector initialized")
 
 	return mc, nil
@@ -379,13 +427,13 @@ func NewMetricsCollectorWithProvider(provider *sdkmetric.MeterProvider, opts ...
 func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOptions) (*MetricsCollector, error) {
 	meter := provider.Meter("rpingmesh.agent")
 
-	// Register histogram instruments with explicit bucket boundaries
-	// covering datacenter RDMA RTT ranges (100ns to 10ms).
+	// Register histogram instruments with explicit bucket boundaries sized
+	// per histogram (see networkRTTBucketBoundaries, delayBucketBoundaries).
 	networkRTT, err := meter.Int64Histogram(
 		"rpingmesh.network_rtt_ns",
 		metric.WithDescription("Network round-trip time in nanoseconds"),
 		metric.WithUnit("ns"),
-		metric.WithExplicitBucketBoundaries(rttBucketBoundaries...),
+		metric.WithExplicitBucketBoundaries(networkRTTBucketBoundaries...),
 	)
 	if err != nil {
 		return nil, err
@@ -395,7 +443,7 @@ func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOpt
 		"rpingmesh.prober_delay_ns",
 		metric.WithDescription("Prober-side processing delay in nanoseconds"),
 		metric.WithUnit("ns"),
-		metric.WithExplicitBucketBoundaries(rttBucketBoundaries...),
+		metric.WithExplicitBucketBoundaries(delayBucketBoundaries...),
 	)
 	if err != nil {
 		return nil, err
@@ -405,7 +453,7 @@ func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOpt
 		"rpingmesh.responder_delay_ns",
 		metric.WithDescription("Responder-side processing delay in nanoseconds"),
 		metric.WithUnit("ns"),
-		metric.WithExplicitBucketBoundaries(rttBucketBoundaries...),
+		metric.WithExplicitBucketBoundaries(delayBucketBoundaries...),
 	)
 	if err != nil {
 		return nil, err
@@ -488,6 +536,7 @@ func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOpt
 		selfThrottle:     selfThrottle,
 		target:           target,
 		targetRnicLabels: options.targetRnicLabels,
+		delayTargetTor:   options.delayTargetTor,
 		logger:           log.With().Str("component", "telemetry").Logger(),
 	}, nil
 }
@@ -516,18 +565,19 @@ func registerTargetInstruments(meter metric.Meter, withHistograms bool) (*target
 		return &t, nil
 	}
 	histograms := []struct {
-		dst  *metric.Int64Histogram
-		name string
-		desc string
+		dst        *metric.Int64Histogram
+		name       string
+		desc       string
+		boundaries []float64
 	}{
-		{&t.networkRTT, "network_rtt_ns", "Network round-trip time in nanoseconds, per target RNIC"},
-		{&t.proberDelay, "prober_delay_ns", "Prober-side processing delay in nanoseconds, per target RNIC"},
-		{&t.responderDelay, "responder_delay_ns", "Responder-side processing delay in nanoseconds, per target RNIC"},
+		{&t.networkRTT, "network_rtt_ns", "Network round-trip time in nanoseconds, per target RNIC", networkRTTBucketBoundaries},
+		{&t.proberDelay, "prober_delay_ns", "Prober-side processing delay in nanoseconds, per target RNIC", delayBucketBoundaries},
+		{&t.responderDelay, "responder_delay_ns", "Responder-side processing delay in nanoseconds, per target RNIC", delayBucketBoundaries},
 	}
 	for _, h := range histograms {
 		if *h.dst, err = meter.Int64Histogram(targetRnicMetricPrefix+h.name,
 			metric.WithDescription(h.desc), metric.WithUnit("ns"),
-			metric.WithExplicitBucketBoundaries(rttBucketBoundaries...)); err != nil {
+			metric.WithExplicitBucketBoundaries(h.boundaries...)); err != nil {
 			return nil, err
 		}
 	}
@@ -573,6 +623,12 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		attribute.String("source_netdev", sourceNetdev),
 	}
 	attrs := metric.WithAttributes(attrSet...)
+	// The delay histograms drop target_tor unless WithDelayTargetTor is set
+	// (see its doc). attrSet[1] is target_tor.
+	delayAttrs := attrs
+	if !mc.delayTargetTor {
+		delayAttrs = metric.WithAttributes(attrSet[0], attrSet[2], attrSet[3])
+	}
 
 	// Always increment total probe count.
 	mc.probeTotal.Add(ctx, 1, attrs)
@@ -582,8 +638,8 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 	if success {
 		// Record RTT histogram values for successful probes.
 		mc.networkRTT.Record(ctx, rtt.NetworkRTT, attrs)
-		mc.proberDelay.Record(ctx, rtt.ProberDelay, attrs)
-		mc.responderDelay.Record(ctx, rtt.ResponderDelay, attrs)
+		mc.proberDelay.Record(ctx, rtt.ProberDelay, delayAttrs)
+		mc.responderDelay.Record(ctx, rtt.ResponderDelay, delayAttrs)
 		mc.probeSuccess.Add(ctx, 1, attrs)
 	} else {
 		reason = probeFailureReason(result, rtt)

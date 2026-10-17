@@ -45,8 +45,8 @@ temporality, which is what a Prometheus-style backend expects.
 | Instrument (OTLP name) | Type | Attributes | Meaning |
 |---|---|---|---|
 | `rpingmesh.network_rtt_ns` | Int64 Histogram | `source_tor`, `target_tor`, `source_rdma_device`, `source_netdev` | Network RTT `(T5-T2)-(T4-T3)` |
-| `rpingmesh.prober_delay_ns` | Int64 Histogram | same | Prober-side delay `(T6-T1)-(T5-T2)` |
-| `rpingmesh.responder_delay_ns` | Int64 Histogram | same | Responder-side delay `T4-T3` |
+| `rpingmesh.prober_delay_ns` | Int64 Histogram | same, without `target_tor` unless `metrics_delay_target_tor: true` | Prober-side delay `(T6-T1)-(T5-T2)` |
+| `rpingmesh.responder_delay_ns` | Int64 Histogram | same as `prober_delay_ns` | Responder-side delay `T4-T3` |
 | `rpingmesh.probe_total` | Int64 Counter | same | Probes attempted |
 | `rpingmesh.probe_success_total` | Int64 Counter | same | Probes with a valid RTT |
 | `rpingmesh.probe_failed_total` | Int64 Counter | same, plus `reason` ∈ {`timeout`, `send_error`, `invalid_rtt`, `unknown`} | Failed probes |
@@ -55,13 +55,29 @@ temporality, which is what a Prometheus-style backend expects.
 | `rpingmesh.analyzer.path_summaries_total` | Int64 Counter | none | Per-path window summaries ingested by the analyzer |
 | `rpingmesh.analyzer.sla_violations_total` | Int64 Counter | `source_tor`, `target_tor`, `kind` ∈ {`loss`, `rtt`} | SLA violations detected by the analyzer |
 
-The three histograms share 29 explicit bucket boundaries in nanoseconds
-(`rttBucketBoundaries`), densest in 1–10 µs where RoCEv2 network RTTs land:
-`100, 250, 500`, then 500 ns steps from 1 µs to 5 µs, 1 µs steps to 10 µs, then
-`12 500, 15 000, 20 000, 25 000, 50 000, 100 000, 250 000, 500 000,
-1 000 000, 2 500 000, 5 000 000, 10 000 000`, plus the implicit `+Inf`. The
-ladder is a superset of the analyzer's own bucket ladder
-(`rttBucketBoundariesNs` in `internal/probe/aggregator.go`).
+The network RTT histogram and the two delay histograms use separate explicit
+bucket ladders in nanoseconds, sized from production RoCEv2 leaf-spine
+distributions. Explicit-bucket histograms export every bucket of every series,
+including empty ones, so boundaries where no samples land are pure cost.
+
+- `rpingmesh.network_rtt_ns` (`networkRTTBucketBoundaries`, 20 boundaries):
+  `2 000`, 500 ns steps to 4 µs, 1 µs steps from 5 µs to 10 µs, then
+  `12 500, 15 000, 20 000, 25 000, 50 000, 100 000, 500 000, 1 000 000,
+  10 000 000`. Resolution is densest in 2–25 µs, where 99.99% of samples
+  fall. `500 000` is the default `analyzer_sla_network_rtt_p99_ns`, so
+  `le="500000"` gives the share of probes within the SLA threshold; the
+  controller logs a warning at startup when its threshold is not a boundary.
+  The 1 ms and 10 ms boundaries keep congestion (for example a PFC pause
+  storm) measurable instead of collapsing it into `+Inf`.
+- `rpingmesh.prober_delay_ns` and `rpingmesh.responder_delay_ns`
+  (`delayBucketBoundaries`, 10 boundaries): `25 000, 50 000, 75 000, 100 000,
+  150 000, 250 000, 500 000, 1 000 000, 2 500 000, 10 000 000`. These are
+  host-side processing delays, which sit two orders of magnitude above network
+  RTT (p50 roughly 45–120 µs).
+
+Neither ladder is tied to the analyzer's own ladder (`rttBucketBoundariesNs`
+in `internal/probe/aggregator.go`): the analyzer aggregates inside the agent
+and never reads the exported histograms.
 
 **Attribute contract.**
 
@@ -79,6 +95,14 @@ ladder is a superset of the analyzer's own bucket ladder
   `tor_id`, and a device or netdev that cannot be resolved (e.g. a bonded
   RNIC's netdev). Template variables and the ToR × ToR matrix therefore still
   render; an all-untagged mesh shows one `unspecified` × `unspecified` cell.
+- The delay histograms omit `target_tor` by default. The prober delay is
+  time spent on the probing host, and the responder delay split by
+  `target_tor` is still an average over every host behind that ToR, while
+  `target_tor` would multiply their series by the ToRs probed.
+  `metrics_delay_target_tor: true` restores it. The ToR Pair Drilldown delay
+  panel matches `target_tor=~"${target_tor:regex}|"`, so it filters by pair
+  when the label is present and shows every probe from the source ToR when it
+  is not.
 - Every bundled dashboard query and alert aggregates the source-RNIC labels
   and the agent identity away (`sum by (source_tor, target_tor)`,
   `sum by (le)`, and similar). Custom queries that should stay ToR-level must
@@ -109,19 +133,24 @@ has seen for the life of the process, so as samples rotate the long-run bound
 is the number of ToRs in the RNIC's plane. Untagged RNICs only see
 `target_tor="unspecified"`, so `T(r) = 1` on an all-untagged fabric.
 
-After OTLP → Prometheus conversion, each tuple becomes the following series
-(29 boundaries → 30 `_bucket` series including `+Inf`, plus `_sum` and
-`_count`):
+After OTLP → Prometheus conversion, a histogram with `n` boundaries becomes
+`n + 1` `_bucket` series (including `+Inf`) plus `_sum` and `_count`. Each
+tuple becomes the following series:
 
 | Metric | Prometheus series per tuple |
 |---|---|
-| 3 histograms (`network_rtt_ns`, `prober_delay_ns`, `responder_delay_ns`) | 3 × (30 + 2) = 96 |
+| `network_rtt_ns` (20 boundaries) | 21 + 2 = 23 |
 | `probe_total`, `probe_success_total` | 2 |
 | `probe_failed_total` | `R` = number of `reason` values seen (0–4) |
-| **Total** | **98 + R ≤ 102** |
+| **Total** | **25 + R ≤ 29** |
+
+The delay histograms do not carry `target_tor` by default, so they cost
+`2 × (11 + 2) = 26` series per source RNIC rather than per tuple. With
+`N_agent` RNICs on the host:
 
 ```
-series_agent ≤ P_agent × 102
+series_agent ≤ P_agent × 29 + N_agent × 26     (default)
+series_agent ≤ P_agent × 55                    (metrics_delay_target_tor: true)
 series_fleet = Σ_agents series_agent
 ```
 
@@ -131,20 +160,23 @@ The growth factor from those labels is *RNICs per host ÷ distinct source ToRs
 per host*: 1 when every RNIC has its own ToR, up to the RNIC count when all
 RNICs share one ToR or are untagged.
 
-Worked examples (fleet totals use the upper bound `R = 4`):
+Worked examples (fleet totals use the upper bound `R = 4`; `P_agent` is shown
+before → after the source-RNIC labels were added):
 
-| Fabric | `T(r)` | `P_agent` before → after | Fleet series before → after |
-|---|---|---|---|
-| **A.** 60 hosts × 6 RNICs, rail-optimized: 6 planes × 3 leaves (18 ToRs), each RNIC on its own leaf | 1 own + 2 foreign in the plane = 3 | 18 → 18 | 110,160 → 110,160 (×1) |
-| **B.** 40 hosts × 2 RNICs, both RNICs of a host on the same ToR, 10 ToRs, no planes | 1 own + up to 9 foreign = 10 (long-run) | 10 → 20 | 40,800 → 81,600 (×2) |
-| **C.** 300 hosts × 6 RNICs, no `tor_id` (all untagged) | 1 (`unspecified`) | 1 → 6 | 30,600 → 183,600 (×6) |
+| Fabric | `T(r)` | `P_agent` | Fleet series (default) | Fleet series (`metrics_delay_target_tor: true`) |
+|---|---|---|---|---|
+| **A.** 60 hosts × 6 RNICs, rail-optimized: 6 planes × 3 leaves (18 ToRs), each RNIC on its own leaf | 1 own + 2 foreign in the plane = 3 | 18 → 18 | 40,680 | 59,400 |
+| **B.** 40 hosts × 2 RNICs, both RNICs of a host on the same ToR, 10 ToRs, no planes | 1 own + up to 9 foreign = 10 (long-run) | 10 → 20 | 25,280 | 44,000 |
+| **C.** 300 hosts × 6 RNICs, no `tor_id` (all untagged) | 1 (`unspecified`) | 1 → 6 | 99,000 | 99,000 |
 
-Arithmetic for A: `P_agent = 6 × 3 = 18`, `series_agent = 18 × 102 = 1,836`,
-fleet `= 1,836 × 60 = 110,160`. In B the instantaneous `T(r)` is
-`1 + 5 = 6` with the default sample size; 10 is the bound once sampling has
-visited every foreign ToR. Histogram buckets dominate (96 of 102 series per
-tuple), so fewer bucket boundaries is the main lever if the total is too
-high. Dropping the source-RNIC labels only helps in cases like B and C.
+Arithmetic for A: `P_agent = 6 × 3 = 18`,
+`series_agent = 18 × 29 + 6 × 26 = 678`, fleet `= 678 × 60 = 40,680`. In B
+the instantaneous `T(r)` is `1 + 5 = 6` with the default sample size; 10 is
+the bound once sampling has visited every foreign ToR. In C every RNIC has a
+single tuple, so dropping `target_tor` from the delays saves nothing.
+Histogram buckets still dominate, so fewer bucket boundaries is the main lever
+if the total is too high. Dropping the source-RNIC labels only helps in cases
+like B and C.
 
 ### Optional destination-RNIC metrics
 
@@ -159,12 +191,14 @@ foreign ToRs:
 
 ```
 counters: added_series_agent ≤ Σ_r (M(r) + F(r)) × (2 + R)
-all:      added_series_agent ≤ Σ_r (M(r) + F(r)) × (98 + R)
+all:      added_series_agent ≤ Σ_r (M(r) + F(r)) × (51 + R)
 ```
 
 For fabric A (each leaf holds 20 RNICs of one rail, so `M(r) = 19`, and
-`F(r) = 2`): `counters` adds `6 × 21 × 6 = 756` series per agent (+41% over
-1,836), `all` adds `6 × 21 × 102 = 12,852` (×8 in total). With `scope: all`,
+`F(r) = 2`): `counters` adds `6 × 21 × 6 = 756` series per agent (×2.1 in
+total over 678), `all` adds `6 × 21 × 55 = 6,930` (×11 in total). The
+`rpingmesh.target_rnic.*` histograms use the same ladders as the default ones
+and always carry `target_tor`. With `scope: all`,
 sampled targets contribute their real identities, and because the controller
 re-samples them on every refresh the long-run bound becomes every RNIC in the
 plane (or in the untagged mesh).

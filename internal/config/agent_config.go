@@ -173,8 +173,13 @@ type AgentConfig struct {
 	// the OTel SDK default (2000). The SDK applies one limit to every
 	// instrument, so only raising it is allowed (see
 	// MinMetricsCardinalityLimit).
-	MetricsCardinalityLimit int      `mapstructure:"metrics_cardinality_limit"`
-	AllowedDeviceNames      []string `mapstructure:"allowed_device_names"`
+	MetricsCardinalityLimit int `mapstructure:"metrics_cardinality_limit"`
+	// MetricsDelayTargetTor attaches target_tor to rpingmesh.prober_delay_ns
+	// and rpingmesh.responder_delay_ns. Off by default: the delays are
+	// host-side processing time, and target_tor multiplies their series by
+	// the number of ToRs probed.
+	MetricsDelayTargetTor bool     `mapstructure:"metrics_delay_target_tor"`
+	AllowedDeviceNames    []string `mapstructure:"allowed_device_names"`
 	// ExcludedDeviceNames lists RDMA devices the agent never opens, matched
 	// case-insensitively. It applies on top of AllowedDeviceNames; naming a
 	// device in both lists is rejected by Validate().
@@ -287,6 +292,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("metrics_target_rnic_labels", DefaultMetricsTargetRnicLabels)
 	v.SetDefault("metrics_target_rnic_labels_scope", DefaultMetricsTargetRnicLabelsScope)
 	v.SetDefault("metrics_cardinality_limit", 0)
+	v.SetDefault("metrics_delay_target_tor", false)
 	v.SetDefault("allowed_device_names", []string{})
 	v.SetDefault("excluded_device_names", []string{})
 	v.SetDefault("gid_index", 0)
@@ -378,6 +384,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		MetricsTargetRnicLabels:      v.GetString("metrics_target_rnic_labels"),
 		MetricsTargetRnicLabelsScope: v.GetString("metrics_target_rnic_labels_scope"),
 		MetricsCardinalityLimit:      v.GetInt("metrics_cardinality_limit"),
+		MetricsDelayTargetTor:        v.GetBool("metrics_delay_target_tor"),
 		AllowedDeviceNames:           v.GetStringSlice("allowed_device_names"),
 		ExcludedDeviceNames:          v.GetStringSlice("excluded_device_names"),
 		GIDIndex:                     v.GetInt("gid_index"),

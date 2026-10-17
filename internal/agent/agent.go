@@ -1255,7 +1255,8 @@ func (a *Agent) createMetricsCollector(ctx context.Context) {
 		Msg("Creating metrics collector")
 	mc, err := telemetry.NewMetricsCollector(ctx, a.cfg.OtelCollectorAddr,
 		telemetry.WithTargetRnicLabels(targetRnicLabels(a.cfg)),
-		telemetry.WithCardinalityLimit(a.cfg.MetricsCardinalityLimit))
+		telemetry.WithCardinalityLimit(a.cfg.MetricsCardinalityLimit),
+		telemetry.WithDelayTargetTor(a.cfg.MetricsDelayTargetTor))
 	if err != nil {
 		a.logger.Warn().Err(err).
 			Msg("Failed to create metrics collector, continuing without metrics")

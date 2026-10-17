@@ -94,6 +94,7 @@ func run(cmd *cobra.Command, args []string) error {
 		Str("metrics_target_rnic_labels", cfg.MetricsTargetRnicLabels).
 		Str("metrics_target_rnic_labels_scope", cfg.MetricsTargetRnicLabelsScope).
 		Int("metrics_cardinality_limit", cfg.MetricsCardinalityLimit).
+		Bool("metrics_delay_target_tor", cfg.MetricsDelayTargetTor).
 		Strs("allowed_devices", cfg.AllowedDeviceNames).
 		Strs("excluded_devices", cfg.ExcludedDeviceNames).
 		Int("gid_index", cfg.GIDIndex).

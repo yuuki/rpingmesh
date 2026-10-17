@@ -254,6 +254,15 @@ func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerServi
 	}, metrics)
 	svc.SetAnalyzer(az)
 
+	// Dashboards read the fraction of probes above the SLA threshold off the
+	// agents' rpingmesh.network_rtt_ns bucket at that boundary, which only
+	// exists when the threshold is one of the agent's default boundaries.
+	if sla := cfg.AnalyzerSLANetworkRTTP99Ns; sla != 0 && !telemetry.IsNetworkRTTBucketBoundary(sla) {
+		log.Warn().
+			Uint64("slaNetworkRttP99Ns", sla).
+			Msg("analyzer_sla_network_rtt_p99_ns is not a bucket boundary of the agents' rpingmesh.network_rtt_ns histogram; dashboards can only approximate the share of probes above it")
+	}
+
 	log.Info().
 		Float64("slaLossRatio", cfg.AnalyzerSLALossRatio).
 		Uint64("slaNetworkRttP99Ns", cfg.AnalyzerSLANetworkRTTP99Ns).

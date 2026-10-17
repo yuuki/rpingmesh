@@ -3,10 +3,12 @@ package telemetry
 import (
 	"context"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/yuuki/rpingmesh/internal/buildinfo"
+	"github.com/yuuki/rpingmesh/internal/config"
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -686,24 +688,151 @@ func TestBuildResource_HostName(t *testing.T) {
 	t.Fatal("host.name attribute not found in resource")
 }
 
-// TestRTTBucketBoundaries_SupersetOfAggregator verifies that the exported
-// histogram ladder is strictly increasing and contains every boundary of the
-// analyzer's aggregation ladder, so percentiles computed on either side are
-// never split across incompatible buckets.
-func TestRTTBucketBoundaries_SupersetOfAggregator(t *testing.T) {
-	for i := 1; i < len(rttBucketBoundaries); i++ {
-		if rttBucketBoundaries[i] <= rttBucketBoundaries[i-1] {
-			t.Fatalf("rttBucketBoundaries not strictly increasing at %d: %v <= %v",
-				i, rttBucketBoundaries[i], rttBucketBoundaries[i-1])
+// TestBucketBoundaries_StrictlyIncreasing verifies that every histogram
+// ladder is strictly increasing, as OTel requires.
+func TestBucketBoundaries_StrictlyIncreasing(t *testing.T) {
+	ladders := map[string][]float64{
+		"networkRTTBucketBoundaries": networkRTTBucketBoundaries,
+		"delayBucketBoundaries":      delayBucketBoundaries,
+	}
+	for name, ladder := range ladders {
+		for i := 1; i < len(ladder); i++ {
+			if ladder[i] <= ladder[i-1] {
+				t.Fatalf("%s not strictly increasing at %d: %v <= %v", name, i, ladder[i], ladder[i-1])
+			}
 		}
 	}
-	have := make(map[uint64]bool, len(rttBucketBoundaries))
-	for _, b := range rttBucketBoundaries {
-		have[uint64(b)] = true
+}
+
+// TestNetworkRTTBucketBoundaries_ContainsDefaultSLA verifies that the default
+// analyzer SLA threshold (config.DefaultAnalyzerSLANetworkRTTP99Ns) is an RTT
+// bucket boundary, so dashboards can read the share of probes above it off
+// one bucket, and that the RTT ladder still reaches 10ms for congestion.
+func TestNetworkRTTBucketBoundaries_ContainsDefaultSLA(t *testing.T) {
+	if !IsNetworkRTTBucketBoundary(config.DefaultAnalyzerSLANetworkRTTP99Ns) {
+		t.Errorf("default analyzer SLA %dns is not a network RTT bucket boundary",
+			uint64(config.DefaultAnalyzerSLANetworkRTTP99Ns))
 	}
-	for _, b := range probe.RTTBucketBoundariesNs() {
-		if !have[b] {
-			t.Errorf("aggregator boundary %dns missing from rttBucketBoundaries", b)
+	if IsNetworkRTTBucketBoundary(config.DefaultAnalyzerSLANetworkRTTP99Ns + 1) {
+		t.Error("IsNetworkRTTBucketBoundary accepted a non-boundary value")
+	}
+	if last := networkRTTBucketBoundaries[len(networkRTTBucketBoundaries)-1]; last < 10_000_000 {
+		t.Errorf("last network RTT boundary = %vns, want >= 10ms", last)
+	}
+}
+
+// TestRecordProbeResult_HistogramBoundaries verifies that the RTT histogram
+// and the two delay histograms export their own bucket ladders.
+func TestRecordProbeResult_HistogramBoundaries(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer provider.Shutdown(context.Background())
+
+	mc, err := NewMetricsCollectorWithProvider(provider)
+	if err != nil {
+		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
+	}
+	mc.RecordProbeResult(&probe.ProbeResult{TargetTorID: "tor-b", Success: true},
+		&probe.RTTResult{NetworkRTT: 5_000, ProberDelay: 80_000, ResponderDelay: 60_000, Valid: true}, "tor-a")
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("ManualReader.Collect: %v", err)
+	}
+	cases := map[string][]float64{
+		"rpingmesh.network_rtt_ns":     networkRTTBucketBoundaries,
+		"rpingmesh.prober_delay_ns":    delayBucketBoundaries,
+		"rpingmesh.responder_delay_ns": delayBucketBoundaries,
+	}
+	for name, want := range cases {
+		m := findMetric(&rm, name)
+		if m == nil {
+			t.Fatalf("%s metric not found", name)
+		}
+		dp := m.Data.(metricdata.Histogram[int64]).DataPoints[0]
+		if !slices.Equal(dp.Bounds, want) {
+			t.Errorf("%s bounds = %v, want %v", name, dp.Bounds, want)
+		}
+	}
+}
+
+// TestRecordProbeResult_DelayTargetTor verifies that, by default,
+// rpingmesh.prober_delay_ns drops target_tor while
+// rpingmesh.responder_delay_ns keeps it, that each option flips only its own
+// histogram, and that network RTT and the counters always keep target_tor.
+func TestRecordProbeResult_DelayTargetTor(t *testing.T) {
+	cases := []struct {
+		name                 string
+		opts                 []Option
+		proberKeep, respKeep bool
+	}{
+		{"default", nil, false, true},
+		{"prober_on", []Option{WithProberDelayTargetTor(true)}, true, true},
+		{"responder_off", []Option{WithResponderDelayTargetTor(false)}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			defer provider.Shutdown(context.Background())
+
+			mc, err := NewMetricsCollectorWithProvider(provider, tc.opts...)
+			if err != nil {
+				t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
+			}
+			rtt := &probe.RTTResult{NetworkRTT: 5_000, ProberDelay: 80_000, ResponderDelay: 60_000, Valid: true}
+			for _, tor := range []string{"tor-b", "tor-c"} {
+				mc.RecordProbeResult(&probe.ProbeResult{TargetTorID: tor, Success: true,
+					SourceRdmaDevice: "mlx5_0", SourceNetdev: "eth0"}, rtt, "tor-a")
+			}
+
+			var rm metricdata.ResourceMetrics
+			if err := reader.Collect(context.Background(), &rm); err != nil {
+				t.Fatalf("ManualReader.Collect: %v", err)
+			}
+			for name, keep := range map[string]bool{
+				"rpingmesh.prober_delay_ns":    tc.proberKeep,
+				"rpingmesh.responder_delay_ns": tc.respKeep,
+			} {
+				dps := findMetric(&rm, name).Data.(metricdata.Histogram[int64]).DataPoints
+				wantPoints := 1
+				if keep {
+					wantPoints = 2
+				}
+				if len(dps) != wantPoints {
+					t.Fatalf("%s has %d data points, want %d", name, len(dps), wantPoints)
+				}
+				for _, dp := range dps {
+					if _, ok := dp.Attributes.Value("target_tor"); ok != keep {
+						t.Errorf("%s target_tor present = %v, want %v", name, ok, keep)
+					}
+					for _, k := range []attribute.Key{"source_tor", "source_rdma_device", "source_netdev"} {
+						if _, ok := dp.Attributes.Value(k); !ok {
+							t.Errorf("%s missing %s", name, k)
+						}
+					}
+				}
+				if !keep && dps[0].Count != 2 {
+					t.Errorf("%s count = %d, want 2 (both targets in one series)", name, dps[0].Count)
+				}
+			}
+			if dps := findMetric(&rm, "rpingmesh.network_rtt_ns").Data.(metricdata.Histogram[int64]).DataPoints; len(dps) != 2 {
+				t.Errorf("rpingmesh.network_rtt_ns has %d data points, want 2 (one per target_tor)", len(dps))
+			}
+			if dps := findMetric(&rm, "rpingmesh.probe_total").Data.(metricdata.Sum[int64]).DataPoints; len(dps) != 2 {
+				t.Errorf("rpingmesh.probe_total has %d data points, want 2 (one per target_tor)", len(dps))
+			}
+		})
+	}
+}
+
+// TestNetworkRTTBucketBoundaries_TailSteps verifies that the RTT ladder keeps
+// intermediate boundaries between 1ms and 10ms, so histogram_quantile does
+// not report a congested 1.1ms distribution as ~5.5ms.
+func TestNetworkRTTBucketBoundaries_TailSteps(t *testing.T) {
+	for _, ns := range []uint64{1_000_000, 2_500_000, 5_000_000, 10_000_000} {
+		if !IsNetworkRTTBucketBoundary(ns) {
+			t.Errorf("%dns is not a network RTT bucket boundary", ns)
 		}
 	}
 }

@@ -173,8 +173,18 @@ type AgentConfig struct {
 	// the OTel SDK default (2000). The SDK applies one limit to every
 	// instrument, so only raising it is allowed (see
 	// MinMetricsCardinalityLimit).
-	MetricsCardinalityLimit int      `mapstructure:"metrics_cardinality_limit"`
-	AllowedDeviceNames      []string `mapstructure:"allowed_device_names"`
+	MetricsCardinalityLimit int `mapstructure:"metrics_cardinality_limit"`
+	// MetricsProberDelayTargetTor attaches target_tor to
+	// rpingmesh.prober_delay_ns. Off by default: the prober delay is time
+	// spent on the probing host, so target_tor only multiplies its series by
+	// the number of ToRs probed.
+	MetricsProberDelayTargetTor bool `mapstructure:"metrics_prober_delay_target_tor"`
+	// MetricsResponderDelayTargetTor attaches target_tor to
+	// rpingmesh.responder_delay_ns. On by default: it is the only default
+	// metric that localizes slow responders, because network RTT subtracts
+	// the responder delay.
+	MetricsResponderDelayTargetTor bool     `mapstructure:"metrics_responder_delay_target_tor"`
+	AllowedDeviceNames             []string `mapstructure:"allowed_device_names"`
 	// ExcludedDeviceNames lists RDMA devices the agent never opens, matched
 	// case-insensitively. It applies on top of AllowedDeviceNames; naming a
 	// device in both lists is rejected by Validate().
@@ -287,6 +297,8 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("metrics_target_rnic_labels", DefaultMetricsTargetRnicLabels)
 	v.SetDefault("metrics_target_rnic_labels_scope", DefaultMetricsTargetRnicLabelsScope)
 	v.SetDefault("metrics_cardinality_limit", 0)
+	v.SetDefault("metrics_prober_delay_target_tor", false)
+	v.SetDefault("metrics_responder_delay_target_tor", true)
 	v.SetDefault("allowed_device_names", []string{})
 	v.SetDefault("excluded_device_names", []string{})
 	v.SetDefault("gid_index", 0)
@@ -359,49 +371,51 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	}
 
 	config := &AgentConfig{
-		AgentID:                      agentID,
-		HostName:                     hostname,
-		TorID:                        v.GetString("tor_id"),
-		DeviceTorIDs:                 canonicalDeviceTorIDs(v.GetStringMapString("device_tor_ids")),
-		PlaneID:                      probe.CanonicalPlaneID(v.GetString("plane_id")),
-		DevicePlaneIDs:               canonicalDevicePlaneIDs(v.GetStringMapString("device_plane_ids")),
-		LLDPTorDiscovery:             v.GetBool("lldp_tor_discovery"),
-		LLDPTorIDField:               v.GetString("lldp_tor_id_field"),
-		LLDPCLIPath:                  v.GetString("lldpcli_path"),
-		LLDPDiscoveryTimeoutSec:      v.GetUint32("lldp_discovery_timeout_sec"),
-		ControllerAddr:               v.GetString("controller_addr"),
-		LogLevel:                     v.GetString("log_level"),
-		LogFormat:                    v.GetString("log_format"),
-		ProbeIntervalMS:              v.GetUint32("probe_interval_ms"),
-		OtelCollectorAddr:            v.GetString("otel_collector_addr"),
-		MetricsEnabled:               v.GetBool("metrics_enabled"),
-		MetricsTargetRnicLabels:      v.GetString("metrics_target_rnic_labels"),
-		MetricsTargetRnicLabelsScope: v.GetString("metrics_target_rnic_labels_scope"),
-		MetricsCardinalityLimit:      v.GetInt("metrics_cardinality_limit"),
-		AllowedDeviceNames:           v.GetStringSlice("allowed_device_names"),
-		ExcludedDeviceNames:          v.GetStringSlice("excluded_device_names"),
-		GIDIndex:                     v.GetInt("gid_index"),
-		ServiceLevel:                 v.GetInt("service_level"),
-		TrafficClass:                 v.GetInt("traffic_class"),
-		CQPollMode:                   v.GetString("cq_poll_mode"),
-		PinglistUpdateIntervalSec:    v.GetUint32("pinglist_update_interval_sec"),
-		TargetProbeRatePerSecond:     v.GetInt("target_probe_rate_per_second"),
-		TorMeshProbeRatePerSecond:    v.GetInt("tor_mesh_probe_rate_per_second"),
-		InterTorProbeRatePerSecond:   v.GetInt("inter_tor_probe_rate_per_second"),
-		FlowLabelRotationPeriodSec:   v.GetUint32("flow_label_rotation_period_sec"),
-		AnalysisReportEnabled:        v.GetBool("analysis_report_enabled"),
-		AnalysisWindowSec:            v.GetUint32("analysis_window_sec"),
-		TLSMode:                      v.GetString("tls_mode"),
-		TLSCertFile:                  v.GetString("tls_cert_file"),
-		TLSKeyFile:                   v.GetString("tls_key_file"),
-		TLSCAFile:                    v.GetString("tls_ca_file"),
-		TLSServerName:                v.GetString("tls_server_name"),
-		SelfProtectionEnabled:        v.GetBool("self_protection_enabled"),
-		WatchdogIntervalSec:          v.GetUint32("watchdog_interval_sec"),
-		MaxMemoryMB:                  v.GetInt("max_memory_mb"),
-		MaxProcs:                     v.GetInt("max_procs"),
-		ThrottleMemoryRatio:          v.GetFloat64("throttle_memory_ratio"),
-		ThrottleCPUPercent:           v.GetFloat64("throttle_cpu_percent"),
+		AgentID:                        agentID,
+		HostName:                       hostname,
+		TorID:                          v.GetString("tor_id"),
+		DeviceTorIDs:                   canonicalDeviceTorIDs(v.GetStringMapString("device_tor_ids")),
+		PlaneID:                        probe.CanonicalPlaneID(v.GetString("plane_id")),
+		DevicePlaneIDs:                 canonicalDevicePlaneIDs(v.GetStringMapString("device_plane_ids")),
+		LLDPTorDiscovery:               v.GetBool("lldp_tor_discovery"),
+		LLDPTorIDField:                 v.GetString("lldp_tor_id_field"),
+		LLDPCLIPath:                    v.GetString("lldpcli_path"),
+		LLDPDiscoveryTimeoutSec:        v.GetUint32("lldp_discovery_timeout_sec"),
+		ControllerAddr:                 v.GetString("controller_addr"),
+		LogLevel:                       v.GetString("log_level"),
+		LogFormat:                      v.GetString("log_format"),
+		ProbeIntervalMS:                v.GetUint32("probe_interval_ms"),
+		OtelCollectorAddr:              v.GetString("otel_collector_addr"),
+		MetricsEnabled:                 v.GetBool("metrics_enabled"),
+		MetricsTargetRnicLabels:        v.GetString("metrics_target_rnic_labels"),
+		MetricsTargetRnicLabelsScope:   v.GetString("metrics_target_rnic_labels_scope"),
+		MetricsCardinalityLimit:        v.GetInt("metrics_cardinality_limit"),
+		MetricsProberDelayTargetTor:    v.GetBool("metrics_prober_delay_target_tor"),
+		MetricsResponderDelayTargetTor: v.GetBool("metrics_responder_delay_target_tor"),
+		AllowedDeviceNames:             v.GetStringSlice("allowed_device_names"),
+		ExcludedDeviceNames:            v.GetStringSlice("excluded_device_names"),
+		GIDIndex:                       v.GetInt("gid_index"),
+		ServiceLevel:                   v.GetInt("service_level"),
+		TrafficClass:                   v.GetInt("traffic_class"),
+		CQPollMode:                     v.GetString("cq_poll_mode"),
+		PinglistUpdateIntervalSec:      v.GetUint32("pinglist_update_interval_sec"),
+		TargetProbeRatePerSecond:       v.GetInt("target_probe_rate_per_second"),
+		TorMeshProbeRatePerSecond:      v.GetInt("tor_mesh_probe_rate_per_second"),
+		InterTorProbeRatePerSecond:     v.GetInt("inter_tor_probe_rate_per_second"),
+		FlowLabelRotationPeriodSec:     v.GetUint32("flow_label_rotation_period_sec"),
+		AnalysisReportEnabled:          v.GetBool("analysis_report_enabled"),
+		AnalysisWindowSec:              v.GetUint32("analysis_window_sec"),
+		TLSMode:                        v.GetString("tls_mode"),
+		TLSCertFile:                    v.GetString("tls_cert_file"),
+		TLSKeyFile:                     v.GetString("tls_key_file"),
+		TLSCAFile:                      v.GetString("tls_ca_file"),
+		TLSServerName:                  v.GetString("tls_server_name"),
+		SelfProtectionEnabled:          v.GetBool("self_protection_enabled"),
+		WatchdogIntervalSec:            v.GetUint32("watchdog_interval_sec"),
+		MaxMemoryMB:                    v.GetInt("max_memory_mb"),
+		MaxProcs:                       v.GetInt("max_procs"),
+		ThrottleMemoryRatio:            v.GetFloat64("throttle_memory_ratio"),
+		ThrottleCPUPercent:             v.GetFloat64("throttle_cpu_percent"),
 	}
 
 	if err := config.Validate(); err != nil {

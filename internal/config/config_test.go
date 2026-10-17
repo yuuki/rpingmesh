@@ -662,12 +662,20 @@ func TestLoadAgentConfig_MetricsTargetRnicLabelsDefaults(t *testing.T) {
 	if cfg.MetricsCardinalityLimit != 0 {
 		t.Errorf("MetricsCardinalityLimit = %d, want 0", cfg.MetricsCardinalityLimit)
 	}
+	if cfg.MetricsProberDelayTargetTor {
+		t.Error("MetricsProberDelayTargetTor = true, want false")
+	}
+	if !cfg.MetricsResponderDelayTargetTor {
+		t.Error("MetricsResponderDelayTargetTor = false, want true")
+	}
 }
 
 func TestLoadAgentConfig_MetricsTargetRnicLabelsFromEnv(t *testing.T) {
 	t.Setenv("RPINGMESH_METRICS_TARGET_RNIC_LABELS", MetricsTargetRnicLabelsAll)
 	t.Setenv("RPINGMESH_METRICS_TARGET_RNIC_LABELS_SCOPE", MetricsTargetRnicLabelsScopeAll)
 	t.Setenv("RPINGMESH_METRICS_CARDINALITY_LIMIT", "10000")
+	t.Setenv("RPINGMESH_METRICS_PROBER_DELAY_TARGET_TOR", "true")
+	t.Setenv("RPINGMESH_METRICS_RESPONDER_DELAY_TARGET_TOR", "false")
 
 	cfg, err := LoadAgentConfig("", nil)
 	if err != nil {
@@ -682,6 +690,12 @@ func TestLoadAgentConfig_MetricsTargetRnicLabelsFromEnv(t *testing.T) {
 	}
 	if cfg.MetricsCardinalityLimit != 10000 {
 		t.Errorf("MetricsCardinalityLimit = %d, want 10000", cfg.MetricsCardinalityLimit)
+	}
+	if !cfg.MetricsProberDelayTargetTor {
+		t.Error("MetricsProberDelayTargetTor = false, want true")
+	}
+	if cfg.MetricsResponderDelayTargetTor {
+		t.Error("MetricsResponderDelayTargetTor = true, want false")
 	}
 }
 

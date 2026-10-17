@@ -106,7 +106,8 @@ metrics_target_rnic_labels: "off"
 # untagged ToR-mesh targets get "_sampled"); "all" labels sampled ones too,
 # whose set rotates on every pinglist refresh.
 metrics_target_rnic_labels_scope: "stable"
-# Max attribute sets per metric instrument (0 = OTel SDK default, 2000).
+# Max attribute sets per metric instrument (0 = OTel SDK default, 2000). It
+# applies to every instrument, so a non-zero value must be at least 2000.
 metrics_cardinality_limit: 0
 
 # Self-protection (opt-in)

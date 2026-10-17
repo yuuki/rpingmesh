@@ -69,6 +69,13 @@ const (
 // place the real GID table size is known.
 const MaxGIDIndex = 255
 
+// MinMetricsCardinalityLimit is the smallest non-zero
+// metrics_cardinality_limit, equal to the OTel SDK default. The SDK (v1.47)
+// cannot scope the limit to the rpingmesh.target_rnic.* instruments: it
+// applies to every instrument, so a lower value would fold the default
+// ToR-level series that dashboards and alerts use into the overflow series.
+const MinMetricsCardinalityLimit = 2000
+
 // Values accepted by metrics_target_rnic_labels (see
 // AgentConfig.MetricsTargetRnicLabels).
 const (
@@ -163,7 +170,9 @@ type AgentConfig struct {
 	MetricsTargetRnicLabelsScope string `mapstructure:"metrics_target_rnic_labels_scope"`
 	// MetricsCardinalityLimit caps the attribute sets each metric instrument
 	// keeps; extra sets fold into one otel.metric.overflow series. 0 keeps
-	// the OTel SDK default (2000).
+	// the OTel SDK default (2000). The SDK applies one limit to every
+	// instrument, so only raising it is allowed (see
+	// MinMetricsCardinalityLimit).
 	MetricsCardinalityLimit int      `mapstructure:"metrics_cardinality_limit"`
 	AllowedDeviceNames      []string `mapstructure:"allowed_device_names"`
 	// ExcludedDeviceNames lists RDMA devices the agent never opens, matched
@@ -503,10 +512,12 @@ func (c *AgentConfig) Validate() error {
 			MetricsTargetRnicLabelsScopeStable, MetricsTargetRnicLabelsScopeAll,
 			c.MetricsTargetRnicLabelsScope)
 	}
-	// A negative limit would disable the OTel SDK's cardinality cap entirely;
-	// 0 already means "SDK default", so reject negatives as likely typos.
-	if c.MetricsCardinalityLimit < 0 {
-		return fmt.Errorf("metrics_cardinality_limit must be >= 0, got: %d", c.MetricsCardinalityLimit)
+	// A negative limit would disable the OTel SDK's cardinality cap entirely,
+	// and a limit below the SDK default would also cap the default ToR-level
+	// instruments, so only 0 (SDK default) or a raised limit is accepted.
+	if c.MetricsCardinalityLimit != 0 && c.MetricsCardinalityLimit < MinMetricsCardinalityLimit {
+		return fmt.Errorf("metrics_cardinality_limit must be 0 (OTel SDK default) or >= %d, got: %d",
+			MinMetricsCardinalityLimit, c.MetricsCardinalityLimit)
 	}
 
 	// A zero or negative probe interval would make time.NewTicker panic at

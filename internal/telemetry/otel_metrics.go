@@ -183,8 +183,9 @@ func WithTargetRnicLabels(labels TargetRnicLabels) Option {
 // WithCardinalityLimit caps the number of attribute sets each instrument
 // keeps per collection cycle; label sets beyond it are folded into a single
 // otel.metric.overflow=true series. Zero or a negative value keeps the OTel
-// SDK default (2000, or OTEL_GO_X_CARDINALITY_LIMIT). Only NewMetricsCollector
-// applies it, since it is a MeterProvider setting.
+// SDK default (2000, or OTEL_GO_X_CARDINALITY_LIMIT). It is a MeterProvider
+// setting, so it applies to every instrument (the default ToR-level ones
+// too) and only NewMetricsCollector applies it.
 func WithCardinalityLimit(limit int) Option {
 	return func(o *collectorOptions) {
 		o.cardinalityLimit = limit

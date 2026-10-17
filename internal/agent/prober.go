@@ -1289,6 +1289,8 @@ func fillTargetMetadata(result *probe.ProbeResult, seqNum uint64, flowLabel uint
 	result.TargetTorID = target.GetTargetTorId()
 	result.TargetRdmaDevice = target.GetTargetDeviceName()
 	result.TargetNetdev = target.GetTargetNetdev()
+	// The controller sets Sampled; INTER_TOR is checked as well because an
+	// older controller never sets it, and every inter-ToR target is sampled.
 	result.TargetSampled = target.GetSampled() ||
 		target.GetPinglistType() == controller_agent.PinglistType_INTER_TOR
 	if parsedGID, err := probe.ParseGID(target.GetTargetGid()); err == nil {

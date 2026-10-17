@@ -169,12 +169,22 @@ sampled targets contribute their real identities, and because the controller
 re-samples them on every refresh the long-run bound becomes every RNIC in the
 plane (or in the untagged mesh).
 
+These bounds count the targets at one point in time. The SDK never drops an
+attribute set while the agent runs, so every target that leaves (a replaced
+host, a renamed netdev, a value that changes between `unspecified` and a real
+netdev) keeps its series until the agent restarts. Likewise, an untagged mesh
+whose size crosses `unspecified_mesh_max_targets` leaves series under both its
+targets' identities and `_sampled`.
+
 The SDK keeps at most `metrics_cardinality_limit` (default 2000) attribute
 sets per instrument and folds the excess into one `otel.metric.overflow="true"`
 series of that instrument. `rpingmesh.target_rnic.probe_failed_total` holds one
 set per tuple and `reason`, so raise the limit if `Σ_r (M(r) + F(r)) × R` can
 exceed it. Only the `target_rnic` instruments can overflow this way: the
-default instruments are separate and keep their own, much smaller, set.
+default instruments are separate and keep their own, much smaller, set. The
+SDK (v1.47) cannot set the limit per instrument, so the same value also
+applies to the default instruments; the agent therefore rejects values below
+the 2000 default, which could only shrink their headroom.
 
 To check the real count in Prometheus:
 

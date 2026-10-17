@@ -691,6 +691,15 @@ func TestLoadAgentConfig_InvalidMetricsTargetRnicLabels(t *testing.T) {
 		"RPINGMESH_METRICS_TARGET_RNIC_LABELS_SCOPE": "inter_tor",
 		"RPINGMESH_METRICS_CARDINALITY_LIMIT":        "-1",
 	}
+	// A limit below the SDK default would also cap the default instruments.
+	for _, value := range []string{"-1", "1", "1999"} {
+		t.Run("cardinality_limit_"+value, func(t *testing.T) {
+			t.Setenv("RPINGMESH_METRICS_CARDINALITY_LIMIT", value)
+			if _, err := LoadAgentConfig("", nil); err == nil {
+				t.Fatalf("expected an error for metrics_cardinality_limit=%s, got nil", value)
+			}
+		})
+	}
 	for env, value := range cases {
 		t.Run(env, func(t *testing.T) {
 			t.Setenv(env, value)

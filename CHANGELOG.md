@@ -19,8 +19,9 @@ All notable changes to this project are documented in this file.
 - The controller marks targets it samples at random on every refresh
   (`PingTarget.sampled`): inter-ToR targets and the targets of a capped
   untagged ToR-mesh.
-- `metrics_cardinality_limit` sets the OTel SDK's per-instrument attribute-set
-  cap (default: the SDK's 2000).
+- `metrics_cardinality_limit` raises the OTel SDK's per-instrument
+  attribute-set cap (default: the SDK's 2000). It applies to every
+  instrument, so values below 2000 are rejected.
 - Agents register each RNIC's netdev (`RnicInfo.netdev`), the controller stores
   it in a new `rnics.netdev` column (added automatically to existing tables),
   and pinglists carry it as `PingTarget.target_netdev`.

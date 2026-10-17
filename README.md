@@ -364,7 +364,7 @@ To choose `service_level` and `traffic_class`, see
 | `otel_collector_addr` | `localhost:4317` | OTLP/gRPC collector as `host:port`, without a URL scheme |
 | `metrics_target_rnic_labels` | `off` | Export `rpingmesh.target_rnic.*` metrics labelled with the destination RNIC (`target_hostname`, `target_rdma_device`, `target_netdev`): `off`, `counters` (probe counters only), or `all` (counters and RTT histograms). See [Metrics](#metrics) before enabling |
 | `metrics_target_rnic_labels_scope` | `stable` | `stable` labels only targets whose set is stable across pinglist refreshes and gives sampled targets (inter-ToR, capped untagged ToR-mesh) the value `_sampled`; `all` labels sampled targets too |
-| `metrics_cardinality_limit` | `0` | Maximum attribute sets per metric instrument; extra sets fold into one `otel.metric.overflow="true"` series. `0` keeps the OTel SDK default (2000) |
+| `metrics_cardinality_limit` | `0` | Maximum attribute sets per metric instrument; extra sets fold into one `otel.metric.overflow="true"` series. `0` keeps the OTel SDK default (2000); otherwise it must be at least 2000, because the limit applies to every instrument |
 | `analysis_report_enabled` | `true` | Send per-path summaries to the controller's analyzer. Reporting is best-effort and never blocks probing |
 | `analysis_window_sec` | `30` | Per-path aggregation window |
 | `log_level` | `info` | `debug`, `info`, `warn`, or `error` |
@@ -746,9 +746,15 @@ as before, so the bundled dashboards and alerts are unaffected.
   attribute set it has seen, so labelling them would grow the series count
   over time. An older controller does not set the flag; the agent still
   treats inter-ToR targets as sampled, but a capped untagged mesh is labelled.
+  Whether an untagged mesh is sampled is decided on each refresh, so a mesh
+  whose size crosses `unspecified_mesh_max_targets` switches its targets
+  between their identity and `_sampled`, leaving both sets of series.
+- Series are never removed while the agent runs: a target that leaves (a
+  replaced host, a renamed netdev) keeps its series until the agent restarts.
 - The OTel SDK caps each instrument at 2000 attribute sets per agent by
-  default; `metrics_cardinality_limit` changes it. When a `target_rnic`
-  instrument reaches the cap, further label sets fold into its
+  default. `metrics_cardinality_limit` can only raise it, because the SDK
+  applies one limit to every instrument, including the default ones. When a
+  `target_rnic` instrument reaches the cap, further label sets fold into its
   `otel.metric.overflow="true"` series. Because the instruments are separate,
   the default metrics never overflow because of the destination labels. Query
   `{otel_metric_overflow="true"}` to detect it.
@@ -756,7 +762,9 @@ as before, so the bundled dashboards and alerts are unaffected.
   (this release or later); otherwise it is `unspecified`. Upgrade every
   controller before enabling the option: an older controller sharing the
   rqlite database rewrites the RNIC rows it re-registers without the netdev,
-  so the label would alternate between the netdev and `unspecified`. "Estimating the series count" in
+  so the label would alternate between the netdev and `unspecified`.
+
+"Estimating the series count" in
 [`docs/design/grafana-dashboards.md`](docs/design/grafana-dashboards.md) shows
 how to size the metric volume.
 

@@ -139,6 +139,9 @@ func TestGeneratePinglist_StampsPinglistType(t *testing.T) {
 			t.Errorf("ToR-mesh target %s: PinglistType = %v, want TOR_MESH",
 				tgt.GetTargetGid(), tgt.GetPinglistType())
 		}
+		if tgt.GetSampled() {
+			t.Errorf("named ToR-mesh target %s: Sampled = true, want false", tgt.GetTargetGid())
+		}
 	}
 
 	interTor, err := gen.GenerateInterTorPinglist(context.Background(), "fe80::1", "tor-1", "")
@@ -152,6 +155,9 @@ func TestGeneratePinglist_StampsPinglistType(t *testing.T) {
 		if tgt.GetPinglistType() != controller_agent.PinglistType_INTER_TOR {
 			t.Errorf("inter-ToR target %s: PinglistType = %v, want INTER_TOR",
 				tgt.GetTargetGid(), tgt.GetPinglistType())
+		}
+		if !tgt.GetSampled() {
+			t.Errorf("inter-ToR target %s: Sampled = false, want true", tgt.GetTargetGid())
 		}
 	}
 }
@@ -183,5 +189,28 @@ func TestGenerateInterTorPinglist_Error(t *testing.T) {
 	}
 	if targets != nil {
 		t.Errorf("GenerateInterTorPinglist targets = %v, want nil on error", targets)
+	}
+}
+
+// TestGenerateTorMeshPinglist_CopiesTargetRnicIdentity verifies that each
+// target carries the target RNIC's device name and netdev, which agents use
+// as optional destination metric labels.
+func TestGenerateTorMeshPinglist_CopiesTargetRnicIdentity(t *testing.T) {
+	gen := newTestGenerator(&fakeRnicSource{torMesh: []*controller_agent.RnicInfo{
+		{Gid: "fe80::2", HostName: "host-b", DeviceName: "mlx5_1", Netdev: "ens2f0"},
+	}})
+
+	targets, err := gen.GenerateTorMeshPinglist(context.Background(), "fe80::1", "tor-1", "")
+	if err != nil {
+		t.Fatalf("GenerateTorMeshPinglist: %v", err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("got %d targets, want 1", len(targets))
+	}
+	if got := targets[0].GetTargetDeviceName(); got != "mlx5_1" {
+		t.Errorf("TargetDeviceName = %q, want %q", got, "mlx5_1")
+	}
+	if got := targets[0].GetTargetNetdev(); got != "ens2f0" {
+		t.Errorf("TargetNetdev = %q, want %q", got, "ens2f0")
 	}
 }

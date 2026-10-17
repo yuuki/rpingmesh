@@ -216,6 +216,10 @@ func (g *PinglistGenerator) GenerateTorMeshPinglist(
 			targets[i], targets[j] = targets[j], targets[i]
 		})
 		targets = targets[:g.unspecifiedMeshMax]
+		// The kept subset changes on every refresh, like inter-ToR samples.
+		for _, t := range targets {
+			t.Sampled = true
+		}
 		log.Warn().
 			Str("requesterGID", requesterGID).
 			Str("planeID", rc.plane).
@@ -326,7 +330,9 @@ func (g *PinglistGenerator) buildPingTarget(requesterGID string, rnic *controlle
 		TargetHostname:   rnic.GetHostName(),
 		TargetTorId:      rnic.GetTorId(),
 		TargetDeviceName: rnic.GetDeviceName(),
+		TargetNetdev:     rnic.GetNetdev(),
 		PinglistType:     ptype,
+		Sampled:          ptype == controller_agent.PinglistType_INTER_TOR,
 		// FlowLabel is the legacy base label (low 20 bits of the seed), kept
 		// for backward compatibility and used verbatim when FlowLabelCount<=1.
 		FlowLabel: seed & 0xFFFFF,

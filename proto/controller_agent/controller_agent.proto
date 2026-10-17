@@ -31,6 +31,12 @@ message RnicInfo {
     // untagged (empty ToR) pinglists. Empty means unknown: the RNIC is then
     // paired as before plane support existed. Older agents never set it.
     string plane_id = 7;
+    // netdev is the Linux network interface bound to the RNIC's probing
+    // port/GID (e.g. "ens1f0"). It is metadata only: the controller stores it
+    // and copies it into PingTarget.target_netdev so agents can label probe
+    // metrics with the destination netdev when that option is enabled. Empty
+    // when the agent could not resolve it, and from older agents.
+    string netdev = 8;
 }
 
 // AgentRegistrationRequest is sent by agents to register with the controller.
@@ -113,6 +119,16 @@ message PingTarget {
     // TOR_MESH (0), which is also the backward-compatible reading of targets
     // from an older controller that did not stamp the field.
     PinglistType pinglist_type = 12;
+    // target_netdev is the target RNIC's netdev (RnicInfo.netdev), used only
+    // as an optional destination metric label. Empty when unknown.
+    string target_netdev = 13;
+    // sampled marks a target the controller picked by random sampling that
+    // changes across pinglist refreshes: every inter-ToR target, and the
+    // targets of an untagged ToR-mesh that exceeded
+    // unspecified_mesh_max_targets. Agents keep sampled targets out of the
+    // optional destination-RNIC metric labels by default, because their
+    // identities would otherwise accumulate as ever-new series.
+    bool sampled = 14;
 }
 
 // PinglistResponse contains the list of targets to probe.

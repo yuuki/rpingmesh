@@ -624,9 +624,34 @@ func TestRegisterRNICs_StoresPlaneID(t *testing.T) {
 		if !strings.Contains(ins.Query, "plane_id") {
 			t.Fatalf("insert query lacks plane_id: %s", ins.Query)
 		}
-		// plane_id is bound right before last_updated_epoch.
-		if got := ins.Arguments[len(ins.Arguments)-2]; got != want {
+		// plane_id is bound right before netdev and last_updated_epoch.
+		if got := ins.Arguments[len(ins.Arguments)-3]; got != want {
 			t.Errorf("insert %d plane_id = %v, want %q", i, got, want)
+		}
+	}
+}
+
+// TestRegisterRNICs_StoresNetdev verifies that each RNIC's netdev is written
+// to the netdev column, and that an unresolved netdev is stored as empty.
+func TestRegisterRNICs_StoresNetdev(t *testing.T) {
+	fake := &fakeConn{}
+	reg := newTestRegistry(fake)
+
+	resolved := testRnic("gid-1")
+	resolved.Netdev = "ens1f0"
+	if err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1",
+		[]*controller_agent.RnicInfo{resolved, testRnic("gid-2")}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	stmts := fake.writeParameterizedCalls[0]
+	for i, want := range []string{"ens1f0", ""} {
+		ins := stmts[i+1]
+		if !strings.Contains(ins.Query, "plane_id, netdev, last_updated_epoch") {
+			t.Fatalf("insert query lacks netdev: %s", ins.Query)
+		}
+		// netdev is bound right before last_updated_epoch.
+		if got := ins.Arguments[len(ins.Arguments)-2]; got != want {
+			t.Errorf("insert %d netdev = %v, want %q", i, got, want)
 		}
 	}
 }
@@ -648,8 +673,8 @@ func TestReadQueriesSelectPlaneID(t *testing.T) {
 		t.Fatalf("captured %d queries, want 5", len(fake.queryOneParameterizedCalls))
 	}
 	for _, q := range fake.queryOneParameterizedCalls {
-		if !strings.Contains(q.Query, "device_name, plane_id") {
-			t.Errorf("query does not select plane_id: %s", q.Query)
+		if !strings.Contains(q.Query, "device_name, plane_id, netdev") {
+			t.Errorf("query does not select plane_id and netdev: %s", q.Query)
 		}
 	}
 }
@@ -679,6 +704,18 @@ func TestInitializeSchema_AddsPlaneColumnToLegacyTable(t *testing.T) {
 	}
 	if alters != 1 {
 		t.Errorf("ALTER TABLE issued %d times, want 1; statements: %v", alters, fake.writeOneCalls)
+	}
+	if !strings.Contains(fake.writeOneCalls[0], "netdev TEXT NOT NULL DEFAULT ''") {
+		t.Errorf("CREATE TABLE lacks netdev: %s", fake.writeOneCalls[0])
+	}
+	var netdevAlters int
+	for _, stmt := range fake.writeOneCalls {
+		if strings.Contains(stmt, "ALTER TABLE rnics ADD COLUMN netdev TEXT NOT NULL DEFAULT ''") {
+			netdevAlters++
+		}
+	}
+	if netdevAlters != 1 {
+		t.Errorf("netdev ALTER TABLE issued %d times, want 1; statements: %v", netdevAlters, fake.writeOneCalls)
 	}
 }
 

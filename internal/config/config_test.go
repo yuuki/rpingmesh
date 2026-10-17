@@ -647,6 +647,69 @@ func TestLoadAgentConfig_InvalidCQPollMode(t *testing.T) {
 	}
 }
 
+func TestLoadAgentConfig_MetricsTargetRnicLabelsDefaults(t *testing.T) {
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MetricsTargetRnicLabels != MetricsTargetRnicLabelsOff {
+		t.Errorf("MetricsTargetRnicLabels = %q, want %q", cfg.MetricsTargetRnicLabels, MetricsTargetRnicLabelsOff)
+	}
+	if cfg.MetricsTargetRnicLabelsScope != MetricsTargetRnicLabelsScopeStable {
+		t.Errorf("MetricsTargetRnicLabelsScope = %q, want %q",
+			cfg.MetricsTargetRnicLabelsScope, MetricsTargetRnicLabelsScopeStable)
+	}
+	if cfg.MetricsCardinalityLimit != 0 {
+		t.Errorf("MetricsCardinalityLimit = %d, want 0", cfg.MetricsCardinalityLimit)
+	}
+}
+
+func TestLoadAgentConfig_MetricsTargetRnicLabelsFromEnv(t *testing.T) {
+	t.Setenv("RPINGMESH_METRICS_TARGET_RNIC_LABELS", MetricsTargetRnicLabelsAll)
+	t.Setenv("RPINGMESH_METRICS_TARGET_RNIC_LABELS_SCOPE", MetricsTargetRnicLabelsScopeAll)
+	t.Setenv("RPINGMESH_METRICS_CARDINALITY_LIMIT", "10000")
+
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MetricsTargetRnicLabels != MetricsTargetRnicLabelsAll {
+		t.Errorf("MetricsTargetRnicLabels = %q, want %q", cfg.MetricsTargetRnicLabels, MetricsTargetRnicLabelsAll)
+	}
+	if cfg.MetricsTargetRnicLabelsScope != MetricsTargetRnicLabelsScopeAll {
+		t.Errorf("MetricsTargetRnicLabelsScope = %q, want %q",
+			cfg.MetricsTargetRnicLabelsScope, MetricsTargetRnicLabelsScopeAll)
+	}
+	if cfg.MetricsCardinalityLimit != 10000 {
+		t.Errorf("MetricsCardinalityLimit = %d, want 10000", cfg.MetricsCardinalityLimit)
+	}
+}
+
+func TestLoadAgentConfig_InvalidMetricsTargetRnicLabels(t *testing.T) {
+	cases := map[string]string{
+		"RPINGMESH_METRICS_TARGET_RNIC_LABELS":       "histograms",
+		"RPINGMESH_METRICS_TARGET_RNIC_LABELS_SCOPE": "inter_tor",
+		"RPINGMESH_METRICS_CARDINALITY_LIMIT":        "-1",
+	}
+	// A limit below the SDK default would also cap the default instruments.
+	for _, value := range []string{"-1", "1", "1999"} {
+		t.Run("cardinality_limit_"+value, func(t *testing.T) {
+			t.Setenv("RPINGMESH_METRICS_CARDINALITY_LIMIT", value)
+			if _, err := LoadAgentConfig("", nil); err == nil {
+				t.Fatalf("expected an error for metrics_cardinality_limit=%s, got nil", value)
+			}
+		})
+	}
+	for env, value := range cases {
+		t.Run(env, func(t *testing.T) {
+			t.Setenv(env, value)
+			if _, err := LoadAgentConfig("", nil); err == nil {
+				t.Fatalf("expected an error for %s=%s, got nil", env, value)
+			}
+		})
+	}
+}
+
 func TestLoadAgentConfig_NegativeServiceLevel(t *testing.T) {
 	t.Setenv("RPINGMESH_SERVICE_LEVEL", "-1")
 

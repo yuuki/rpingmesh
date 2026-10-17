@@ -71,6 +71,15 @@ type ProbeResult struct {
 	// unknown (test fakes, or a netdev that could not be resolved).
 	SourceRdmaDevice string
 	SourceNetdev     string
+	// TargetRdmaDevice and TargetNetdev name the target RNIC, copied from
+	// the PingTarget (empty when the controller or target agent does not
+	// know them). TargetSampled reports that the controller picked the
+	// target by sampling that changes across pinglist refreshes (inter-ToR,
+	// or a capped untagged ToR-mesh). All three exist only for the optional
+	// destination-RNIC metrics.
+	TargetRdmaDevice string
+	TargetNetdev     string
+	TargetSampled    bool
 }
 
 // RTTResult contains calculated RTT metrics from a probe.

@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in per-destination-RNIC agent metrics, `rpingmesh.target_rnic.*`,
+  labelled with `target_hostname`, `target_rdma_device`, and `target_netdev`
+  on top of the default attributes. `metrics_target_rnic_labels` selects `off`
+  (default), `counters` (`probe_total`, `probe_success_total`,
+  `probe_failed_total`), or `all` (also the RTT histograms). They are separate
+  instruments, so the existing probe metrics are unchanged and can never fold
+  into the OTel overflow series because of them.
+  `metrics_target_rnic_labels_scope` (default `stable`) gives sampled targets
+  `_sampled` instead of their identity, because their set rotates on every
+  pinglist refresh.
+- The controller marks targets it samples at random on every refresh
+  (`PingTarget.sampled`): inter-ToR targets and the targets of a capped
+  untagged ToR-mesh.
+- `metrics_cardinality_limit` raises the OTel SDK's per-instrument
+  attribute-set cap (default: the SDK's 2000). It applies to every
+  instrument, so values below 2000 are rejected.
+- Agents register each RNIC's netdev (`RnicInfo.netdev`), the controller stores
+  it in a new `rnics.netdev` column (added automatically to existing tables),
+  and pinglists carry it as `PingTarget.target_netdev`.
+
 ## [0.5.3] - 2026-10-16
 
 ### Added

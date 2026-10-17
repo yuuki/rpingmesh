@@ -97,6 +97,18 @@ excluded_device_names: []        # Empty = exclude nothing
 # Telemetry
 metrics_enabled: true
 otel_collector_addr: "localhost:4317"
+# Per-destination-RNIC metrics (rpingmesh.target_rnic.*, labelled with
+# target_hostname, target_rdma_device, target_netdev): "off", "counters" (probe
+# counters only), or "all" (also the RTT histograms). Their series grow with
+# the targets per RNIC; see README. The default metrics are unaffected.
+metrics_target_rnic_labels: "off"
+# "stable" labels only targets with a stable set (sampled inter-ToR and capped
+# untagged ToR-mesh targets get "_sampled"); "all" labels sampled ones too,
+# whose set rotates on every pinglist refresh.
+metrics_target_rnic_labels_scope: "stable"
+# Max attribute sets per metric instrument (0 = OTel SDK default, 2000). It
+# applies to every instrument, so a non-zero value must be at least 2000.
+metrics_cardinality_limit: 0
 
 # Self-protection (opt-in)
 # When enabled, a watchdog samples this process's CPU/memory every

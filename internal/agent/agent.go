@@ -301,11 +301,22 @@ func (a *Agent) resolveDeviceNetdevs() {
 	}
 }
 
+// cachedNetdev returns the netdev cached for devices[i] by
+// resolveDeviceNetdevs, or "" when it is unknown or not resolved yet. The
+// source_netdev label and the netdev registered with the controller both use
+// it, so they always agree.
+func (a *Agent) cachedNetdev(i int) string {
+	if i < len(a.deviceNetdevs) {
+		return a.deviceNetdevs[i]
+	}
+	return ""
+}
+
 // netdevForDevice returns the netdev of devices[i]: the value cached by
 // resolveDeviceNetdevs when it has run, else a fresh sysfs lookup.
 func (a *Agent) netdevForDevice(i int) (string, error) {
 	if i < len(a.deviceNetdevs) {
-		if netdev := a.deviceNetdevs[i]; netdev != "" {
+		if netdev := a.cachedNetdev(i); netdev != "" {
 			return netdev, nil
 		}
 		return "", fmt.Errorf("no netdev resolved for RDMA device %s", a.devices[i].Info.DeviceName)
@@ -580,9 +591,7 @@ func (a *Agent) Initialize(ctx context.Context) error {
 				dev.Info.DeviceName, err)
 		}
 		prober.SetSourceTorID(a.torIDForDevice(i))
-		if i < len(a.deviceNetdevs) {
-			prober.SetSourceNetdev(a.deviceNetdevs[i])
-		}
+		prober.SetSourceNetdev(a.cachedNetdev(i))
 		torMeshRate := a.cfg.EffectiveTorMeshProbeRate()
 		interTorRate := a.cfg.EffectiveInterTorProbeRate()
 		if torMeshRate > 0 || interTorRate > 0 {
@@ -752,6 +761,7 @@ func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRe
 			TorId:      a.torIDForDevice(i),
 			DeviceName: dev.Info.DeviceName,
 			PlaneId:    a.planeIDForDevice(i),
+			Netdev:     a.cachedNetdev(i),
 		}
 		rnics = append(rnics, rnic)
 
@@ -1243,7 +1253,9 @@ func (a *Agent) createMetricsCollector(ctx context.Context) {
 	a.logger.Info().
 		Str("collector_addr", a.cfg.OtelCollectorAddr).
 		Msg("Creating metrics collector")
-	mc, err := telemetry.NewMetricsCollector(ctx, a.cfg.OtelCollectorAddr)
+	mc, err := telemetry.NewMetricsCollector(ctx, a.cfg.OtelCollectorAddr,
+		telemetry.WithTargetRnicLabels(targetRnicLabels(a.cfg)),
+		telemetry.WithCardinalityLimit(a.cfg.MetricsCardinalityLimit))
 	if err != nil {
 		a.logger.Warn().Err(err).
 			Msg("Failed to create metrics collector, continuing without metrics")
@@ -1264,6 +1276,18 @@ func (a *Agent) createMetricsCollector(ctx context.Context) {
 	}); err != nil {
 		a.logger.Warn().Err(err).
 			Msg("Failed to register event ring drop count callback")
+	}
+}
+
+// targetRnicLabels maps the metrics_target_rnic_labels and
+// metrics_target_rnic_labels_scope settings onto telemetry.TargetRnicLabels.
+// Empty values (a zero-value config) mean the defaults, off and stable.
+func targetRnicLabels(cfg *config.AgentConfig) telemetry.TargetRnicLabels {
+	mode := cfg.MetricsTargetRnicLabels
+	return telemetry.TargetRnicLabels{
+		Enabled:        mode == config.MetricsTargetRnicLabelsCounters || mode == config.MetricsTargetRnicLabelsAll,
+		Histograms:     mode == config.MetricsTargetRnicLabelsAll,
+		IncludeSampled: cfg.MetricsTargetRnicLabelsScope == config.MetricsTargetRnicLabelsScopeAll,
 	}
 }
 

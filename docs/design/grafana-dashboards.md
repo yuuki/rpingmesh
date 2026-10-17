@@ -70,8 +70,11 @@ ladder is a superset of the analyzer's own bucket ladder
   port/GID) map 1:1, so together they multiply series only by the RNICs per
   host. They distinguish a multi-rail host's RNICs that share a ToR and join
   with RDMA hardware counters and node_exporter `node_network_*{device=...}`.
-- Destination-RNIC identity and GIDs never become attributes; they appear
-  only in debug logs.
+- GIDs never become attributes; they appear only in debug logs.
+  Destination-RNIC identity (`target_hostname`, `target_rdma_device`,
+  `target_netdev`) never reaches these instruments; it goes only to the
+  separate opt-in `rpingmesh.target_rnic.*` instruments described in
+  "Optional destination-RNIC metrics" below.
 - Empty values are exported as the non-empty label `unspecified`: an unset
   `tor_id`, and a device or netdev that cannot be resolved (e.g. a bonded
   RNIC's netdev). Template variables and the ToR × ToR matrix therefore still
@@ -142,6 +145,46 @@ fleet `= 1,836 × 60 = 110,160`. In B the instantaneous `T(r)` is
 visited every foreign ToR. Histogram buckets dominate (96 of 102 series per
 tuple), so fewer bucket boundaries is the main lever if the total is too
 high. Dropping the source-RNIC labels only helps in cases like B and C.
+
+### Optional destination-RNIC metrics
+
+`metrics_target_rnic_labels: counters` adds the `rpingmesh.target_rnic.*`
+counters, whose tuple is `(source RNIC, target RNIC)`; `all` adds the matching
+histograms. They come on top of the default series, which do not change. With
+the default `metrics_target_rnic_labels_scope: stable`, sampled targets
+(inter-ToR, capped untagged ToR-mesh) share one `_sampled` value per
+`target_tor`. Let `M(r)` be the number of stable ToR-mesh targets of RNIC `r`
+(the other RNICs on its ToR, excluding its own host) and `F(r) = T(r) − 1` its
+foreign ToRs:
+
+```
+counters: added_series_agent ≤ Σ_r (M(r) + F(r)) × (2 + R)
+all:      added_series_agent ≤ Σ_r (M(r) + F(r)) × (98 + R)
+```
+
+For fabric A (each leaf holds 20 RNICs of one rail, so `M(r) = 19`, and
+`F(r) = 2`): `counters` adds `6 × 21 × 6 = 756` series per agent (+41% over
+1,836), `all` adds `6 × 21 × 102 = 12,852` (×8 in total). With `scope: all`,
+sampled targets contribute their real identities, and because the controller
+re-samples them on every refresh the long-run bound becomes every RNIC in the
+plane (or in the untagged mesh).
+
+These bounds count the targets at one point in time. The SDK never drops an
+attribute set while the agent runs, so every target that leaves (a replaced
+host, a renamed netdev, a value that changes between `unspecified` and a real
+netdev) keeps its series until the agent restarts. Likewise, an untagged mesh
+whose size crosses `unspecified_mesh_max_targets` leaves series under both its
+targets' identities and `_sampled`.
+
+The SDK keeps at most `metrics_cardinality_limit` (default 2000) attribute
+sets per instrument and folds the excess into one `otel.metric.overflow="true"`
+series of that instrument. `rpingmesh.target_rnic.probe_failed_total` holds one
+set per tuple and `reason`, so raise the limit if `Σ_r (M(r) + F(r)) × R` can
+exceed it. Only the `target_rnic` instruments can overflow this way: the
+default instruments are separate and keep their own, much smaller, set. The
+SDK (v1.47) cannot set the limit per instrument, so the same value also
+applies to the default instruments; the agent therefore rejects values below
+the 2000 default, which could only shrink their headroom.
 
 To check the real count in Prometheus:
 

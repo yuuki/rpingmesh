@@ -8,7 +8,7 @@ All notable changes to this project are documented in this file.
 
 - The agent's network RTT histogram and its two delay histograms use separate
   bucket ladders sized from production distributions, cutting their buckets
-  from 30 each to 21 for `rpingmesh.network_rtt_ns` (2 µs–10 ms, densest in
+  from 30 each to 23 for `rpingmesh.network_rtt_ns` (2 µs–10 ms, densest in
   2–25 µs) and 11 for `rpingmesh.prober_delay_ns` and
   `rpingmesh.responder_delay_ns` (25 µs–10 ms). Queries using
   `histogram_quantile` keep working, but `le` series whose boundary was
@@ -17,12 +17,15 @@ All notable changes to this project are documented in this file.
   be updated. The exported ladder is no longer a superset of the analyzer's
   internal ladder; the controller warns at startup when
   `analyzer_sla_network_rtt_p99_ns` is not an RTT bucket boundary.
-- `rpingmesh.prober_delay_ns` and `rpingmesh.responder_delay_ns` no longer
-  carry `target_tor` by default, so their series scale with the source RNICs
-  instead of the ToRs probed. Set the new agent option
-  `metrics_delay_target_tor: true` to keep it; queries that group or filter
-  the delays by `target_tor` need it. The ToR Pair Drilldown delay panel works
-  either way. `rpingmesh.network_rtt_ns`, the probe counters, and the
+- `rpingmesh.prober_delay_ns` no longer carries `target_tor` by default, so
+  its series scale with the source RNICs instead of the ToRs probed. Set the
+  new agent option `metrics_prober_delay_target_tor: true` to keep it; queries
+  that group or filter the prober delay by `target_tor` need it. The ToR Pair
+  Drilldown now plots the prober delay by `source_tor` only.
+  `rpingmesh.responder_delay_ns` keeps `target_tor` by default because it is
+  the only default metric that localizes slow responders; the new option
+  `metrics_responder_delay_target_tor: false` drops it.
+  `rpingmesh.network_rtt_ns`, the probe counters, and the
   `rpingmesh.target_rnic.*` instruments keep `target_tor`.
 
 ### Added

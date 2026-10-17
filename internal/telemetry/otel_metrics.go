@@ -44,9 +44,11 @@ import (
 // resolution is densest there, so a regression within that range moves
 // between buckets and shows up in histogram_quantile. Explicit-bucket
 // histograms export every bucket of every series, including empty ones, so
-// boundaries where no samples land are dropped. The tail keeps coarse
-// boundaries up to 10ms so congestion (e.g. PFC pause storms) still has a
-// magnitude instead of collapsing into +Inf, and keeps 500us, the default
+// boundaries where no samples land are dropped. The tail keeps the
+// 1ms-2.5ms-5ms-10ms steps so congestion (e.g. PFC pause storms) still has a
+// magnitude: histogram_quantile interpolates linearly inside a bucket, so a
+// single 1ms-10ms bucket would report every sample in it as ~5.5ms at p50.
+// It also keeps 500us, the default
 // analyzer_sla_network_rtt_p99_ns, so the fraction of samples above the SLA
 // threshold can be read off one bucket.
 //
@@ -57,7 +59,8 @@ var networkRTTBucketBoundaries = []float64{
 	2_000, 2_500, 3_000, 3_500, 4_000,
 	5_000, 6_000, 7_000, 8_000, 9_000, 10_000,
 	12_500, 15_000, 20_000, 25_000, 50_000,
-	100_000, 500_000, 1_000_000, 10_000_000,
+	100_000, 500_000,
+	1_000_000, 2_500_000, 5_000_000, 10_000_000,
 }
 
 // delayBucketBoundaries are the explicit bucket boundaries (ns) of the prober
@@ -190,7 +193,19 @@ type collectorOptions struct {
 	serviceName      string
 	targetRnicLabels TargetRnicLabels
 	cardinalityLimit int
-	delayTargetTor   bool
+	// proberDelayTargetTor and responderDelayTargetTor keep target_tor on
+	// the delay histograms (see WithProberDelayTargetTor,
+	// WithResponderDelayTargetTor).
+	proberDelayTargetTor    bool
+	responderDelayTargetTor bool
+}
+
+// defaultCollectorOptions returns the options applied before any Option.
+func defaultCollectorOptions() collectorOptions {
+	return collectorOptions{
+		serviceName:             defaultServiceName,
+		responderDelayTargetTor: true,
+	}
 }
 
 // WithServiceName overrides the OTel resource service.name reported by the
@@ -210,16 +225,27 @@ func WithTargetRnicLabels(labels TargetRnicLabels) Option {
 	}
 }
 
-// WithDelayTargetTor attaches target_tor to rpingmesh.prober_delay_ns and
-// rpingmesh.responder_delay_ns. By default they carry only the source labels:
-// the prober delay is time spent on the probing host, and the responder delay
-// split by target_tor is still an average over every host behind that ToR, so
-// target_tor would multiply their series by the ToRs probed for little
-// information. rpingmesh.network_rtt_ns and the probe counters always carry
-// target_tor; the rpingmesh.target_rnic.* histograms always carry it too.
-func WithDelayTargetTor(enabled bool) Option {
+// WithProberDelayTargetTor attaches target_tor to rpingmesh.prober_delay_ns.
+// It is off by default: the prober delay is time spent on the probing host,
+// so splitting it by the remote ToR adds no information and multiplies its
+// series by the ToRs probed.
+func WithProberDelayTargetTor(enabled bool) Option {
 	return func(o *collectorOptions) {
-		o.delayTargetTor = enabled
+		o.proberDelayTargetTor = enabled
+	}
+}
+
+// WithResponderDelayTargetTor controls target_tor on
+// rpingmesh.responder_delay_ns. It is on by default: the responder delay is
+// time spent on the remote host, network RTT subtracts it, and the analyzer's
+// path summaries do not carry it, so target_tor is the only default signal
+// that localizes slow responders. Without it, a slow ToR's responders are
+// diluted by every other target of the source RNIC.
+// rpingmesh.network_rtt_ns, the probe counters and the
+// rpingmesh.target_rnic.* histograms always carry target_tor.
+func WithResponderDelayTargetTor(enabled bool) Option {
+	return func(o *collectorOptions) {
+		o.responderDelayTargetTor = enabled
 	}
 }
 
@@ -255,10 +281,12 @@ type MetricsCollector struct {
 	// WithTargetRnicLabels enabled them.
 	target           *targetInstruments
 	targetRnicLabels TargetRnicLabels
-	// delayTargetTor keeps target_tor on the default delay histograms (see
-	// WithDelayTargetTor).
-	delayTargetTor bool
-	logger         zerolog.Logger
+	// proberDelayTargetTor and responderDelayTargetTor keep target_tor on
+	// the delay histograms (see WithProberDelayTargetTor,
+	// WithResponderDelayTargetTor).
+	proberDelayTargetTor    bool
+	responderDelayTargetTor bool
+	logger                  zerolog.Logger
 }
 
 // targetInstruments are the destination-RNIC-labelled counterparts of the
@@ -337,7 +365,7 @@ func buildResource(serviceName string) (*resource.Resource, error) {
 // WithServiceName to override it (e.g. for non-agent processes reusing this
 // collector).
 func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Option) (*MetricsCollector, error) {
-	options := collectorOptions{serviceName: defaultServiceName}
+	options := defaultCollectorOptions()
 	for _, opt := range opts {
 		opt(&options)
 	}
@@ -363,7 +391,8 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 		Bool("target_rnic_labels_histograms", options.targetRnicLabels.Histograms).
 		Bool("target_rnic_labels_sampled", options.targetRnicLabels.IncludeSampled).
 		Int("cardinality_limit", options.cardinalityLimit).
-		Bool("delay_target_tor", options.delayTargetTor).
+		Bool("prober_delay_target_tor", options.proberDelayTargetTor).
+		Bool("responder_delay_target_tor", options.responderDelayTargetTor).
 		Msg("MetricsCollector initialized")
 
 	return mc, nil
@@ -414,7 +443,7 @@ func NewMeterProvider(ctx context.Context, collectorAddr, serviceName string, op
 // WithServiceName and WithCardinalityLimit are ignored here: the caller
 // configures its own provider.
 func NewMetricsCollectorWithProvider(provider *sdkmetric.MeterProvider, opts ...Option) (*MetricsCollector, error) {
-	var options collectorOptions
+	options := defaultCollectorOptions()
 	for _, opt := range opts {
 		opt(&options)
 	}
@@ -524,20 +553,21 @@ func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOpt
 	}
 
 	return &MetricsCollector{
-		meterProvider:    provider,
-		meter:            meter,
-		networkRTT:       networkRTT,
-		proberDelay:      proberDelay,
-		responderDelay:   responderDelay,
-		probeSuccess:     probeSuccess,
-		probeFailed:      probeFailed,
-		probeTotal:       probeTotal,
-		eventRingDropped: eventRingDropped,
-		selfThrottle:     selfThrottle,
-		target:           target,
-		targetRnicLabels: options.targetRnicLabels,
-		delayTargetTor:   options.delayTargetTor,
-		logger:           log.With().Str("component", "telemetry").Logger(),
+		meterProvider:           provider,
+		meter:                   meter,
+		networkRTT:              networkRTT,
+		proberDelay:             proberDelay,
+		responderDelay:          responderDelay,
+		probeSuccess:            probeSuccess,
+		probeFailed:             probeFailed,
+		probeTotal:              probeTotal,
+		eventRingDropped:        eventRingDropped,
+		selfThrottle:            selfThrottle,
+		target:                  target,
+		targetRnicLabels:        options.targetRnicLabels,
+		proberDelayTargetTor:    options.proberDelayTargetTor,
+		responderDelayTargetTor: options.responderDelayTargetTor,
+		logger:                  log.With().Str("component", "telemetry").Logger(),
 	}, nil
 }
 
@@ -623,11 +653,16 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		attribute.String("source_netdev", sourceNetdev),
 	}
 	attrs := metric.WithAttributes(attrSet...)
-	// The delay histograms drop target_tor unless WithDelayTargetTor is set
-	// (see its doc). attrSet[1] is target_tor.
-	delayAttrs := attrs
-	if !mc.delayTargetTor {
-		delayAttrs = metric.WithAttributes(attrSet[0], attrSet[2], attrSet[3])
+	// The delay histograms may drop target_tor (see
+	// WithProberDelayTargetTor, WithResponderDelayTargetTor). attrSet[1] is
+	// target_tor.
+	noTargetTorAttrs := metric.WithAttributes(attrSet[0], attrSet[2], attrSet[3])
+	proberDelayAttrs, responderDelayAttrs := noTargetTorAttrs, noTargetTorAttrs
+	if mc.proberDelayTargetTor {
+		proberDelayAttrs = attrs
+	}
+	if mc.responderDelayTargetTor {
+		responderDelayAttrs = attrs
 	}
 
 	// Always increment total probe count.
@@ -638,8 +673,8 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 	if success {
 		// Record RTT histogram values for successful probes.
 		mc.networkRTT.Record(ctx, rtt.NetworkRTT, attrs)
-		mc.proberDelay.Record(ctx, rtt.ProberDelay, delayAttrs)
-		mc.responderDelay.Record(ctx, rtt.ResponderDelay, delayAttrs)
+		mc.proberDelay.Record(ctx, rtt.ProberDelay, proberDelayAttrs)
+		mc.responderDelay.Record(ctx, rtt.ResponderDelay, responderDelayAttrs)
 		mc.probeSuccess.Add(ctx, 1, attrs)
 	} else {
 		reason = probeFailureReason(result, rtt)

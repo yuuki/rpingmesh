@@ -364,7 +364,8 @@ To choose `service_level` and `traffic_class`, see
 | `otel_collector_addr` | `localhost:4317` | OTLP/gRPC collector as `host:port`, without a URL scheme |
 | `metrics_target_rnic_labels` | `off` | Export `rpingmesh.target_rnic.*` metrics labelled with the destination RNIC (`target_hostname`, `target_rdma_device`, `target_netdev`): `off`, `counters` (probe counters only), or `all` (counters and RTT histograms). See [Metrics](#metrics) before enabling |
 | `metrics_target_rnic_labels_scope` | `stable` | `stable` labels only targets whose set is stable across pinglist refreshes and gives sampled targets (inter-ToR, capped untagged ToR-mesh) the value `_sampled`; `all` labels sampled targets too |
-| `metrics_delay_target_tor` | `false` | Attach `target_tor` to `rpingmesh.prober_delay_ns` and `rpingmesh.responder_delay_ns`. Off by default because the delays are host-side processing time and `target_tor` multiplies their series by the ToRs probed |
+| `metrics_prober_delay_target_tor` | `false` | Attach `target_tor` to `rpingmesh.prober_delay_ns`. Off by default because the prober delay is time spent on the probing host, so `target_tor` only multiplies its series by the ToRs probed |
+| `metrics_responder_delay_target_tor` | `true` | Attach `target_tor` to `rpingmesh.responder_delay_ns`. It is the only default metric that localizes slow responders, because network RTT subtracts the responder delay; `false` saves series but loses that signal |
 | `metrics_cardinality_limit` | `0` | Maximum attribute sets per metric instrument; extra sets fold into one `otel.metric.overflow="true"` series. `0` keeps the OTel SDK default (2000); otherwise it must be at least 2000, because the limit applies to every instrument |
 | `analysis_report_enabled` | `true` | Send per-path summaries to the controller's analyzer. Reporting is best-effort and never blocks probing |
 | `analysis_window_sec` | `30` | Per-path aggregation window |
@@ -706,8 +707,8 @@ Agent metrics:
 Probe metrics carry these attributes:
 
 - `source_tor`, `target_tor`: ToR IDs, or `unspecified` for an RNIC without a
-  ToR. The two delay histograms omit `target_tor` unless
-  `metrics_delay_target_tor` is `true`.
+  ToR. `rpingmesh.prober_delay_ns` omits `target_tor` unless
+  `metrics_prober_delay_target_tor` is `true`.
 - `source_rdma_device`, `source_netdev`: the local RNIC that sent the probe
   (for example `mlx5_0` and `ens1f0`), or `unspecified` when unknown.
 - `reason` (on `probe_failed_total` only): `timeout`, `send_error`,

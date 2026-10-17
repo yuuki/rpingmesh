@@ -2,7 +2,6 @@ package telemetry
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"slices"
 	"testing"
@@ -757,21 +756,27 @@ func TestRecordProbeResult_HistogramBoundaries(t *testing.T) {
 	}
 }
 
-// TestRecordProbeResult_DelayTargetTor verifies that the delay histograms
-// drop target_tor by default and keep it with WithDelayTargetTor(true),
-// while network RTT and the counters always keep it.
+// TestRecordProbeResult_DelayTargetTor verifies that, by default,
+// rpingmesh.prober_delay_ns drops target_tor while
+// rpingmesh.responder_delay_ns keeps it, that each option flips only its own
+// histogram, and that network RTT and the counters always keep target_tor.
 func TestRecordProbeResult_DelayTargetTor(t *testing.T) {
-	for _, keep := range []bool{false, true} {
-		t.Run(fmt.Sprintf("keep=%v", keep), func(t *testing.T) {
+	cases := []struct {
+		name                 string
+		opts                 []Option
+		proberKeep, respKeep bool
+	}{
+		{"default", nil, false, true},
+		{"prober_on", []Option{WithProberDelayTargetTor(true)}, true, true},
+		{"responder_off", []Option{WithResponderDelayTargetTor(false)}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			reader := sdkmetric.NewManualReader()
 			provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 			defer provider.Shutdown(context.Background())
 
-			var opts []Option
-			if keep {
-				opts = append(opts, WithDelayTargetTor(true))
-			}
-			mc, err := NewMetricsCollectorWithProvider(provider, opts...)
+			mc, err := NewMetricsCollectorWithProvider(provider, tc.opts...)
 			if err != nil {
 				t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
 			}
@@ -785,7 +790,10 @@ func TestRecordProbeResult_DelayTargetTor(t *testing.T) {
 			if err := reader.Collect(context.Background(), &rm); err != nil {
 				t.Fatalf("ManualReader.Collect: %v", err)
 			}
-			for _, name := range []string{"rpingmesh.prober_delay_ns", "rpingmesh.responder_delay_ns"} {
+			for name, keep := range map[string]bool{
+				"rpingmesh.prober_delay_ns":    tc.proberKeep,
+				"rpingmesh.responder_delay_ns": tc.respKeep,
+			} {
 				dps := findMetric(&rm, name).Data.(metricdata.Histogram[int64]).DataPoints
 				wantPoints := 1
 				if keep {
@@ -815,5 +823,16 @@ func TestRecordProbeResult_DelayTargetTor(t *testing.T) {
 				t.Errorf("rpingmesh.probe_total has %d data points, want 2 (one per target_tor)", len(dps))
 			}
 		})
+	}
+}
+
+// TestNetworkRTTBucketBoundaries_TailSteps verifies that the RTT ladder keeps
+// intermediate boundaries between 1ms and 10ms, so histogram_quantile does
+// not report a congested 1.1ms distribution as ~5.5ms.
+func TestNetworkRTTBucketBoundaries_TailSteps(t *testing.T) {
+	for _, ns := range []uint64{1_000_000, 2_500_000, 5_000_000, 10_000_000} {
+		if !IsNetworkRTTBucketBoundary(ns) {
+			t.Errorf("%dns is not a network RTT bucket boundary", ns)
+		}
 	}
 }

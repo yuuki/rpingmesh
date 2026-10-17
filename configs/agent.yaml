@@ -109,10 +109,14 @@ metrics_target_rnic_labels_scope: "stable"
 # Max attribute sets per metric instrument (0 = OTel SDK default, 2000). It
 # applies to every instrument, so a non-zero value must be at least 2000.
 metrics_cardinality_limit: 0
-# Attach target_tor to rpingmesh.prober_delay_ns and rpingmesh.responder_delay_ns.
-# Off by default: delays are host-side processing time, and target_tor multiplies
-# their series by the number of ToRs probed.
-metrics_delay_target_tor: false
+# Attach target_tor to rpingmesh.prober_delay_ns. Off by default: the prober
+# delay is time spent on the probing host, so target_tor only multiplies its
+# series by the number of ToRs probed.
+metrics_prober_delay_target_tor: false
+# Attach target_tor to rpingmesh.responder_delay_ns. On by default: it is the
+# only default metric that localizes slow responders (network RTT subtracts the
+# responder delay). Turning it off saves series but loses that signal.
+metrics_responder_delay_target_tor: true
 
 # Self-protection (opt-in)
 # When enabled, a watchdog samples this process's CPU/memory every

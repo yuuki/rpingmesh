@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-19
+
 ### Changed
 
 - The agent's network RTT histogram and its two delay histograms use separate

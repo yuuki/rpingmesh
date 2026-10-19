@@ -98,6 +98,8 @@ func run(cmd *cobra.Command, args []string) error {
 		Bool("metrics_responder_delay_target_tor", cfg.MetricsResponderDelayTargetTor).
 		Strs("allowed_devices", cfg.AllowedDeviceNames).
 		Strs("excluded_devices", cfg.ExcludedDeviceNames).
+		Strs("excluded_gid_cidrs", cfg.ExcludedGIDCIDRs).
+		Bool("mapped_devices_only", cfg.MappedDevicesOnly).
 		Int("gid_index", cfg.GIDIndex).
 		Msg("Starting rpingmesh-agent")
 

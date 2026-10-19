@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
@@ -189,7 +190,19 @@ type AgentConfig struct {
 	// case-insensitively. It applies on top of AllowedDeviceNames; naming a
 	// device in both lists is rejected by Validate().
 	ExcludedDeviceNames []string `mapstructure:"excluded_device_names"`
-	GIDIndex            int      `mapstructure:"gid_index"`
+	// ExcludedGIDCIDRs lists networks (CIDRs) whose RDMA devices the agent
+	// never uses: a device whose GID at gid_index (as an IP address; RoCE v2
+	// IPv4-mapped GIDs match IPv4 networks) lies in one of them is closed
+	// right after it is opened, before any queue is created. Unlike device
+	// names, a host's management or service network does not change when
+	// the kernel renames or re-registers an RDMA device.
+	ExcludedGIDCIDRs []string `mapstructure:"excluded_gid_cidrs"`
+	// MappedDevicesOnly makes the agent use only the devices listed in
+	// device_tor_ids. Any other device is closed right after it is opened
+	// and logged at warn level, instead of silently falling back to the
+	// host-wide tor_id. Requires a non-empty device_tor_ids.
+	MappedDevicesOnly bool `mapstructure:"mapped_devices_only"`
+	GIDIndex          int  `mapstructure:"gid_index"`
 	// ServiceLevel is the Service Level (SL, PFC priority) applied to every
 	// Address Handle the agent's RDMA devices create (0-7; see Validate()).
 	ServiceLevel int `mapstructure:"service_level"`
@@ -301,6 +314,8 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("metrics_responder_delay_target_tor", true)
 	v.SetDefault("allowed_device_names", []string{})
 	v.SetDefault("excluded_device_names", []string{})
+	v.SetDefault("excluded_gid_cidrs", []string{})
+	v.SetDefault("mapped_devices_only", false)
 	v.SetDefault("gid_index", 0)
 	v.SetDefault("service_level", 0)
 	v.SetDefault("traffic_class", 0)
@@ -394,6 +409,8 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		MetricsResponderDelayTargetTor: v.GetBool("metrics_responder_delay_target_tor"),
 		AllowedDeviceNames:             v.GetStringSlice("allowed_device_names"),
 		ExcludedDeviceNames:            v.GetStringSlice("excluded_device_names"),
+		ExcludedGIDCIDRs:               v.GetStringSlice("excluded_gid_cidrs"),
+		MappedDevicesOnly:              v.GetBool("mapped_devices_only"),
 		GIDIndex:                       v.GetInt("gid_index"),
 		ServiceLevel:                   v.GetInt("service_level"),
 		TrafficClass:                   v.GetInt("traffic_class"),
@@ -469,6 +486,15 @@ func (c *AgentConfig) Validate() error {
 		if c.IsDeviceExcluded(dev) {
 			return fmt.Errorf("device %q is listed in both allowed_device_names and excluded_device_names", dev)
 		}
+	}
+	for _, cidr := range c.ExcludedGIDCIDRs {
+		if _, _, err := net.ParseCIDR(strings.TrimSpace(cidr)); err != nil {
+			return fmt.Errorf("excluded_gid_cidrs entry %q is not a CIDR: %w", cidr, err)
+		}
+	}
+	// With nothing mapped, mapped_devices_only would leave no device to open.
+	if c.MappedDevicesOnly && len(c.DeviceTorIDs) == 0 {
+		return fmt.Errorf("mapped_devices_only requires a non-empty device_tor_ids")
 	}
 
 	// An empty field (a zero-value AgentConfig) means the default, system_name.
@@ -646,6 +672,8 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.Bool("metrics-enabled", true, "Enable OpenTelemetry metrics export")
 	flags.StringSlice("allowed-device-names", []string{}, "List of allowed RDMA device names (empty = all)")
 	flags.StringSlice("excluded-device-names", []string{}, "List of RDMA device names never to open (applied after allowed-device-names)")
+	flags.StringSlice("excluded-gid-cidrs", []string{}, "Networks (CIDRs) whose RDMA devices are never used, matched against each device's GID at gid-index")
+	flags.Bool("mapped-devices-only", false, "Use only the RDMA devices listed in device_tor_ids (requires a non-empty device_tor_ids)")
 	flags.Int("gid-index", 0, "GID index to use for RDMA devices (0-255)")
 	flags.Int("service-level", 0, "Service Level (SL, PFC priority) for Address Handles (0-7)")
 	flags.Int("traffic-class", 0, "GRH traffic class (DSCP << 2) for Address Handles (0-255)")
@@ -721,6 +749,24 @@ func (c *AgentConfig) IsDeviceExcluded(deviceName string) bool {
 		}
 	}
 	return false
+}
+
+// ExcludedGIDCIDR returns the excluded_gid_cidrs entry that contains ip (a
+// device's GID formatted as an IP address) and whether one does. An IPv4
+// address matches IPv4 networks whether it is written dotted or
+// IPv4-mapped. Entries are assumed valid (see Validate).
+func (c *AgentConfig) ExcludedGIDCIDR(ip string) (string, bool) {
+	addr := net.ParseIP(strings.TrimSpace(ip))
+	if addr == nil {
+		return "", false
+	}
+	for _, cidr := range c.ExcludedGIDCIDRs {
+		_, network, err := net.ParseCIDR(strings.TrimSpace(cidr))
+		if err == nil && network.Contains(addr) {
+			return strings.TrimSpace(cidr), true
+		}
+	}
+	return "", false
 }
 
 // DeviceTorID returns the canonical device_tor_ids entry for an RDMA device

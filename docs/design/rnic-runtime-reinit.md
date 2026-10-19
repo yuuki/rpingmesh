@@ -1,6 +1,10 @@
 # RNIC Runtime Re-initialization
 
-Status: design only, not implemented (tracking ID P3-I). This document
+Status: design only, not implemented (tracking ID P3-I). As an interim
+measure, the agent detects that an opened device was unregistered (its
+`/sys/class/infiniband/<dev>/node_guid` disappears or changes) and exits
+non-zero so systemd restarts it (`internal/agent/device_watch.go`). This
+design would replace that restart with per-RNIC recovery. This document
 specifies how the agent detects an RDMA device or port fault at runtime and
 rebuilds the affected device's Prober, Responder, and queues without a process
 restart.

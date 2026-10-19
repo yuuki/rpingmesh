@@ -346,12 +346,36 @@ pinglist comes back empty or when every probe to a target keeps timing out
 | `cq_poll_mode` | `auto` | `event`, `busy`, or `auto`; see [Event-driven completion handling](#event-driven-completion-handling) |
 | `allowed_device_names` | `[]` | Devices to open; empty opens all |
 | `excluded_device_names` | `[]` | Devices never to open. A device in both lists is a configuration error |
+| `excluded_gid_cidrs` | `[]` | Networks (`10.0.0.0/24`) whose devices are never used, matched against each device's GID at `gid_index` |
+| `mapped_devices_only` | `false` | Use only the devices listed in `device_tor_ids`; requires a non-empty `device_tor_ids` |
 
 The right `gid_index` depends on the device. Many NVIDIA NICs place a RoCE v1
 entry at index 0 and the RoCE v2 entry at a higher index; check with
 `ibv_devinfo -d <dev> -v`. Validation rejects only values outside 0–255. If the
 index does not resolve to a usable GID on a device, the agent exits with an
 error that names the device, port, and GID table size.
+
+Kernel RDMA device names (`mlx5_N`, `mlx5_bond_N`) follow driver probe order
+and RoCE LAG state, so they can change across reboots. A bond's RDMA device,
+for example, can register as a plain `mlx5_N` before RoCE LAG forms and be
+replaced by `mlx5_bond_0` later. Two options select devices without relying on
+names alone:
+
+- `excluded_gid_cidrs` skips a device whose GID (RoCE v2 IPv4-mapped GIDs
+  match IPv4 networks) lies in a listed network, such as the management
+  network. The device is opened to read its GID and closed before any queue is
+  created; it is logged at info level with its name, netdev, and GID.
+- `mapped_devices_only` skips every device without a `device_tor_ids` entry
+  and logs it at warn level. Without it, such a device falls back to `tor_id`;
+  when `device_tor_ids` is set, the agent warns about that fallback.
+
+The agent also checks every 5 s that each opened device is still registered
+under its name with the same node GUID
+(`/sys/class/infiniband/<dev>/node_guid`). If a device disappears (RoCE LAG
+change, NIC reset, driver reload, hot unplug), the agent logs it, shuts down,
+and exits non-zero, so systemd (`Restart=on-failure`) restarts it with the
+current devices. Devices whose node GUID cannot be read at startup are not
+checked.
 
 To choose `service_level` and `traffic_class`, see
 [Choosing `traffic_class` and `service_level`](#choosing-traffic_class-and-service_level).

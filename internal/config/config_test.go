@@ -1148,6 +1148,76 @@ func TestLoadAgentConfig_ExcludedDeviceNamesRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestLoadAgentConfig_ExcludedGIDCIDRs(t *testing.T) {
+	path := writeYAML(t, "agent.yaml", `excluded_gid_cidrs:
+  - 10.0.0.0/24
+  - " fd00:1::/64 "
+`)
+	cfg, err := LoadAgentConfig(path, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cases := map[string]string{
+		"10.0.0.7":        "10.0.0.0/24",
+		"::ffff:10.0.0.7": "10.0.0.0/24", // IPv4-mapped form matches IPv4 networks
+		"10.0.1.7":        "",
+		"fd00:0001:0000:0000:0000:0000:0000:0005": "fd00:1::/64", // full-width GID text
+		"fe80::1":   "",
+		"":          "",
+		"not-an-ip": "",
+	}
+	for ip, want := range cases {
+		got, ok := cfg.ExcludedGIDCIDR(ip)
+		if got != want || ok != (want != "") {
+			t.Errorf("ExcludedGIDCIDR(%q) = (%q, %v), want %q", ip, got, ok, want)
+		}
+	}
+}
+
+func TestLoadAgentConfig_ExcludedGIDCIDRsEnv(t *testing.T) {
+	t.Setenv("RPINGMESH_EXCLUDED_GID_CIDRS", "10.0.0.0/24 192.168.0.0/16")
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := cfg.ExcludedGIDCIDR("192.168.3.4"); !ok {
+		t.Errorf("ExcludedGIDCIDRs = %v, want 192.168.0.0/16 included", cfg.ExcludedGIDCIDRs)
+	}
+}
+
+func TestLoadAgentConfig_MappedDevicesOnly(t *testing.T) {
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MappedDevicesOnly {
+		t.Error("MappedDevicesOnly should default to false")
+	}
+
+	path := writeYAML(t, "agent.yaml", "mapped_devices_only: true\ndevice_tor_ids:\n  mlx5_0: leaf-a\n")
+	cfg, err = LoadAgentConfig(path, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.MappedDevicesOnly {
+		t.Error("MappedDevicesOnly = false, want true")
+	}
+}
+
+func TestLoadAgentConfig_DeviceSelectionRejectsInvalid(t *testing.T) {
+	for name, content := range map[string]string{
+		"bare address":               "excluded_gid_cidrs: [10.0.0.1]\n",
+		"garbage":                    "excluded_gid_cidrs: [mgmt]\n",
+		"mapped_devices_only no map": "mapped_devices_only: true\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := LoadAgentConfig(writeYAML(t, "agent.yaml", content), nil); err == nil {
+				t.Error("expected a validation error, got nil")
+			}
+		})
+	}
+}
+
 func TestLoadAgentConfig_LLDPDefaults(t *testing.T) {
 	cfg, err := LoadAgentConfig("", nil)
 	if err != nil {

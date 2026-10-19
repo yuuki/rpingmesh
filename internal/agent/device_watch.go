@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -24,64 +25,115 @@ const (
 	deviceLostStopTimeout = 30 * time.Second
 )
 
-// watchedDevice is an opened RDMA device's identity in sysfs, recorded at
-// startup so a later check can tell that the device was unregistered, or
-// that its name now belongs to a different device.
+// watchedDevice is an opened RDMA device's uverbs node in sysfs
+// (/sys/class/infiniband_verbs/uverbsN), recorded at startup.
+//
+// The uverbs node, not /sys/class/infiniband/<dev>, is what tells that the
+// device is gone: on unregistration the kernel deletes the uverbs node
+// first, and only then waits for open contexts to close (on drivers without
+// disassociate_ucontext, such as rxe) before removing the IB device. A
+// watch on the IB device would wait for the agent to close the device while
+// the kernel waits for the agent. The node's inode changes when the device
+// is re-registered, even under the same name and uverbs number, and its
+// ibdev attribute follows a rename.
 type watchedDevice struct {
-	name     string
-	netdev   string
-	nodeGUID string
+	name   string
+	netdev string
+	uverbs string // path of the uverbs node under the sysfs root
+	ino    uint64
 }
 
-// nodeGUIDPath returns the sysfs node_guid file of an RDMA device.
-func nodeGUIDPath(sysfsRoot, device string) string {
-	return filepath.Join(sysfsRoot, "class", "infiniband", device, "node_guid")
+// uverbsClassDir returns the sysfs directory listing the uverbs nodes.
+func uverbsClassDir(sysfsRoot string) string {
+	return filepath.Join(sysfsRoot, "class", "infiniband_verbs")
 }
 
-// readNodeGUID reads an RDMA device's node GUID from sysfs.
-func readNodeGUID(sysfsRoot, device string) (string, error) {
-	b, err := os.ReadFile(nodeGUIDPath(sysfsRoot, device))
+// findUverbsNode returns the path of the uverbs node whose ibdev attribute
+// names device.
+func findUverbsNode(sysfsRoot, device string) (string, error) {
+	entries, err := os.ReadDir(uverbsClassDir(sysfsRoot))
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		path := filepath.Join(uverbsClassDir(sysfsRoot), e.Name())
+		if ibdev, err := readIBDev(path); err == nil && ibdev == device {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("no uverbs node for RDMA device %s", device)
+}
+
+// readIBDev reads the IB device name a uverbs node belongs to.
+func readIBDev(uverbsPath string) (string, error) {
+	b, err := os.ReadFile(filepath.Join(uverbsPath, "ibdev"))
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(b)), nil
 }
 
-// recordWatchedDevices records the sysfs identity of every opened device.
-// A device whose node GUID cannot be read (e.g. /sys/class/infiniband is not
+// inode returns the inode of path, following symlinks (the class entries are
+// symlinks to the device directories).
+func inode(path string) (uint64, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("no inode for %s", path)
+	}
+	return uint64(st.Ino), nil
+}
+
+// recordWatchedDevices records the uverbs node of every opened device. A
+// device whose node cannot be found (e.g. /sys/class/infiniband_verbs is not
 // mounted in a container) is not watched, so a missing sysfs never makes a
 // healthy agent exit.
 func (a *Agent) recordWatchedDevices() {
 	a.watchedDevices = nil
 	for i, dev := range a.devices {
-		guid, err := readNodeGUID(a.sysfsRoot, dev.Info.DeviceName)
-		if err != nil || guid == "" {
+		path, err := findUverbsNode(a.sysfsRoot, dev.Info.DeviceName)
+		var ino uint64
+		if err == nil {
+			ino, err = inode(path)
+		}
+		if err != nil {
 			a.logger.Warn().Err(err).
 				Str("device", dev.Info.DeviceName).
-				Msg("Cannot read the device's node GUID from sysfs; its removal will not be detected")
+				Msg("Cannot find the device's uverbs node in sysfs; its removal will not be detected")
 			continue
 		}
 		a.watchedDevices = append(a.watchedDevices, watchedDevice{
-			name:     dev.Info.DeviceName,
-			netdev:   a.cachedNetdev(i),
-			nodeGUID: guid,
+			name:   dev.Info.DeviceName,
+			netdev: a.cachedNetdev(i),
+			uverbs: path,
+			ino:    ino,
 		})
 	}
 }
 
-// checkWatchedDevice returns a non-nil error when the device is no longer
-// registered under its name, or its name now belongs to another device (a
-// different node GUID). Any other read error is not treated as a removal.
-func checkWatchedDevice(sysfsRoot string, d watchedDevice) error {
-	guid, err := readNodeGUID(sysfsRoot, d.name)
+// checkWatchedDevice returns a non-nil error when the device was
+// unregistered, re-registered (its open context is dead either way), or
+// renamed. A rename leaves the context working, but device_tor_ids,
+// device_plane_ids, the device filters, and the source_rdma_device label
+// are keyed by name, so the agent restarts to apply them to the new name.
+// Any other read error is not treated as a loss.
+func checkWatchedDevice(d watchedDevice) error {
+	ino, err := inode(d.uverbs)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("RDMA device %s (netdev %q) was unregistered by the kernel", d.name, d.netdev)
 	case err != nil:
 		return nil
-	case guid != d.nodeGUID:
-		return fmt.Errorf("RDMA device name %s now belongs to another device (node GUID %s, was %s)",
-			d.name, guid, d.nodeGUID)
+	case ino != d.ino:
+		return fmt.Errorf("RDMA device %s (netdev %q) was re-registered; its open context is no longer valid",
+			d.name, d.netdev)
+	}
+	ibdev, err := readIBDev(d.uverbs)
+	if err == nil && ibdev != d.name {
+		return fmt.Errorf("RDMA device %s (netdev %q) was renamed to %s", d.name, d.netdev, ibdev)
 	}
 	return nil
 }
@@ -111,12 +163,12 @@ func (a *Agent) startDeviceWatch(ctx context.Context) {
 				return
 			case <-ticker.C:
 				for _, d := range a.watchedDevices {
-					if err := checkWatchedDevice(a.sysfsRoot, d); err != nil {
+					if err := checkWatchedDevice(d); err != nil {
 						a.logger.Warn().
 							Str("device", d.name).
 							Str("netdev", d.netdev).
 							Err(err).
-							Msg("Opened RDMA device disappeared; stopping the agent so it restarts with the current devices")
+							Msg("Opened RDMA device was removed, re-registered, or renamed; stopping the agent so it restarts with the current devices")
 						select {
 						case a.deviceLost <- err:
 						default:

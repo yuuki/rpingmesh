@@ -14,16 +14,35 @@ import (
 	"github.com/yuuki/rpingmesh/internal/rdmabridge"
 )
 
-// writeNodeGUID creates sysfs/class/infiniband/<device>/node_guid.
-func writeNodeGUID(t *testing.T, sysfs, device, guid string) {
+// writeUverbsNode creates sysfs/class/infiniband_verbs/<node>/ibdev naming
+// device, and returns the node's path.
+func writeUverbsNode(t *testing.T, sysfs, node, device string) string {
 	t.Helper()
-	dir := filepath.Join(sysfs, "class", "infiniband", device)
+	dir := filepath.Join(sysfs, "class", "infiniband_verbs", node)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "node_guid"), []byte(guid+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "ibdev"), []byte(device+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	return dir
+}
+
+// recordOne records the watch identity of a single device.
+func recordOne(t *testing.T, sysfs, device string) watchedDevice {
+	t.Helper()
+	a, err := NewAgent(&config.AgentConfig{AgentID: "agent-1"})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	a.logger = zerolog.Nop()
+	a.sysfsRoot = sysfs
+	a.devices = []*rdmabridge.Device{fakeDevice(device, "0")}
+	a.recordWatchedDevices()
+	if len(a.watchedDevices) != 1 {
+		t.Fatalf("watchedDevices = %+v, want one entry", a.watchedDevices)
+	}
+	return a.watchedDevices[0]
 }
 
 // TestDeviceSkipReason verifies the post-open filters: a GID in
@@ -139,31 +158,56 @@ func TestAgent_UnmappedDeviceFallbackWarns(t *testing.T) {
 	}
 }
 
-// TestCheckWatchedDevice covers the removal conditions: the device is
-// gone, its name now belongs to another device, or it is unchanged.
+// TestCheckWatchedDevice covers the loss conditions: the uverbs node is
+// gone, it was re-created (re-registration under the same name and number),
+// or its device was renamed. An unchanged node is not a loss.
 func TestCheckWatchedDevice(t *testing.T) {
 	sysfs := t.TempDir()
-	writeNodeGUID(t, sysfs, "mlx5_0", "aaaa:bbbb:cccc:0001")
-	writeNodeGUID(t, sysfs, "mlx5_1", "aaaa:bbbb:cccc:0099")
+	node := writeUverbsNode(t, sysfs, "uverbs2", "mlx5_2")
+	writeUverbsNode(t, sysfs, "uverbs0", "mlx5_0")
 
-	if err := checkWatchedDevice(sysfs, watchedDevice{name: "mlx5_0", nodeGUID: "aaaa:bbbb:cccc:0001"}); err != nil {
+	d := recordOne(t, sysfs, "mlx5_2")
+	if d.uverbs != node {
+		t.Fatalf("recorded uverbs node = %s, want %s", d.uverbs, node)
+	}
+	if err := checkWatchedDevice(d); err != nil {
 		t.Errorf("present device reported lost: %v", err)
 	}
-	if err := checkWatchedDevice(sysfs, watchedDevice{name: "mlx5_1", nodeGUID: "aaaa:bbbb:cccc:0002"}); err == nil {
-		t.Error("device name reused by another node GUID not reported")
+
+	if err := os.WriteFile(filepath.Join(node, "ibdev"), []byte("mlx5_bond_0\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if err := checkWatchedDevice(sysfs, watchedDevice{name: "mlx5_2", netdev: "bond0", nodeGUID: "x"}); err == nil ||
-		!strings.Contains(err.Error(), "unregistered") {
+	if err := checkWatchedDevice(d); err == nil || !strings.Contains(err.Error(), "renamed to mlx5_bond_0") {
+		t.Errorf("rename: err = %v, want a renamed error", err)
+	}
+
+	// Re-created with the same name and uverbs number. The replacement is
+	// created before the original is removed so that the filesystem cannot
+	// hand it the original's inode.
+	if err := os.WriteFile(filepath.Join(node, "ibdev"), []byte("mlx5_2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fresh := writeUverbsNode(t, sysfs, "uverbs2.new", "mlx5_2")
+	if err := os.RemoveAll(node); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkWatchedDevice(d); err == nil || !strings.Contains(err.Error(), "unregistered") {
 		t.Errorf("removed device: err = %v, want an unregistered error", err)
+	}
+	if err := os.Rename(fresh, node); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkWatchedDevice(d); err == nil || !strings.Contains(err.Error(), "re-registered") {
+		t.Errorf("re-registered device: err = %v, want a re-registered error", err)
 	}
 }
 
-// TestAgent_RecordWatchedDevicesSkipsUnreadable verifies that a device whose
-// node GUID cannot be read is not watched, so a missing sysfs can never make
-// the agent exit.
-func TestAgent_RecordWatchedDevicesSkipsUnreadable(t *testing.T) {
+// TestAgent_RecordWatchedDevicesSkipsUnknown verifies that a device without
+// a uverbs node is not watched, so a missing sysfs can never make the agent
+// exit.
+func TestAgent_RecordWatchedDevicesSkipsUnknown(t *testing.T) {
 	sysfs := t.TempDir()
-	writeNodeGUID(t, sysfs, "rxe0", "guid-0")
+	node := writeUverbsNode(t, sysfs, "uverbs0", "rxe0")
 
 	a, err := NewAgent(&config.AgentConfig{AgentID: "agent-1"})
 	if err != nil {
@@ -175,8 +219,18 @@ func TestAgent_RecordWatchedDevicesSkipsUnreadable(t *testing.T) {
 	a.deviceNetdevs = []string{"eth0", "eth1"}
 
 	a.recordWatchedDevices()
-	if len(a.watchedDevices) != 1 || a.watchedDevices[0] != (watchedDevice{name: "rxe0", netdev: "eth0", nodeGUID: "guid-0"}) {
+	if len(a.watchedDevices) != 1 || a.watchedDevices[0].name != "rxe0" ||
+		a.watchedDevices[0].netdev != "eth0" || a.watchedDevices[0].uverbs != node {
 		t.Errorf("watchedDevices = %+v, want only rxe0", a.watchedDevices)
+	}
+
+	b, _ := NewAgent(&config.AgentConfig{AgentID: "agent-1"})
+	b.logger = zerolog.Nop()
+	b.sysfsRoot = filepath.Join(sysfs, "missing")
+	b.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0")}
+	b.recordWatchedDevices()
+	if len(b.watchedDevices) != 0 {
+		t.Errorf("watchedDevices without sysfs = %+v, want none", b.watchedDevices)
 	}
 }
 
@@ -185,8 +239,8 @@ func TestAgent_RecordWatchedDevicesSkipsUnreadable(t *testing.T) {
 // returns once the watch goroutine has exited.
 func TestAgent_DeviceWatchReportsLoss(t *testing.T) {
 	sysfs := t.TempDir()
-	writeNodeGUID(t, sysfs, "mlx5_0", "guid-0")
-	writeNodeGUID(t, sysfs, "mlx5_2", "guid-2")
+	writeUverbsNode(t, sysfs, "uverbs0", "mlx5_0")
+	node := writeUverbsNode(t, sysfs, "uverbs2", "mlx5_2")
 
 	a, err := NewAgent(&config.AgentConfig{AgentID: "agent-1"})
 	if err != nil {
@@ -208,7 +262,7 @@ func TestAgent_DeviceWatchReportsLoss(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	if err := os.RemoveAll(filepath.Join(sysfs, "class", "infiniband", "mlx5_2")); err != nil {
+	if err := os.RemoveAll(node); err != nil {
 		t.Fatal(err)
 	}
 	select {

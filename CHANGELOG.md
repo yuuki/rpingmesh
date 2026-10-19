@@ -20,11 +20,11 @@ All notable changes to this project are documented in this file.
 - The agent no longer keeps probing through an RDMA device that the kernel
   removed after the agent opened it (RoCE LAG forming after boot, NIC reset,
   driver reload, hot unplug), which failed every probe with `send_error`
-  until a manual restart. It checks every 5 s that each opened device is still
-  registered with the same node GUID; on a loss it shuts down and exits
-  non-zero, so systemd (`Restart=on-failure`) restarts it with the current
-  devices. Agents run without such a supervisor stay down after a device
-  loss.
+  until a manual restart. It checks every 5 s the uverbs node of each opened
+  device; when the device is removed, re-registered, or renamed, the agent
+  shuts down and exits non-zero, so systemd (`Restart=on-failure`) restarts
+  it with the current devices. Agents run without such a supervisor stay down
+  after a device loss.
 
 ## [0.6.0] - 2026-10-19
 

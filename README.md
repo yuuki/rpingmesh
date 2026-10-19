@@ -369,13 +369,17 @@ names alone:
   and logs it at warn level. Without it, such a device falls back to `tor_id`;
   when `device_tor_ids` is set, the agent warns about that fallback.
 
-The agent also checks every 5 s that each opened device is still registered
-under its name with the same node GUID
-(`/sys/class/infiniband/<dev>/node_guid`). If a device disappears (RoCE LAG
-change, NIC reset, driver reload, hot unplug), the agent logs it, shuts down,
-and exits non-zero, so systemd (`Restart=on-failure`) restarts it with the
-current devices. Devices whose node GUID cannot be read at startup are not
-checked.
+The agent also checks every 5 s the uverbs node of each opened device
+(`/sys/class/infiniband_verbs/uverbsN`). If the node disappears or is
+re-created (RoCE LAG change, NIC reset, driver reload, hot unplug), or the
+device is renamed, the agent logs it, shuts down, and exits non-zero, so
+systemd (`Restart=on-failure`) restarts it with the current devices. A rename
+leaves the device working, but the device filters, `device_tor_ids`,
+`device_plane_ids`, and the `source_rdma_device` label are keyed by name.
+The kernel deletes the uverbs node before it waits for open contexts to
+close, so this also releases a removal that waits for the agent (drivers
+without context disassociation, such as rxe). Devices without a uverbs node
+in sysfs at startup are not checked.
 
 To choose `service_level` and `traffic_class`, see
 [Choosing `traffic_class` and `service_level`](#choosing-traffic_class-and-service_level).

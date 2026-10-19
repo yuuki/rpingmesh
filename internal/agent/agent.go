@@ -161,6 +161,16 @@ type Agent struct {
 	// the controller to keep the agent's registry entry alive.
 	heartbeatStopCh chan struct{}
 	heartbeatWg     sync.WaitGroup
+
+	// watchedDevices, recorded by recordWatchedDevices, are the opened
+	// devices whose removal startDeviceWatch detects; deviceLost carries the
+	// first loss to Run. deviceWatchPeriod overrides deviceWatchInterval in
+	// tests.
+	watchedDevices    []watchedDevice
+	deviceLost        chan error
+	deviceWatchStopCh chan struct{}
+	deviceWatchWg     sync.WaitGroup
+	deviceWatchPeriod time.Duration
 }
 
 // NewAgent creates a new Agent instance with the given configuration.
@@ -181,6 +191,7 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 		logger:         log.With().Str("component", "agent").Logger(),
 		lldpQuerier:    lldp.CLIQuerier{Path: cfg.LLDPCLIPath},
 		sysfsRoot:      lldp.DefaultSysfsRoot,
+		deviceLost:     make(chan error, 1),
 	}
 
 	// Apply optional hard runtime caps as early as possible (before any heavy
@@ -356,6 +367,18 @@ func (a *Agent) resolveDeviceTorIDs(lldpTors []string) {
 			Str("tor_id", tor).
 			Str("source", source).
 			Msg("Resolved device ToR")
+		if source == torSourceAgent && len(a.cfg.DeviceTorIDs) > 0 {
+			// In a mapped deployment an unmapped device is usually one that
+			// was renamed or registered unexpectedly, and tor_id is often a
+			// placeholder, so its probes would be attributed to the wrong ToR.
+			a.logger.Warn().
+				Str("device", dev.Info.DeviceName).
+				Str("netdev", a.cachedNetdev(i)).
+				Str("gid", dev.Info.GID).
+				Str("tor_id", tor).
+				Msg("Device has no device_tor_ids entry and falls back to tor_id; " +
+					"check whether it was renamed, or set mapped_devices_only to skip it")
+		}
 	}
 	for key := range a.cfg.DeviceTorIDs {
 		if !matched[key] {
@@ -547,13 +570,15 @@ func (a *Agent) Initialize(ctx context.Context) error {
 		return fmt.Errorf("failed to open RDMA devices: %w", err)
 	}
 	if len(a.devices) == 0 {
-		if len(a.cfg.ExcludedDeviceNames) > 0 {
-			return fmt.Errorf("no RDMA devices available (excluded_device_names: %v)", a.cfg.ExcludedDeviceNames)
+		if len(a.cfg.ExcludedDeviceNames) > 0 || len(a.cfg.ExcludedGIDCIDRs) > 0 || a.cfg.MappedDevicesOnly {
+			return fmt.Errorf("no RDMA devices available (excluded_device_names: %v, excluded_gid_cidrs: %v, mapped_devices_only: %v)",
+				a.cfg.ExcludedDeviceNames, a.cfg.ExcludedGIDCIDRs, a.cfg.MappedDevicesOnly)
 		}
 		return fmt.Errorf("no RDMA devices available")
 	}
 	a.logger.Info().Int("device_count", len(a.devices)).Msg("RDMA devices opened")
 	a.resolveDeviceNetdevs()
+	a.recordWatchedDevices()
 	a.resolveDeviceTorIDs(a.discoverLLDPTorIDs(ctx))
 	a.resolveDevicePlaneIDs()
 
@@ -897,6 +922,11 @@ func (a *Agent) Start(ctx context.Context) error {
 	// controller, keeping the agent's registry entry alive.
 	a.startHeartbeat(ctx)
 
+	// Watch the opened devices so that a device the kernel removes (RoCE
+	// LAG change, NIC reset, driver reload) stops the agent instead of
+	// leaving it probing through a dead context.
+	a.startDeviceWatch(ctx)
+
 	// Start the metrics result consumer if metrics are enabled. It reads from
 	// the fan-in channel that merges every prober's results (see
 	// createResultsFanIn), so results from every device are recorded.
@@ -927,6 +957,8 @@ func (a *Agent) Start(ctx context.Context) error {
 // and event rings).
 func (a *Agent) Stop(ctx context.Context) {
 	a.logger.Info().Msg("Stopping agent")
+
+	a.stopDeviceWatch()
 
 	// Stop all cluster monitors first to prevent new pinglist updates.
 	for _, monitor := range a.monitors {
@@ -1116,8 +1148,13 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("agent start failed: %w", err)
 	}
 
-	// Block until the context is cancelled (signal handler, etc.).
-	<-ctx.Done()
+	// Block until the context is cancelled (signal handler, etc.) or an
+	// opened device disappears.
+	select {
+	case <-ctx.Done():
+	case err := <-a.deviceLost:
+		return a.stopAfterDeviceLoss(err)
+	}
 	a.logger.Info().Msg("Context cancelled, initiating shutdown")
 
 	// Use a fresh context for shutdown operations since the parent is cancelled.
@@ -1127,10 +1164,82 @@ func (a *Agent) Run(ctx context.Context) error {
 	return nil
 }
 
+// stopAfterDeviceLoss stops the agent after an opened device disappeared
+// and returns an error, so the process exits non-zero and systemd
+// (Restart=on-failure) restarts it; the restart re-evaluates the
+// configuration against the current devices. The stop is bounded by
+// deviceLostStopTimeout so a teardown stuck on the removed device cannot
+// keep the process alive.
+func (a *Agent) stopAfterDeviceLoss(lost error) error {
+	a.logger.Error().Err(lost).Msg("RDMA device lost, shutting down")
+	done := make(chan struct{})
+	go func() {
+		a.Stop(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(deviceLostStopTimeout):
+		a.logger.Error().
+			Dur("timeout", deviceLostStopTimeout).
+			Msg("Shutdown after device loss timed out; exiting anyway")
+	}
+	return fmt.Errorf("RDMA device lost: %w", lost)
+}
+
+// deviceSkipReason reports why an opened device must not be used, or "" to
+// keep it. These filters need the device's GID, so unlike
+// excluded_device_names they run after the device is opened (but before any
+// queue is created on it).
+func deviceSkipReason(cfg *config.AgentConfig, info rdmabridge.DeviceInfo) string {
+	if cidr, ok := cfg.ExcludedGIDCIDR(info.IPAddr); ok {
+		return "excluded_gid_cidrs:" + cidr
+	}
+	if cfg.MappedDevicesOnly {
+		if _, ok := cfg.DeviceTorID(info.DeviceName); !ok {
+			return "mapped_devices_only"
+		}
+	}
+	return ""
+}
+
+// admitDevice applies deviceSkipReason to a freshly opened device. A skipped
+// device is logged with its netdev and GID and closed, and admitDevice
+// returns false. A device missing from device_tor_ids is logged at warn
+// level: in a mapped deployment it usually means a device was renamed or
+// appeared unexpectedly (e.g. a bond's RDMA device registered before RoCE
+// LAG formed).
+func (a *Agent) admitDevice(dev *rdmabridge.Device) bool {
+	reason := deviceSkipReason(a.cfg, dev.Info)
+	if reason == "" {
+		return true
+	}
+	netdev, _ := lldp.NetdevForRDMAPort(a.sysfsRoot, dev.Info.DeviceName,
+		dev.Info.ActivePort, dev.Info.ActiveGIDIndex)
+	event := a.logger.Info()
+	msg := "Skipping RDMA device whose GID is in excluded_gid_cidrs"
+	if reason == "mapped_devices_only" {
+		event = a.logger.Warn()
+		msg = "Skipping RDMA device without a device_tor_ids entry (mapped_devices_only); " +
+			"check whether a device was renamed or registered unexpectedly"
+	}
+	event.
+		Str("device_name", dev.Info.DeviceName).
+		Str("netdev", netdev).
+		Str("gid", dev.Info.GID).
+		Str("ip", dev.Info.IPAddr).
+		Str("reason", reason).
+		Msg(msg)
+	dev.Close()
+	return false
+}
+
 // openDevices opens RDMA devices based on configuration. If AllowedDeviceNames
 // is configured, only those devices are opened by name. Otherwise, all available
 // devices are opened by index. Devices in ExcludedDeviceNames are skipped before
-// they are opened, so no verbs resources are ever allocated on them.
+// they are opened, so no verbs resources are ever allocated on them. Devices
+// rejected by excluded_gid_cidrs or mapped_devices_only are closed right
+// after opening (see admitDevice).
 func (a *Agent) openDevices() error {
 	gidIndex := a.cfg.GIDIndex
 	// Config.Validate() guarantees ServiceLevel is in [0,7] and TrafficClass
@@ -1156,6 +1265,9 @@ func (a *Agent) openDevices() error {
 				a.logger.Warn().Err(err).
 					Str("device_name", name).
 					Msg("Failed to open allowed RDMA device, skipping")
+				continue
+			}
+			if !a.admitDevice(dev) {
 				continue
 			}
 			dev.CQPollMode = cqMode
@@ -1197,6 +1309,9 @@ func (a *Agent) openDevices() error {
 				a.logger.Warn().Err(err).
 					Int("index", i).
 					Msg("Failed to open RDMA device by index, skipping")
+				continue
+			}
+			if !a.admitDevice(dev) {
 				continue
 			}
 			dev.CQPollMode = cqMode

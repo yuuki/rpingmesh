@@ -93,6 +93,13 @@ allowed_device_names: []         # Empty = all devices
 # RDMA devices never to open (e.g. a storage-only or faulty RNIC). Applied on
 # top of allowed_device_names; a name in both lists is a config error.
 excluded_device_names: []        # Empty = exclude nothing
+# Networks whose RDMA devices are never used, matched against each device's GID
+# at gid_index (e.g. the management network). Unlike device names, this does
+# not change when the kernel renames an RDMA device.
+excluded_gid_cidrs: []           # e.g. ["10.0.0.0/24"]
+# Use only the devices listed in device_tor_ids; others are skipped with a
+# warning instead of falling back to tor_id. Requires device_tor_ids.
+mapped_devices_only: false
 
 # Telemetry
 metrics_enabled: true

@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Agent option `excluded_gid_cidrs`: skip RDMA devices whose GID at
+  `gid_index` lies in one of the listed networks (for example the management
+  network). Unlike `excluded_device_names`, it keeps working when the kernel
+  renames a device.
+- Agent option `mapped_devices_only`: use only the devices listed in
+  `device_tor_ids` and warn about the rest. Off by default, so unmapped devices
+  still fall back to `tor_id`; the agent now warns about that fallback when
+  `device_tor_ids` is set.
+
+### Fixed
+
+- The agent no longer keeps probing through an RDMA device that the kernel
+  removed after the agent opened it (RoCE LAG forming after boot, NIC reset,
+  driver reload, hot unplug), which failed every probe with `send_error`
+  until a manual restart. It checks every 5 s the uverbs node of each opened
+  device; when the device is removed, re-registered, or renamed, the agent
+  shuts down and exits non-zero, so systemd (`Restart=on-failure`) restarts
+  it with the current devices. Agents run without such a supervisor stay down
+  after a device loss.
+
 ## [0.6.0] - 2026-10-19
 
 ### Changed

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -101,8 +102,10 @@ const periodicReaderInterval = 10 * time.Second
 //     outright before any ACK could be expected.
 //   - reasonInvalidRTT: all 6 timestamps arrived (result.Success == true) but
 //     probe.CalculateRTT rejected the measurement (rtt.Valid == false), e.g.
-//     a small negative NetworkRTT from SW-timestamp jitter on soft-RoCE. This
-//     is measurement noise, not a protocol failure.
+//     a small negative NetworkRTT from SW-timestamp jitter on soft-RoCE, or a
+//     ResponderDelay above probe.MaxSaneDelay from a responder that fell
+//     behind. It is not a protocol failure; rpingmesh.probe_invalid_total
+//     splits it by probe.InvalidKind.
 //   - reasonUnknown: a failed result whose ErrorMessage does not match a
 //     known pattern; kept so new failure paths are still visible instead of
 //     silently falling into one of the above buckets.
@@ -112,6 +115,12 @@ const (
 	reasonInvalidRTT = "invalid_rtt"
 	reasonUnknown    = "unknown"
 )
+
+// invalidRTTWarnInterval is the minimum interval between the Warn-level
+// logs of rejected measurements (see logInvalidRTT). Rejections are counted
+// on rpingmesh.probe_invalid_total regardless; the Warn log only samples
+// them so a burst of hundreds per second cannot flood the journal.
+const invalidRTTWarnInterval = 10 * time.Second
 
 // probeFailureReason classifies a non-successful probe outcome into one of
 // the fixed reason buckets documented above. It is the single place that
@@ -267,16 +276,24 @@ func WithCardinalityLimit(limit int) Option {
 // goes only to the opt-in target instruments. GID-level detail is emitted
 // only in debug logs.
 type MetricsCollector struct {
-	meterProvider    *sdkmetric.MeterProvider
-	meter            metric.Meter
-	networkRTT       metric.Int64Histogram // nanoseconds
-	proberDelay      metric.Int64Histogram // nanoseconds
-	responderDelay   metric.Int64Histogram // nanoseconds
-	probeSuccess     metric.Int64Counter
-	probeFailed      metric.Int64Counter
-	probeTotal       metric.Int64Counter
-	eventRingDropped metric.Int64ObservableCounter
-	selfThrottle     metric.Float64ObservableGauge
+	meterProvider  *sdkmetric.MeterProvider
+	meter          metric.Meter
+	networkRTT     metric.Int64Histogram // nanoseconds
+	proberDelay    metric.Int64Histogram // nanoseconds
+	responderDelay metric.Int64Histogram // nanoseconds
+	probeSuccess   metric.Int64Counter
+	probeFailed    metric.Int64Counter
+	probeTotal     metric.Int64Counter
+	// probeInvalid splits the reason="invalid_rtt" failures by
+	// probe.InvalidKind (attribute "kind").
+	probeInvalid       metric.Int64Counter
+	eventRingDropped   metric.Int64ObservableCounter
+	eventRingOccupancy metric.Int64ObservableGauge
+	eventRingCapacity  metric.Int64ObservableGauge
+	hwTimestamps       metric.Int64ObservableGauge
+	selfThrottle       metric.Float64ObservableGauge
+	// invalidWarn rate-limits the Warn log of rejected measurements.
+	invalidWarn invalidRTTWarnLimiter
 	// target holds the rpingmesh.target_rnic.* instruments; nil unless
 	// WithTargetRnicLabels enabled them.
 	target           *targetInstruments
@@ -299,6 +316,30 @@ type targetInstruments struct {
 	probeSuccess   metric.Int64Counter
 	probeFailed    metric.Int64Counter
 	probeTotal     metric.Int64Counter
+	probeInvalid   metric.Int64Counter
+}
+
+// invalidRTTWarnLimiter lets one Warn log through per invalidRTTWarnInterval
+// and counts the rejections it suppressed in between.
+type invalidRTTWarnLimiter struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed uint64
+}
+
+// allow reports whether a Warn log may be emitted at now and, if so, how
+// many rejections were suppressed since the previous one.
+func (l *invalidRTTWarnLimiter) allow(now time.Time) (bool, uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.last.IsZero() && now.Sub(l.last) < invalidRTTWarnInterval {
+		l.suppressed++
+		return false, 0
+	}
+	suppressed := l.suppressed
+	l.last = now
+	l.suppressed = 0
+	return true, suppressed
 }
 
 // instanceID returns a value suitable for the OTel resource's
@@ -516,6 +557,15 @@ func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOpt
 		return nil, err
 	}
 
+	probeInvalid, err := meter.Int64Counter(
+		"rpingmesh.probe_invalid_total",
+		metric.WithDescription("Total number of probes whose 6 timestamps arrived but whose RTT was rejected, by rejection kind"),
+		metric.WithUnit("{probe}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// Registered without a callback here: the EventRing values it reads are
 	// owned by the agent package (internal/agent/agent.go), not telemetry.
 	// RegisterEventRingDropCallback wires the callback in once the agent has
@@ -524,6 +574,34 @@ func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOpt
 		"rpingmesh.event_ring_dropped_total",
 		metric.WithDescription("Total number of completion events dropped because an event ring was full"),
 		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// The ring occupancy, ring capacity and timestamp-mode gauges are, like
+	// eventRingDropped, owned by the agent package and wired in later by
+	// RegisterEventRingOccupancyCallback and RegisterTimestampModeCallback.
+	eventRingOccupancy, err := meter.Int64ObservableGauge(
+		"rpingmesh.event_ring_occupancy_max",
+		metric.WithDescription("Highest number of completion events waiting in an event ring since the previous collection"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	eventRingCapacity, err := meter.Int64ObservableGauge(
+		"rpingmesh.event_ring_capacity",
+		metric.WithDescription("Number of completion events an event ring can hold"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	hwTimestamps, err := meter.Int64ObservableGauge(
+		"rpingmesh.agent.hw_timestamps",
+		metric.WithDescription("Whether a queue reads NIC hardware completion timestamps (1) or falls back to software timestamps taken when the CQ is polled (0)"),
+		metric.WithUnit("1"),
 	)
 	if err != nil {
 		return nil, err
@@ -561,7 +639,11 @@ func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOpt
 		probeSuccess:            probeSuccess,
 		probeFailed:             probeFailed,
 		probeTotal:              probeTotal,
+		probeInvalid:            probeInvalid,
 		eventRingDropped:        eventRingDropped,
+		eventRingOccupancy:      eventRingOccupancy,
+		eventRingCapacity:       eventRingCapacity,
+		hwTimestamps:            hwTimestamps,
 		selfThrottle:            selfThrottle,
 		target:                  target,
 		targetRnicLabels:        options.targetRnicLabels,
@@ -584,6 +666,7 @@ func registerTargetInstruments(meter metric.Meter, withHistograms bool) (*target
 		{&t.probeTotal, "probe_total", "Total number of probes recorded, per target RNIC"},
 		{&t.probeSuccess, "probe_success_total", "Total number of successful probes with valid RTT, per target RNIC"},
 		{&t.probeFailed, "probe_failed_total", "Total number of failed probes or probes with invalid RTT, per target RNIC"},
+		{&t.probeInvalid, "probe_invalid_total", "Total number of probes whose RTT was rejected, by rejection kind, per target RNIC"},
 	}
 	for _, c := range counters {
 		if *c.dst, err = meter.Int64Counter(targetRnicMetricPrefix+c.name,
@@ -681,6 +764,12 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		failedAttrs := append(attrSet[:len(attrSet):len(attrSet)],
 			attribute.String("reason", reason))
 		mc.probeFailed.Add(ctx, 1, metric.WithAttributes(failedAttrs...))
+		if reason == reasonInvalidRTT {
+			invalidAttrs := append(attrSet[:len(attrSet):len(attrSet)],
+				attribute.String("kind", invalidKindLabel(rtt)))
+			mc.probeInvalid.Add(ctx, 1, metric.WithAttributes(invalidAttrs...))
+			mc.logInvalidRTT(result, rtt, sourceTor, targetTor, sourceRdmaDevice)
+		}
 	}
 
 	if mc.target != nil {
@@ -688,7 +777,13 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 	}
 
 	// Log GID-level detail at Debug level. This provides per-flow
-	// visibility without metric cardinality cost.
+	// visibility without metric cardinality cost. invalid_kind and
+	// validation_error are set only for a rejected measurement
+	// (reason=invalid_rtt), not for a probe that never completed.
+	var rejectedKind, rejectedError string
+	if reason == reasonInvalidRTT {
+		rejectedKind, rejectedError = invalidKindLabel(rtt), validationErrorOf(rtt)
+	}
 	mc.logger.Debug().
 		Str("source_gid", probe.FormatGID(result.SourceGID)).
 		Str("target_gid", probe.FormatGID(result.TargetGID)).
@@ -707,7 +802,72 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		Uint64("t6", result.T6).
 		Bool("success", result.Success).
 		Str("error", result.ErrorMessage).
+		Bool("rtt_valid", success).
+		Str("invalid_kind", rejectedKind).
+		Str("validation_error", rejectedError).
 		Msg("Probe result recorded")
+}
+
+// invalidKindOf returns rtt's InvalidKind as a string ("" when rtt is nil).
+func invalidKindOf(rtt *probe.RTTResult) string {
+	if rtt == nil {
+		return ""
+	}
+	return string(rtt.InvalidKind)
+}
+
+// validationErrorOf returns rtt's ValidationError ("" when rtt is nil).
+func validationErrorOf(rtt *probe.RTTResult) string {
+	if rtt == nil {
+		return ""
+	}
+	return rtt.ValidationError
+}
+
+// invalidKindLabel returns the "kind" attribute of
+// rpingmesh.probe_invalid_total. A rejected result always has a kind; the
+// fallback keeps the attribute non-empty if a future validation path forgets
+// to set one.
+func invalidKindLabel(rtt *probe.RTTResult) string {
+	if kind := invalidKindOf(rtt); kind != "" {
+		return kind
+	}
+	return reasonUnknown
+}
+
+// logInvalidRTT logs a rejected measurement at Warn level, at most once per
+// invalidRTTWarnInterval, with the rejection kind, the validation error and
+// all six timestamps, so an operator can tell a slow responder
+// (responder_delay_too_large) from clock or timestamp trouble without
+// enabling debug logs. Per the cardinality convention, GIDs and IPs stay in
+// the Debug log; this one names the RNICs by hostname and device instead.
+func (mc *MetricsCollector) logInvalidRTT(result *probe.ProbeResult, rtt *probe.RTTResult,
+	sourceTor, targetTor, sourceRdmaDevice string) {
+	ok, suppressed := mc.invalidWarn.allow(time.Now())
+	if !ok {
+		return
+	}
+	ev := mc.logger.Warn().
+		Str("invalid_kind", invalidKindLabel(rtt)).
+		Str("validation_error", validationErrorOf(rtt)).
+		Str("source_tor", sourceTor).
+		Str("target_tor", targetTor).
+		Str("source_rdma_device", sourceRdmaDevice).
+		Str("target_hostname", result.TargetHostname).
+		Str("target_rdma_device", result.TargetRdmaDevice).
+		Uint64("t1", result.T1).
+		Uint64("t2", result.T2).
+		Uint64("t3", result.T3).
+		Uint64("t4", result.T4).
+		Uint64("t5", result.T5).
+		Uint64("t6", result.T6).
+		Uint64("suppressed_since_last", suppressed)
+	if rtt != nil {
+		ev = ev.Int64("network_rtt_ns", rtt.NetworkRTT).
+			Int64("prober_delay_ns", rtt.ProberDelay).
+			Int64("responder_delay_ns", rtt.ResponderDelay)
+	}
+	ev.Msg("Probe measurement rejected (sampled; see rpingmesh.probe_invalid_total for the full count)")
 }
 
 // recordTargetRnic records one probe on the rpingmesh.target_rnic.*
@@ -736,8 +896,12 @@ func (mc *MetricsCollector) recordTargetRnic(ctx context.Context, baseAttrs []at
 	t := mc.target
 	t.probeTotal.Add(ctx, 1, attrs)
 	if !success {
-		attrSet = append(attrSet, attribute.String("reason", reason))
-		t.probeFailed.Add(ctx, 1, metric.WithAttributes(attrSet...))
+		failedAttrs := append(attrSet[:len(attrSet):len(attrSet)], attribute.String("reason", reason))
+		t.probeFailed.Add(ctx, 1, metric.WithAttributes(failedAttrs...))
+		if reason == reasonInvalidRTT {
+			invalidAttrs := append(attrSet[:len(attrSet):len(attrSet)], attribute.String("kind", invalidKindLabel(rtt)))
+			t.probeInvalid.Add(ctx, 1, metric.WithAttributes(invalidAttrs...))
+		}
 		return
 	}
 	t.probeSuccess.Add(ctx, 1, attrs)
@@ -774,6 +938,82 @@ func (mc *MetricsCollector) RegisterEventRingDropCallback(readers map[string]fun
 	)
 	if err != nil {
 		return fmt.Errorf("register event ring drop callback: %w", err)
+	}
+	return nil
+}
+
+// EventRingOccupancy is one sample of an event ring's fill level for
+// RegisterEventRingOccupancyCallback.
+type EventRingOccupancy struct {
+	// Max is the highest number of events waiting in the ring since the
+	// previous sample.
+	Max uint64
+	// Capacity is the number of events the ring can hold.
+	Capacity uint64
+}
+
+// RegisterEventRingOccupancyCallback registers an OTel callback that reports,
+// for each named ring, rpingmesh.event_ring_occupancy_max (the highest fill
+// level since the previous collection) and rpingmesh.event_ring_capacity,
+// both with a "ring" attribute. A max occupancy that approaches the capacity
+// warns that the consumer is falling behind before
+// rpingmesh.event_ring_dropped_total starts to grow. readers maps a ring
+// label to a function that returns that ring's sample and resets its max, so
+// it is called exactly once per collection cycle.
+func (mc *MetricsCollector) RegisterEventRingOccupancyCallback(readers map[string]func() EventRingOccupancy) error {
+	_, err := mc.meter.RegisterCallback(
+		func(_ context.Context, o metric.Observer) error {
+			for label, read := range readers {
+				sample := read()
+				attrs := metric.WithAttributes(attribute.String("ring", label))
+				o.ObserveInt64(mc.eventRingOccupancy, int64(sample.Max), attrs)
+				o.ObserveInt64(mc.eventRingCapacity, int64(sample.Capacity), attrs)
+			}
+			return nil
+		},
+		mc.eventRingOccupancy, mc.eventRingCapacity,
+	)
+	if err != nil {
+		return fmt.Errorf("register event ring occupancy callback: %w", err)
+	}
+	return nil
+}
+
+// QueueTimestampMode reports the completion timestamp source of one queue
+// for RegisterTimestampModeCallback.
+type QueueTimestampMode struct {
+	RdmaDevice string // e.g. "mlx5_0"
+	Queue      string // "prober" or "responder"
+	// HWTimestamps is true when the queue reads NIC wallclock completion
+	// timestamps, false when it fell back to software timestamps.
+	HWTimestamps bool
+}
+
+// RegisterTimestampModeCallback registers an OTel callback that reports
+// rpingmesh.agent.hw_timestamps (1 = hardware, 0 = software) for every queue
+// read returns, with rdma_device and queue attributes. The series count is
+// bounded by twice the local RNIC count. A queue in software mode stamps
+// T2-T5 when its CQ poller reads the completion, so CPU contention on the
+// host shows up in its RTTs; the gauge makes that mode visible.
+func (mc *MetricsCollector) RegisterTimestampModeCallback(read func() []QueueTimestampMode) error {
+	_, err := mc.meter.RegisterCallback(
+		func(_ context.Context, o metric.Observer) error {
+			for _, q := range read() {
+				var v int64
+				if q.HWTimestamps {
+					v = 1
+				}
+				o.ObserveInt64(mc.hwTimestamps, v, metric.WithAttributes(
+					attribute.String("rdma_device", deviceMetricLabel(q.RdmaDevice)),
+					attribute.String("queue", q.Queue),
+				))
+			}
+			return nil
+		},
+		mc.hwTimestamps,
+	)
+	if err != nil {
+		return fmt.Errorf("register timestamp mode callback: %w", err)
 	}
 	return nil
 }

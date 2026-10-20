@@ -647,6 +647,50 @@ func TestLoadAgentConfig_InvalidCQPollMode(t *testing.T) {
 	}
 }
 
+func TestLoadAgentConfig_EventRingCapacity(t *testing.T) {
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.EventRingCapacity != DefaultEventRingCapacity {
+		t.Errorf("EventRingCapacity = %d, want %d", cfg.EventRingCapacity, DefaultEventRingCapacity)
+	}
+
+	t.Setenv("RPINGMESH_EVENT_RING_CAPACITY", "8192")
+	cfg, err = LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.EffectiveEventRingCapacity(); got != 8192 {
+		t.Errorf("EffectiveEventRingCapacity = %d, want 8192", got)
+	}
+}
+
+func TestAgentConfig_EventRingCapacityValidation(t *testing.T) {
+	base := AgentConfig{ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600}
+	for _, tc := range []struct {
+		capacity uint32
+		wantErr  bool
+	}{
+		{0, false}, // unset: the default
+		{MinEventRingCapacity, false},
+		{4096, false},
+		{MaxEventRingCapacity, false},
+		{MinEventRingCapacity / 2, true},
+		{MaxEventRingCapacity * 2, true},
+		{3000, true}, // not a power of two
+	} {
+		cfg := base
+		cfg.EventRingCapacity = tc.capacity
+		if err := cfg.Validate(); (err != nil) != tc.wantErr {
+			t.Errorf("Validate(event_ring_capacity=%d) error = %v, wantErr %v", tc.capacity, err, tc.wantErr)
+		}
+	}
+	if got := base.EffectiveEventRingCapacity(); got != DefaultEventRingCapacity {
+		t.Errorf("EffectiveEventRingCapacity of a zero value = %d, want %d", got, DefaultEventRingCapacity)
+	}
+}
+
 func TestLoadAgentConfig_MetricsTargetRnicLabelsDefaults(t *testing.T) {
 	cfg, err := LoadAgentConfig("", nil)
 	if err != nil {

@@ -89,6 +89,13 @@ traffic_class: 0
 # NIC hardware timestamps and busy with software timestamps (whose accuracy
 # depends on prompt polling).
 cq_poll_mode: "auto"
+# Completion events each prober and responder event ring holds (power of two,
+# 64-65536; 80 bytes each, two rings per RDMA device). A responder ring
+# absorbs the inbound probes that arrive while the agent is descheduled.
+# Beyond about one second of inbound probes a larger ring buys little: a probe
+# answered more than 1 s after it arrived is rejected as invalid_rtt
+# (kind responder_delay_too_large) instead of timing out.
+event_ring_capacity: 1024
 allowed_device_names: []         # Empty = all devices
 # RDMA devices never to open (e.g. a storage-only or faulty RNIC). Applied on
 # top of allowed_device_names; a name in both lists is a config error.

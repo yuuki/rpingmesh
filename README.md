@@ -127,6 +127,9 @@ old import path.
 
 Each probe produces six timestamps. The responder sends two ACKs: the first as
 soon as the probe arrives, and the second to carry the send time of the first.
+The responder's Go goroutine only posts the first ACK; the Zig CQ poller posts
+the second as soon as the first ACK's send completion arrives (see
+[Responder ACK path](#responder-ack-path)).
 
 ```
    Prober                                   Responder
@@ -160,13 +163,33 @@ Each difference uses a single clock: T2/T5 and T3/T4 come from one NIC each,
 and T1/T6 from the prober host. The two hosts' clocks therefore never need to
 be synchronized. A measurement is rejected as invalid when NetworkRTT,
 ResponderDelay, or ProberDelay is negative or exceeds a sanity bound
-(`internal/probe/probe.go`).
+(`internal/probe/probe.go`: 10 s for NetworkRTT, 1 s for the two delays). The
+rejection kind is exported as the `kind` attribute of
+`rpingmesh.probe_invalid_total`:
+
+| `kind` | Condition | Usual cause |
+|--------|-----------|-------------|
+| `missing_timestamp` | One of T1–T6 is zero | A bug or a corrupted packet |
+| `negative_network_rtt` | `(T5 - T2) < (T4 - T3)` | Software-timestamp jitter, or skew between the two NICs' clock rates |
+| `network_rtt_too_large` | NetworkRTT above 10 s | Corrupted timestamps |
+| `negative_responder_delay` | `T4 < T3` | Responder timestamps from different clocks |
+| `responder_delay_too_large` | ResponderDelay above 1 s | A responder that fell behind its inbound probes: the probe waited more than 1 s before the first ACK was posted |
+| `negative_prober_delay` | `(T6 - T1) < (T5 - T2)` | Prober timestamps from different clocks |
+| `prober_delay_too_large` | ProberDelay above 1 s | A prober that fell behind its ACKs |
+
+`responder_delay_too_large` points at the responder host, not the network:
+NetworkRTT subtracts the responder delay, so with hardware timestamps the
+network part of such a probe is still accurate, but the probe is counted as
+invalid.
 
 **Hardware timestamps.** When a queue is created, the Zig library requests a
 CQ with `IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK`. If the provider
 returns `EOPNOTSUPP`, it creates the CQ without that flag and takes T2–T5 from
 `CLOCK_MONOTONIC` when the poller reads each completion. Software timestamps
-include poller latency; soft-RoCE (`rxe`) always uses them.
+include poller latency; soft-RoCE (`rxe`) always uses them. The `Prober
+started` and `Responder started` log lines report the mode as
+`hw_timestamps`, the agent logs a warning at startup for every queue that uses
+software timestamps, and `rpingmesh.agent.hw_timestamps` exports it per queue.
 
 ### Wire format
 
@@ -346,6 +369,7 @@ pinglist comes back empty or when every probe to a target keeps timing out
 | `service_level` | `0` | Service Level (PFC priority, 0–7) of every address handle; does not select the queue with `trust dscp` |
 | `traffic_class` | `0` | GRH traffic class (0–255) of every address handle: DSCP in the upper 6 bits, ECN in the lower 2 |
 | `cq_poll_mode` | `auto` | `event`, `busy`, or `auto`; see [Event-driven completion handling](#event-driven-completion-handling) |
+| `event_ring_capacity` | `1024` | Completion events each prober and responder [event ring](#event-delivery-through-an-spsc-ring) holds: a power of two from 64 to 65536, 80 bytes per event, two rings per device. Beyond about one second of inbound probes a larger ring buys little, because a probe answered more than 1 s after it arrived is rejected as `responder_delay_too_large` instead of timing out |
 | `allowed_device_names` | `[]` | Devices to open; empty opens all |
 | `excluded_device_names` | `[]` | Devices never to open. A device in both lists is a configuration error |
 | `excluded_gid_cidrs` | `[]` | Networks (`10.0.0.0/24`) whose devices are never used, matched against each device's GID at `gid_index` |
@@ -597,6 +621,39 @@ and exports the multiplier as `rpingmesh.agent.self_throttle`.
 
 ## Deployment
 
+### CPU budget
+
+The agent's CPU use scales with the probe rate it sends and the probe rate it
+answers. Per probe answered, the responder handles one receive completion and
+two send completions in its CQ poller thread, one ring event and one Cgo call
+in Go, and one address-handle creation. Per probe sent, the prober also
+spin-waits in Zig for the probe's send completion. In event mode an idle
+queue costs no CPU; in busy mode each queue costs about 1% of a CPU even when
+idle. Measure the agent's usage at the peak probe rate of your fabric (every
+host answers the probes of all its ToR-mesh and inter-ToR peers) and size any
+limit from that.
+
+When the agent runs under a CPU limit such as a systemd `CPUQuota`, the kernel
+stops every agent thread, CQ pollers included, for the rest of the scheduling
+period (100 ms by default) once the quota is used up. Inbound probes then wait
+in the responder's event ring. A probe answered more than 1 s after it arrived
+is rejected as `invalid_rtt` (kind `responder_delay_too_large`), and once the
+ring is full, further probes are dropped and time out at the prober. Both
+show up on the probers that target the host, not on the host itself. Leave
+headroom above the measured peak, and watch for these signs that the limit
+is too low:
+
+- `rpingmesh.event_ring_occupancy_max{ring="responder"}` approaching
+  `rpingmesh.event_ring_capacity`, then `rpingmesh.event_ring_dropped_total`
+  rising, on the host.
+- `rpingmesh.probe_invalid_total{kind="responder_delay_too_large"}` (or the
+  `rpingmesh.target_rnic.` variant, which names the host) on its peers.
+- `nr_throttled` growing in the agent's cgroup `cpu.stat`.
+
+Self-protection (`throttle_cpu_percent`) reduces only the probes the agent
+sends, not the probes it answers.
+
+
 ### Packages
 
 `make package` builds `.deb` and `.rpm` packages for both binaries into
@@ -731,7 +788,11 @@ Agent metrics:
 | `rpingmesh.probe_total` | Counter | Recorded probes |
 | `rpingmesh.probe_success_total` | Counter | Probes with a valid RTT |
 | `rpingmesh.probe_failed_total` | Counter | Failed or invalid probes, by `reason` |
+| `rpingmesh.probe_invalid_total` | Counter | The `reason="invalid_rtt"` probes, by rejection `kind` (see [6-timestamp protocol](#6-timestamp-protocol)) |
 | `rpingmesh.event_ring_dropped_total` | Counter | Completion events dropped because an event ring was full, by `ring` (`prober`, `responder`) |
+| `rpingmesh.event_ring_occupancy_max` | Gauge | Highest number of events waiting in a ring since the previous export, by `ring`; the fullest ring of all devices |
+| `rpingmesh.event_ring_capacity` | Gauge | Events a ring holds (`event_ring_capacity` rounded up to a power of two), by `ring` |
+| `rpingmesh.agent.hw_timestamps` | Gauge | `1` when a queue reads NIC hardware timestamps, `0` when it falls back to software timestamps, by `rdma_device` and `queue` (`prober`, `responder`) |
 | `rpingmesh.agent.self_throttle` | Gauge | Self-protection multiplier (`1.0` = unthrottled); exported only with self-protection enabled |
 
 Probe metrics carry these attributes:
@@ -743,6 +804,7 @@ Probe metrics carry these attributes:
   (for example `mlx5_0` and `ens1f0`), or `unspecified` when unknown.
 - `reason` (on `probe_failed_total` only): `timeout`, `send_error`,
   `invalid_rtt`, or `unknown`.
+- `kind` (on `probe_invalid_total` only): one of the seven rejection kinds.
 
 Analyzer metrics, exported by the controller with
 `service.name=rpingmesh-analyzer`:
@@ -765,8 +827,9 @@ plus `target_hostname`, `target_rdma_device`, and `target_netdev`
 as before, so the bundled dashboards and alerts are unaffected.
 
 - `counters` exports `rpingmesh.target_rnic.probe_total`,
-  `probe_success_total`, and `probe_failed_total` (with `reason`), which is
-  enough to find the RNIC behind a loss.
+  `probe_success_total`, `probe_failed_total` (with `reason`), and
+  `probe_invalid_total` (with `kind`), which is enough to find the RNIC behind
+  a loss or a burst of invalid measurements.
 - `all` also exports `rpingmesh.target_rnic.network_rtt_ns`,
   `prober_delay_ns`, and `responder_delay_ns`. Each label set costs about 50
   histogram series, so use it on small fabrics or for a time-boxed
@@ -847,7 +910,17 @@ describes the dashboards and alerts.
 Both binaries log to stderr through zerolog, either human-readable
 (`log_format: console`) or as one JSON object per line (`log_format: json`).
 `scripts/topology/rtt_tor_check.py` reads the JSON form. Per-probe detail is
-logged only at `debug` level.
+logged only at `debug` level; its `Probe result recorded` line carries
+`invalid_kind` and `validation_error` for a rejected measurement.
+
+Rejected measurements are also logged at `warn` level, at most once every
+10 s, with the kind, the validation error, all six timestamps, the three
+derived values, the target host and device, and the number of rejections
+suppressed since the previous line. The full count is on
+`rpingmesh.probe_invalid_total`. A responder logs a warning, at most every
+10 s, when ACK pairs failed after it posted them (a send completion error, or
+a second ACK the CQ poller could not post); the prober sees each of them as a
+timeout.
 
 ## Design Notes
 
@@ -895,6 +968,28 @@ taken when the poller reads a completion, so wake-up latency becomes
 measurement error. `cq_poll_mode: auto` therefore uses event mode with hardware
 timestamps and busy mode with software timestamps. The `Prober started` and
 `Responder started` log lines report the mode in effect as `cq_events`.
+
+### Responder ACK path
+
+The second ACK carries T4, the send completion time of the first ACK, so it
+cannot be sent before that completion arrives. The responder does not wait for
+it. For each probe, the Go goroutine calls `rdma_send_ack_pair()`, which
+serializes both ACKs into one send slot (T4 still zero in the second), creates
+one address handle, posts the first ACK, and returns. When the CQ poller
+reads that ACK's send completion, it writes the completion timestamp into the
+staged second ACK and posts it on the same slot and address handle, after the
+current CQ poll ends. The second ACK's completion frees the slot.
+
+The goroutine that drains the responder's event ring therefore never blocks on
+a send completion and never spins while one is outstanding: the ring drains at
+the inbound probe rate, and a late completion delays only its own probe. Up to
+32 ACK pairs (the queue's send slots) can be in flight. When all of them are,
+the goroutine retries for up to 1 s before giving up on the probe.
+
+T4 is the same timestamp as before: the NIC's send completion time of the
+first ACK, or with software timestamps the time the CQ poller read that
+completion. Probes still use the synchronous path: the prober waits for each
+probe's send completion to read T2.
 
 ### Address handles
 

@@ -9,6 +9,10 @@
 //   - Producer writes head with .release ordering; consumer reads with .acquire
 //   - Consumer writes tail with .release ordering; producer reads with .acquire
 //   - When the ring is full, events are dropped and drop_count is incremented
+//   - The producer records the highest occupancy it has seen (max_occupancy);
+//     the metrics reader takes and resets it once per collection, so a ring
+//     that nearly filled up between two collections is visible before it
+//     starts dropping
 //   - A non-blocking eventfd (notify_fd) lets the consumer sleep until the
 //     producer signals new events, instead of polling on a timer. The
 //     producer calls notify() once per drained CQ batch, not per event.
@@ -155,6 +159,11 @@ pub const EventRing = struct {
     /// Read by Go for metrics/diagnostics.
     drop_count: std.atomic.Value(u64),
 
+    /// Highest number of events waiting in the ring (head - tail) observed by
+    /// the producer since the last takeMaxOccupancy(). A dropped event counts
+    /// as full occupancy. Raised by the producer, reset by the metrics reader.
+    max_occupancy: std.atomic.Value(u64),
+
     /// eventfd (EFD_NONBLOCK | EFD_CLOEXEC) written by the producer after a
     /// batch of pushes, or -1 if eventfd creation failed. The Go consumer
     /// blocks on a dup of this fd in its netpoller and then drains the ring;
@@ -202,6 +211,7 @@ pub const EventRing = struct {
             .capacity = cap,
             .mask = cap - 1,
             .drop_count = std.atomic.Value(u64).init(0),
+            .max_occupancy = std.atomic.Value(u64).init(0),
             .notify_fd = if (efd >= 0) efd else -1,
         };
 
@@ -247,6 +257,7 @@ pub const EventRing = struct {
         // Ring is full when head is one full lap ahead of tail
         if (current_head - current_tail >= self.capacity) {
             _ = self.drop_count.fetchAdd(1, .monotonic);
+            self.recordOccupancy(self.capacity);
             return false;
         }
 
@@ -258,7 +269,25 @@ pub const EventRing = struct {
         // sees the event data before seeing the updated head.
         self.head.value.store(current_head + 1, .release);
 
+        self.recordOccupancy(current_head + 1 - current_tail);
         return true;
+    }
+
+    /// Raise max_occupancy to occupancy (producer side). The plain load
+    /// first keeps the common case, where the ring is no fuller than
+    /// before, free of an atomic read-modify-write.
+    fn recordOccupancy(self: *EventRing, occupancy: u64) void {
+        if (occupancy > self.max_occupancy.load(.monotonic)) {
+            _ = self.max_occupancy.fetchMax(occupancy, .monotonic);
+        }
+    }
+
+    /// Return the highest occupancy since the previous call and reset it to
+    /// zero. Safe to call from any thread while the producer runs: the swap
+    /// and the producer's fetchMax are both atomic, so a concurrent raise
+    /// lands either in this sample or in the next one.
+    pub fn takeMaxOccupancy(self: *EventRing) u64 {
+        return self.max_occupancy.swap(0, .monotonic);
     }
 
     /// Poll the ring for completion events (consumer side).
@@ -347,6 +376,24 @@ export fn rdma_event_ring_destroy(ring_ptr: ?*EventRing) void {
 export fn rdma_event_ring_drop_count(ring_ptr: ?*EventRing) u64 {
     const r = ring_ptr orelse return 0;
     return r.getDropCount();
+}
+
+/// Take and reset the ring's highest occupancy since the previous call.
+///
+/// Exported as `rdma_event_ring_take_max_occupancy` for the C ABI. Meant for a
+/// single periodic reader (the agent's metrics callback). Returns 0 for a
+/// null ring pointer.
+export fn rdma_event_ring_take_max_occupancy(ring_ptr: ?*EventRing) u64 {
+    const r = ring_ptr orelse return 0;
+    return r.takeMaxOccupancy();
+}
+
+/// Get the ring's capacity (the requested capacity rounded up to a power of
+/// two). Exported as `rdma_event_ring_capacity` for the C ABI. Returns 0 for
+/// a null ring pointer.
+export fn rdma_event_ring_capacity(ring_ptr: ?*EventRing) u64 {
+    const r = ring_ptr orelse return 0;
+    return r.capacity;
 }
 
 /// Get the ring's producer-notification eventfd.
@@ -579,4 +626,35 @@ test "EventRing notify makes the eventfd readable and read resets it" {
     try std.testing.expectEqual(@as(isize, 8), c.read(fd, &counter, @sizeOf(u64)));
     try std.testing.expectEqual(@as(u64, 2), counter);
     try std.testing.expect(c.read(fd, &counter, @sizeOf(u64)) < 0);
+}
+
+test "EventRing tracks and resets max occupancy" {
+    const r = EventRing.create(4) orelse return error.TestUnexpectedResult;
+    defer r.destroy();
+
+    var ev = std.mem.zeroes(CompletionEvent);
+    try std.testing.expectEqual(@as(u64, 0), r.takeMaxOccupancy());
+
+    _ = r.push(&ev);
+    _ = r.push(&ev);
+    _ = r.push(&ev);
+    var out: [4]CompletionEvent = undefined;
+    try std.testing.expectEqual(@as(i32, 3), r.poll(&out, 4));
+    _ = r.push(&ev);
+    // Three events were waiting at once; the later single push does not
+    // lower the mark.
+    try std.testing.expectEqual(@as(u64, 3), r.takeMaxOccupancy());
+    // The take reset the mark; nothing was pushed since.
+    try std.testing.expectEqual(@as(u64, 0), r.takeMaxOccupancy());
+
+    // Fill the ring (one event is still waiting) and drop one event: a drop
+    // records full occupancy.
+    _ = r.push(&ev);
+    _ = r.push(&ev);
+    _ = r.push(&ev);
+    try std.testing.expect(!r.push(&ev));
+    try std.testing.expectEqual(@as(u64, 4), r.takeMaxOccupancy());
+    try std.testing.expectEqual(@as(u64, 4), rdma_event_ring_capacity(r));
+    try std.testing.expectEqual(@as(u64, 0), rdma_event_ring_capacity(null));
+    try std.testing.expectEqual(@as(u64, 0), rdma_event_ring_take_max_occupancy(null));
 }

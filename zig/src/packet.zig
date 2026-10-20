@@ -176,7 +176,7 @@ pub fn serializeProbePacket(pkt: *const ProbePacket, buf: *[40]u8) void {
     writeBigEndianU64(buf, 4, pkt.sequence_num);
     writeBigEndianU64(buf, 12, pkt.t1);
     writeBigEndianU64(buf, 20, pkt.t3);
-    writeBigEndianU64(buf, 28, pkt.t4);
+    writeBigEndianU64(buf, types.WIRE_T4_OFFSET, pkt.t4);
 
     // Reserved bytes (36-39) zeroed
     buf[36] = 0;
@@ -215,7 +215,7 @@ pub fn deserializeProbePacket(buf: *const [40]u8) ProbePacket {
         .sequence_num = readBigEndianU64(buf, 4),
         .t1 = readBigEndianU64(buf, 12),
         .t3 = readBigEndianU64(buf, 20),
-        .t4 = readBigEndianU64(buf, 28),
+        .t4 = readBigEndianU64(buf, types.WIRE_T4_OFFSET),
     };
 }
 
@@ -365,33 +365,16 @@ fn sendPacketInternal(
     // this wr_id is still in flight to be lost by the reset.
     queue.send_completion_wr_id.store(types.SEND_WR_ID_NONE, .release);
 
-    // Step 5: Build and post the send work request
-    var sge = c.ibv_sge{
-        .addr = @intFromPtr(slot_ptr),
-        .length = types.PROBE_PACKET_SIZE,
-        .lkey = queue.send_mr.lkey,
-    };
-
-    var wr = std.mem.zeroes(c.ibv_send_wr);
-    wr.wr_id = wr_id;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-    wr.opcode = c.IBV_WR_SEND;
-    wr.send_flags = c.IBV_SEND_SIGNALED;
-    wr.wr.ud.ah = ah;
-    wr.wr.ud.remote_qpn = target_qpn;
-    wr.wr.ud.remote_qkey = types.QKEY;
-
-    var bad_wr: ?*c.ibv_send_wr = null;
-    const ret = c.ibv_post_send(queue.qp, &wr, &bad_wr);
-    if (ret != 0) {
-        types.setLastError("ibv_post_send() failed");
+    // Step 5: Post the send work request. The slot is synchronous: its
+    // completion is published to the mailbox (see types.SendSlotMode).
+    queue.setSendSlotMode(slot_index, .Sync);
+    memory.postUdSend(queue.qp, queue.send_mr, slot_ptr, wr_id, ah, target_qpn) catch {
         // No WR was accepted by the QP, so no completion will ever arrive to
         // free this slot or its AH; destroy both here.
         queue.destroySendSlotAh(slot_index);
         freeSendSlot(queue, slot_index);
         return PacketError.PostSendFailed;
-    }
+    };
 
     // Step 6: Wait for this send's completion (matched by wr_id). On timeout we
     // intentionally leave the slot allocated: the WR is still outstanding and
@@ -447,6 +430,100 @@ pub fn sendProbe(
         .t2_ns = t2_ns,
         .err = 0,
     };
+}
+
+/// Return code of sendAckPair / rdma_send_ack_pair when every send slot is
+/// held by an in-flight send. The caller may retry once a completion has
+/// returned a slot.
+pub const ACK_PAIR_NO_FREE_SLOT: i32 = -2;
+
+/// Post the first ACK of a probe and return without waiting for it.
+///
+/// Both ACKs are serialized up front into one send slot: the first ACK at
+/// offset 0, and the second ACK (with T3, and T4 still zero) at
+/// types.SECOND_ACK_SLOT_OFFSET. When the first ACK's send completion
+/// arrives, the CQ poller writes its timestamp into the staged second ACK as
+/// T4 and posts it on the same slot and AH (see cq.zig
+/// flushPendingSecondAcks). The responder therefore never blocks on a send
+/// completion, so a slow completion delays only its own probe instead of
+/// every probe queued behind it, and no thread spins while it waits.
+///
+/// T4 has the same meaning as with sendFirstAck: the first ACK's send
+/// completion timestamp (NIC hardware, or CLOCK_MONOTONIC read by the CQ
+/// poller in software-timestamp mode).
+///
+/// Failures of the asynchronous part (completion errors, a second ACK that
+/// cannot be posted) are counted in queue.async_ack_failures.
+///
+/// Returns 0 once the first ACK is posted, ACK_PAIR_NO_FREE_SLOT when no
+/// send slot is free, or -1 on any other error (see rdma_get_last_error).
+pub fn sendAckPair(
+    queue: *types.UdQueue,
+    target_gid: [16]u8,
+    target_qpn: u32,
+    flow_label: u32,
+    recv_packet: [*]const u8,
+    recv_timestamp_ns: u64,
+) i32 {
+    const original = deserializeProbePacket(@ptrCast(recv_packet));
+
+    const slot_index = findFreeSendSlot(queue) orelse {
+        types.setLastError("no free send slot available");
+        return ACK_PAIR_NO_FREE_SLOT;
+    };
+    const wr_id: u64 = @intCast(slot_index);
+
+    // Until ibv_post_send accepts the WR, this function owns the slot and
+    // frees it on every error path (as in sendPacketInternal).
+    const slot_ptr = memory.getSlotPtr(queue.send_buf, slot_index, types.NUM_SEND_SLOTS) catch {
+        types.setLastError("send slot index out of bounds");
+        freeSendSlot(queue, slot_index);
+        return -1;
+    };
+
+    stageAckPair(slot_ptr, &original, recv_timestamp_ns);
+
+    const ah = queue_module.createAddressHandle(queue.device, target_gid, flow_label) catch {
+        freeSendSlot(queue, slot_index);
+        return -1;
+    };
+
+    // Publish the pair's context before the post: the CQ poller reads the
+    // mode (acquire) when the completion arrives, and through it sees the
+    // remote QPN, the staged second ACK and the AH.
+    queue.send_slot_remote_qpn[slot_index] = target_qpn;
+    queue.setSendSlotAh(slot_index, ah);
+    queue.setSendSlotMode(slot_index, .AsyncFirstAck);
+
+    memory.postUdSend(queue.qp, queue.send_mr, slot_ptr, wr_id, ah, target_qpn) catch {
+        queue.setSendSlotMode(slot_index, .Sync);
+        queue.destroySendSlotAh(slot_index);
+        freeSendSlot(queue, slot_index);
+        return -1;
+    };
+    return 0;
+}
+
+/// Serialize both ACKs of a pair into a send slot: the first ACK at offset 0
+/// and the second ACK at types.SECOND_ACK_SLOT_OFFSET. Both echo the probe's
+/// sequence number and T1 and carry T3; T4 is zero and is filled into the
+/// second ACK by the CQ poller (cq.zig stampStagedSecondAck) once the first
+/// ACK's send completion supplies it.
+pub fn stageAckPair(slot_ptr: [*]u8, original: *const ProbePacket, t3_ns: u64) void {
+    const first_ack = ProbePacket{
+        .version = PACKET_VERSION,
+        .msg_type = MSG_TYPE_ACK,
+        .ack_type = ACK_TYPE_FIRST,
+        .flags = 0,
+        .sequence_num = original.sequence_num,
+        .t1 = original.t1,
+        .t3 = t3_ns,
+        .t4 = 0,
+    };
+    var second_ack = first_ack;
+    second_ack.ack_type = ACK_TYPE_SECOND;
+    serializeProbePacket(&first_ack, @ptrCast(slot_ptr));
+    serializeProbePacket(&second_ack, @ptrCast(slot_ptr + types.SECOND_ACK_SLOT_OFFSET));
 }
 
 /// Send the first ACK in response to a received probe.
@@ -613,6 +690,49 @@ export fn rdma_send_first_ack(
 
     t4_out.* = result.t4_ns;
     return 0;
+}
+
+/// Post an asynchronous ACK pair (C-ABI export matching rdma_send_ack_pair in
+/// rdma_bridge.h). See sendAckPair.
+///
+/// @param queue_ptr          Responder queue handle
+/// @param target_gid         Pointer to 16-byte prober GID
+/// @param target_qpn         Prober's QPN
+/// @param flow_label         Flow label for ECMP path consistency
+/// @param recv_packet        Raw received packet buffer (payload after GRH)
+/// @param recv_timestamp_ns  T3: receive completion timestamp (ns)
+/// @return                   0 when the first ACK is posted,
+///                           ACK_PAIR_NO_FREE_SLOT (-2) when no send slot
+///                           is free, -1 on other errors
+export fn rdma_send_ack_pair(
+    queue_ptr: ?*types.UdQueue,
+    target_gid: ?*const [16]u8,
+    target_qpn: u32,
+    flow_label: u32,
+    recv_packet: ?[*]const u8,
+    recv_timestamp_ns: u64,
+) i32 {
+    const queue = queue_ptr orelse {
+        types.setLastError("null queue pointer");
+        return -1;
+    };
+    const gid = target_gid orelse {
+        types.setLastError("null target_gid pointer");
+        return -1;
+    };
+    const pkt = recv_packet orelse {
+        types.setLastError("null recv_packet pointer");
+        return -1;
+    };
+    return sendAckPair(queue, gid.*, target_qpn, flow_label, pkt, recv_timestamp_ns);
+}
+
+/// Number of asynchronous ACK pairs that failed after rdma_send_ack_pair
+/// returned (C-ABI export matching rdma_queue_async_ack_failures in
+/// rdma_bridge.h). Monotonic; 0 for a null queue.
+export fn rdma_queue_async_ack_failures(queue_ptr: ?*types.UdQueue) u64 {
+    const queue = queue_ptr orelse return 0;
+    return queue.async_ack_failures.load(.monotonic);
 }
 
 /// Send the second ACK (C-ABI export matching rdma_send_second_ack in rdma_bridge.h).
@@ -995,4 +1115,42 @@ test "getMonotonicNs is monotonic" {
     if (sum == 0) unreachable; // prevent optimizer from eliminating the loop
     const t2 = getMonotonicNs();
     try std.testing.expect(t2 >= t1);
+}
+
+test "stageAckPair stages both ACKs and the CQ poller's T4 stamp completes the second" {
+    const cq = @import("cq.zig");
+    var slot: [types.SLOT_SIZE]u8 = @splat(0);
+    const probe_pkt = ProbePacket{
+        .version = PACKET_VERSION,
+        .msg_type = MSG_TYPE_PROBE,
+        .ack_type = ACK_TYPE_NONE,
+        .flags = 0,
+        .sequence_num = 0xAABBCCDD00000007,
+        .t1 = 111,
+        .t3 = 0,
+        .t4 = 0,
+    };
+    stageAckPair(&slot, &probe_pkt, 333);
+    cq.stampStagedSecondAck(&slot, 444);
+
+    const first = deserializeProbePacket(slot[0..40]);
+    try std.testing.expectEqual(MSG_TYPE_ACK, first.msg_type);
+    try std.testing.expectEqual(ACK_TYPE_FIRST, first.ack_type);
+    try std.testing.expectEqual(probe_pkt.sequence_num, first.sequence_num);
+    try std.testing.expectEqual(@as(u64, 111), first.t1);
+    try std.testing.expectEqual(@as(u64, 333), first.t3);
+    try std.testing.expectEqual(@as(u64, 0), first.t4);
+
+    const off = types.SECOND_ACK_SLOT_OFFSET;
+    const second = deserializeProbePacket(slot[off..][0..40]);
+    try std.testing.expectEqual(MSG_TYPE_ACK, second.msg_type);
+    try std.testing.expectEqual(ACK_TYPE_SECOND, second.ack_type);
+    try std.testing.expectEqual(probe_pkt.sequence_num, second.sequence_num);
+    try std.testing.expectEqual(@as(u64, 111), second.t1);
+    try std.testing.expectEqual(@as(u64, 333), second.t3);
+    try std.testing.expectEqual(@as(u64, 444), second.t4);
+}
+
+test "ACK_PAIR_NO_FREE_SLOT matches RDMA_ACK_PAIR_NO_FREE_SLOT" {
+    try std.testing.expectEqual(@as(i32, -2), ACK_PAIR_NO_FREE_SLOT);
 }

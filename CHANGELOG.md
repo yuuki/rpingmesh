@@ -6,6 +6,27 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `rpingmesh.probe_invalid_total` (and `rpingmesh.target_rnic.probe_invalid_total`
+  with `metrics_target_rnic_labels`) splits the `reason="invalid_rtt"`
+  failures by why the measurement was rejected: `kind` is one of
+  `missing_timestamp`, `negative_network_rtt`, `network_rtt_too_large`,
+  `negative_responder_delay`, `responder_delay_too_large`,
+  `negative_prober_delay`, or `prober_delay_too_large`. Rejected measurements
+  are also logged at `warn` level, at most once every 10 s, with the kind, the
+  validation error, and all six timestamps, and the debug `Probe result
+  recorded` line carries `invalid_kind` and `validation_error`.
+- `rpingmesh.agent.hw_timestamps` reports per queue (`rdma_device`, `queue`)
+  whether it reads NIC hardware timestamps (1) or software timestamps (0).
+  The `Prober started` and `Responder started` lines log `device` and
+  `hw_timestamps`, and the agent warns at startup about every queue that uses
+  software timestamps.
+- `rpingmesh.event_ring_occupancy_max` (the highest ring fill level since the
+  previous export) and `rpingmesh.event_ring_capacity`, by `ring`, show a
+  ring filling up before it drops events.
+- Agent option `event_ring_capacity` (default 1024) sizes the prober and
+  responder event rings.
+- The README documents the agent's CPU budget and how a CPU quota shows up
+  in the metrics.
 - `PATENTS.md` records third-party patent information known to the
   maintainers, including the Chinese application CN118984289A, whose
   inventors include authors of the R-Pingmesh paper. It is informational
@@ -13,6 +34,17 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- The responder no longer blocks on send completions. It posts the first ACK
+  of each probe and returns; the Zig CQ poller posts the second ACK, which
+  carries T4, as soon as the first ACK's send completion arrives. Before, the
+  goroutine that drains the responder's event ring spin-waited for two send
+  completions per probe, so slow completions (for example under a CPU quota
+  on a busy host) stalled every probe behind them: the ring overflowed, and
+  probes to the host came back as timeouts or as `invalid_rtt` with a
+  ResponderDelay above 1 s. T4 keeps its meaning. The responder now creates
+  one address handle per probe instead of two. The C ABI gains
+  `rdma_send_ack_pair()`, `rdma_queue_async_ack_failures()`,
+  `rdma_event_ring_take_max_occupancy()`, and `rdma_event_ring_capacity()`.
 - The project license changes from MIT to the Apache License, Version 2.0,
   starting with the next release. Releases up to and including v0.6.1 remain
   available under the MIT License. A `NOTICE` file is added, the deb/rpm

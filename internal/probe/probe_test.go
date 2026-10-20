@@ -408,3 +408,40 @@ func TestCalculateRTT_RealisticTimestamps(t *testing.T) {
 		t.Errorf("ProberDelay: got %d ns, want 2000 ns", rtt.ProberDelay)
 	}
 }
+
+func TestCalculateRTT_InvalidKind(t *testing.T) {
+	sec := uint64(time.Second)
+	tests := []struct {
+		name   string
+		result *ProbeResult
+		want   InvalidKind
+	}{
+		{"valid", &ProbeResult{T1: 100_000, T2: 101_000, T3: 200_000, T4: 202_000, T5: 301_000, T6: 302_000}, InvalidKindNone},
+		{"nil", nil, InvalidKindMissingTimestamp},
+		{"zero T4", &ProbeResult{T1: 1, T2: 1, T3: 1, T4: 0, T5: 1, T6: 1}, InvalidKindMissingTimestamp},
+		{"negative network rtt", &ProbeResult{T1: 100_000, T2: 101_000, T3: 200_000, T4: 300_000, T5: 150_000, T6: 160_000}, InvalidKindNegativeNetworkRTT},
+		{"network rtt too large", &ProbeResult{T1: sec, T2: sec, T3: 2 * sec, T4: 2*sec + 1, T5: 12 * sec, T6: 13 * sec}, InvalidKindNetworkRTTTooLarge},
+		{"negative responder delay", &ProbeResult{T1: 100_000, T2: 101_000, T3: 200_000, T4: 199_000, T5: 301_000, T6: 302_000}, InvalidKindNegativeResponderDelay},
+		{"negative prober delay", &ProbeResult{T1: 100_000, T2: 100_000, T3: 150_000, T4: 151_000, T5: 300_000, T6: 250_000}, InvalidKindNegativeProberDelay},
+		{"prober delay too large", &ProbeResult{T1: 100_000, T2: 100_000, T3: 150_000, T4: 151_000, T5: 300_000, T6: 300_000 + 2*sec}, InvalidKindProberDelayTooLarge},
+		// A responder whose event ring held the probe for 3s before the
+		// first ACK was posted: with HW timestamps the network RTT is still
+		// a sane 10us, but ResponderDelay exceeds MaxSaneDelay.
+		{"responder backlog", &ProbeResult{
+			T1: 1_000_000, T2: 1_001_000,
+			T3: 50 * sec, T4: 53 * sec,
+			T5: 1_001_000 + 3*sec + 10_000, T6: 1_001_000 + 3*sec + 20_000,
+		}, InvalidKindResponderDelayTooLarge},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rtt := CalculateRTT(tc.result)
+			if rtt.InvalidKind != tc.want {
+				t.Fatalf("InvalidKind = %q, want %q (ValidationError %q)", rtt.InvalidKind, tc.want, rtt.ValidationError)
+			}
+			if rtt.Valid != (tc.want == InvalidKindNone) {
+				t.Fatalf("Valid = %v with InvalidKind %q", rtt.Valid, rtt.InvalidKind)
+			}
+		})
+	}
+}

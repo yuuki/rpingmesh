@@ -414,8 +414,10 @@ func (p *Prober) Start(ctx context.Context) error {
 	go p.ackProcessLoop(ctx)
 
 	p.logger.Info().
+		Str("device", p.sourceRdmaDevice).
 		Uint32("qpn", p.queue.Info.QPN).
 		Bool("cq_events", p.queue.Info.UsesCQEvents).
+		Bool("hw_timestamps", !p.queue.Info.UsesSWTimestamps).
 		Msg("Prober started")
 	return nil
 }

@@ -319,8 +319,11 @@ void rdma_destroy_queue(rdma_queue_t queue);
  *
  * These functions implement the R-Pingmesh probing protocol:
  *   1. Prober sends probe       -> rdma_send_probe()
- *   2. Responder sends 1st ACK  -> rdma_send_first_ack()
- *   3. Responder sends 2nd ACK  -> rdma_send_second_ack()
+ *   2. Responder sends 1st ACK  -> rdma_send_ack_pair() (asynchronous), or
+ *                                  rdma_send_first_ack() (synchronous)
+ *   3. Responder sends 2nd ACK  -> posted by the CQ poller after the 1st
+ *                                  ACK's completion (rdma_send_ack_pair), or
+ *                                  rdma_send_second_ack() (synchronous)
  *
  * Completions are delivered asynchronously via the event ring.
  * ========================================================================= */
@@ -372,6 +375,50 @@ int32_t rdma_send_first_ack(rdma_queue_t queue,
                             uint64_t recv_timestamp_ns,
                             uint64_t* out_t4_ns,
                             uint32_t timeout_ms);
+
+/* Return code of rdma_send_ack_pair() when every send slot is in flight. */
+#define RDMA_ACK_PAIR_NO_FREE_SLOT (-2)
+
+/*
+ * rdma_send_ack_pair - Post the first ACK of a probe without waiting
+ *
+ * Stages the first and second ACK in one send slot and posts the first. When
+ * its send completion arrives, the queue's CQ poller writes the completion
+ * timestamp (T4) into the staged second ACK and posts it on the same slot
+ * and address handle. The caller never waits for a send completion, so a
+ * slow completion delays only this probe and no thread spins meanwhile.
+ * T4 has the same meaning as with rdma_send_first_ack(). Failures after
+ * this call returns are counted by rdma_queue_async_ack_failures().
+ *
+ * @param queue              Responder queue handle
+ * @param target_gid         Prober's GID (16-byte binary, from GRH)
+ * @param target_qpn         Prober's QPN
+ * @param flow_label         Flow label to maintain same ECMP path
+ * @param recv_packet        Raw received packet buffer (for payload extraction)
+ * @param recv_timestamp_ns  T3: receive completion timestamp (ns)
+ * @return                   0 once the first ACK is posted,
+ *                           RDMA_ACK_PAIR_NO_FREE_SLOT when every send slot
+ *                           is in flight (retry after a completion), or -1
+ *                           on any other error
+ */
+int32_t rdma_send_ack_pair(rdma_queue_t queue,
+                           const rdma_gid_t* target_gid,
+                           uint32_t target_qpn,
+                           uint32_t flow_label,
+                           const uint8_t* recv_packet,
+                           uint64_t recv_timestamp_ns);
+
+/*
+ * rdma_queue_async_ack_failures - Count ACK pairs that failed asynchronously
+ *
+ * Counts pairs posted by rdma_send_ack_pair() whose first or second ACK
+ * completed with an error, or whose second ACK could not be posted.
+ * Monotonically increasing.
+ *
+ * @param queue  Queue handle
+ * @return       Failure count (0 for a NULL queue)
+ */
+uint64_t rdma_queue_async_ack_failures(rdma_queue_t queue);
 
 /*
  * rdma_send_second_ack - Send the second ACK with processing delay info
@@ -454,6 +501,27 @@ void rdma_event_ring_destroy(rdma_event_ring_t ring);
  * @return      Total dropped event count (0 for a NULL ring)
  */
 uint64_t rdma_event_ring_drop_count(rdma_event_ring_t ring);
+
+/*
+ * rdma_event_ring_take_max_occupancy - Take the ring's high-water mark
+ *
+ * Returns the highest number of events that were waiting in the ring at
+ * once since the previous call (a dropped event counts as full), and resets
+ * it to 0. Intended for a single periodic metrics reader.
+ *
+ * @param ring  Ring handle from rdma_event_ring_create()
+ * @return      Highest occupancy since the previous call (0 for a NULL ring)
+ */
+uint64_t rdma_event_ring_take_max_occupancy(rdma_event_ring_t ring);
+
+/*
+ * rdma_event_ring_capacity - Get the ring's capacity
+ *
+ * @param ring  Ring handle from rdma_event_ring_create()
+ * @return      Capacity in events: the requested capacity rounded up to a
+ *              power of two (0 for a NULL ring)
+ */
+uint64_t rdma_event_ring_capacity(rdma_event_ring_t ring);
 
 /*
  * rdma_event_ring_notify_fd - Get the ring's producer-notification eventfd

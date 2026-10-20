@@ -6,7 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/rpingmesh)](https://goreportcard.com/report/github.com/yuuki/rpingmesh)
 [![Go version](https://img.shields.io/github/go-mod/go-version/yuuki/rpingmesh)](go.mod)
 [![Zig](https://img.shields.io/badge/Zig-0.17.0-F7A41D?logo=zig&logoColor=white)](https://ziglang.org)
-[![License: MIT](https://img.shields.io/github/license/yuuki/rpingmesh)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/github/license/yuuki/rpingmesh)](LICENSE)
 
 R-Pingmesh measures the health of RDMA over Converged Ethernet (RoCEv2) fabrics
 by probing between every RDMA NIC (RNIC) and reporting latency and loss. It is
@@ -40,6 +40,7 @@ paper's eBPF-based service tracing are not implemented (see
 - [Development](#development)
 - [Limitations](#limitations)
 - [References](#references)
+- [License](#license)
 
 ## Architecture
 
@@ -1064,3 +1065,8 @@ acceptable; GIDs and other destination-RNIC identities are not.
 - [rdma-core](https://github.com/linux-rdma/rdma-core) (libibverbs)
 - [Zig](https://ziglang.org)
 - [OpenTelemetry Go](https://opentelemetry.io/docs/languages/go/)
+
+## License
+
+R-Pingmesh is licensed under the [Apache License, Version 2.0](LICENSE).
+Releases up to and including v0.6.1 were published under the MIT License.

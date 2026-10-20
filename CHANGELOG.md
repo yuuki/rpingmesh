@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- The project license changes from MIT to the Apache License, Version 2.0,
+  starting with the next release. Releases up to and including v0.6.1 remain
+  available under the MIT License. A `NOTICE` file is added, the deb/rpm
+  package metadata declares `Apache-2.0`, and the packages and release
+  archives now ship `LICENSE` and `NOTICE`.
+
 ## [0.6.1] - 2026-10-20
 
 ### Added

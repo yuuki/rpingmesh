@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `PATENTS.md` records third-party patent information known to the
+  maintainers, including the Chinese application CN118984289A, whose
+  inventors include authors of the R-Pingmesh paper. It is informational
+  only and adds no conditions to the license.
+
 ### Changed
 
 - The project license changes from MIT to the Apache License, Version 2.0,

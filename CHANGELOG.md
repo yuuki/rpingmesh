@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-21
+
 ### Added
 
 - `rpingmesh.probe_invalid_total` (and `rpingmesh.target_rnic.probe_invalid_total`
@@ -46,7 +48,7 @@ All notable changes to this project are documented in this file.
   `rdma_send_ack_pair()`, `rdma_queue_async_ack_failures()`,
   `rdma_event_ring_take_max_occupancy()`, and `rdma_event_ring_capacity()`.
 - The project license changes from MIT to the Apache License, Version 2.0,
-  starting with the next release. Releases up to and including v0.6.1 remain
+  starting with this release. Releases up to and including v0.6.1 remain
   available under the MIT License. A `NOTICE` file is added, the deb/rpm
   package metadata declares `Apache-2.0`, and the packages and release
   archives now ship `LICENSE` and `NOTICE`.

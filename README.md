@@ -695,7 +695,7 @@ Each release tag publishes Linux/amd64 packages and archives for both binaries,
 built with the EL9 agent builder, together with `checksums.txt`:
 
 ```sh
-gh release download v0.6.1 --repo yuuki/rpingmesh \
+gh release download v0.7.0 --repo yuuki/rpingmesh \
     --pattern 'rpingmesh-*' --pattern checksums.txt
 sha256sum -c --ignore-missing checksums.txt
 sudo apt install ./rpingmesh-controller_*.deb

@@ -256,10 +256,10 @@ package-controller: package-build-controller check-nfpm
 	nfpm package --config packaging/nfpm/nfpm-controller.yaml --packager rpm --target $(DIST_DIR)/
 	@echo "==> Controller packages written to $(DIST_DIR)/"
 
-# Build compressed binary-only archives for GitHub Releases. Each archive has
-# one top-level directory so extraction never writes the binary directly into
-# the caller's current directory. The agent archive has the same Linux/Cgo
-# build-host requirement as package-agent.
+# Build compressed binary archives (with LICENSE and NOTICE) for GitHub
+# Releases. Each archive has one top-level directory so extraction never writes
+# the binary directly into the caller's current directory. The agent archive
+# has the same Linux/Cgo build-host requirement as package-agent.
 archive: archive-agent archive-controller
 
 archive-agent: $(AGENT_PACKAGE_BUILD)
@@ -269,6 +269,7 @@ archive-agent: $(AGENT_PACKAGE_BUILD)
 		archive=rpingmesh-agent_$(NFPM_VERSION)_linux_$(NFPM_ARCH); \
 		mkdir -p "$$stage/$$archive"; \
 		cp $(AGENT_BIN) "$$stage/$$archive/rpingmesh-agent"; \
+		cp LICENSE NOTICE "$$stage/$$archive/"; \
 		tar -C "$$stage" -czf "$(DIST_DIR)/$$archive.tar.gz" "$$archive"
 	@echo "==> Agent archive written to $(DIST_DIR)/"
 
@@ -279,6 +280,7 @@ archive-controller: package-build-controller
 		archive=rpingmesh-controller_$(NFPM_VERSION)_linux_$(NFPM_ARCH); \
 		mkdir -p "$$stage/$$archive"; \
 		cp $(CONTROLLER_BIN) "$$stage/$$archive/rpingmesh-controller"; \
+		cp LICENSE NOTICE "$$stage/$$archive/"; \
 		tar -C "$$stage" -czf "$(DIST_DIR)/$$archive.tar.gz" "$$archive"
 	@echo "==> Controller archive written to $(DIST_DIR)/"
 

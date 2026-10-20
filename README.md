@@ -11,7 +11,8 @@
 R-Pingmesh measures the health of RDMA over Converged Ethernet (RoCEv2) fabrics
 by probing between every RDMA NIC (RNIC) and reporting latency and loss. It is
 a clean-room reimplementation of the system described in the SIGCOMM 2024 paper
-by Liu et al.
+by Liu et al. It is not affiliated with the paper's authors. See
+[PATENTS.md](PATENTS.md) for related patent information.
 
 This implementation keeps the paper's core measurement design:
 
@@ -1070,3 +1071,5 @@ acceptable; GIDs and other destination-RNIC identities are not.
 
 R-Pingmesh is licensed under the [Apache License, Version 2.0](LICENSE).
 Releases up to and including v0.6.1 were published under the MIT License.
+See [PATENTS.md](PATENTS.md) for reported third-party patent information and
+the limits of the license's patent grant.

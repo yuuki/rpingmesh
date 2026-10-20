@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-20
+
 ### Added
 
 - Agent option `excluded_gid_cidrs`: skip RDMA devices whose GID at

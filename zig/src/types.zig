@@ -43,6 +43,17 @@ pub const PROBE_PACKET_SIZE: u32 = 40;
 /// constant instead of importing packet.zig (that import would cycle).
 pub const PACKET_VERSION: u8 = 1;
 
+/// Byte offset of the T4 field in the 40-byte probe wire format (see
+/// packet.zig serializeProbePacket). The CQ poller patches T4 into a staged
+/// second ACK at this offset when the first ACK's send completion arrives.
+pub const WIRE_T4_OFFSET: usize = 28;
+
+/// Byte offset, within a send slot, of the second ACK that an asynchronous
+/// ACK pair stages at post time (see packet.zig sendAckPair). The first ACK
+/// occupies bytes [0, PROBE_PACKET_SIZE) of the slot, so the staged second
+/// ACK follows it; SLOT_SIZE leaves ample room.
+pub const SECOND_ACK_SLOT_OFFSET: usize = PROBE_PACKET_SIZE;
+
 /// Number of send slots in the send memory region.
 pub const NUM_SEND_SLOTS: u32 = 32;
 
@@ -63,6 +74,23 @@ pub const SLOT_SIZE: u32 = MR_SIZE + GRH_SIZE;
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
+
+/// What the CQ poller does when an in-flight send slot completes. Stored per
+/// slot (UdQueue.send_slot_modes) by the thread that posts the send.
+pub const SendSlotMode = enum(u8) {
+    /// Synchronous send (probe, or rdma_send_first_ack/second_ack): the
+    /// completion frees the slot and is published to the mailbox for
+    /// waitSendCompletion().
+    Sync = 0,
+    /// First ACK of an asynchronous ACK pair (rdma_send_ack_pair). On a
+    /// successful completion the CQ poller writes the completion timestamp
+    /// as T4 into the second ACK staged in the same slot and posts it,
+    /// reusing the slot and its AH. Nothing is published to the mailbox.
+    AsyncFirstAck = 1,
+    /// Second ACK of an asynchronous pair, posted by the CQ poller. Its
+    /// completion only reclaims the slot and AH.
+    AsyncSecondAck = 2,
+};
 
 /// Describes whether a send/receive slot is available, waiting for a
 /// completion, or actively being used by the application.
@@ -259,6 +287,23 @@ pub const UdQueue = struct {
     /// concurrently; the atomic access keeps that race-free.
     send_slot_states: [NUM_SEND_SLOTS]std.atomic.Value(u8),
 
+    /// Per-slot SendSlotMode (as its u8 tag). Written with release ordering
+    /// by the thread that posts the send, after send_slot_remote_qpn and the
+    /// slot payload, and read with acquire ordering by the CQ poller when
+    /// the completion arrives. Reset to Sync when the slot is reclaimed.
+    send_slot_modes: [NUM_SEND_SLOTS]std.atomic.Value(u8),
+
+    /// Destination QPN of the asynchronous ACK pair in each slot, so the CQ
+    /// poller can post the staged second ACK. Valid only while the slot's
+    /// mode is AsyncFirstAck; published by the release store of the mode.
+    send_slot_remote_qpn: [NUM_SEND_SLOTS]u32,
+
+    /// Asynchronous ACK pairs that did not complete: a first or second ACK
+    /// whose completion reported an error, or a second ACK the CQ poller
+    /// could not post. Monotonic; read by Go via
+    /// rdma_queue_async_ack_failures().
+    async_ack_failures: std.atomic.Value(u64),
+
     /// Per-slot state tracking for receive buffers.
     recv_slot_states: [NUM_RECV_SLOTS]SlotState,
 
@@ -371,6 +416,31 @@ pub const UdQueue = struct {
         if (ptr == 0) return;
         const ah: *c.ibv_ah = @ptrFromInt(ptr);
         _ = c.ibv_destroy_ah(ah);
+    }
+
+    /// Load the AH stored on a send slot without taking ownership, or null.
+    /// The CQ poller uses it to post an asynchronous pair's second ACK on the
+    /// AH of its first ACK, which stays on the slot until the second
+    /// completes.
+    pub fn sendSlotAh(self: *UdQueue, slot_index: u32) ?*c.ibv_ah {
+        if (slot_index >= NUM_SEND_SLOTS) return null;
+        const ptr = self.send_slot_ah[slot_index].load(.acquire);
+        if (ptr == 0) return null;
+        return @ptrFromInt(ptr);
+    }
+
+    /// Set a send slot's SendSlotMode with release ordering (see
+    /// send_slot_modes).
+    pub fn setSendSlotMode(self: *UdQueue, slot_index: u32, mode: SendSlotMode) void {
+        if (slot_index < NUM_SEND_SLOTS) {
+            self.send_slot_modes[slot_index].store(@backingInt(mode), .release);
+        }
+    }
+
+    /// Read a send slot's SendSlotMode with acquire ordering.
+    pub fn sendSlotMode(self: *UdQueue, slot_index: u32) SendSlotMode {
+        if (slot_index >= NUM_SEND_SLOTS) return .Sync;
+        return @fromBackingInt(self.send_slot_modes[slot_index].load(.acquire));
     }
 
     /// Destroy every remaining per-slot AH. Safe only after the CQ poller
@@ -540,6 +610,15 @@ test "setLastError overwrites previous message" {
     const err = getLastError();
     const err_slice = std.mem.sliceTo(err, 0);
     try std.testing.expectEqualStrings("second", err_slice);
+}
+
+test "SendSlotMode tags and staging offsets" {
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(SendSlotMode.Sync));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(SendSlotMode.AsyncFirstAck));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(SendSlotMode.AsyncSecondAck));
+    // The staged second ACK must fit in the slot after the first ACK.
+    try std.testing.expect(SECOND_ACK_SLOT_OFFSET + PROBE_PACKET_SIZE <= SLOT_SIZE);
+    try std.testing.expect(WIRE_T4_OFFSET + 8 <= PROBE_PACKET_SIZE);
 }
 
 test "SlotState enum values" {

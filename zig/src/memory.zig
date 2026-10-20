@@ -37,6 +37,8 @@ pub const MemoryError = error{
     SlotIndexOutOfBounds,
     /// ibv_post_recv() failed.
     PostRecvFailed,
+    /// ibv_post_send() failed.
+    PostSendFailed,
     /// A required pointer argument was null.
     NullPointer,
 };
@@ -176,6 +178,47 @@ pub fn getSlotPtr(buf: [*]u8, slot_index: u32, num_slots: u32) MemoryError![*]u8
 // ---------------------------------------------------------------------------
 // Receive buffer posting
 // ---------------------------------------------------------------------------
+
+/// Post one signaled UD send of a PROBE_PACKET_SIZE-byte packet.
+///
+/// `packet` must point into the send MR `mr` (a send slot, or the second ACK
+/// staged inside one). `wr_id` is the send slot index, which is how the CQ
+/// poller maps the completion back to the slot. Used by packet.zig for every
+/// send it posts and by cq.zig for the second ACK of an asynchronous pair.
+/// ibv_post_send is thread-safe for a QP created without a thread domain (as
+/// queue.zig creates it), so the CQ poller may post while the application
+/// thread posts on the same QP. A provider single-thread mode (for example
+/// MLX5_SINGLE_THREADED=1) or a thread domain would break that.
+pub fn postUdSend(
+    qp: *c.ibv_qp,
+    mr: *c.ibv_mr,
+    packet: [*]u8,
+    wr_id: u64,
+    ah: *c.ibv_ah,
+    remote_qpn: u32,
+) MemoryError!void {
+    var sge = c.ibv_sge{
+        .addr = @intFromPtr(packet),
+        .length = types.PROBE_PACKET_SIZE,
+        .lkey = mr.lkey,
+    };
+
+    var wr = std.mem.zeroes(c.ibv_send_wr);
+    wr.wr_id = wr_id;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = c.IBV_WR_SEND;
+    wr.send_flags = c.IBV_SEND_SIGNALED;
+    wr.wr.ud.ah = ah;
+    wr.wr.ud.remote_qpn = remote_qpn;
+    wr.wr.ud.remote_qkey = types.QKEY;
+
+    var bad_wr: ?*c.ibv_send_wr = null;
+    if (c.ibv_post_send(qp, &wr, &bad_wr) != 0) {
+        types.setLastError("ibv_post_send() failed");
+        return MemoryError.PostSendFailed;
+    }
+}
 
 /// Post a single receive buffer to a Queue Pair.
 ///

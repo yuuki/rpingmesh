@@ -102,6 +102,14 @@ const (
 	DefaultCQPollMode = CQPollModeAuto
 )
 
+// Bounds and default of event_ring_capacity (see
+// AgentConfig.EventRingCapacity).
+const (
+	DefaultEventRingCapacity = 1024
+	MinEventRingCapacity     = 64
+	MaxEventRingCapacity     = 65536
+)
+
 // DefaultLLDPDiscoveryTimeoutSec is how long the agent waits at startup for
 // lldpd to report a neighbor on every RDMA device's netdev. lldpd learns a
 // neighbor only from the switch's next LLDP frame (sent every 30 s by
@@ -217,7 +225,18 @@ type AgentConfig struct {
 	// "busy" polls (the CQ every ~50us, the ring every 100us), and "auto"
 	// (default) uses event with hardware timestamps and busy with software
 	// timestamps, whose accuracy depends on prompt polling.
-	CQPollMode                string `mapstructure:"cq_poll_mode"`
+	CQPollMode string `mapstructure:"cq_poll_mode"`
+	// EventRingCapacity is the number of completion events each prober and
+	// responder event ring holds (a power of two between
+	// MinEventRingCapacity and MaxEventRingCapacity; 0 means
+	// DefaultEventRingCapacity). Each event takes 80 bytes, and there are
+	// two rings per RDMA device. A responder ring has to absorb the inbound
+	// probes that arrive while its consumer goroutine is descheduled. Sizing
+	// it beyond about one second of inbound probes buys little: a probe
+	// answered more than probe.MaxSaneDelay (1 s) after it arrived is
+	// rejected as invalid_rtt (kind responder_delay_too_large) instead of
+	// timing out.
+	EventRingCapacity         uint32 `mapstructure:"event_ring_capacity"`
 	PinglistUpdateIntervalSec uint32 `mapstructure:"pinglist_update_interval_sec"`
 	// TargetProbeRatePerSecond is the legacy uniform per-target probe rate. It
 	// is the fallback for whichever per-pinglist-type rate below is left unset
@@ -320,6 +339,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	v.SetDefault("service_level", 0)
 	v.SetDefault("traffic_class", 0)
 	v.SetDefault("cq_poll_mode", DefaultCQPollMode)
+	v.SetDefault("event_ring_capacity", DefaultEventRingCapacity)
 	v.SetDefault("pinglist_update_interval_sec", 300)
 	v.SetDefault("target_probe_rate_per_second", DefaultTargetProbeRatePerSecond)
 	v.SetDefault("tor_mesh_probe_rate_per_second", DefaultTorMeshProbeRatePerSecond)
@@ -415,6 +435,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		ServiceLevel:                   v.GetInt("service_level"),
 		TrafficClass:                   v.GetInt("traffic_class"),
 		CQPollMode:                     v.GetString("cq_poll_mode"),
+		EventRingCapacity:              v.GetUint32("event_ring_capacity"),
 		PinglistUpdateIntervalSec:      v.GetUint32("pinglist_update_interval_sec"),
 		TargetProbeRatePerSecond:       v.GetInt("target_probe_rate_per_second"),
 		TorMeshProbeRatePerSecond:      v.GetInt("tor_mesh_probe_rate_per_second"),
@@ -534,6 +555,13 @@ func (c *AgentConfig) Validate() error {
 	default:
 		return fmt.Errorf("cq_poll_mode must be %q, %q or %q, got: %q",
 			CQPollModeAuto, CQPollModeEvent, CQPollModeBusy, c.CQPollMode)
+	}
+
+	// Zero (a zero-value AgentConfig) means the default.
+	if n := c.EventRingCapacity; n != 0 &&
+		(n < MinEventRingCapacity || n > MaxEventRingCapacity || n&(n-1) != 0) {
+		return fmt.Errorf("event_ring_capacity must be a power of two between %d and %d, got: %d",
+			MinEventRingCapacity, MaxEventRingCapacity, n)
 	}
 
 	// Empty values (a zero-value AgentConfig) mean the defaults, off and
@@ -678,6 +706,7 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 	flags.Int("service-level", 0, "Service Level (SL, PFC priority) for Address Handles (0-7)")
 	flags.Int("traffic-class", 0, "GRH traffic class (DSCP << 2) for Address Handles (0-255)")
 	flags.String("cq-poll-mode", DefaultCQPollMode, "CQ poller wait mode: auto, event or busy")
+	flags.Uint32("event-ring-capacity", DefaultEventRingCapacity, "Completion events each prober/responder event ring holds (power of two, 64-65536)")
 	flags.Uint32("pinglist-update-interval-sec", 300, "Pinglist update interval in seconds")
 	flags.Int("target-probe-rate-per-second", DefaultTargetProbeRatePerSecond, "Legacy uniform probe rate per second per target (fallback for the per-type rates below when they are 0)")
 	flags.Int("tor-mesh-probe-rate-per-second", DefaultTorMeshProbeRatePerSecond, "Probe rate per second per ToR-mesh target (0 = inherit target-probe-rate-per-second)")
@@ -809,4 +838,13 @@ func (c *AgentConfig) PlaneIDForDevice(deviceName string) string {
 		return plane
 	}
 	return probe.CanonicalPlaneID(c.PlaneID)
+}
+
+// EffectiveEventRingCapacity returns EventRingCapacity, or
+// DefaultEventRingCapacity when it is unset (0).
+func (c *AgentConfig) EffectiveEventRingCapacity() int {
+	if c.EventRingCapacity == 0 {
+		return DefaultEventRingCapacity
+	}
+	return int(c.EventRingCapacity)
 }

@@ -18,6 +18,7 @@ import "C"
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"runtime"
 	"time"
@@ -356,6 +357,28 @@ func (ring *EventRing) DropCount() uint64 {
 	return uint64(C.rdma_event_ring_drop_count(ring.handle))
 }
 
+// TakeMaxOccupancy returns the highest number of events that were waiting in
+// the ring at once since the previous call (a dropped event counts as full
+// capacity) and resets it to zero. It is meant for one periodic reader (the
+// agent's metrics callback); concurrent callers would split the samples.
+// Returns 0 if the ring has already been destroyed.
+func (ring *EventRing) TakeMaxOccupancy() uint64 {
+	if ring.handle == nil {
+		return 0
+	}
+	return uint64(C.rdma_event_ring_take_max_occupancy(ring.handle))
+}
+
+// Capacity returns the number of events the ring holds: the capacity passed
+// to NewEventRing rounded up to a power of two. Returns 0 if the ring has
+// already been destroyed.
+func (ring *EventRing) Capacity() uint64 {
+	if ring.handle == nil {
+		return 0
+	}
+	return uint64(C.rdma_event_ring_capacity(ring.handle))
+}
+
 // ---------------------------------------------------------------------------
 // Queue Operations
 // ---------------------------------------------------------------------------
@@ -436,6 +459,63 @@ func (q *Queue) SendProbe(targetGID [16]byte, targetQPN uint32, seqNum uint64, f
 			int(cResult.error), GetLastError())
 	}
 	return result
+}
+
+// ErrNoFreeSendSlot is returned by SendAckPair when every send slot of the
+// queue holds an in-flight send. It is transient: the CQ poller returns a
+// slot with each completion.
+var ErrNoFreeSendSlot = errors.New("no free send slot")
+
+// SendAckPair answers a received probe with both ACKs without waiting for
+// any send completion. It posts the first ACK (echoing T1, carrying T3 =
+// recvTimestampNS) and returns; when that ACK's send completion arrives, the
+// queue's CQ poller writes the completion timestamp as T4 into the second
+// ACK, which was staged in the same send slot, and posts it. T4 therefore
+// means the same as the value SendFirstAck returns.
+//
+// Because nothing blocks on a completion, the caller can keep draining its
+// event ring while completions are slow, and no thread spins while waiting.
+// Failures after SendAckPair returns are counted by AsyncAckFailures.
+// It returns ErrNoFreeSendSlot when all send slots are in flight.
+func (q *Queue) SendAckPair(targetGID [16]byte, targetQPN uint32, flowLabel uint32, recvPacket []byte, recvTimestampNS uint64) error {
+	// The Zig side unconditionally reads ProbePacketSize bytes from recvPacket.
+	if len(recvPacket) < ProbePacketSize {
+		return fmt.Errorf("recvPacket too short: got %d bytes, need at least %d", len(recvPacket), ProbePacketSize)
+	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	cGID := goGIDToC(targetGID)
+	pktPtr := (*C.uint8_t)(unsafe.Pointer(&recvPacket[0]))
+
+	rc := C.rdma_send_ack_pair(
+		q.handle,
+		&cGID,
+		C.uint32_t(targetQPN),
+		C.uint32_t(flowLabel),
+		pktPtr,
+		C.uint64_t(recvTimestampNS),
+	)
+	switch {
+	case rc == 0:
+		return nil
+	case rc == C.RDMA_ACK_PAIR_NO_FREE_SLOT:
+		return ErrNoFreeSendSlot
+	default:
+		return fmt.Errorf("rdma_send_ack_pair failed (rc=%d): %s", int(rc), GetLastError())
+	}
+}
+
+// AsyncAckFailures returns how many ACK pairs posted by SendAckPair failed
+// after it returned: a first or second ACK that completed with an error, or a
+// second ACK the CQ poller could not post. It is monotonically increasing.
+// Returns 0 once the queue has been destroyed.
+func (q *Queue) AsyncAckFailures() uint64 {
+	if q.handle == nil {
+		return 0
+	}
+	return uint64(C.rdma_queue_async_ack_failures(q.handle))
 }
 
 // SendFirstAck sends the first ACK in response to a received probe (step 2

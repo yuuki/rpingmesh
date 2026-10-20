@@ -60,6 +60,8 @@ scope.
 
 **40-byte BigEndian wire format** — The probe packet uses explicit BigEndian serialization (no packed structs). Zig (`serializeProbePacket`/`deserializeProbePacket` in `zig/src/packet.zig`) and Go (`SerializeProbePacket`/`DeserializeProbePacket` in `internal/rdmabridge/bridge.go`) implement it independently, and `internal/agent/responder.go` interprets the decoded fields; keep all three in sync. A version byte at offset 0 enables future format changes.
 
+**Asynchronous ACK pair** — The responder answers a probe with `rdma_send_ack_pair()` (`Queue.SendAckPair`), which stages both ACKs in one send slot (second ACK at `SECOND_ACK_SLOT_OFFSET`), posts the first, and returns. The slot's `SendSlotMode` (`zig/src/types.zig`) tells the CQ poller what to do on completion: `AsyncFirstAck` → stamp the completion timestamp as T4 into the staged second ACK (`WIRE_T4_OFFSET`) and post it on the same slot and AH after the poll session ends (`flushPendingSecondAcks` in `zig/src/cq.zig`); `AsyncSecondAck` → reclaim; `Sync` → the mailbox for `waitSendCompletion` (probes, and the synchronous `rdma_send_first_ack`/`rdma_send_second_ack` the raw e2e test uses). Async completions never touch the mailbox, so the single-sender mailbox contract still holds for synchronous sends. The CQ poller and the responder goroutine both call `ibv_post_send` on the responder QP, which relies on libibverbs' default thread safety (no thread domain, no provider single-thread mode). Never make the responder wait on a send completion again: a slow completion would stall its event ring.
+
 **Sequence number format** — `high 32 bits = random agentEpoch | low 32 bits = monotonic counter`. The epoch is randomised on startup to prevent ACK misrouting after agent restarts. Defined in `internal/agent/prober.go`.
 
 **`ControllerClient` interface** — `internal/agent/cluster_monitor.go` depends on the interface, not the concrete gRPC client. The concrete `GRPCControllerClient` lives in `internal/agent/controller_client/`. This separation enables mock injection in tests.
@@ -75,10 +77,10 @@ The Zig library exposes a C-ABI defined in `zig/include/rdma_bridge.h`. The Go b
 | `types.zig` | Core types: `RdmaContext`, `RdmaDevice`, `UdQueue`, GID as `[16]u8` |
 | `device.zig` | Device discovery, `ibv_open_device`, GID query, IP extraction |
 | `queue.zig` | UD QP creation, INIT→RTR→RTS, AH via `ibv_create_ah()`, HW timestamp probe |
-| `memory.zig` | Buffer allocation, `ibv_reg_mr()`, send/recv slot tracking (32 each) |
-| `cq.zig` | CQ poller thread (event mode via completion channel, busy-poll fallback), GRH parsing, `ibv_wc_read_completion_wallclock_ns`, SW fallback |
-| `ring.zig` | Lock-free SPSC ring buffer for Zig→Go event delivery, eventfd consumer notification |
-| `packet.zig` | Probe/ACK BigEndian serialization, probe and ACK sends |
+| `memory.zig` | Buffer allocation, `ibv_reg_mr()`, recv posting, `postUdSend` (shared by packet.zig and the CQ poller's second ACK) |
+| `cq.zig` | CQ poller thread (event mode via completion channel, busy-poll fallback), GRH parsing, `ibv_wc_read_completion_wallclock_ns`, SW fallback, second-ACK posting of async ACK pairs |
+| `ring.zig` | Lock-free SPSC ring buffer for Zig→Go event delivery, eventfd consumer notification, max-occupancy high-water mark |
+| `packet.zig` | Probe/ACK BigEndian serialization, probe and ACK sends (sync, and the async `sendAckPair`) |
 | `main.zig` | C-ABI entry points (`export fn`), test entry |
 | `last_error.zig` | Thread-local last-error string returned by `rdma_get_last_error()` |
 | `c.h` | C headers translated into the `c` module by `build.zig` (TranslateC; Zig 0.16+ has no `@cImport`) |
@@ -100,7 +102,7 @@ Metrics: `NetworkRTT = (T5-T2)-(T4-T3)`, `ProberDelay = (T6-T1)-(T5-T2)`, `Respo
 
 Default config files are in `configs/`. Both binaries use Viper with precedence CLI flag > env var > YAML > default; without `--config` they search `.`, `$HOME/.rpingmesh`, and `/etc/rpingmesh`. README.md documents every key.
 
-- `configs/agent.yaml`: `probe_interval_ms: 500`, `gid_index: 0`, `cq_poll_mode: auto`, `controller_addr: localhost:50051`, `otel_collector_addr: localhost:4317`
+- `configs/agent.yaml`: `probe_interval_ms: 500`, `gid_index: 0`, `cq_poll_mode: auto`, `event_ring_capacity: 1024`, `controller_addr: localhost:50051`, `otel_collector_addr: localhost:4317`
 - `configs/controller.yaml`: `listen_addr: :50051`, `database_uri: http://localhost:4001`
 
 Configuration fields can be overridden with the `RPINGMESH_` prefix and

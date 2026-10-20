@@ -50,12 +50,15 @@ export fn rdma_get_last_error() [*:0]const u8 {
 comptime {
     // Modules containing C-ABI exported functions that must be retained:
     //   ring.zig   -> rdma_event_ring_create, rdma_event_ring_poll,
-    //                 rdma_event_ring_destroy, rdma_event_ring_drop_count
+    //                 rdma_event_ring_destroy, rdma_event_ring_drop_count,
+    //                 rdma_event_ring_take_max_occupancy,
+    //                 rdma_event_ring_capacity, rdma_event_ring_notify_fd
     //   device.zig -> rdma_init, rdma_destroy, rdma_get_device_count,
     //                 rdma_get_device_name, rdma_open_device,
     //                 rdma_open_device_by_name, rdma_close_device
     //   queue.zig  -> rdma_create_queue, rdma_destroy_queue
-    //   packet.zig -> rdma_send_probe, rdma_send_first_ack, rdma_send_second_ack
+    //   packet.zig -> rdma_send_probe, rdma_send_first_ack, rdma_send_second_ack,
+    //                 rdma_send_ack_pair, rdma_queue_async_ack_failures
     _ = ring;
     _ = device;
     _ = queue;

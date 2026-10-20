@@ -82,14 +82,43 @@ type ProbeResult struct {
 	TargetSampled    bool
 }
 
+// InvalidKind classifies why CalculateRTT rejected a measurement. The values
+// form a small fixed set so they can be used as a metric attribute; the
+// detailed, value-bearing message stays in RTTResult.ValidationError.
+type InvalidKind string
+
+// InvalidKind values. InvalidKindNone is the kind of a valid result.
+const (
+	InvalidKindNone InvalidKind = ""
+	// InvalidKindMissingTimestamp: one of T1-T6 is zero (or the result is nil).
+	InvalidKindMissingTimestamp InvalidKind = "missing_timestamp"
+	// InvalidKindNegativeNetworkRTT: (T5-T2) < (T4-T3), e.g. timestamp
+	// jitter or skew between the prober's and responder's NIC clocks.
+	InvalidKindNegativeNetworkRTT InvalidKind = "negative_network_rtt"
+	// InvalidKindNetworkRTTTooLarge: NetworkRTT above MaxSaneRTT.
+	InvalidKindNetworkRTTTooLarge InvalidKind = "network_rtt_too_large"
+	// InvalidKindNegativeResponderDelay: T4 < T3 on the responder.
+	InvalidKindNegativeResponderDelay InvalidKind = "negative_responder_delay"
+	// InvalidKindResponderDelayTooLarge: T4-T3 above MaxSaneDelay. The usual
+	// cause is a responder that fell behind its inbound probes (a backlog of
+	// more than MaxSaneDelay before the first ACK was posted), not the
+	// network.
+	InvalidKindResponderDelayTooLarge InvalidKind = "responder_delay_too_large"
+	// InvalidKindNegativeProberDelay: (T6-T1) < (T5-T2) on the prober.
+	InvalidKindNegativeProberDelay InvalidKind = "negative_prober_delay"
+	// InvalidKindProberDelayTooLarge: ProberDelay above MaxSaneDelay.
+	InvalidKindProberDelayTooLarge InvalidKind = "prober_delay_too_large"
+)
+
 // RTTResult contains calculated RTT metrics from a probe.
 // All durations are in nanoseconds.
 type RTTResult struct {
-	NetworkRTT      int64  // nanoseconds: (T5-T2) - (T4-T3)
-	ProberDelay     int64  // nanoseconds: (T6-T1) - (T5-T2)
-	ResponderDelay  int64  // nanoseconds: T4-T3
-	Valid           bool   // Whether all timestamps are present and calculation is sane
-	ValidationError string // Reason if not valid
+	NetworkRTT      int64       // nanoseconds: (T5-T2) - (T4-T3)
+	ProberDelay     int64       // nanoseconds: (T6-T1) - (T5-T2)
+	ResponderDelay  int64       // nanoseconds: T4-T3
+	Valid           bool        // Whether all timestamps are present and calculation is sane
+	ValidationError string      // Reason if not valid
+	InvalidKind     InvalidKind // Classification of ValidationError; InvalidKindNone if valid
 }
 
 // CalculateRTT computes RTT metrics from a 6-timestamp probe result.
@@ -104,6 +133,7 @@ func CalculateRTT(result *ProbeResult) *RTTResult {
 		return &RTTResult{
 			Valid:           false,
 			ValidationError: "nil ProbeResult",
+			InvalidKind:     InvalidKindMissingTimestamp,
 		}
 	}
 
@@ -112,36 +142,42 @@ func CalculateRTT(result *ProbeResult) *RTTResult {
 		return &RTTResult{
 			Valid:           false,
 			ValidationError: "T1 (prober send time) is zero",
+			InvalidKind:     InvalidKindMissingTimestamp,
 		}
 	}
 	if result.T2 == 0 {
 		return &RTTResult{
 			Valid:           false,
 			ValidationError: "T2 (probe send completion timestamp) is zero",
+			InvalidKind:     InvalidKindMissingTimestamp,
 		}
 	}
 	if result.T3 == 0 {
 		return &RTTResult{
 			Valid:           false,
 			ValidationError: "T3 (responder recv timestamp) is zero",
+			InvalidKind:     InvalidKindMissingTimestamp,
 		}
 	}
 	if result.T4 == 0 {
 		return &RTTResult{
 			Valid:           false,
 			ValidationError: "T4 (responder ACK send completion timestamp) is zero",
+			InvalidKind:     InvalidKindMissingTimestamp,
 		}
 	}
 	if result.T5 == 0 {
 		return &RTTResult{
 			Valid:           false,
 			ValidationError: "T5 (prober first ACK recv timestamp) is zero",
+			InvalidKind:     InvalidKindMissingTimestamp,
 		}
 	}
 	if result.T6 == 0 {
 		return &RTTResult{
 			Valid:           false,
 			ValidationError: "T6 (prober second ACK recv time) is zero",
+			InvalidKind:     InvalidKindMissingTimestamp,
 		}
 	}
 
@@ -160,6 +196,7 @@ func CalculateRTT(result *ProbeResult) *RTTResult {
 			ResponderDelay:  responderDelay,
 			Valid:           false,
 			ValidationError: fmt.Sprintf("negative NetworkRTT (%d ns) indicates clock skew", networkRTT),
+			InvalidKind:     InvalidKindNegativeNetworkRTT,
 		}
 	}
 
@@ -171,6 +208,7 @@ func CalculateRTT(result *ProbeResult) *RTTResult {
 			ResponderDelay:  responderDelay,
 			Valid:           false,
 			ValidationError: fmt.Sprintf("NetworkRTT (%d ns) exceeds max sane bound (%d ns)", networkRTT, MaxSaneRTT),
+			InvalidKind:     InvalidKindNetworkRTTTooLarge,
 		}
 	}
 
@@ -183,6 +221,7 @@ func CalculateRTT(result *ProbeResult) *RTTResult {
 			ResponderDelay:  responderDelay,
 			Valid:           false,
 			ValidationError: fmt.Sprintf("negative ResponderDelay (%d ns) indicates timestamp ordering issue", responderDelay),
+			InvalidKind:     InvalidKindNegativeResponderDelay,
 		}
 	}
 
@@ -194,6 +233,7 @@ func CalculateRTT(result *ProbeResult) *RTTResult {
 			ResponderDelay:  responderDelay,
 			Valid:           false,
 			ValidationError: fmt.Sprintf("ResponderDelay (%d ns) exceeds max sane bound (%d ns)", responderDelay, MaxSaneDelay),
+			InvalidKind:     InvalidKindResponderDelayTooLarge,
 		}
 	}
 
@@ -207,6 +247,7 @@ func CalculateRTT(result *ProbeResult) *RTTResult {
 			ResponderDelay:  responderDelay,
 			Valid:           false,
 			ValidationError: fmt.Sprintf("negative ProberDelay (%d ns) indicates clock skew or T1/T6 clock-domain mismatch", proberDelay),
+			InvalidKind:     InvalidKindNegativeProberDelay,
 		}
 	}
 
@@ -220,6 +261,7 @@ func CalculateRTT(result *ProbeResult) *RTTResult {
 			ResponderDelay:  responderDelay,
 			Valid:           false,
 			ValidationError: fmt.Sprintf("ProberDelay (%d ns) exceeds max sane bound (%d ns)", proberDelay, MaxSaneDelay),
+			InvalidKind:     InvalidKindProberDelayTooLarge,
 		}
 	}
 

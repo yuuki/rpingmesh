@@ -27,7 +27,6 @@ import (
 // Timing constants for shutdown operations.
 const (
 	metricsShutdownTimeout = 5 * time.Second
-	eventRingCapacity      = 1024 // Power of 2 for optimal SPSC ring performance.
 
 	// heartbeatInterval is the period between periodic re-registration
 	// heartbeats sent to the controller. The controller's liveness check
@@ -705,6 +704,7 @@ func (a *Agent) Initialize(ctx context.Context) error {
 			Uint32("qpn", resp.GetQueueInfo().QPN).
 			Msg("Responder created")
 	}
+	a.registerTimestampModeMetric()
 
 	// (The metrics collector is created earlier, before the results fan-in; see
 	// createMetricsCollector above.)
@@ -1333,14 +1333,14 @@ func (a *Agent) openDevices() error {
 // completion events from the Zig poller thread to Go.
 func (a *Agent) createEventRings() error {
 	for i, dev := range a.devices {
-		proberRing, err := rdmabridge.NewEventRing(eventRingCapacity)
+		proberRing, err := rdmabridge.NewEventRing(a.cfg.EffectiveEventRingCapacity())
 		if err != nil {
 			return fmt.Errorf("failed to create prober event ring for device %d (%s): %w",
 				i, dev.Info.DeviceName, err)
 		}
 		a.proberRings = append(a.proberRings, proberRing)
 
-		respRing, err := rdmabridge.NewEventRing(eventRingCapacity)
+		respRing, err := rdmabridge.NewEventRing(a.cfg.EffectiveEventRingCapacity())
 		if err != nil {
 			return fmt.Errorf("failed to create responder event ring for device %d (%s): %w",
 				i, dev.Info.DeviceName, err)
@@ -1351,6 +1351,7 @@ func (a *Agent) createEventRings() error {
 	a.logger.Info().
 		Int("prober_rings", len(a.proberRings)).
 		Int("responder_rings", len(a.respRings)).
+		Int("capacity", a.cfg.EffectiveEventRingCapacity()).
 		Msg("Event rings created")
 	return nil
 }
@@ -1394,6 +1395,66 @@ func (a *Agent) createMetricsCollector(ctx context.Context) {
 		a.logger.Warn().Err(err).
 			Msg("Failed to register event ring drop count callback")
 	}
+	if err := a.metrics.RegisterEventRingOccupancyCallback(map[string]func() telemetry.EventRingOccupancy{
+		"prober":    func() telemetry.EventRingOccupancy { return takeRingOccupancy(a.proberRings) },
+		"responder": func() telemetry.EventRingOccupancy { return takeRingOccupancy(a.respRings) },
+	}); err != nil {
+		a.logger.Warn().Err(err).
+			Msg("Failed to register event ring occupancy callback")
+	}
+}
+
+// registerTimestampModeMetric warns about every prober and responder queue
+// that uses software timestamps and, with metrics enabled, reports each
+// queue's timestamp source on rpingmesh.agent.hw_timestamps. A queue's mode is fixed
+// when the queue is created, so it is captured once here, after every queue
+// exists, and the callback only returns that snapshot: it never touches the
+// queues, which Stop destroys before the final metrics flush.
+func (a *Agent) registerTimestampModeMetric() {
+	modes := make([]telemetry.QueueTimestampMode, 0, len(a.probers)+len(a.responders))
+	for i, p := range a.probers {
+		modes = append(modes, telemetry.QueueTimestampMode{
+			RdmaDevice:   a.devices[i].Info.DeviceName,
+			Queue:        "prober",
+			HWTimestamps: !p.GetQueueInfo().UsesSWTimestamps,
+		})
+	}
+	for i, r := range a.responders {
+		modes = append(modes, telemetry.QueueTimestampMode{
+			RdmaDevice:   a.devices[i].Info.DeviceName,
+			Queue:        "responder",
+			HWTimestamps: !r.GetQueueInfo().UsesSWTimestamps,
+		})
+	}
+	for _, m := range modes {
+		if !m.HWTimestamps {
+			a.logger.Warn().
+				Str("device", m.RdmaDevice).
+				Str("queue", m.Queue).
+				Msg("Queue uses software timestamps: T2-T5 are taken when the CQ is polled, so host CPU contention adds to its RTT and delay measurements")
+		}
+	}
+	if a.metrics == nil {
+		return
+	}
+	if err := a.metrics.RegisterTimestampModeCallback(func() []telemetry.QueueTimestampMode { return modes }); err != nil {
+		a.logger.Warn().Err(err).
+			Msg("Failed to register timestamp mode callback")
+	}
+}
+
+// takeRingOccupancy samples a group of per-device rings for
+// rpingmesh.event_ring_occupancy_max: the highest occupancy of any ring
+// since the previous sample (resetting each ring's mark) and the capacity.
+// Like the drop counters, the rings of every device share one ring label to
+// keep cardinality low; the fullest ring is the one that matters.
+func takeRingOccupancy(rings []*rdmabridge.EventRing) telemetry.EventRingOccupancy {
+	var sample telemetry.EventRingOccupancy
+	for _, ring := range rings {
+		sample.Max = max(sample.Max, ring.TakeMaxOccupancy())
+		sample.Capacity = max(sample.Capacity, ring.Capacity())
+	}
+	return sample
 }
 
 // targetRnicLabels maps the metrics_target_rnic_labels and

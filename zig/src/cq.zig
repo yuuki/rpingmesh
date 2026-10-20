@@ -16,8 +16,11 @@
 // by the Go side. After each drained batch that produced events it signals
 // the ring's eventfd so the Go consumer can sleep instead of polling.
 //
-// For send completions, the poller extracts the timestamp and signals the
-// waiting sender thread via atomic variables on the UdQueue struct.
+// For send completions, the poller extracts the timestamp and either signals
+// the waiting sender thread via atomic variables on the UdQueue struct
+// (synchronous sends), or, for the first ACK of an asynchronous ACK pair,
+// writes the timestamp as T4 into the second ACK staged in the same send slot
+// and posts it (see types.SendSlotMode and packet.zig sendAckPair).
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -380,38 +383,124 @@ fn busyPollerLoop(queue: *types.UdQueue) void {
 ///
 /// Returns the number of work completions consumed (0 when the CQ is empty).
 fn pollCqCompletions(queue: *types.UdQueue, cq: *c.ibv_cq_ex) usize {
-    if (queue.uses_sw_timestamps) {
-        return pollCqClassic(queue, cq);
-    }
-    return pollCqExtended(queue, cq);
+    var pending = PendingSecondAcks{};
+    const n = if (queue.uses_sw_timestamps)
+        pollCqClassic(queue, cq, &pending)
+    else
+        pollCqExtended(queue, cq, &pending);
+    // Post the second ACKs only after the poll session has ended
+    // (ibv_end_poll in the extended path), so no send is posted while the
+    // provider is in the middle of iterating the CQ.
+    flushPendingSecondAcks(queue, &pending);
+    return n;
 }
+
+// ---------------------------------------------------------------------------
+// Asynchronous ACK pairs
+// ---------------------------------------------------------------------------
+
+/// Second ACKs whose first ACK completed during one CQ poll, waiting to be
+/// posted once the poll ends. A slot has at most one WR in flight and its
+/// second ACK is posted only by the flush, so a slot appears at most once
+/// and NUM_SEND_SLOTS entries always suffice.
+pub const PendingSecondAcks = struct {
+    slots: [types.NUM_SEND_SLOTS]u32 = undefined,
+    t4_ns: [types.NUM_SEND_SLOTS]u64 = undefined,
+    len: usize = 0,
+
+    /// Queue slot's second ACK with T4 = t4_ns. Returns false when full,
+    /// which the invariant above rules out; the caller then fails the pair.
+    pub fn add(self: *PendingSecondAcks, slot: u32, t4_ns: u64) bool {
+        if (self.len >= self.slots.len) return false;
+        self.slots[self.len] = slot;
+        self.t4_ns[self.len] = t4_ns;
+        self.len += 1;
+        return true;
+    }
+};
+
+/// Write t4_ns into the T4 field of the second ACK staged in a send slot.
+pub fn stampStagedSecondAck(slot_ptr: [*]u8, t4_ns: u64) void {
+    const field = slot_ptr + types.SECOND_ACK_SLOT_OFFSET + types.WIRE_T4_OFFSET;
+    std.mem.writeInt(u64, field[0..8], t4_ns, .big);
+}
+
+/// Post every queued second ACK: stamp T4, switch the slot to
+/// AsyncSecondAck and post the staged packet on the slot's AH. A pair whose
+/// second ACK cannot be posted is counted as failed and its slot reclaimed.
+fn flushPendingSecondAcks(queue: *types.UdQueue, pending: *const PendingSecondAcks) void {
+    for (pending.slots[0..pending.len], pending.t4_ns[0..pending.len]) |slot, t4_ns| {
+        const slot_ptr = memory.getSlotPtr(queue.send_buf, slot, types.NUM_SEND_SLOTS) catch {
+            failAsyncAck(queue, slot);
+            continue;
+        };
+        const ah = queue.sendSlotAh(slot) orelse {
+            failAsyncAck(queue, slot);
+            continue;
+        };
+        stampStagedSecondAck(slot_ptr, t4_ns);
+        queue.setSendSlotMode(slot, .AsyncSecondAck);
+        memory.postUdSend(
+            queue.qp,
+            queue.send_mr,
+            slot_ptr + types.SECOND_ACK_SLOT_OFFSET,
+            @intCast(slot),
+            ah,
+            queue.send_slot_remote_qpn[slot],
+        ) catch {
+            log.debug("@{x} failed to post second ACK on slot={d}", .{ @intFromPtr(queue), slot });
+            failAsyncAck(queue, slot);
+        };
+    }
+}
+
+/// Count a failed asynchronous ACK pair and reclaim its slot and AH.
+fn failAsyncAck(queue: *types.UdQueue, slot: u32) void {
+    _ = queue.async_ack_failures.fetchAdd(1, .monotonic);
+    reclaimSendSlot(queue, slot);
+}
+
+/// Destroy a completed send's AH and return its slot to the free pool. The
+/// AH goes first: this is the slot's last completion, so the AH is no longer
+/// referenced by any WR.
+fn reclaimSendSlot(queue: *types.UdQueue, slot: u32) void {
+    queue.destroySendSlotAh(slot);
+    queue.setSendSlotMode(slot, .Sync);
+    queue.freeSendSlot(slot);
+}
+
+/// Maximum completions consumed by one poll session (classic ibv_poll_cq call
+/// or extended start/next/end sequence). Bounding it lets pollCqCompletions
+/// post the second ACKs queued during the session promptly under sustained
+/// load, instead of only once the CQ runs empty.
+const MAX_POLL_BATCH = 32;
 
 /// Classic CQ polling using ibv_poll_cq().
 ///
 /// Converts the extended CQ handle to a base CQ, calls ibv_poll_cq() to
 /// drain up to 32 completions at once, and dispatches each to
 /// dispatchClassicWc().
-fn pollCqClassic(queue: *types.UdQueue, cq: *c.ibv_cq_ex) usize {
+fn pollCqClassic(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *PendingSecondAcks) usize {
     const base_cq = c.ibv_cq_ex_to_cq(cq) orelse return 0;
-    var wc_buf: [32]c.ibv_wc = undefined;
-    const n = c.ibv_poll_cq(base_cq, 32, &wc_buf[0]);
+    var wc_buf: [MAX_POLL_BATCH]c.ibv_wc = undefined;
+    const n = c.ibv_poll_cq(base_cq, MAX_POLL_BATCH, &wc_buf[0]);
     if (n <= 0) return 0;
     const count: usize = @intCast(n);
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        dispatchClassicWc(queue, &wc_buf[i]);
+        dispatchClassicWc(queue, &wc_buf[i], pending);
     }
     return count;
 }
 
 /// Dispatch a classic ibv_wc completion to the appropriate handler.
-fn dispatchClassicWc(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
+fn dispatchClassicWc(queue: *types.UdQueue, wc: *const c.ibv_wc, pending: *PendingSecondAcks) void {
     const status_int: i32 = @intCast(wc.status);
     if (wc.opcode == c.IBV_WC_SEND) {
         log.debug("@{x} SEND (classic) status={d}", .{ @intFromPtr(queue), status_int });
         // Signal the waiting sender thread with a SW timestamp, matched by
         // wr_id (see signalSendCompletion / the mailbox invariant in types.zig).
-        signalSendCompletion(queue, wc.wr_id, swTimestampNs(), status_int);
+        signalSendCompletion(queue, wc.wr_id, swTimestampNs(), status_int, pending);
     } else if (wc.opcode == c.IBV_WC_RECV) {
         log.debug("@{x} RECV (classic) status={d}", .{ @intFromPtr(queue), status_int });
         if (wc.status == c.IBV_WC_SUCCESS) {
@@ -492,7 +581,7 @@ fn processRecvClassic(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
 ///
 /// Used only when the device supports hardware wallclock timestamps
 /// (uses_sw_timestamps == false).
-fn pollCqExtended(queue: *types.UdQueue, cq: *c.ibv_cq_ex) usize {
+fn pollCqExtended(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *PendingSecondAcks) usize {
     var poll_attr = std.mem.zeroes(c.ibv_poll_cq_attr);
 
     const ret_start = c.ibv_start_poll(cq, &poll_attr);
@@ -502,12 +591,15 @@ fn pollCqExtended(queue: *types.UdQueue, cq: *c.ibv_cq_ex) usize {
     }
 
     // Process the first completion
-    dispatchCompletion(queue, cq);
+    dispatchCompletion(queue, cq, pending);
     var count: usize = 1;
 
-    // Process remaining completions
-    while (c.ibv_next_poll(cq) == 0) {
-        dispatchCompletion(queue, cq);
+    // Process remaining completions, at most MAX_POLL_BATCH per poll
+    // session: the session must end (and the queued second ACKs be posted)
+    // even if completions keep arriving faster than they are drained.
+    // drainCq() polls again until the CQ is empty.
+    while (count < MAX_POLL_BATCH and c.ibv_next_poll(cq) == 0) {
+        dispatchCompletion(queue, cq, pending);
         count += 1;
     }
 
@@ -527,11 +619,11 @@ fn swTimestampNs() u64 {
 
 /// Dispatch a single work completion to the appropriate handler.
 ///
-/// Routes by opcode (IBV_WC_SEND or IBV_WC_RECV). For send completions,
-/// always signals the waiting sender thread (even on error) so it does
-/// not spin-wait indefinitely. For recv completions, only pushes to the
-/// ring on success.
-fn dispatchCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
+/// Routes by opcode (IBV_WC_SEND or IBV_WC_RECV). Every send completion,
+/// even an error, goes to signalSendCompletion(), so a synchronous sender
+/// never spin-waits indefinitely and an asynchronous ACK pair is always
+/// resolved. For recv completions, only pushes to the ring on success.
+fn dispatchCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *PendingSecondAcks) void {
     const opcode = c.ibv_wc_read_opcode(cq);
     const status: i32 = @intCast(cq.status);
 
@@ -539,7 +631,7 @@ fn dispatchCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
         log.debug("@{x} SEND completion status={d}", .{ @intFromPtr(queue), status });
         // Always signal the sender, regardless of status, so waitSendCompletion
         // can report the error rather than timing out.
-        processSendCompletion(queue, cq);
+        processSendCompletion(queue, cq, pending);
     } else if (opcode == c.IBV_WC_RECV) {
         log.debug("@{x} RECV completion status={d}", .{ @intFromPtr(queue), status });
         if (status == c.IBV_WC_SUCCESS) {
@@ -667,15 +759,23 @@ pub fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
 /// Process a single send completion (extended CQ path).
 ///
 /// Extracts the timestamp, status, and wr_id from the completion and hands
-/// them to signalSendCompletion(), which frees the send slot and publishes the
-/// result to the waiting sender.
-pub fn processSendCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
+/// them to signalSendCompletion().
+pub fn processSendCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *PendingSecondAcks) void {
     const timestamp_ns: u64 = getCompletionTimestamp(queue, cq);
     const status: i32 = @intCast(cq.status);
-    signalSendCompletion(queue, cq.wr_id, timestamp_ns, status);
+    signalSendCompletion(queue, cq.wr_id, timestamp_ns, status, pending);
 }
 
-/// Free the completed send's slot and publish its result to the waiting sender.
+/// Handle a send completion according to its slot's SendSlotMode.
+///
+/// AsyncFirstAck: on success, queue the slot's staged second ACK with
+/// T4 = timestamp_ns; the slot and AH stay allocated for it. On error, count
+/// the pair as failed and reclaim the slot.
+/// AsyncSecondAck: reclaim the slot (counting an error status as a failure).
+/// Neither touches the mailbox, so asynchronous pairs never disturb a
+/// synchronous waiter on the same queue.
+/// Sync: free the completed send's slot and publish its result to the
+/// waiting sender, as follows.
 ///
 /// The slot is freed here (not by the sender) so that a late completion for a
 /// timed-out send still returns its slot for reuse. The completed wr_id is
@@ -683,8 +783,25 @@ pub fn processSendCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
 /// on send_completion_wr_id with acquire ordering, so it only observes the
 /// timestamp/status once its own wr_id is published. See the mailbox invariant
 /// comment in types.zig.
-fn signalSendCompletion(queue: *types.UdQueue, wr_id: u64, timestamp_ns: u64, status: i32) void {
+fn signalSendCompletion(queue: *types.UdQueue, wr_id: u64, timestamp_ns: u64, status: i32, pending: *PendingSecondAcks) void {
     const slot_index: u32 = @intCast(wr_id & 0xFFFFFFFF);
+    switch (queue.sendSlotMode(slot_index)) {
+        .AsyncFirstAck => {
+            if (status == 0 and pending.add(slot_index, timestamp_ns)) return;
+            log.debug("@{x} first ACK completion status={d} on slot={d}", .{ @intFromPtr(queue), status, slot_index });
+            failAsyncAck(queue, slot_index);
+            return;
+        },
+        .AsyncSecondAck => {
+            if (status != 0) {
+                log.debug("@{x} second ACK completion status={d} on slot={d}", .{ @intFromPtr(queue), status, slot_index });
+                _ = queue.async_ack_failures.fetchAdd(1, .monotonic);
+            }
+            reclaimSendSlot(queue, slot_index);
+            return;
+        },
+        .Sync => {},
+    }
     // Destroy the AH before freeing the slot: this is the matching
     // completion for the posted WR, so the AH is no longer referenced.
     queue.destroySendSlotAh(slot_index);
@@ -861,4 +978,26 @@ test "GRHInfo struct has expected fields" {
     try std.testing.expectEqual(@as(u32, 0), info.flow_label);
     try std.testing.expectEqual(@as(usize, 16), info.source_gid.len);
     try std.testing.expectEqual(@as(usize, 16), info.dest_gid.len);
+}
+
+test "PendingSecondAcks holds one entry per send slot" {
+    var pending = PendingSecondAcks{};
+    var i: u32 = 0;
+    while (i < types.NUM_SEND_SLOTS) : (i += 1) {
+        try std.testing.expect(pending.add(i, 1000 + i));
+    }
+    try std.testing.expect(!pending.add(0, 1));
+    try std.testing.expectEqual(@as(usize, types.NUM_SEND_SLOTS), pending.len);
+    try std.testing.expectEqual(@as(u32, 3), pending.slots[3]);
+    try std.testing.expectEqual(@as(u64, 1003), pending.t4_ns[3]);
+}
+
+test "stampStagedSecondAck writes T4 big-endian into the staged packet only" {
+    var slot: [types.SLOT_SIZE]u8 = @splat(0xAA);
+    stampStagedSecondAck(&slot, 0x0102030405060708);
+    const at = types.SECOND_ACK_SLOT_OFFSET + types.WIRE_T4_OFFSET;
+    try std.testing.expectEqual(@as(u64, 0x0102030405060708), readBigEndianU64(&slot, at));
+    // The first ACK and the rest of the staged packet are untouched.
+    for (slot[0..at]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+    for (slot[at + 8 ..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
 }

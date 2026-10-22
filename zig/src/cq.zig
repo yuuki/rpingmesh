@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const wire = @import("wire.zig");
 const ring = @import("ring.zig");
 const memory = @import("memory.zig");
 const c = types.c;
@@ -139,63 +140,14 @@ pub fn parseGRH(buf: [*]const u8) GRHInfo {
 }
 
 // ---------------------------------------------------------------------------
-// Probe packet payload parsing
+// Receive sanity checks
 // ---------------------------------------------------------------------------
-
-/// Parse probe packet fields from the payload buffer (after GRH).
-///
-/// Wire format (40 bytes, matching packet.zig serializeProbePacket):
-///   Byte  0:     version (u8)
-///   Byte  1:     msg_type (u8) — 0=probe, 1=ack
-///   Byte  2:     ack_type (u8) — 0=N/A, 1=first, 2=second
-///   Byte  3:     flags (u8)
-///   Bytes 4-11:  sequence_num (u64, big-endian)
-///   Bytes 12-19: t1 (u64, big-endian)
-///   Bytes 20-27: t3 (u64, big-endian)
-///   Bytes 28-35: t4 (u64, big-endian)
-///   Bytes 36-39: reserved (zero)
-const ProbePayload = struct {
-    sequence_num: u64,
-    t1: u64,
-    t3: u64,
-    t4: u64,
-    is_ack: u8,
-    ack_type: u8,
-};
-
-/// Read a big-endian u64 from a byte pointer at the given offset.
-fn readBigEndianU64(buf: [*]const u8, offset: usize) u64 {
-    return (@as(u64, buf[offset]) << 56) |
-        (@as(u64, buf[offset + 1]) << 48) |
-        (@as(u64, buf[offset + 2]) << 40) |
-        (@as(u64, buf[offset + 3]) << 32) |
-        (@as(u64, buf[offset + 4]) << 24) |
-        (@as(u64, buf[offset + 5]) << 16) |
-        (@as(u64, buf[offset + 6]) << 8) |
-        @as(u64, buf[offset + 7]);
-}
 
 /// True when the UD completion is long enough to hold a GRH plus a full
 /// 40-byte probe payload. Short completions can still succeed with the
 /// configured QKEY; reading past byte_len would interpret stale slot bytes.
 fn recvByteLenOK(byte_len: u32) bool {
     return byte_len >= types.GRH_SIZE + types.PROBE_PACKET_SIZE;
-}
-
-/// Parse a probe packet payload from raw bytes.
-/// Reads fields at the correct wire format offsets (see ProbePayload comment above).
-/// Returns null when the version byte is not PACKET_VERSION so the caller
-/// can drop the completion instead of treating leftover slot data as a probe.
-fn parseProbePayload(buf: [*]const u8) ?ProbePayload {
-    if (buf[0] != types.PACKET_VERSION) return null;
-    return ProbePayload{
-        .sequence_num = readBigEndianU64(buf, 4), // offset 4: after 4-byte header
-        .t1 = readBigEndianU64(buf, 12), // offset 12
-        .t3 = readBigEndianU64(buf, 20), // offset 20
-        .t4 = readBigEndianU64(buf, 28), // offset 28
-        .is_ack = buf[1], // msg_type: 0=probe, 1=ack
-        .ack_type = buf[2], // ack_type: 0=none, 1=first, 2=second
-    };
 }
 
 /// Drop a receive completion without delivering it to Go and repost the slot.
@@ -421,8 +373,7 @@ pub const PendingSecondAcks = struct {
 
 /// Write t4_ns into the T4 field of the second ACK staged in a send slot.
 pub fn stampStagedSecondAck(slot_ptr: [*]u8, t4_ns: u64) void {
-    const field = slot_ptr + types.SECOND_ACK_SLOT_OFFSET + types.WIRE_T4_OFFSET;
-    std.mem.writeInt(u64, field[0..8], t4_ns, .big);
+    wire.writeT4(@ptrCast(slot_ptr + types.SECOND_ACK_SLOT_OFFSET), t4_ns);
 }
 
 /// Post every queued second ACK: stamp T4, switch the slot to
@@ -535,7 +486,7 @@ fn processRecvClassic(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
     // IBV_WC_GRH (bit 0) indicates the driver wrote a GRH into the receive
     // buffer.  For RoCEv2 UD this should always be set, but if it is not we
     // cannot determine the sender's GID — repost the buffer and drop.
-    if ((wc.wc_flags & 1) == 0) {
+    if ((wc.wc_flags & c.IBV_WC_GRH) == 0) {
         dropAndRepostRecv(queue, slot_index);
         return;
     }
@@ -547,7 +498,7 @@ fn processRecvClassic(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
 
     const grh_info = parseGRH(slot_ptr);
     const payload_ptr = slot_ptr + types.GRH_SIZE;
-    const payload = parseProbePayload(payload_ptr) orelse {
+    const payload = wire.deserializeProbePacket(@ptrCast(payload_ptr)) orelse {
         dropAndRepostRecv(queue, slot_index);
         return;
     };
@@ -557,7 +508,7 @@ fn processRecvClassic(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
         .t1 = payload.t1,
         .t3 = payload.t3,
         .t4 = payload.t4,
-        .is_ack = payload.is_ack,
+        .is_ack = payload.msg_type,
         .ack_type = payload.ack_type,
         .flags = 0,
         ._pad = 0,
@@ -716,7 +667,7 @@ pub fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
 
     // Parse probe payload from bytes after the GRH
     const payload_ptr = slot_ptr + types.GRH_SIZE;
-    const payload = parseProbePayload(payload_ptr) orelse {
+    const payload = wire.deserializeProbePacket(@ptrCast(payload_ptr)) orelse {
         dropAndRepostRecv(queue, slot_index);
         return;
     };
@@ -727,7 +678,7 @@ pub fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
         .t1 = payload.t1,
         .t3 = payload.t3,
         .t4 = payload.t4,
-        .is_ack = payload.is_ack,
+        .is_ack = payload.msg_type,
         .ack_type = payload.ack_type,
         .flags = 0,
         ._pad = 0,
@@ -896,72 +847,6 @@ test "parseGRH flow label max (20 bits)" {
     try std.testing.expectEqual(@as(u32, 0xFFFFF), info.flow_label);
 }
 
-test "readBigEndianU64 correctness" {
-    const buf = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A };
-    try std.testing.expectEqual(@as(u64, 42), readBigEndianU64(&buf, 0));
-
-    const buf2 = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    try std.testing.expectEqual(@as(u64, 1 << 56), readBigEndianU64(&buf2, 0));
-
-    const buf3 = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-    try std.testing.expectEqual(@as(u64, 0xFFFFFFFFFFFFFFFF), readBigEndianU64(&buf3, 0));
-}
-
-test "parseProbePayload extracts fields" {
-    // Wire format under test (see the ProbePayload doc comment above, and
-    // packet.zig's serializeProbePacket/deserializeProbePacket, which this
-    // must stay in sync with):
-    //   byte  0:     version
-    //   byte  1:     msg_type (is_ack)
-    //   byte  2:     ack_type
-    //   byte  3:     flags
-    //   bytes 4-11:  sequence_num (u64 BigEndian)
-    //   bytes 12-19: t1 (u64 BigEndian)
-    //   bytes 20-27: t3 (u64 BigEndian)
-    //   bytes 28-35: t4 (u64 BigEndian)
-    //   bytes 36-39: reserved
-    var payload: [40]u8 = @splat(0);
-
-    payload[0] = types.PACKET_VERSION;
-
-    // msg_type (is_ack) = 1 (byte 1)
-    payload[1] = 1;
-
-    // ack_type = 2 (byte 2)
-    payload[2] = 2;
-
-    // sequence_num = 1 (bytes 4-11, BigEndian; LSB is the last byte, index 11)
-    payload[11] = 0x01;
-
-    // t1 = 1000 = 0x03E8 (bytes 12-19, BigEndian; LSB is index 19)
-    payload[18] = 0x03;
-    payload[19] = 0xE8;
-
-    // t3 = 2000 = 0x07D0 (bytes 20-27, BigEndian; LSB is index 27)
-    payload[26] = 0x07;
-    payload[27] = 0xD0;
-
-    // t4 = 3000 = 0x0BB8 (bytes 28-35, BigEndian; LSB is index 35)
-    payload[34] = 0x0B;
-    payload[35] = 0xB8;
-
-    const parsed = parseProbePayload(&payload) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u64, 1), parsed.sequence_num);
-    try std.testing.expectEqual(@as(u64, 1000), parsed.t1);
-    try std.testing.expectEqual(@as(u64, 2000), parsed.t3);
-    try std.testing.expectEqual(@as(u64, 3000), parsed.t4);
-    try std.testing.expectEqual(@as(u8, 1), parsed.is_ack);
-    try std.testing.expectEqual(@as(u8, 2), parsed.ack_type);
-}
-
-test "parseProbePayload rejects unexpected version" {
-    var payload: [40]u8 = @splat(0);
-    payload[1] = 1;
-    try std.testing.expect(parseProbePayload(&payload) == null);
-    payload[0] = types.PACKET_VERSION + 1;
-    try std.testing.expect(parseProbePayload(&payload) == null);
-}
-
 test "recvByteLenOK requires GRH plus probe payload" {
     const need: u32 = types.GRH_SIZE + types.PROBE_PACKET_SIZE;
     try std.testing.expect(!recvByteLenOK(need - 1));
@@ -995,8 +880,8 @@ test "PendingSecondAcks holds one entry per send slot" {
 test "stampStagedSecondAck writes T4 big-endian into the staged packet only" {
     var slot: [types.SLOT_SIZE]u8 = @splat(0xAA);
     stampStagedSecondAck(&slot, 0x0102030405060708);
-    const at = types.SECOND_ACK_SLOT_OFFSET + types.WIRE_T4_OFFSET;
-    try std.testing.expectEqual(@as(u64, 0x0102030405060708), readBigEndianU64(&slot, at));
+    const at = types.SECOND_ACK_SLOT_OFFSET + wire.OFFSET_T4;
+    try std.testing.expectEqual(@as(u64, 0x0102030405060708), std.mem.readInt(u64, slot[at..][0..8], .big));
     // The first ACK and the rest of the staged packet are untouched.
     for (slot[0..at]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
     for (slot[at + 8 ..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);

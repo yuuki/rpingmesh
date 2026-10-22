@@ -35,18 +35,8 @@ pub const INITIAL_RECV_BUFFERS: u32 = 32;
 /// Queue key used for all UD Queue Pairs in this system.
 pub const QKEY: u32 = 0x11111111;
 
-/// Size of a probe packet payload in bytes.
-pub const PROBE_PACKET_SIZE: u32 = 40;
-
-/// Current version of the probe packet wire format. Mirrored by packet.zig
-/// as PACKET_VERSION so send/recv stay in lockstep. cq.zig reads this
-/// constant instead of importing packet.zig (that import would cycle).
-pub const PACKET_VERSION: u8 = 1;
-
-/// Byte offset of the T4 field in the 40-byte probe wire format (see
-/// packet.zig serializeProbePacket). The CQ poller patches T4 into a staged
-/// second ACK at this offset when the first ACK's send completion arrives.
-pub const WIRE_T4_OFFSET: usize = 28;
+/// Size of a probe packet payload in bytes (the wire format in wire.zig).
+pub const PROBE_PACKET_SIZE: u32 = @intCast(wire.PACKET_SIZE);
 
 /// Byte offset, within a send slot, of the second ACK that an asynchronous
 /// ACK pair stages at post time (see packet.zig sendAckPair). The first ACK
@@ -142,6 +132,7 @@ pub const CqPollMode = enum(i32) {
 
 const ring = @import("ring.zig");
 const last_error = @import("last_error.zig");
+const wire = @import("wire.zig");
 
 /// Store an error message in the thread-local error buffer. Re-exported so
 /// existing types.setLastError call sites stay unchanged.
@@ -618,7 +609,6 @@ test "SendSlotMode tags and staging offsets" {
     try std.testing.expectEqual(@as(u8, 2), @backingInt(SendSlotMode.AsyncSecondAck));
     // The staged second ACK must fit in the slot after the first ACK.
     try std.testing.expect(SECOND_ACK_SLOT_OFFSET + PROBE_PACKET_SIZE <= SLOT_SIZE);
-    try std.testing.expect(WIRE_T4_OFFSET + 8 <= PROBE_PACKET_SIZE);
 }
 
 test "SlotState enum values" {

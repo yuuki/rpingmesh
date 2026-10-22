@@ -1,84 +1,17 @@
-// packet.zig - Data-path module for sending and receiving RDMA probes and ACKs.
+// packet.zig - Send side of the R-Pingmesh probing protocol.
 //
-// This module implements the R-Pingmesh probing protocol wire format and the
-// send-side operations for probes, first ACKs, and second ACKs. The wire format
-// uses explicit BigEndian serialization (no packed struct casting) for portability.
-//
-// Wire Format (40 bytes):
-//   Offset  Size  Field           Encoding
-//   0       1     version         uint8 (currently 1)
-//   1       1     msg_type        uint8 (0=probe, 1=ack)
-//   2       1     ack_type        uint8 (0=N/A, 1=first, 2=second)
-//   3       1     flags           uint8 (reserved)
-//   4       8     sequence_num    uint64 BigEndian
-//   12      8     t1              uint64 BigEndian (nanoseconds)
-//   20      8     t3              uint64 BigEndian (nanoseconds)
-//   28      8     t4              uint64 BigEndian (nanoseconds)
-//   36      4     reserved        zero padding
-//   Total: 40 bytes (= PROBE_PACKET_SIZE)
+// Sends probes, first ACKs and second ACKs over a UD queue. The wire format
+// itself lives in wire.zig; this module owns the send slots, the address
+// handles and the synchronous completion mailbox (waitSendCompletion).
 
 const std = @import("std");
 const types = @import("types.zig");
+const wire = @import("wire.zig");
 const queue_module = @import("queue.zig");
 const memory = @import("memory.zig");
 const c = types.c;
 
-// ---------------------------------------------------------------------------
-// Protocol constants
-// ---------------------------------------------------------------------------
-
-/// Current version of the probe packet wire format.
-pub const PACKET_VERSION: u8 = types.PACKET_VERSION;
-
-/// Message type: probe packet (initiator sends to responder).
-pub const MSG_TYPE_PROBE: u8 = 0;
-
-/// Message type: acknowledgement packet (responder sends back).
-pub const MSG_TYPE_ACK: u8 = 1;
-
-/// ACK type: not applicable (used in probe packets).
-pub const ACK_TYPE_NONE: u8 = 0;
-
-/// ACK type: first ACK containing T3 (responder receive timestamp).
-pub const ACK_TYPE_FIRST: u8 = 1;
-
-/// ACK type: second ACK containing both T3 and T4 (processing delay).
-pub const ACK_TYPE_SECOND: u8 = 2;
-
-// ---------------------------------------------------------------------------
-// ProbePacket struct (Zig-native, NOT extern)
-// ---------------------------------------------------------------------------
-
-/// Represents a probe or ACK packet in Zig-native layout.
-///
-/// This struct is used for application-level manipulation of packet fields.
-/// It is NOT laid out to match the wire format; use serializeProbePacket()
-/// and deserializeProbePacket() for wire conversion.
-pub const ProbePacket = struct {
-    /// Wire format version (currently PACKET_VERSION = 1).
-    version: u8,
-
-    /// Message type: MSG_TYPE_PROBE (0) or MSG_TYPE_ACK (1).
-    msg_type: u8,
-
-    /// ACK type: ACK_TYPE_NONE (0), ACK_TYPE_FIRST (1), or ACK_TYPE_SECOND (2).
-    ack_type: u8,
-
-    /// Reserved flags for future use.
-    flags: u8,
-
-    /// Probe sequence number for correlating probes with their ACKs.
-    sequence_num: u64,
-
-    /// T1 timestamp: time the prober posted the send (nanoseconds).
-    t1: u64,
-
-    /// T3 timestamp: time the responder received the probe (nanoseconds).
-    t3: u64,
-
-    /// T4 timestamp: time the responder's first ACK send completed (nanoseconds).
-    t4: u64,
-};
+const ProbePacket = wire.ProbePacket;
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -129,93 +62,13 @@ pub const PacketError = error{
     SlotIndexOutOfBounds,
 };
 
-// ---------------------------------------------------------------------------
-// BigEndian helpers
-// ---------------------------------------------------------------------------
-
-/// Write a u64 value in BigEndian byte order at the given offset.
-fn writeBigEndianU64(buf: [*]u8, offset: usize, value: u64) void {
-    buf[offset] = @intCast((value >> 56) & 0xFF);
-    buf[offset + 1] = @intCast((value >> 48) & 0xFF);
-    buf[offset + 2] = @intCast((value >> 40) & 0xFF);
-    buf[offset + 3] = @intCast((value >> 32) & 0xFF);
-    buf[offset + 4] = @intCast((value >> 24) & 0xFF);
-    buf[offset + 5] = @intCast((value >> 16) & 0xFF);
-    buf[offset + 6] = @intCast((value >> 8) & 0xFF);
-    buf[offset + 7] = @intCast(value & 0xFF);
-}
-
-/// Read a u64 value in BigEndian byte order from the given offset.
-fn readBigEndianU64(buf: [*]const u8, offset: usize) u64 {
-    return (@as(u64, buf[offset]) << 56) |
-        (@as(u64, buf[offset + 1]) << 48) |
-        (@as(u64, buf[offset + 2]) << 40) |
-        (@as(u64, buf[offset + 3]) << 32) |
-        (@as(u64, buf[offset + 4]) << 24) |
-        (@as(u64, buf[offset + 5]) << 16) |
-        (@as(u64, buf[offset + 6]) << 8) |
-        @as(u64, buf[offset + 7]);
-}
-
-// ---------------------------------------------------------------------------
-// Serialization / Deserialization
-// ---------------------------------------------------------------------------
-
-/// Serialize a ProbePacket into a 40-byte wire format buffer.
-///
-/// Writes each field at the correct offset using explicit BigEndian encoding.
-/// The reserved bytes at offset 36-39 are zeroed.
-pub fn serializeProbePacket(pkt: *const ProbePacket, buf: *[40]u8) void {
-    // Single-byte fields at offsets 0-3
-    buf[0] = pkt.version;
-    buf[1] = pkt.msg_type;
-    buf[2] = pkt.ack_type;
-    buf[3] = pkt.flags;
-
-    // Multi-byte fields in BigEndian
-    writeBigEndianU64(buf, 4, pkt.sequence_num);
-    writeBigEndianU64(buf, 12, pkt.t1);
-    writeBigEndianU64(buf, 20, pkt.t3);
-    writeBigEndianU64(buf, types.WIRE_T4_OFFSET, pkt.t4);
-
-    // Reserved bytes (36-39) zeroed
-    buf[36] = 0;
-    buf[37] = 0;
-    buf[38] = 0;
-    buf[39] = 0;
-}
-
-/// Deserialize a 40-byte wire format buffer into a ProbePacket.
-///
-/// Reads each field from the correct offset using BigEndian decoding.
-/// If the version byte does not match PACKET_VERSION, returns a default
-/// packet with flags set to 0xFF to indicate an error.
-pub fn deserializeProbePacket(buf: *const [40]u8) ProbePacket {
-    const version = buf[0];
-
-    // Version validation: return error-flagged packet on mismatch
-    if (version != PACKET_VERSION) {
-        return ProbePacket{
-            .version = version,
-            .msg_type = 0,
-            .ack_type = 0,
-            .flags = 0xFF, // Error indicator
-            .sequence_num = 0,
-            .t1 = 0,
-            .t3 = 0,
-            .t4 = 0,
-        };
-    }
-
-    return ProbePacket{
-        .version = version,
-        .msg_type = buf[1],
-        .ack_type = buf[2],
-        .flags = buf[3],
-        .sequence_num = readBigEndianU64(buf, 4),
-        .t1 = readBigEndianU64(buf, 12),
-        .t3 = readBigEndianU64(buf, 20),
-        .t4 = readBigEndianU64(buf, types.WIRE_T4_OFFSET),
+/// Decode the probe a responder is answering. `recv_packet` points at the
+/// payload after the GRH; the CQ poller already checked its version before
+/// delivering it, so a mismatch here means the caller passed stale bytes.
+fn decodeReceivedProbe(recv_packet: [*]const u8) ?ProbePacket {
+    return wire.deserializeProbePacket(@ptrCast(recv_packet)) orelse {
+        types.setLastError("received packet has an unsupported wire format version");
+        return null;
     };
 }
 
@@ -344,8 +197,8 @@ fn sendPacketInternal(
         freeSendSlot(queue, slot_index);
         return PacketError.SlotIndexOutOfBounds;
     };
-    const buf_ptr: *[40]u8 = @ptrCast(slot_ptr);
-    serializeProbePacket(pkt, buf_ptr);
+    const buf_ptr: *wire.Bytes = @ptrCast(slot_ptr);
+    wire.serializeProbePacket(pkt, buf_ptr);
 
     // Step 3: Create an address handle for the target. Ownership transfers
     // to the send slot before post_send: the CQ poller destroys the AH when
@@ -403,9 +256,9 @@ pub fn sendProbe(
 ) SendResult {
     // Construct the probe packet
     const pkt = ProbePacket{
-        .version = PACKET_VERSION,
-        .msg_type = MSG_TYPE_PROBE,
-        .ack_type = ACK_TYPE_NONE,
+        .version = wire.PACKET_VERSION,
+        .msg_type = wire.MSG_TYPE_PROBE,
+        .ack_type = wire.ACK_TYPE_NONE,
         .flags = 0,
         .sequence_num = sequence_num,
         .t1 = 0, // Will be captured separately
@@ -465,7 +318,7 @@ pub fn sendAckPair(
     recv_packet: [*]const u8,
     recv_timestamp_ns: u64,
 ) i32 {
-    const original = deserializeProbePacket(@ptrCast(recv_packet));
+    const original = decodeReceivedProbe(recv_packet) orelse return -1;
 
     const slot_index = findFreeSendSlot(queue) orelse {
         types.setLastError("no free send slot available");
@@ -511,9 +364,9 @@ pub fn sendAckPair(
 /// ACK's send completion supplies it.
 pub fn stageAckPair(slot_ptr: [*]u8, original: *const ProbePacket, t3_ns: u64) void {
     const first_ack = ProbePacket{
-        .version = PACKET_VERSION,
-        .msg_type = MSG_TYPE_ACK,
-        .ack_type = ACK_TYPE_FIRST,
+        .version = wire.PACKET_VERSION,
+        .msg_type = wire.MSG_TYPE_ACK,
+        .ack_type = wire.ACK_TYPE_FIRST,
         .flags = 0,
         .sequence_num = original.sequence_num,
         .t1 = original.t1,
@@ -521,9 +374,9 @@ pub fn stageAckPair(slot_ptr: [*]u8, original: *const ProbePacket, t3_ns: u64) v
         .t4 = 0,
     };
     var second_ack = first_ack;
-    second_ack.ack_type = ACK_TYPE_SECOND;
-    serializeProbePacket(&first_ack, @ptrCast(slot_ptr));
-    serializeProbePacket(&second_ack, @ptrCast(slot_ptr + types.SECOND_ACK_SLOT_OFFSET));
+    second_ack.ack_type = wire.ACK_TYPE_SECOND;
+    wire.serializeProbePacket(&first_ack, @ptrCast(slot_ptr));
+    wire.serializeProbePacket(&second_ack, @ptrCast(slot_ptr + types.SECOND_ACK_SLOT_OFFSET));
 }
 
 /// Send the first ACK in response to a received probe.
@@ -542,15 +395,15 @@ pub fn sendFirstAck(
     recv_timestamp_ns: u64,
     timeout_ms: u32,
 ) FirstAckResult {
-    // Deserialize the received probe packet to extract sequence_num and t1.
-    // The recv_packet pointer points to the payload after the GRH.
-    const original = deserializeProbePacket(@ptrCast(recv_packet));
+    const original = decodeReceivedProbe(recv_packet) orelse {
+        return FirstAckResult{ .t4_ns = 0, .error_code = -1 };
+    };
 
     // Construct the first ACK packet
     const ack_pkt = ProbePacket{
-        .version = PACKET_VERSION,
-        .msg_type = MSG_TYPE_ACK,
-        .ack_type = ACK_TYPE_FIRST,
+        .version = wire.PACKET_VERSION,
+        .msg_type = wire.MSG_TYPE_ACK,
+        .ack_type = wire.ACK_TYPE_FIRST,
         .flags = 0,
         .sequence_num = original.sequence_num,
         .t1 = original.t1,
@@ -589,14 +442,13 @@ pub fn sendSecondAck(
     t4_ns: u64,
     timeout_ms: u32,
 ) i32 {
-    // Deserialize the received probe packet to extract sequence_num and t1
-    const original = deserializeProbePacket(@ptrCast(recv_packet));
+    const original = decodeReceivedProbe(recv_packet) orelse return -1;
 
     // Construct the second ACK packet with processing delay information
     const ack_pkt = ProbePacket{
-        .version = PACKET_VERSION,
-        .msg_type = MSG_TYPE_ACK,
-        .ack_type = ACK_TYPE_SECOND,
+        .version = wire.PACKET_VERSION,
+        .msg_type = wire.MSG_TYPE_ACK,
+        .ack_type = wire.ACK_TYPE_SECOND,
         .flags = 0,
         .sequence_num = original.sequence_num,
         .t1 = original.t1,
@@ -776,272 +628,9 @@ export fn rdma_send_second_ack(
 // Tests
 // ---------------------------------------------------------------------------
 
-test "ProbePacket struct has expected fields" {
-    const pkt = ProbePacket{
-        .version = PACKET_VERSION,
-        .msg_type = MSG_TYPE_PROBE,
-        .ack_type = ACK_TYPE_NONE,
-        .flags = 0,
-        .sequence_num = 42,
-        .t1 = 1000,
-        .t3 = 2000,
-        .t4 = 3000,
-    };
-    try std.testing.expectEqual(@as(u8, 1), pkt.version);
-    try std.testing.expectEqual(@as(u8, 0), pkt.msg_type);
-    try std.testing.expectEqual(@as(u8, 0), pkt.ack_type);
-    try std.testing.expectEqual(@as(u64, 42), pkt.sequence_num);
-    try std.testing.expectEqual(@as(u64, 1000), pkt.t1);
-    try std.testing.expectEqual(@as(u64, 2000), pkt.t3);
-    try std.testing.expectEqual(@as(u64, 3000), pkt.t4);
-}
-
 test "SendResult size matches C ABI" {
     // rdma_send_result_t: uint64_t t1_ns + uint64_t t2_ns + int32_t error + 4 bytes padding = 24 bytes
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(SendResult));
-}
-
-test "protocol constants have correct values" {
-    try std.testing.expectEqual(@as(u8, 1), PACKET_VERSION);
-    try std.testing.expectEqual(@as(u8, 0), MSG_TYPE_PROBE);
-    try std.testing.expectEqual(@as(u8, 1), MSG_TYPE_ACK);
-    try std.testing.expectEqual(@as(u8, 0), ACK_TYPE_NONE);
-    try std.testing.expectEqual(@as(u8, 1), ACK_TYPE_FIRST);
-    try std.testing.expectEqual(@as(u8, 2), ACK_TYPE_SECOND);
-}
-
-test "writeBigEndianU64 and readBigEndianU64 roundtrip" {
-    var buf: [8]u8 = undefined;
-    const test_values = [_]u64{
-        0,
-        1,
-        42,
-        0xFF,
-        0xFFFF,
-        0xFFFFFFFF,
-        0xDEADBEEFCAFEBABE,
-        0xFFFFFFFFFFFFFFFF,
-    };
-
-    for (test_values) |value| {
-        writeBigEndianU64(&buf, 0, value);
-        const read_back = readBigEndianU64(&buf, 0);
-        try std.testing.expectEqual(value, read_back);
-    }
-}
-
-test "writeBigEndianU64 produces correct byte order" {
-    var buf: [8]u8 = undefined;
-
-    // 0x0102030405060708 should produce bytes [01, 02, 03, 04, 05, 06, 07, 08]
-    writeBigEndianU64(&buf, 0, 0x0102030405060708);
-    try std.testing.expectEqual(@as(u8, 0x01), buf[0]);
-    try std.testing.expectEqual(@as(u8, 0x02), buf[1]);
-    try std.testing.expectEqual(@as(u8, 0x03), buf[2]);
-    try std.testing.expectEqual(@as(u8, 0x04), buf[3]);
-    try std.testing.expectEqual(@as(u8, 0x05), buf[4]);
-    try std.testing.expectEqual(@as(u8, 0x06), buf[5]);
-    try std.testing.expectEqual(@as(u8, 0x07), buf[6]);
-    try std.testing.expectEqual(@as(u8, 0x08), buf[7]);
-}
-
-test "writeBigEndianU64 with offset" {
-    var buf: [16]u8 = @splat(0);
-    writeBigEndianU64(&buf, 4, 0x0A0B0C0D0E0F1011);
-
-    // Bytes before offset should be untouched
-    try std.testing.expectEqual(@as(u8, 0x00), buf[0]);
-    try std.testing.expectEqual(@as(u8, 0x00), buf[3]);
-
-    // Value at offset
-    try std.testing.expectEqual(@as(u8, 0x0A), buf[4]);
-    try std.testing.expectEqual(@as(u8, 0x11), buf[11]);
-
-    // Bytes after should be untouched
-    try std.testing.expectEqual(@as(u8, 0x00), buf[12]);
-}
-
-test "serializeProbePacket writes correct bytes" {
-    const pkt = ProbePacket{
-        .version = PACKET_VERSION,
-        .msg_type = MSG_TYPE_ACK,
-        .ack_type = ACK_TYPE_FIRST,
-        .flags = 0x42,
-        .sequence_num = 0x0000000000000001,
-        .t1 = 0x00000000000003E8, // 1000
-        .t3 = 0x00000000000007D0, // 2000
-        .t4 = 0x0000000000000BB8, // 3000
-    };
-
-    var buf: [40]u8 = undefined;
-    serializeProbePacket(&pkt, &buf);
-
-    // Check single-byte header fields
-    try std.testing.expectEqual(@as(u8, 1), buf[0]); // version
-    try std.testing.expectEqual(@as(u8, 1), buf[1]); // msg_type = ACK
-    try std.testing.expectEqual(@as(u8, 1), buf[2]); // ack_type = FIRST
-    try std.testing.expectEqual(@as(u8, 0x42), buf[3]); // flags
-
-    // Check sequence_num at offset 4 (BigEndian)
-    try std.testing.expectEqual(@as(u64, 1), readBigEndianU64(&buf, 4));
-
-    // Check t1 at offset 12
-    try std.testing.expectEqual(@as(u64, 1000), readBigEndianU64(&buf, 12));
-
-    // Check t3 at offset 20
-    try std.testing.expectEqual(@as(u64, 2000), readBigEndianU64(&buf, 20));
-
-    // Check t4 at offset 28
-    try std.testing.expectEqual(@as(u64, 3000), readBigEndianU64(&buf, 28));
-
-    // Check reserved bytes are zero
-    try std.testing.expectEqual(@as(u8, 0), buf[36]);
-    try std.testing.expectEqual(@as(u8, 0), buf[37]);
-    try std.testing.expectEqual(@as(u8, 0), buf[38]);
-    try std.testing.expectEqual(@as(u8, 0), buf[39]);
-}
-
-test "deserializeProbePacket roundtrip" {
-    const original = ProbePacket{
-        .version = PACKET_VERSION,
-        .msg_type = MSG_TYPE_ACK,
-        .ack_type = ACK_TYPE_SECOND,
-        .flags = 0,
-        .sequence_num = 12345678,
-        .t1 = 1_000_000_000,
-        .t3 = 2_000_000_000,
-        .t4 = 3_000_000_000,
-    };
-
-    var buf: [40]u8 = undefined;
-    serializeProbePacket(&original, &buf);
-    const deserialized = deserializeProbePacket(&buf);
-
-    try std.testing.expectEqual(original.version, deserialized.version);
-    try std.testing.expectEqual(original.msg_type, deserialized.msg_type);
-    try std.testing.expectEqual(original.ack_type, deserialized.ack_type);
-    try std.testing.expectEqual(original.flags, deserialized.flags);
-    try std.testing.expectEqual(original.sequence_num, deserialized.sequence_num);
-    try std.testing.expectEqual(original.t1, deserialized.t1);
-    try std.testing.expectEqual(original.t3, deserialized.t3);
-    try std.testing.expectEqual(original.t4, deserialized.t4);
-}
-
-test "deserializeProbePacket with version mismatch returns error-flagged packet" {
-    var buf: [40]u8 = @splat(0);
-    buf[0] = 99; // Invalid version
-
-    const pkt = deserializeProbePacket(&buf);
-
-    try std.testing.expectEqual(@as(u8, 99), pkt.version);
-    try std.testing.expectEqual(@as(u8, 0xFF), pkt.flags); // Error indicator
-    try std.testing.expectEqual(@as(u64, 0), pkt.sequence_num);
-}
-
-test "serialize probe packet has correct total size" {
-    // Verify the wire format size matches the protocol constant
-    try std.testing.expectEqual(@as(u32, 40), types.PROBE_PACKET_SIZE);
-}
-
-test "serializeProbePacket zeroes reserved bytes even if buffer was dirty" {
-    var buf: [40]u8 = @splat(0xFF); // Fill with 0xFF
-
-    const pkt = ProbePacket{
-        .version = PACKET_VERSION,
-        .msg_type = MSG_TYPE_PROBE,
-        .ack_type = ACK_TYPE_NONE,
-        .flags = 0,
-        .sequence_num = 0,
-        .t1 = 0,
-        .t3 = 0,
-        .t4 = 0,
-    };
-
-    serializeProbePacket(&pkt, &buf);
-
-    // Reserved bytes must be zero regardless of previous buffer content
-    try std.testing.expectEqual(@as(u8, 0), buf[36]);
-    try std.testing.expectEqual(@as(u8, 0), buf[37]);
-    try std.testing.expectEqual(@as(u8, 0), buf[38]);
-    try std.testing.expectEqual(@as(u8, 0), buf[39]);
-}
-
-test "serializeProbePacket all message type combinations" {
-    // Test probe packet
-    {
-        const pkt = ProbePacket{
-            .version = PACKET_VERSION,
-            .msg_type = MSG_TYPE_PROBE,
-            .ack_type = ACK_TYPE_NONE,
-            .flags = 0,
-            .sequence_num = 100,
-            .t1 = 0,
-            .t3 = 0,
-            .t4 = 0,
-        };
-        var buf: [40]u8 = undefined;
-        serializeProbePacket(&pkt, &buf);
-        try std.testing.expectEqual(@as(u8, 0), buf[1]); // MSG_TYPE_PROBE
-        try std.testing.expectEqual(@as(u8, 0), buf[2]); // ACK_TYPE_NONE
-    }
-
-    // Test first ACK
-    {
-        const pkt = ProbePacket{
-            .version = PACKET_VERSION,
-            .msg_type = MSG_TYPE_ACK,
-            .ack_type = ACK_TYPE_FIRST,
-            .flags = 0,
-            .sequence_num = 100,
-            .t1 = 500,
-            .t3 = 1000,
-            .t4 = 0,
-        };
-        var buf: [40]u8 = undefined;
-        serializeProbePacket(&pkt, &buf);
-        try std.testing.expectEqual(@as(u8, 1), buf[1]); // MSG_TYPE_ACK
-        try std.testing.expectEqual(@as(u8, 1), buf[2]); // ACK_TYPE_FIRST
-    }
-
-    // Test second ACK
-    {
-        const pkt = ProbePacket{
-            .version = PACKET_VERSION,
-            .msg_type = MSG_TYPE_ACK,
-            .ack_type = ACK_TYPE_SECOND,
-            .flags = 0,
-            .sequence_num = 100,
-            .t1 = 500,
-            .t3 = 1000,
-            .t4 = 1500,
-        };
-        var buf: [40]u8 = undefined;
-        serializeProbePacket(&pkt, &buf);
-        try std.testing.expectEqual(@as(u8, 1), buf[1]); // MSG_TYPE_ACK
-        try std.testing.expectEqual(@as(u8, 2), buf[2]); // ACK_TYPE_SECOND
-    }
-}
-
-test "deserializeProbePacket with max u64 values" {
-    const original = ProbePacket{
-        .version = PACKET_VERSION,
-        .msg_type = MSG_TYPE_PROBE,
-        .ack_type = ACK_TYPE_NONE,
-        .flags = 0,
-        .sequence_num = 0xFFFFFFFFFFFFFFFF,
-        .t1 = 0xFFFFFFFFFFFFFFFF,
-        .t3 = 0xFFFFFFFFFFFFFFFF,
-        .t4 = 0xFFFFFFFFFFFFFFFF,
-    };
-
-    var buf: [40]u8 = undefined;
-    serializeProbePacket(&original, &buf);
-    const deserialized = deserializeProbePacket(&buf);
-
-    try std.testing.expectEqual(original.sequence_num, deserialized.sequence_num);
-    try std.testing.expectEqual(original.t1, deserialized.t1);
-    try std.testing.expectEqual(original.t3, deserialized.t3);
-    try std.testing.expectEqual(original.t4, deserialized.t4);
 }
 
 test "findFreeSendSlot and freeSendSlot basic behavior" {
@@ -1121,9 +710,9 @@ test "stageAckPair stages both ACKs and the CQ poller's T4 stamp completes the s
     const cq = @import("cq.zig");
     var slot: [types.SLOT_SIZE]u8 = @splat(0);
     const probe_pkt = ProbePacket{
-        .version = PACKET_VERSION,
-        .msg_type = MSG_TYPE_PROBE,
-        .ack_type = ACK_TYPE_NONE,
+        .version = wire.PACKET_VERSION,
+        .msg_type = wire.MSG_TYPE_PROBE,
+        .ack_type = wire.ACK_TYPE_NONE,
         .flags = 0,
         .sequence_num = 0xAABBCCDD00000007,
         .t1 = 111,
@@ -1133,18 +722,18 @@ test "stageAckPair stages both ACKs and the CQ poller's T4 stamp completes the s
     stageAckPair(&slot, &probe_pkt, 333);
     cq.stampStagedSecondAck(&slot, 444);
 
-    const first = deserializeProbePacket(slot[0..40]);
-    try std.testing.expectEqual(MSG_TYPE_ACK, first.msg_type);
-    try std.testing.expectEqual(ACK_TYPE_FIRST, first.ack_type);
+    const first = wire.deserializeProbePacket(slot[0..40]) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(wire.MSG_TYPE_ACK, first.msg_type);
+    try std.testing.expectEqual(wire.ACK_TYPE_FIRST, first.ack_type);
     try std.testing.expectEqual(probe_pkt.sequence_num, first.sequence_num);
     try std.testing.expectEqual(@as(u64, 111), first.t1);
     try std.testing.expectEqual(@as(u64, 333), first.t3);
     try std.testing.expectEqual(@as(u64, 0), first.t4);
 
     const off = types.SECOND_ACK_SLOT_OFFSET;
-    const second = deserializeProbePacket(slot[off..][0..40]);
-    try std.testing.expectEqual(MSG_TYPE_ACK, second.msg_type);
-    try std.testing.expectEqual(ACK_TYPE_SECOND, second.ack_type);
+    const second = wire.deserializeProbePacket(slot[off..][0..40]) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(wire.MSG_TYPE_ACK, second.msg_type);
+    try std.testing.expectEqual(wire.ACK_TYPE_SECOND, second.ack_type);
     try std.testing.expectEqual(probe_pkt.sequence_num, second.sequence_num);
     try std.testing.expectEqual(@as(u64, 111), second.t1);
     try std.testing.expectEqual(@as(u64, 333), second.t3);

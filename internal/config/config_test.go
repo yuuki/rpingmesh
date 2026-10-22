@@ -437,6 +437,7 @@ func TestLoadAgentConfig_EnvValidation(t *testing.T) {
 		wantErr    string
 	}{
 		{"RPINGMESH_OTEL_COLLECTOR_ADDR", "grpc://collector:4317", "otel_collector_addr"},
+		{"RPINGMESH_LOG_LEVEL", "not-a-level", "log_level"},
 		{"RPINGMESH_LOG_FORMAT", "logfmt", "log_format"},
 		{"RPINGMESH_GID_INDEX", "-1", "gid_index"},
 		{"RPINGMESH_GID_INDEX", "255", ""},

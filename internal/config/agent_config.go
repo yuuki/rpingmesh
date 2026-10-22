@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"github.com/rs/zerolog"
 	"net"
 	"os"
 	"strings"
@@ -447,6 +448,11 @@ func BindAgentFlags(flags *pflag.FlagSet) {
 // an error describing the first invalid field encountered. The helpers run
 // in a fixed order so that the first error for a given input is stable.
 func (c *AgentConfig) Validate() error {
+	// Reject an unknown level at load, as the controller does, instead of
+	// silently running at info.
+	if _, err := zerolog.ParseLevel(c.LogLevel); err != nil {
+		return fmt.Errorf("log_level %q is not a known level: %w", c.LogLevel, err)
+	}
 	if err := c.validateTorAndPlaneIDs(); err != nil {
 		return err
 	}

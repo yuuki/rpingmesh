@@ -296,6 +296,10 @@ is: CLI flag, environment variable, configuration file, built-in default.
   `RPINGMESH_LOG_LEVEL=debug`.
 - **Flags.** Most scalar keys have a flag with hyphens instead of underscores,
   for example `--probe-interval-ms`. Run a binary with `--help` for the list.
+- **Lists.** A list key (`allowed_device_names`, `excluded_gid_cidrs`, ...) is a
+  YAML sequence in the file, whitespace-separated in an environment variable
+  (`RPINGMESH_EXCLUDED_DEVICE_NAMES="mlx5_3 mlx5_8"`), and comma-separated on
+  the command line (`--excluded-device-names mlx5_3,mlx5_8`).
 
 Both binaries validate the configuration at startup and exit with an error that
 names the first invalid key. The commented defaults are in
@@ -423,7 +427,7 @@ To choose `service_level` and `traffic_class`, see
 | `metrics_cardinality_limit` | `0` | Maximum attribute sets per metric instrument; extra sets fold into one `otel.metric.overflow="true"` series. `0` keeps the OTel SDK default (2000); otherwise it must be at least 2000, because the limit applies to every instrument |
 | `analysis_report_enabled` | `true` | Send per-path summaries to the controller's analyzer. Reporting is best-effort and never blocks probing |
 | `analysis_window_sec` | `30` | Per-path aggregation window |
-| `log_level` | `info` | `debug`, `info`, `warn`, or `error` |
+| `log_level` | `info` | `debug`, `info`, `warn`, or `error`; any other value is rejected at startup |
 | `log_format` | `console` | `console` or `json` (one object per line on stderr) |
 
 **Self-protection**
@@ -909,7 +913,9 @@ describes the dashboards and alerts.
 
 Both binaries log to stderr through zerolog, either human-readable
 (`log_format: console`) or as one JSON object per line (`log_format: json`).
-`scripts/topology/rtt_tor_check.py` reads the JSON form. Per-probe detail is
+`scripts/topology/rtt_tor_check.py` reads the JSON form. The JSON field names
+are stable but differ by binary: the agent uses snake_case keys (`agent_id`,
+`source_tor`), the controller camelCase ones (`listenAddr`, `requesterGID`). Per-probe detail is
 logged only at `debug` level; its `Probe result recorded` line carries
 `invalid_kind` and `validation_error` for a rejected measurement.
 

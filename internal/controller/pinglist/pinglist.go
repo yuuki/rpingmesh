@@ -13,7 +13,8 @@ import (
 
 // DefaultInterTorSampleSize is the fallback number of distinct foreign ToRs
 // sampled for an inter-ToR pinglist when NewPinglistGenerator is given a
-// non-positive size. It mirrors config.DefaultInterTorSampleSize.
+// non-positive size. config.DefaultInterTorSampleSize carries the same value
+// (pinned equal by a test in internal/config).
 const DefaultInterTorSampleSize = 5
 
 // RnicSource is the subset of registry.RnicRegistry's read API required to
@@ -35,8 +36,9 @@ type RnicSource interface {
 }
 
 // DefaultUnspecifiedMeshMaxTargets is the fallback cap on ToR-mesh targets
-// generated for the untagged (empty tor_id) bucket. It mirrors
-// config.DefaultUnspecifiedMeshMaxTargets. 0 means unlimited.
+// generated for the untagged (empty tor_id) bucket. 0 means unlimited.
+// config.DefaultUnspecifiedMeshMaxTargets carries the same value (pinned
+// equal by a test in internal/config).
 const DefaultUnspecifiedMeshMaxTargets = 32
 
 // PinglistGenerator generates probe target lists for agents.

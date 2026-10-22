@@ -21,9 +21,11 @@ const (
 
 	// MaxDistinctFlowLabels caps how many labels one target's set may hold,
 	// so a bad or malicious controller value can neither make the agent build
-	// a huge set nor spin the dedup loop forever. It mirrors the controller's
-	// config.MaxEcmpFlowLabels (defense in depth) and stays far below the
-	// 2^20 distinct 20-bit values.
+	// a huge set nor spin the dedup loop forever. 4096 labels is ~16KB per
+	// target and covers even extreme Eq.(1) configurations (m=256, p=0.99
+	// needs ~2600), far below the 2^20 distinct 20-bit values. The controller
+	// enforces the same ceiling on ecmp_max_flow_labels
+	// (config.MaxEcmpFlowLabels references this constant).
 	MaxDistinctFlowLabels = 4096
 )
 

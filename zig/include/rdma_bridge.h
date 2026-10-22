@@ -2,7 +2,7 @@
  * rdma_bridge.h - C-ABI interface between Go (Cgo) and Zig RDMA library
  *
  * This header is the single source of truth for the Zig-Go RDMA interface.
- * The Zig library implements these functions with @export.
+ * The Zig library implements these functions as `export fn`.
  * The Go bridge (rdmabridge/bridge.go) calls them via Cgo.
  *
  * ABI safety rules:

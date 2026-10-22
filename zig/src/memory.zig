@@ -24,16 +24,12 @@ pub const MemoryError = error{
     AllocFailed,
     /// ibv_reg_mr() returned null.
     RegMrFailed,
-    /// ibv_dereg_mr() returned a non-zero error code.
-    DeregMrFailed,
     /// The slot index is out of bounds for the buffer.
     SlotIndexOutOfBounds,
     /// ibv_post_recv() failed.
     PostRecvFailed,
     /// ibv_post_send() failed.
     PostSendFailed,
-    /// A required pointer argument was null.
-    NullPointer,
 };
 
 /// See types.BufferSet; allocateBuffers() creates one.
@@ -59,20 +55,14 @@ pub fn allocateBuffers(dev: *types.RdmaDevice, num_slots: u32) MemoryError!Buffe
 
     const total_size: usize = @as(usize, num_slots) * @as(usize, SLOT_SIZE);
 
-    // Allocate page-aligned memory. The page_allocator produces page-aligned
-    // allocations by default, but we explicitly request the alignment.
     const buf = std.heap.page_allocator.alignedAlloc(u8, @as(std.mem.Alignment, @fromBackingInt(@intCast(@ctz(@as(usize, PAGE_SIZE))))), total_size) catch {
         types.setLastError("failed to allocate page-aligned buffer");
         return MemoryError.AllocFailed;
     };
     errdefer std.heap.page_allocator.free(buf);
-
-    // Zero-initialize the buffer
     @memset(buf, 0);
 
-    // Register the buffer as a Memory Region with the device's PD.
-    // IBV_ACCESS_LOCAL_WRITE allows the HCA to write into this buffer
-    // (required for receive operations).
+    // IBV_ACCESS_LOCAL_WRITE lets the HCA write received data into the buffer.
     const mr = c.ibv_reg_mr(
         dev.pd,
         @ptrCast(buf.ptr),
@@ -117,11 +107,10 @@ pub fn freeBuffers(buf_set: *BufferSet) void {
         return;
     }
 
-    // Free the page-aligned buffer
     const slice = buf_set.buf[0..buf_set.size];
     std.heap.page_allocator.free(slice);
 
-    // Zero out the struct to prevent dangling pointer use
+    // Leave nothing dangling behind.
     buf_set.buf = undefined;
     buf_set.mr = undefined;
     buf_set.num_slots = 0;
@@ -194,15 +183,9 @@ pub fn postUdSend(
     }
 }
 
-/// Post a single receive buffer to a Queue Pair.
-///
-/// Creates an ibv_recv_wr (receive work request) that tells the HCA where
-/// to write incoming data for this slot. The wr_id is the bare slot_index
-/// (no SEND_WR_ID_FLAG), which identifies both the buffer and, to the CQ
-/// poller, the completion as a receive.
-///
-/// The scatter/gather entry points to the slot's buffer with a length of
-/// SLOT_SIZE and the lkey from the registered Memory Region.
+/// Post one receive buffer (a whole SLOT_SIZE slot) to a Queue Pair. The
+/// wr_id is the bare slot_index (no SEND_WR_ID_FLAG), which identifies both
+/// the buffer and, to the CQ poller, the completion as a receive.
 pub fn postRecvBuffer(
     qp: *c.ibv_qp,
     mr: *c.ibv_mr,
@@ -210,15 +193,11 @@ pub fn postRecvBuffer(
     slot_index: u32,
 ) MemoryError!void {
     const offset: usize = @as(usize, slot_index) * @as(usize, SLOT_SIZE);
-
-    // Scatter/gather list entry: describes the buffer for this receive
     var sge = c.ibv_sge{
         .addr = @intFromPtr(buf + offset),
         .length = SLOT_SIZE,
         .lkey = mr.lkey,
     };
-
-    // Receive work request
     var wr = c.ibv_recv_wr{
         .wr_id = @intCast(slot_index),
         .next = null,
@@ -234,14 +213,8 @@ pub fn postRecvBuffer(
     }
 }
 
-/// Post receive buffers for slots 0 through num_buffers-1.
-///
-/// This is called during queue initialization to pre-post a batch of
-/// receive buffers so the HCA has buffers ready to receive incoming
-/// packets immediately after the QP transitions to the RTS state.
-///
-/// If any individual post fails, the function returns immediately with
-/// an error. Buffers posted before the failure remain posted.
+/// Post receive buffers for slots 0 through num_buffers-1 at queue
+/// creation. On a failure the slots posted before it remain posted.
 pub fn postInitialRecvBuffers(
     qp: *c.ibv_qp,
     mr: *c.ibv_mr,
@@ -259,22 +232,13 @@ pub fn postInitialRecvBuffers(
 // ---------------------------------------------------------------------------
 
 test "getSlotPtr returns correct offset" {
-    // Create a small test buffer (not registered with RDMA, just for pointer math)
+    // Pointer math only; the buffer is not registered with RDMA.
     var test_buf: [4136 * 4]u8 = undefined;
     const base: [*]u8 = &test_buf;
-
-    // Slot 0 should be at the base
-    const slot0 = try getSlotPtr(base, 0, 4);
-    try std.testing.expectEqual(base, slot0);
-
-    // Slot 1 should be at base + SLOT_SIZE
-    const slot1 = try getSlotPtr(base, 1, 4);
     const expected_offset: usize = SLOT_SIZE;
-    try std.testing.expectEqual(base + expected_offset, slot1);
-
-    // Slot 2 should be at base + 2 * SLOT_SIZE
-    const slot2 = try getSlotPtr(base, 2, 4);
-    try std.testing.expectEqual(base + 2 * expected_offset, slot2);
+    try std.testing.expectEqual(base, try getSlotPtr(base, 0, 4));
+    try std.testing.expectEqual(base + expected_offset, try getSlotPtr(base, 1, 4));
+    try std.testing.expectEqual(base + 2 * expected_offset, try getSlotPtr(base, 2, 4));
 }
 
 test "getSlotPtr rejects out of bounds index" {

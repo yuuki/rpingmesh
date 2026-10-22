@@ -44,8 +44,6 @@ pub const QueueError = error{
     StartPollerFailed,
     /// ibv_create_ah() returned null.
     CreateAhFailed,
-    /// ibv_cq_ex_to_cq() returned null.
-    CqConversionFailed,
 };
 
 // ---------------------------------------------------------------------------
@@ -68,7 +66,6 @@ pub const QueueError = error{
 /// returning the error.
 pub fn createQueue(
     dev: *types.RdmaDevice,
-    queue_type: types.QueueType,
     cq_mode: types.CqPollMode,
     event_ring: *ring.EventRing,
 ) QueueError!*types.UdQueue {
@@ -120,7 +117,6 @@ pub fn createQueue(
         .send_bufs = send_bufs,
         .recv_bufs = recv_bufs,
         .uses_sw_timestamps = cq_result.uses_sw_timestamps,
-        .queue_type = queue_type,
         .event_ring = event_ring,
         .device = dev,
         .comp_channel = wait.comp_channel,
@@ -277,13 +273,6 @@ pub fn createAddressHandle(
     };
 
     return ah;
-}
-
-/// Destroy an Address Handle.
-///
-/// Releases the AH resources allocated by ibv_create_ah().
-pub fn destroyAddressHandle(ah: *c.ibv_ah) void {
-    _ = c.ibv_destroy_ah(ah);
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +441,9 @@ export fn rdma_create_queue(
         types.setLastError("null event ring pointer");
         return -1;
     };
-    const qt = std.enums.fromInt(types.QueueType, queue_type_raw) orelse {
+    // Sender and responder queues are built identically; the type is only
+    // validated so a bad value surfaces at creation.
+    _ = std.enums.fromInt(types.QueueType, queue_type_raw) orelse {
         types.setLastError("invalid queue type");
         return -1;
     };
@@ -461,7 +452,7 @@ export fn rdma_create_queue(
         return -1;
     };
 
-    const queue = createQueue(dev, qt, cq_mode, event_ring) catch return -1;
+    const queue = createQueue(dev, cq_mode, event_ring) catch return -1;
 
     out_queue.* = queue;
     out_info.* = .{
@@ -482,21 +473,6 @@ export fn rdma_destroy_queue(queue_ptr: ?*types.UdQueue) void {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-test "QueueError enum is defined" {
-    // Verify the error set exists and has expected variants
-    const err: QueueError = QueueError.OutOfMemory;
-    try std.testing.expect(err == QueueError.OutOfMemory);
-}
-
-test "destroyAddressHandle does not crash with valid pattern" {
-    // This is a compile-time check that the function signature is correct.
-    // We cannot call it without a real AH, but we can verify it compiles.
-    const ptr: ?*c.ibv_ah = null;
-    if (ptr) |ah| {
-        destroyAddressHandle(ah);
-    }
-}
 
 test "CqPollMode.wantsEvents" {
     try std.testing.expect(types.CqPollMode.Auto.wantsEvents(false));

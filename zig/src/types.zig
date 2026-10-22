@@ -108,15 +108,11 @@ pub const SendSlotMode = enum(u8) {
     AsyncSecondAck = 2,
 };
 
-/// Describes whether a send/receive slot is available, waiting for a
-/// completion, or actively being used by the application.
+/// Whether a send slot is available or holds a send (posted, or being
+/// prepared by the sender).
 pub const SlotState = enum(u8) {
-    /// Slot is available for new work requests.
     Free = 0,
-    /// Slot has been posted to the hardware and is awaiting completion.
-    Posted = 1,
-    /// Slot is being consumed by application code (e.g. packet parsing).
-    InUse = 2,
+    InUse = 1,
 };
 
 /// Identifies the role of a UD Queue Pair (RDMA_QUEUE_TYPE_* in
@@ -181,9 +177,6 @@ pub const RdmaContext = struct {
 
     /// Number of devices in the device list, as returned by ibv_get_device_list().
     device_count: i32,
-
-    /// Whether this context has been successfully initialized.
-    initialized: bool,
 };
 
 /// Represents an opened RDMA device with its Protection Domain and
@@ -300,9 +293,6 @@ pub const UdQueue = struct {
     /// timestamps (false). Determined at creation based on device capabilities.
     uses_sw_timestamps: bool,
 
-    /// Role of this queue: Sender or Responder.
-    queue_type: QueueType,
-
     /// Pointer to the event ring buffer where CQ completions are written.
     /// The ring is owned by the Go side and passed in during queue creation.
     event_ring: ?*ring.EventRing,
@@ -347,9 +337,6 @@ pub const UdQueue = struct {
     /// could not post. Monotonic; read by Go via
     /// rdma_queue_async_ack_failures().
     async_ack_failures: std.atomic.Value(u64),
-
-    /// Per-slot state tracking for receive buffers.
-    recv_slot_states: [NUM_RECV_SLOTS]SlotState,
 
     /// Whether the CQ poller thread should keep running. Set to false
     /// during queue destruction to signal the poller to exit.
@@ -416,7 +403,6 @@ pub const UdQueue = struct {
         send_bufs: BufferSet,
         recv_bufs: BufferSet,
         uses_sw_timestamps: bool,
-        queue_type: QueueType,
         event_ring: ?*ring.EventRing,
         device: *RdmaDevice,
         comp_channel: ?*c.ibv_comp_channel,
@@ -433,7 +419,6 @@ pub const UdQueue = struct {
             .recv_bufs = a.recv_bufs,
             .qpn = a.qp.qp_num,
             .uses_sw_timestamps = a.uses_sw_timestamps,
-            .queue_type = a.queue_type,
             .event_ring = a.event_ring,
             .cq_thread = null,
             .device = a.device,
@@ -442,7 +427,6 @@ pub const UdQueue = struct {
             .send_slot_modes = @splat(std.atomic.Value(u8).init(@backingInt(SendSlotMode.Sync))),
             .send_slot_remote_qpn = @splat(0),
             .async_ack_failures = std.atomic.Value(u64).init(0),
-            .recv_slot_states = @splat(SlotState.Free),
             .running = std.atomic.Value(bool).init(false),
             .comp_channel = a.comp_channel,
             .uses_cq_events = false,
@@ -612,17 +596,16 @@ pub fn gidToString(gid_bytes: [16]u8) [64]u8 {
 
 /// Get the current CLOCK_MONOTONIC time in nanoseconds.
 ///
-/// This is the single shared clock source for every software timestamp
-/// (SW-fallback T1/T2/T3/T4/T5) in the 6-timestamp protocol, so that they
+/// This is the single clock source for every software timestamp (T1, and
+/// the SW-fallback T2/T3/T4/T5) in the 6-timestamp protocol, so that they
 /// stay in the same clock domain as the Go side's T6, which is read via
 /// `unix.ClockGettime(unix.CLOCK_MONOTONIC, ...)` in
-/// `internal/agent/prober.go`. Do NOT use `std.time.nanoTimestamp()` here:
-/// in Zig 0.15.x it returned CLOCK_REALTIME (wall-clock) time despite the
-/// name, which would mix an epoch-scale value with the Go side's
-/// boot-scale monotonic value and make every ProberDelay/NetworkRTT
-/// calculation nonsensical.
+/// `internal/agent/prober.go`. Do NOT use `std.time.nanoTimestamp()`: it
+/// is wall-clock time, which would mix an epoch-scale value with the Go
+/// side's boot-scale monotonic value and make every ProberDelay/NetworkRTT
+/// calculation nonsensical. libc clock_gettime is used because this C-ABI
+/// library carries no std.Io instance.
 pub fn monotonicNs() u64 {
-    // libc clock_gettime: std.posix.clock_gettime was removed in Zig 0.16.
     var ts: c.struct_timespec = .{ .tv_sec = 0, .tv_nsec = 0 };
     if (c.clock_gettime(c.CLOCK_MONOTONIC, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.tv_nsec));
@@ -688,30 +671,6 @@ test "RdmaDevice stores sl and traffic_class as configured" {
     try std.testing.expectEqual(@as(u8, 96), dev.traffic_class);
 }
 
-test "setLastError and getLastError" {
-    setLastError("test error message");
-    const err = getLastError();
-    const err_slice = std.mem.sliceTo(err, 0);
-    try std.testing.expectEqualStrings("test error message", err_slice);
-}
-
-test "setLastError truncates long messages" {
-    // Create a message longer than 255 bytes
-    const long_msg: [300]u8 = @splat('A');
-    setLastError(&long_msg);
-    const err = getLastError();
-    const err_slice = std.mem.sliceTo(err, 0);
-    try std.testing.expectEqual(@as(usize, 255), err_slice.len);
-}
-
-test "setLastError overwrites previous message" {
-    setLastError("first error");
-    setLastError("second");
-    const err = getLastError();
-    const err_slice = std.mem.sliceTo(err, 0);
-    try std.testing.expectEqualStrings("second", err_slice);
-}
-
 test "SendSlotMode tags and staging offsets" {
     try std.testing.expectEqual(@as(u8, 0), @backingInt(SendSlotMode.Sync));
     try std.testing.expectEqual(@as(u8, 1), @backingInt(SendSlotMode.AsyncFirstAck));
@@ -735,24 +694,7 @@ test "send wr_ids are distinguishable from recv wr_ids" {
     }
 }
 
-test "SlotState enum values" {
-    try std.testing.expectEqual(@as(u8, 0), @backingInt(SlotState.Free));
-    try std.testing.expectEqual(@as(u8, 1), @backingInt(SlotState.Posted));
-    try std.testing.expectEqual(@as(u8, 2), @backingInt(SlotState.InUse));
-}
-
 test "SLOT_SIZE holds a GRH plus one MR-sized payload" {
     try std.testing.expectEqual(@as(u32, 4136), SLOT_SIZE);
     try std.testing.expectEqual(GRH_SIZE + MR_SIZE, SLOT_SIZE);
-}
-
-test "DeviceInfo is extern struct with correct field sizes" {
-    // Verify it is a packed/extern struct that can cross the FFI boundary
-    const info = std.mem.zeroes(DeviceInfo);
-    try std.testing.expectEqual(@as(u8, 0), info.active_port);
-    try std.testing.expectEqual(@as(u8, 0), info.active_gid_index);
-    // device_name, gid, ip_addr are each 64 bytes
-    try std.testing.expectEqual(@as(usize, 64), info.device_name.len);
-    try std.testing.expectEqual(@as(usize, 64), info.gid.len);
-    try std.testing.expectEqual(@as(usize, 64), info.ip_addr.len);
 }

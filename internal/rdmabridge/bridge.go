@@ -529,7 +529,7 @@ func GetLastError() string {
 // using big-endian byte order. The buffer must be at least ProbePacketSize
 // (40) bytes long.
 //
-// Wire layout (40 bytes) — must match zig/src/packet.zig serializeProbePacket:
+// Wire layout (40 bytes) — must match zig/src/wire.zig serializeProbePacket:
 //
 //	[0]      Version
 //	[1]      MsgType

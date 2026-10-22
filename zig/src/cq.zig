@@ -40,17 +40,12 @@ const log = std.log.scoped(.cq_poller);
 // GRH parsing
 // ---------------------------------------------------------------------------
 
-/// Information extracted from a Global Routing Header (GRH).
-///
-/// The GRH is 40 bytes prepended by the hardware to every UD receive buffer.
-/// It follows the IPv6 header format and contains the source/destination GIDs
-/// and the flow label used for ECMP path selection.
+/// What the CQ poller needs from a Global Routing Header (GRH): the 40
+/// bytes the hardware prepends to every UD receive buffer, in IPv6 header
+/// format.
 pub const GRHInfo = struct {
     /// Source GID (16 bytes) identifying the sender.
     source_gid: [16]u8,
-
-    /// Destination GID (16 bytes) identifying the receiver.
-    dest_gid: [16]u8,
 
     /// Flow label from the IPv6 header (lower 20 bits of the first 4-byte word).
     /// Used for ECMP path pinning in the R-Pingmesh protocol.
@@ -59,7 +54,7 @@ pub const GRHInfo = struct {
 
 /// Parse the 40-byte GRH at the start of a UD receive buffer.
 ///
-/// Standard GRH layout (IPv6 header format, used for native InfiniBand):
+/// Standard GRH layout (IPv6 header format):
 ///   Bytes 0-3:   Version (4 bits) | Traffic Class (8 bits) | Flow Label (20 bits)
 ///   Bytes 4-5:   Payload Length
 ///   Byte  6:     Next Header
@@ -67,75 +62,27 @@ pub const GRHInfo = struct {
 ///   Bytes 8-23:  Source GID (128 bits)
 ///   Bytes 24-39: Destination GID (128 bits)
 ///
-/// rdma_rxe IPv4 GRH format (Linux soft-RoCE for RoCEv2 over IPv4):
-///   Bytes 0-19:  All zeros (the synthesized GRH header fields are zeroed)
-///   Bytes 20-39: IPv4 header (20 bytes)
-///     - Bytes 20-23: IP version/IHL/DSCP/ECN/total_length (first nibble = 0x4)
-///     - Bytes 32-35: Source IPv4 address
-///     - Bytes 36-39: Destination IPv4 address
-///
-/// This function detects the rdma_rxe IPv4 format by checking whether bytes 0-7
-/// are all zero AND byte 20 has an IPv4 version nibble (0x4x). In that case it
-/// constructs IPv4-mapped IPv6 GIDs (::ffff:a.b.c.d) from the embedded IP header.
+/// rdma_rxe (Linux soft-RoCE) delivers RoCEv2-over-IPv4 datagrams with a
+/// different "GRH": bytes 0-19 are zero and bytes 20-39 hold the IPv4
+/// header (source address at 32-35, destination at 36-39). That format is
+/// detected by bytes 0-7 being zero and byte 20 carrying an IPv4 version
+/// nibble, and the source GID is then built as the IPv4-mapped IPv6 address
+/// ::ffff:a.b.c.d; IPv4 has no flow label.
 pub fn parseGRH(buf: [*]const u8) GRHInfo {
-    // Detect rdma_rxe IPv4 "GRH": bytes 0-7 all zero AND byte 20 is IPv4 (0x4x).
-    const is_rxe_ipv4 = (buf[0] == 0 and buf[1] == 0 and buf[2] == 0 and buf[3] == 0 and
-        buf[4] == 0 and buf[5] == 0 and buf[6] == 0 and buf[7] == 0 and
-        (buf[20] & 0xF0) == 0x40);
-
+    const is_rxe_ipv4 = std.mem.allEqual(u8, buf[0..8], 0) and (buf[20] & 0xF0) == 0x40;
     if (is_rxe_ipv4) {
-        // IPv4 header is at buf[20..39].
-        // Source IP at buf[32..35] (IPv4 header offset 12).
-        // Dest   IP at buf[36..39] (IPv4 header offset 16).
-        // Construct IPv4-mapped IPv6 GIDs: ::ffff:a.b.c.d
         var source_gid: [16]u8 = @splat(0);
         source_gid[10] = 0xff;
         source_gid[11] = 0xff;
-        source_gid[12] = buf[32];
-        source_gid[13] = buf[33];
-        source_gid[14] = buf[34];
-        source_gid[15] = buf[35];
-
-        var dest_gid: [16]u8 = @splat(0);
-        dest_gid[10] = 0xff;
-        dest_gid[11] = 0xff;
-        dest_gid[12] = buf[36];
-        dest_gid[13] = buf[37];
-        dest_gid[14] = buf[38];
-        dest_gid[15] = buf[39];
-
-        return GRHInfo{
-            .source_gid = source_gid,
-            .dest_gid = dest_gid,
-            .flow_label = 0, // IPv4 has no flow label
-        };
+        @memcpy(source_gid[12..16], buf[32..36]);
+        return GRHInfo{ .source_gid = source_gid, .flow_label = 0 };
     }
 
-    // Standard IPv6-format GRH.
-    // Extract the flow label from the first 4 bytes (big-endian).
-    // Flow label occupies bits 12-31 (the lower 20 bits of the 32-bit word).
-    const word0: u32 = (@as(u32, buf[0]) << 24) |
-        (@as(u32, buf[1]) << 16) |
-        (@as(u32, buf[2]) << 8) |
-        @as(u32, buf[3]);
-    const flow_label = word0 & 0x000FFFFF;
-
-    // Source GID: bytes 8-23
-    var source_gid: [16]u8 = undefined;
-    for (0..16) |i| {
-        source_gid[i] = buf[8 + i];
-    }
-
-    // Destination GID: bytes 24-39
-    var dest_gid: [16]u8 = undefined;
-    for (0..16) |i| {
-        dest_gid[i] = buf[24 + i];
-    }
-
+    // The flow label is the low 20 bits of the first big-endian word.
+    const word0 = std.mem.readInt(u32, buf[0..4], .big);
     return GRHInfo{
-        .source_gid = source_gid,
-        .dest_gid = dest_gid,
-        .flow_label = flow_label,
+        .source_gid = buf[8..24].*,
+        .flow_label = word0 & 0x000FFFFF,
     };
 }
 
@@ -317,18 +264,11 @@ fn busyPollerLoop(queue: *types.UdQueue) void {
 
 /// Poll a single CQ for all available completions.
 ///
-/// Dispatches to one of two implementations based on whether the queue uses
-/// software timestamps (rdma_rxe / no HW wallclock) or hardware timestamps.
-///
-/// For software timestamp mode (uses_sw_timestamps == true), the classic
-/// ibv_poll_cq() API is used.  Some rdma_rxe versions do not properly
-/// consume completions through ibv_end_poll(), causing the extended poll API
-/// to re-deliver the same completion on every subsequent ibv_start_poll()
-/// call.  ibv_poll_cq() does not have this issue.
-///
-/// For hardware timestamp mode, the extended API (ibv_start_poll /
-/// ibv_next_poll / ibv_end_poll) is used so that wallclock timestamps can be
-/// read via ibv_wc_read_completion_wallclock_ns().
+/// With hardware timestamps the extended API (ibv_start_poll / ibv_next_poll
+/// / ibv_end_poll) is used so ibv_wc_read_completion_wallclock_ns() can read
+/// them. With software timestamps the classic ibv_poll_cq() is used instead:
+/// some rdma_rxe versions re-deliver a completion on every ibv_start_poll()
+/// because ibv_end_poll() does not consume it.
 ///
 /// Returns the number of work completions consumed (0 when the CQ is empty).
 fn pollCqCompletions(queue: *types.UdQueue, cq: *c.ibv_cq_ex) usize {
@@ -443,7 +383,7 @@ fn dispatchClassicWc(queue: *types.UdQueue, wc: *const c.ibv_wc, pending: *Pendi
     const status: i32 = @intCast(wc.status);
     if (types.isSendWrId(wc.wr_id)) {
         log.debug("@{x} SEND (classic) status={d}", .{ @intFromPtr(queue), status });
-        signalSendCompletion(queue, wc.wr_id, swTimestampNs(), status, pending);
+        signalSendCompletion(queue, wc.wr_id, types.monotonicNs(), status, pending);
     } else if (wc.status == c.IBV_WC_SUCCESS) {
         log.debug("@{x} RECV (classic) status={d}", .{ @intFromPtr(queue), status });
         processRecvClassic(queue, wc);
@@ -466,7 +406,7 @@ fn repostFailedRecv(queue: *types.UdQueue, wr_id: u64, status: i32) void {
 fn processRecvClassic(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
     deliverRecv(queue, .{
         .slot_index = types.wrIdSlot(wc.wr_id),
-        .timestamp_ns = swTimestampNs(),
+        .timestamp_ns = types.monotonicNs(),
         .src_qp = wc.src_qp,
         .has_grh = (wc.wc_flags & c.IBV_WC_GRH) != 0,
         .byte_len = wc.byte_len,
@@ -501,16 +441,6 @@ fn pollCqExtended(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *PendingSeco
 
     c.ibv_end_poll(cq);
     return count;
-}
-
-/// Return the current monotonic clock time in nanoseconds (software fallback).
-///
-/// Delegates to the shared `types.monotonicNs()` helper, which uses true
-/// CLOCK_MONOTONIC (not `std.time.nanoTimestamp()`, which was CLOCK_REALTIME
-/// in Zig 0.15.x) so that SW-fallback T2/T3/T4/T5 stay in the same clock
-/// domain as T1 (`packet.zig`) and the Go side's T6.
-fn swTimestampNs() u64 {
-    return types.monotonicNs();
 }
 
 /// Dispatch a single extended-CQ work completion to the appropriate handler.
@@ -665,20 +595,12 @@ fn signalSendCompletion(queue: *types.UdQueue, wr_id: u64, timestamp_ns: u64, st
 // Timestamp helpers
 // ---------------------------------------------------------------------------
 
-/// Get the completion timestamp, using HW or SW source depending on queue config.
-///
-/// If the queue uses hardware timestamps, reads the wallclock nanosecond
-/// timestamp from the extended CQ. Otherwise falls back to the shared
-/// CLOCK_MONOTONIC helper (see `swTimestampNs`).
+/// The completion's timestamp: the NIC wallclock from the extended CQ, or
+/// CLOCK_MONOTONIC at poll time (same domain as T1 and the Go side's T6)
+/// when the queue fell back to software timestamps.
 fn getCompletionTimestamp(queue: *types.UdQueue, cq: *c.ibv_cq_ex) u64 {
-    if (queue.uses_sw_timestamps) {
-        // Software timestamp: use CLOCK_MONOTONIC, same domain as T1 and
-        // the Go side's T6.
-        return swTimestampNs();
-    } else {
-        // Hardware timestamp: read from extended CQ
-        return c.ibv_wc_read_completion_wallclock_ns(cq);
-    }
+    if (queue.uses_sw_timestamps) return types.monotonicNs();
+    return c.ibv_wc_read_completion_wallclock_ns(cq);
 }
 
 // ---------------------------------------------------------------------------
@@ -715,11 +637,25 @@ test "parseGRH extracts source and dest GID" {
     try std.testing.expectEqual(@as(u8, 0xfe), info.source_gid[0]);
     try std.testing.expectEqual(@as(u8, 0x80), info.source_gid[1]);
     try std.testing.expectEqual(@as(u8, 0x01), info.source_gid[15]);
+    try std.testing.expectEqual(@as(u8, 0x00), info.source_gid[14]);
+}
 
-    // Check dest GID
-    try std.testing.expectEqual(@as(u8, 0xfe), info.dest_gid[0]);
-    try std.testing.expectEqual(@as(u8, 0x80), info.dest_gid[1]);
-    try std.testing.expectEqual(@as(u8, 0x02), info.dest_gid[15]);
+test "parseGRH decodes the rdma_rxe IPv4 header as an IPv4-mapped GID" {
+    var grh: [40]u8 = @splat(0);
+    grh[20] = 0x45; // IPv4, IHL 5
+    grh[32] = 10; // source 10.200.0.2
+    grh[33] = 200;
+    grh[34] = 0;
+    grh[35] = 2;
+    grh[36] = 10; // destination 10.200.0.1
+    grh[37] = 200;
+    grh[38] = 0;
+    grh[39] = 1;
+
+    const info = parseGRH(&grh);
+    const want = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 200, 0, 2 };
+    try std.testing.expectEqualSlices(u8, &want, &info.source_gid);
+    try std.testing.expectEqual(@as(u32, 0), info.flow_label);
 }
 
 test "parseGRH flow label zero" {
@@ -748,17 +684,6 @@ test "recvByteLenOK requires GRH plus probe payload" {
     try std.testing.expect(!recvByteLenOK(need - 1));
     try std.testing.expect(recvByteLenOK(need));
     try std.testing.expect(recvByteLenOK(need + 16));
-}
-
-test "GRHInfo struct has expected fields" {
-    const info = GRHInfo{
-        .source_gid = @splat(0),
-        .dest_gid = @splat(0),
-        .flow_label = 0,
-    };
-    try std.testing.expectEqual(@as(u32, 0), info.flow_label);
-    try std.testing.expectEqual(@as(usize, 16), info.source_gid.len);
-    try std.testing.expectEqual(@as(usize, 16), info.dest_gid.len);
 }
 
 test "PendingSecondAcks holds one entry per send slot" {
@@ -871,7 +796,7 @@ test "recvEvent maps the packet, GRH and completion onto the Go-facing event" {
         .t3 = 3,
         .t4 = 4,
     };
-    var grh_info = GRHInfo{ .source_gid = @splat(0), .dest_gid = @splat(0), .flow_label = 0xABCDE };
+    var grh_info = GRHInfo{ .source_gid = @splat(0), .flow_label = 0xABCDE };
     grh_info.source_gid[15] = 9;
     const rc = RecvCompletion{ .slot_index = 7, .timestamp_ns = 555, .src_qp = 0x2A, .has_grh = true, .byte_len = 80 };
 

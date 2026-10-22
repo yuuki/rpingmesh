@@ -33,8 +33,8 @@ import (
 // Sanity bounds for RTT validation. Values exceeding these thresholds
 // indicate clock skew, misconfiguration, or corrupted timestamps.
 const (
-	MaxSaneRTT   = int64(10 * time.Second) // 10s upper bound for network RTT
-	MaxSaneDelay = int64(1 * time.Second)  // 1s upper bound for processing delays
+	MaxSaneRTT   = int64(10 * time.Second) // network RTT
+	MaxSaneDelay = int64(1 * time.Second)  // prober and responder processing delays
 )
 
 // ProbeResult contains the complete 6-timestamp probe measurement.
@@ -47,18 +47,21 @@ type ProbeResult struct {
 	// (source, target) even after every device's results are merged into one
 	// fan-in stream. Zero when the emitting Prober has no bound device (test
 	// fakes), which is harmless: such results are never aggregated.
-	SourceGID      [16]byte
-	TargetGID      [16]byte
-	TargetQPN      uint32
-	FlowLabel      uint32
-	T1             uint64 // Prober send time (CLOCK_MONOTONIC via Zig)
-	T2             uint64 // NIC HW timestamp of probe send completion (or SW fallback)
-	T3             uint64 // Responder recv timestamp (NIC HW or SW)
-	T4             uint64 // Responder first ACK send completion timestamp
-	T5             uint64 // Prober first ACK recv timestamp (NIC HW or SW)
-	T6             uint64 // Prober second ACK recv time (CLOCK_MONOTONIC, same domain as T1)
-	Success        bool
-	ErrorMessage   string
+	SourceGID    [16]byte
+	TargetGID    [16]byte
+	TargetQPN    uint32
+	FlowLabel    uint32
+	T1           uint64 // Prober send time (CLOCK_MONOTONIC via Zig)
+	T2           uint64 // NIC HW timestamp of probe send completion (or SW fallback)
+	T3           uint64 // Responder recv timestamp (NIC HW or SW)
+	T4           uint64 // Responder first ACK send completion timestamp
+	T5           uint64 // Prober first ACK recv timestamp (NIC HW or SW)
+	T6           uint64 // Prober second ACK recv time (CLOCK_MONOTONIC, same domain as T1)
+	Success      bool
+	ErrorMessage string
+	// FailureReason classifies a failed probe (Success == false) for the
+	// "reason" metric attribute; empty for a successful probe.
+	FailureReason  FailureReason
 	TargetIP       string
 	TargetHostname string
 	TargetTorID    string
@@ -110,6 +113,18 @@ const (
 	InvalidKindProberDelayTooLarge InvalidKind = "prober_delay_too_large"
 )
 
+// FailureReason is the agent's classification of why a probe failed. The
+// values are the "reason" attribute of rpingmesh.probe_failed_total.
+type FailureReason string
+
+const (
+	// FailureTimeout: the probe's ACKs never completed the measurement.
+	FailureTimeout FailureReason = "timeout"
+	// FailureSendError: posting the probe failed before any ACK could be
+	// expected.
+	FailureSendError FailureReason = "send_error"
+)
+
 // RTTResult contains calculated RTT metrics from a probe.
 // All durations are in nanoseconds.
 type RTTResult struct {
@@ -121,156 +136,65 @@ type RTTResult struct {
 	InvalidKind     InvalidKind // Classification of ValidationError; InvalidKindNone if valid
 }
 
-// CalculateRTT computes RTT metrics from a 6-timestamp probe result.
-// It validates that all timestamps are non-zero, computes the three
-// RTT components, and performs sanity checks on the results.
-//
-// A result with Valid=false indicates either missing timestamps or
-// values outside acceptable bounds (e.g., negative NetworkRTT from
-// clock skew, or unreasonably large delays).
+// CalculateRTT computes RTT metrics from a 6-timestamp probe result. It
+// rejects a result with a missing (zero) timestamp, then computes the three
+// components with signed arithmetic and rejects a negative or implausibly
+// large one (see InvalidKind for the causes of each).
 func CalculateRTT(result *ProbeResult) *RTTResult {
+	rtt := &RTTResult{}
+	invalid := func(kind InvalidKind, msg string) *RTTResult {
+		rtt.Valid, rtt.InvalidKind, rtt.ValidationError = false, kind, msg
+		return rtt
+	}
 	if result == nil {
-		return &RTTResult{
-			Valid:           false,
-			ValidationError: "nil ProbeResult",
-			InvalidKind:     InvalidKindMissingTimestamp,
+		return invalid(InvalidKindMissingTimestamp, "nil ProbeResult")
+	}
+	for _, ts := range [...]struct {
+		value uint64
+		name  string
+	}{
+		{result.T1, "T1 (prober send time)"},
+		{result.T2, "T2 (probe send completion timestamp)"},
+		{result.T3, "T3 (responder recv timestamp)"},
+		{result.T4, "T4 (responder ACK send completion timestamp)"},
+		{result.T5, "T5 (prober first ACK recv timestamp)"},
+		{result.T6, "T6 (prober second ACK recv time)"},
+	} {
+		if ts.value == 0 {
+			return invalid(InvalidKindMissingTimestamp, ts.name+" is zero")
 		}
 	}
 
-	// Validate all timestamps are non-zero (present).
-	if result.T1 == 0 {
-		return &RTTResult{
-			Valid:           false,
-			ValidationError: "T1 (prober send time) is zero",
-			InvalidKind:     InvalidKindMissingTimestamp,
-		}
-	}
-	if result.T2 == 0 {
-		return &RTTResult{
-			Valid:           false,
-			ValidationError: "T2 (probe send completion timestamp) is zero",
-			InvalidKind:     InvalidKindMissingTimestamp,
-		}
-	}
-	if result.T3 == 0 {
-		return &RTTResult{
-			Valid:           false,
-			ValidationError: "T3 (responder recv timestamp) is zero",
-			InvalidKind:     InvalidKindMissingTimestamp,
-		}
-	}
-	if result.T4 == 0 {
-		return &RTTResult{
-			Valid:           false,
-			ValidationError: "T4 (responder ACK send completion timestamp) is zero",
-			InvalidKind:     InvalidKindMissingTimestamp,
-		}
-	}
-	if result.T5 == 0 {
-		return &RTTResult{
-			Valid:           false,
-			ValidationError: "T5 (prober first ACK recv timestamp) is zero",
-			InvalidKind:     InvalidKindMissingTimestamp,
-		}
-	}
-	if result.T6 == 0 {
-		return &RTTResult{
-			Valid:           false,
-			ValidationError: "T6 (prober second ACK recv time) is zero",
-			InvalidKind:     InvalidKindMissingTimestamp,
-		}
-	}
+	rtt.ResponderDelay = int64(result.T4) - int64(result.T3)
+	rtt.NetworkRTT = (int64(result.T5) - int64(result.T2)) - rtt.ResponderDelay
+	rtt.ProberDelay = (int64(result.T6) - int64(result.T1)) - (int64(result.T5) - int64(result.T2))
 
-	// Calculate RTT components using signed arithmetic to detect
-	// negative values caused by clock skew.
-	responderDelay := int64(result.T4) - int64(result.T3)
-	networkRTT := (int64(result.T5) - int64(result.T2)) - responderDelay
-	proberDelay := (int64(result.T6) - int64(result.T1)) - (int64(result.T5) - int64(result.T2))
-
-	// Validate: NetworkRTT must be positive. A negative value indicates
-	// clock skew between the prober and responder hardware timestamps.
-	if networkRTT < 0 {
-		return &RTTResult{
-			NetworkRTT:      networkRTT,
-			ProberDelay:     proberDelay,
-			ResponderDelay:  responderDelay,
-			Valid:           false,
-			ValidationError: fmt.Sprintf("negative NetworkRTT (%d ns) indicates clock skew", networkRTT),
-			InvalidKind:     InvalidKindNegativeNetworkRTT,
-		}
+	// The ProberDelay term is only meaningful when T1 and T6 are both
+	// CLOCK_MONOTONIC on the prober host; its bound check mirrors the
+	// ResponderDelay one so a corrupted or wall-clock-contaminated T6 cannot
+	// slip through as a valid measurement.
+	switch {
+	case rtt.NetworkRTT < 0:
+		return invalid(InvalidKindNegativeNetworkRTT,
+			fmt.Sprintf("negative NetworkRTT (%d ns) indicates clock skew", rtt.NetworkRTT))
+	case rtt.NetworkRTT > MaxSaneRTT:
+		return invalid(InvalidKindNetworkRTTTooLarge,
+			fmt.Sprintf("NetworkRTT (%d ns) exceeds max sane bound (%d ns)", rtt.NetworkRTT, MaxSaneRTT))
+	case rtt.ResponderDelay < 0:
+		return invalid(InvalidKindNegativeResponderDelay,
+			fmt.Sprintf("negative ResponderDelay (%d ns) indicates timestamp ordering issue", rtt.ResponderDelay))
+	case rtt.ResponderDelay > MaxSaneDelay:
+		return invalid(InvalidKindResponderDelayTooLarge,
+			fmt.Sprintf("ResponderDelay (%d ns) exceeds max sane bound (%d ns)", rtt.ResponderDelay, MaxSaneDelay))
+	case rtt.ProberDelay < 0:
+		return invalid(InvalidKindNegativeProberDelay,
+			fmt.Sprintf("negative ProberDelay (%d ns) indicates clock skew or T1/T6 clock-domain mismatch", rtt.ProberDelay))
+	case rtt.ProberDelay > MaxSaneDelay:
+		return invalid(InvalidKindProberDelayTooLarge,
+			fmt.Sprintf("ProberDelay (%d ns) exceeds max sane bound (%d ns)", rtt.ProberDelay, MaxSaneDelay))
 	}
-
-	// Validate: NetworkRTT should not exceed the sanity bound.
-	if networkRTT > MaxSaneRTT {
-		return &RTTResult{
-			NetworkRTT:      networkRTT,
-			ProberDelay:     proberDelay,
-			ResponderDelay:  responderDelay,
-			Valid:           false,
-			ValidationError: fmt.Sprintf("NetworkRTT (%d ns) exceeds max sane bound (%d ns)", networkRTT, MaxSaneRTT),
-			InvalidKind:     InvalidKindNetworkRTTTooLarge,
-		}
-	}
-
-	// Validate: ResponderDelay must be positive. A negative value indicates
-	// a timestamp ordering issue on the responder side.
-	if responderDelay < 0 {
-		return &RTTResult{
-			NetworkRTT:      networkRTT,
-			ProberDelay:     proberDelay,
-			ResponderDelay:  responderDelay,
-			Valid:           false,
-			ValidationError: fmt.Sprintf("negative ResponderDelay (%d ns) indicates timestamp ordering issue", responderDelay),
-			InvalidKind:     InvalidKindNegativeResponderDelay,
-		}
-	}
-
-	// Validate: ResponderDelay should not exceed the sanity bound.
-	if responderDelay > MaxSaneDelay {
-		return &RTTResult{
-			NetworkRTT:      networkRTT,
-			ProberDelay:     proberDelay,
-			ResponderDelay:  responderDelay,
-			Valid:           false,
-			ValidationError: fmt.Sprintf("ResponderDelay (%d ns) exceeds max sane bound (%d ns)", responderDelay, MaxSaneDelay),
-			InvalidKind:     InvalidKindResponderDelayTooLarge,
-		}
-	}
-
-	// Validate: ProberDelay must be non-negative. A negative value indicates
-	// clock skew or a T6/T1 clock-domain mismatch (T1 and T6 must both be
-	// CLOCK_MONOTONIC on the prober host for this term to be meaningful).
-	if proberDelay < 0 {
-		return &RTTResult{
-			NetworkRTT:      networkRTT,
-			ProberDelay:     proberDelay,
-			ResponderDelay:  responderDelay,
-			Valid:           false,
-			ValidationError: fmt.Sprintf("negative ProberDelay (%d ns) indicates clock skew or T1/T6 clock-domain mismatch", proberDelay),
-			InvalidKind:     InvalidKindNegativeProberDelay,
-		}
-	}
-
-	// Validate: ProberDelay should not exceed the sanity bound. This mirrors
-	// the ResponderDelay check so that a corrupted or wall-clock-contaminated
-	// T6 cannot slip through as a valid measurement.
-	if proberDelay > MaxSaneDelay {
-		return &RTTResult{
-			NetworkRTT:      networkRTT,
-			ProberDelay:     proberDelay,
-			ResponderDelay:  responderDelay,
-			Valid:           false,
-			ValidationError: fmt.Sprintf("ProberDelay (%d ns) exceeds max sane bound (%d ns)", proberDelay, MaxSaneDelay),
-			InvalidKind:     InvalidKindProberDelayTooLarge,
-		}
-	}
-
-	return &RTTResult{
-		NetworkRTT:     networkRTT,
-		ProberDelay:    proberDelay,
-		ResponderDelay: responderDelay,
-		Valid:          true,
-	}
+	rtt.Valid = true
+	return rtt
 }
 
 // FormatGID formats a 16-byte GID as a colon-separated hex string in
@@ -291,21 +215,15 @@ func FormatGID(gid [16]byte) string {
 func ParseGID(s string) ([16]byte, error) {
 	var gid [16]byte
 
-	// Try parsing as a standard IPv6 address first. This handles both
-	// the abbreviated (fe80::1) and full (fe80:0000:...) forms. The
-	// net.ParseIP function returns a 16-byte IPv6 representation.
-	ip := net.ParseIP(s)
-	if ip != nil {
-		ip6 := ip.To16()
-		if ip6 != nil {
-			copy(gid[:], ip6)
-			return gid, nil
-		}
+	// net.ParseIP handles both the abbreviated (fe80::1) and the full
+	// (fe80:0000:...) form.
+	if ip6 := net.ParseIP(s).To16(); ip6 != nil {
+		copy(gid[:], ip6)
+		return gid, nil
 	}
 
-	// Fallback: try parsing as raw colon-separated hex without abbreviation.
-	// This handles GID formats that may not be valid IPv6 but are valid
-	// InfiniBand GID notation.
+	// Fallback for colon-separated hex that is valid InfiniBand GID notation
+	// but not a valid IPv6 address.
 	parts := strings.Split(s, ":")
 	if len(parts) != 8 {
 		return gid, fmt.Errorf("invalid GID format: expected 8 colon-separated groups, got %d in %q", len(parts), s)
@@ -330,25 +248,21 @@ func ParseGID(s string) ([16]byte, error) {
 	return gid, nil
 }
 
-// GIDToIPv4 converts a 16-byte GID to a human-readable IP string.
-// If the GID is an IPv4-mapped address (bytes 0-9 are zero, bytes 10-11
-// are 0xFFFF), it returns dotted-decimal notation (e.g., "192.168.1.1").
-// Otherwise, it returns the full colon-separated GID hex notation.
+// isIPv4MappedGID reports whether gid is an IPv4-mapped IPv6 address
+// (::ffff:a.b.c.d: bytes 0-9 zero, bytes 10-11 0xff), the form a RoCE GID
+// takes on an IPv4-addressed port. It is the single prefix test behind
+// GIDToIPv4 and GIDFamily.
+func isIPv4MappedGID(gid [16]byte) bool {
+	return net.IP(gid[:]).To4() != nil
+}
+
+// GIDToIPv4 renders a 16-byte GID for display: an IPv4-mapped GID as
+// dotted-decimal (e.g. "192.168.1.1"), any other GID in FormatGID's
+// colon-separated hex notation.
 func GIDToIPv4(gid [16]byte) string {
-	// Check for IPv4-mapped IPv6 address:
-	// bytes 0-9 must be zero, bytes 10-11 must be 0xFF.
-	isIPv4Mapped := true
-	for i := 0; i < 10; i++ {
-		if gid[i] != 0 {
-			isIPv4Mapped = false
-			break
-		}
-	}
-	if isIPv4Mapped && gid[10] == 0xff && gid[11] == 0xff {
+	if isIPv4MappedGID(gid) {
 		return fmt.Sprintf("%d.%d.%d.%d", gid[12], gid[13], gid[14], gid[15])
 	}
-
-	// Not IPv4-mapped, return full GID hex notation.
 	return FormatGID(gid)
 }
 
@@ -393,14 +307,7 @@ func GIDFamily(gid string) string {
 	if err != nil {
 		return GIDFamilyUnknown
 	}
-	// IPv4-mapped IPv6: bytes 0-9 zero, bytes 10-11 == 0xff (the same test
-	// GIDToIPv4 uses to switch to dotted-decimal rendering).
-	for i := 0; i < 10; i++ {
-		if parsed[i] != 0 {
-			return GIDFamilyIPv6
-		}
-	}
-	if parsed[10] == 0xff && parsed[11] == 0xff {
+	if isIPv4MappedGID(parsed) {
 		return GIDFamilyIPv4Mapped
 	}
 	return GIDFamilyIPv6

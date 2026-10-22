@@ -98,13 +98,22 @@ func makeRNIC(gid string, qpn uint32, ip, hostname, torID, device string) *contr
 	}
 }
 
-// registerAgent is a test helper that registers an agent and asserts success.
+// planedRNIC builds an RnicInfo registered on the given plane (rail). The IP
+// is fixed: the plane tests only look at ToR and GID selection.
+func planedRNIC(gid string, qpn uint32, host, tor, device, plane string) *controller_agent.RnicInfo {
+	r := makeRNIC(gid, qpn, "10.9.0.1", host, tor, device)
+	r.PlaneId = plane
+	return r
+}
+
+// registerAgent is a test helper that registers an agent with the given RNICs
+// and asserts success. agentIP and torID may be empty (untagged agent).
 func registerAgent(
 	t *testing.T,
 	client *controller_client.GRPCControllerClient,
 	agentID, agentIP, hostname, torID string,
-	rnics []*controller_agent.RnicInfo,
-) {
+	rnics ...*controller_agent.RnicInfo,
+) *controller_agent.AgentRegistrationResponse {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -124,20 +133,22 @@ func registerAgent(
 	if !resp.GetSuccess() {
 		t.Fatalf("RegisterAgent rejected for %s: %s", agentID, resp.GetMessage())
 	}
+	return resp
 }
 
 // getPinglist is a test helper that fetches a pinglist and asserts no error.
+// planeID is PinglistRequest.plane_id ("" when the requester has no plane).
 func getPinglist(
 	t *testing.T,
 	client *controller_client.GRPCControllerClient,
-	agentID, torID, requesterGID string,
+	agentID, torID, requesterGID, planeID string,
 	ptype controller_agent.PinglistType,
 ) []*controller_agent.PingTarget {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	targets, err := client.GetPinglist(ctx, agentID, torID, requesterGID, "", ptype)
+	targets, err := client.GetPinglist(ctx, agentID, torID, requesterGID, planeID, ptype)
 	if err != nil {
 		t.Fatalf("GetPinglist(%s) failed for %s: %v", ptype, agentID, err)
 	}
@@ -176,15 +187,15 @@ func TestAgentRegistration(t *testing.T) {
 	}
 
 	// First registration.
-	registerAgent(t, client, "agent-01", "192.168.1.1", "host-01", "tor-01", rnics)
+	registerAgent(t, client, "agent-01", "192.168.1.1", "host-01", "tor-01", rnics...)
 
 	// Re-registration (upsert) should also succeed.
-	registerAgent(t, client, "agent-01", "192.168.1.1", "host-01", "tor-01", rnics)
+	registerAgent(t, client, "agent-01", "192.168.1.1", "host-01", "tor-01", rnics...)
 
 	// Verify the RNICs are queryable via a TOR_MESH pinglist from a different
 	// requester GID. Use a GID that does NOT belong to agent-01 so both of
 	// agent-01's RNICs appear in the results.
-	targets := getPinglist(t, client, "other-agent", "tor-01", "fe80::ff", controller_agent.PinglistType_TOR_MESH)
+	targets := getPinglist(t, client, "other-agent", "tor-01", "fe80::ff", "", controller_agent.PinglistType_TOR_MESH)
 	if len(targets) < 2 {
 		t.Fatalf("expected at least 2 targets from tor-01, got %d", len(targets))
 	}
@@ -204,20 +215,14 @@ func TestPinglistTorMesh(t *testing.T) {
 
 	// Register three agents in the same ToR, each with one RNIC.
 	registerAgent(t, client, "mesh-agent-1", "192.168.1.10", "mesh-host-1", "tor-mesh",
-		[]*controller_agent.RnicInfo{
-			makeRNIC("fe80::10", 200, "10.1.0.1", "mesh-host-1", "tor-mesh", "mlx5_0"),
-		})
+		makeRNIC("fe80::10", 200, "10.1.0.1", "mesh-host-1", "tor-mesh", "mlx5_0"))
 	registerAgent(t, client, "mesh-agent-2", "192.168.1.11", "mesh-host-2", "tor-mesh",
-		[]*controller_agent.RnicInfo{
-			makeRNIC("fe80::11", 201, "10.1.0.2", "mesh-host-2", "tor-mesh", "mlx5_0"),
-		})
+		makeRNIC("fe80::11", 201, "10.1.0.2", "mesh-host-2", "tor-mesh", "mlx5_0"))
 	registerAgent(t, client, "mesh-agent-3", "192.168.1.12", "mesh-host-3", "tor-mesh",
-		[]*controller_agent.RnicInfo{
-			makeRNIC("fe80::12", 202, "10.1.0.3", "mesh-host-3", "tor-mesh", "mlx5_0"),
-		})
+		makeRNIC("fe80::12", 202, "10.1.0.3", "mesh-host-3", "tor-mesh", "mlx5_0"))
 
 	// Agent-1 requests TOR_MESH — should see agent-2 and agent-3 but NOT itself.
-	targets := getPinglist(t, client, "mesh-agent-1", "tor-mesh", "fe80::10", controller_agent.PinglistType_TOR_MESH)
+	targets := getPinglist(t, client, "mesh-agent-1", "tor-mesh", "fe80::10", "", controller_agent.PinglistType_TOR_MESH)
 
 	if len(targets) != 2 {
 		t.Fatalf("expected 2 TOR_MESH targets, got %d", len(targets))
@@ -268,20 +273,14 @@ func TestPinglistInterTor(t *testing.T) {
 
 	// Register agents across three different ToRs.
 	registerAgent(t, client, "inter-agent-1", "192.168.2.10", "inter-host-1", "tor-A",
-		[]*controller_agent.RnicInfo{
-			makeRNIC("fe80::a1", 300, "10.2.0.1", "inter-host-1", "tor-A", "mlx5_0"),
-		})
+		makeRNIC("fe80::a1", 300, "10.2.0.1", "inter-host-1", "tor-A", "mlx5_0"))
 	registerAgent(t, client, "inter-agent-2", "192.168.2.11", "inter-host-2", "tor-B",
-		[]*controller_agent.RnicInfo{
-			makeRNIC("fe80::b1", 301, "10.2.0.2", "inter-host-2", "tor-B", "mlx5_0"),
-		})
+		makeRNIC("fe80::b1", 301, "10.2.0.2", "inter-host-2", "tor-B", "mlx5_0"))
 	registerAgent(t, client, "inter-agent-3", "192.168.2.12", "inter-host-3", "tor-C",
-		[]*controller_agent.RnicInfo{
-			makeRNIC("fe80::c1", 302, "10.2.0.3", "inter-host-3", "tor-C", "mlx5_0"),
-		})
+		makeRNIC("fe80::c1", 302, "10.2.0.3", "inter-host-3", "tor-C", "mlx5_0"))
 
 	// Agent-1 (tor-A) requests INTER_TOR — should see targets from tor-B and tor-C.
-	targets := getPinglist(t, client, "inter-agent-1", "tor-A", "fe80::a1", controller_agent.PinglistType_INTER_TOR)
+	targets := getPinglist(t, client, "inter-agent-1", "tor-A", "fe80::a1", "", controller_agent.PinglistType_INTER_TOR)
 
 	if len(targets) < 2 {
 		t.Fatalf("expected at least 2 INTER_TOR targets, got %d", len(targets))
@@ -328,15 +327,13 @@ func TestFullTopology(t *testing.T) {
 
 	for _, a := range agents {
 		registerAgent(t, client, a.id, a.ip, a.hostname, a.torID,
-			[]*controller_agent.RnicInfo{
-				makeRNIC(a.gid, a.qpn, a.rnicIP, a.hostname, a.torID, a.device),
-			})
+			makeRNIC(a.gid, a.qpn, a.rnicIP, a.hostname, a.torID, a.device))
 	}
 
 	// topo-a1 (tor-X) fetches both pinglist types — mimics ClusterMonitor.
 	requesterGID := "fe80::xa1"
-	torMesh := getPinglist(t, client, "topo-a1", "tor-X", requesterGID, controller_agent.PinglistType_TOR_MESH)
-	interTor := getPinglist(t, client, "topo-a1", "tor-X", requesterGID, controller_agent.PinglistType_INTER_TOR)
+	torMesh := getPinglist(t, client, "topo-a1", "tor-X", requesterGID, "", controller_agent.PinglistType_TOR_MESH)
+	interTor := getPinglist(t, client, "topo-a1", "tor-X", requesterGID, "", controller_agent.PinglistType_INTER_TOR)
 
 	// TOR_MESH: should contain topo-a2 (same ToR, different agent) but not self.
 	if len(torMesh) != 1 {
@@ -448,12 +445,10 @@ func TestPinglistEmptyToR(t *testing.T) {
 	gid := fmt.Sprintf("fe80::empty-%d", time.Now().UnixNano()%10000)
 	torID := fmt.Sprintf("tor-empty-%d", time.Now().UnixNano()%10000)
 	registerAgent(t, client, "lonely-agent", "192.168.99.1", "lonely-host", torID,
-		[]*controller_agent.RnicInfo{
-			makeRNIC(gid, 500, "10.99.0.1", "lonely-host", torID, "mlx5_0"),
-		})
+		makeRNIC(gid, 500, "10.99.0.1", "lonely-host", torID, "mlx5_0"))
 
 	// TOR_MESH should return empty (only self in the ToR, and self is excluded).
-	targets := getPinglist(t, client, "lonely-agent", torID, gid, controller_agent.PinglistType_TOR_MESH)
+	targets := getPinglist(t, client, "lonely-agent", torID, gid, "", controller_agent.PinglistType_TOR_MESH)
 	if len(targets) != 0 {
 		t.Fatalf("expected 0 TOR_MESH targets for single-agent ToR, got %d", len(targets))
 	}
@@ -470,15 +465,11 @@ func TestUntaggedAgentsMesh(t *testing.T) {
 	gidB := fmt.Sprintf("fe80::2:%04x", id)
 
 	registerAgent(t, client, "untagged-a", "192.168.50.1", "untagged-host-a", "",
-		[]*controller_agent.RnicInfo{
-			makeRNIC(gidA, 600, "10.50.0.1", "untagged-host-a", "", "mlx5_0"),
-		})
+		makeRNIC(gidA, 600, "10.50.0.1", "untagged-host-a", "", "mlx5_0"))
 	registerAgent(t, client, "untagged-b", "192.168.50.2", "untagged-host-b", "",
-		[]*controller_agent.RnicInfo{
-			makeRNIC(gidB, 601, "10.50.0.2", "untagged-host-b", "", "mlx5_0"),
-		})
+		makeRNIC(gidB, 601, "10.50.0.2", "untagged-host-b", "", "mlx5_0"))
 
-	meshA := getPinglist(t, client, "untagged-a", "", gidA, controller_agent.PinglistType_TOR_MESH)
+	meshA := getPinglist(t, client, "untagged-a", "", gidA, "", controller_agent.PinglistType_TOR_MESH)
 	if !containsGID(meshA, gidB) {
 		t.Errorf("untagged TOR_MESH for A missing B (got %d targets)", len(meshA))
 	}
@@ -486,7 +477,7 @@ func TestUntaggedAgentsMesh(t *testing.T) {
 		t.Errorf("untagged TOR_MESH for A included self")
 	}
 
-	interA := getPinglist(t, client, "untagged-a", "", gidA, controller_agent.PinglistType_INTER_TOR)
+	interA := getPinglist(t, client, "untagged-a", "", gidA, "", controller_agent.PinglistType_INTER_TOR)
 	if len(interA) != 0 {
 		t.Errorf("untagged INTER_TOR in an all-untagged cluster: got %d targets, want 0", len(interA))
 	}
@@ -503,20 +494,16 @@ func TestMixedUntaggedAndNamed(t *testing.T) {
 	gidNamed := fmt.Sprintf("fe80::4:%04x", id)
 
 	registerAgent(t, client, "mixed-untagged", "192.168.51.1", "mixed-untagged-host", "",
-		[]*controller_agent.RnicInfo{
-			makeRNIC(gidUntagged, 610, "10.51.0.1", "mixed-untagged-host", "", "mlx5_0"),
-		})
+		makeRNIC(gidUntagged, 610, "10.51.0.1", "mixed-untagged-host", "", "mlx5_0"))
 	registerAgent(t, client, "mixed-named", "192.168.51.2", "mixed-named-host", "tor-M",
-		[]*controller_agent.RnicInfo{
-			makeRNIC(gidNamed, 611, "10.51.0.2", "mixed-named-host", "tor-M", "mlx5_0"),
-		})
+		makeRNIC(gidNamed, 611, "10.51.0.2", "mixed-named-host", "tor-M", "mlx5_0"))
 
-	interNamed := getPinglist(t, client, "mixed-named", "tor-M", gidNamed, controller_agent.PinglistType_INTER_TOR)
+	interNamed := getPinglist(t, client, "mixed-named", "tor-M", gidNamed, "", controller_agent.PinglistType_INTER_TOR)
 	if !containsGID(interNamed, gidUntagged) {
 		t.Errorf("named INTER_TOR missing untagged agent (got %d targets)", len(interNamed))
 	}
 
-	meshUntagged := getPinglist(t, client, "mixed-untagged", "", gidUntagged, controller_agent.PinglistType_TOR_MESH)
+	meshUntagged := getPinglist(t, client, "mixed-untagged", "", gidUntagged, "", controller_agent.PinglistType_TOR_MESH)
 	if containsGID(meshUntagged, gidNamed) {
 		t.Errorf("untagged TOR_MESH included named-ToR agent")
 	}

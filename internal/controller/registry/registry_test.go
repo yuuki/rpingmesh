@@ -259,6 +259,22 @@ func TestRegisterRNICs_TransactionErrorPropagates(t *testing.T) {
 	}
 }
 
+// TestRegisterRNICs_ResultCountMismatchIsError verifies that a response with
+// fewer results than statements is reported as an error instead of indexing
+// past the end of the result slice.
+func TestRegisterRNICs_ResultCountMismatchIsError(t *testing.T) {
+	fake := &fakeConn{writeParameterizedResults: []gorqlite.WriteResult{}}
+	reg := newTestRegistry(fake)
+
+	err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
+	if err == nil {
+		t.Fatal("expected an error for a result count that does not match the statement count")
+	}
+	if !strings.Contains(err.Error(), "0 results for 2 statements") {
+		t.Errorf("error = %q, want it to report the result/statement counts", err)
+	}
+}
+
 func TestRegisterRNICs_EmptyRNICsStillDeletesAgentRows(t *testing.T) {
 	fake := &fakeConn{}
 	reg := newTestRegistry(fake)
@@ -439,67 +455,6 @@ func TestGetRNICByGID_QueryErrorPropagates(t *testing.T) {
 	}
 }
 
-func TestGetRNICInfo_RequiresIPOrGID(t *testing.T) {
-	reg := newTestRegistry(&fakeConn{})
-
-	_, err := reg.GetRNICInfo(context.Background(), "", "")
-	if err == nil {
-		t.Fatal("expected an error when neither targetIP nor targetGID is provided")
-	}
-}
-
-func TestGetRNICInfo_QueriesByGIDWhenProvided(t *testing.T) {
-	fake := &fakeConn{}
-	reg := newTestRegistry(fake)
-
-	rnic, err := reg.GetRNICInfo(context.Background(), "10.0.0.9", "gid-1")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if rnic != nil {
-		t.Errorf("got %v, want nil for a fake with no matching row", rnic)
-	}
-
-	if len(fake.queryOneParameterizedCalls) != 1 {
-		t.Fatalf("QueryOneParameterizedContext called %d times, want 1", len(fake.queryOneParameterizedCalls))
-	}
-	stmt := fake.queryOneParameterizedCalls[0]
-	if !strings.Contains(stmt.Query, "rnic_gid = ?") {
-		t.Errorf("query = %q, want lookup by rnic_gid since targetGID was provided", stmt.Query)
-	}
-	if stmt.Arguments[0] != "gid-1" {
-		t.Errorf("arguments = %v, want first argument gid-1", stmt.Arguments)
-	}
-}
-
-func TestGetRNICInfo_FallsBackToIPWhenGIDMissing(t *testing.T) {
-	fake := &fakeConn{}
-	reg := newTestRegistry(fake)
-
-	if _, err := reg.GetRNICInfo(context.Background(), "10.0.0.9", ""); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	stmt := fake.queryOneParameterizedCalls[0]
-	if !strings.Contains(stmt.Query, "rnic_ip = ?") {
-		t.Errorf("query = %q, want lookup by rnic_ip since targetGID was empty", stmt.Query)
-	}
-	if stmt.Arguments[0] != "10.0.0.9" {
-		t.Errorf("arguments = %v, want first argument 10.0.0.9", stmt.Arguments)
-	}
-}
-
-func TestGetRNICInfo_QueryErrorPropagates(t *testing.T) {
-	wantErr := errors.New("query failed")
-	fake := &fakeConn{queryOneParameterizedErr: wantErr}
-	reg := newTestRegistry(fake)
-
-	_, err := reg.GetRNICInfo(context.Background(), "", "gid-1")
-	if err == nil || !errors.Is(err, wantErr) {
-		t.Fatalf("got error %v, want wrapping %v", err, wantErr)
-	}
-}
-
 func TestCleanupStaleEntries_UsesStaleThreshold(t *testing.T) {
 	fake := &fakeConn{}
 	reg := newTestRegistry(fake)
@@ -528,38 +483,6 @@ func TestCleanupStaleEntries_WriteErrorPropagates(t *testing.T) {
 	}
 }
 
-func TestListAllRNICs_UsesStaleThreshold(t *testing.T) {
-	fake := &fakeConn{}
-	reg := newTestRegistry(fake)
-
-	rnics, err := reg.ListAllRNICs(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(rnics) != 0 {
-		t.Errorf("got %d rnics, want 0 from a fake with no rows", len(rnics))
-	}
-
-	if len(fake.queryOneParameterizedCalls) != 1 {
-		t.Fatalf("QueryOneParameterizedContext called %d times, want 1", len(fake.queryOneParameterizedCalls))
-	}
-	args := fake.queryOneParameterizedCalls[0].Arguments
-	if len(args) != 1 || args[0] != wantStaleCutoff {
-		t.Errorf("arguments = %v, want [%d]", args, wantStaleCutoff)
-	}
-}
-
-func TestListAllRNICs_QueryErrorPropagates(t *testing.T) {
-	wantErr := errors.New("query failed")
-	fake := &fakeConn{queryOneParameterizedErr: wantErr}
-	reg := newTestRegistry(fake)
-
-	_, err := reg.ListAllRNICs(context.Background())
-	if err == nil || !errors.Is(err, wantErr) {
-		t.Fatalf("got error %v, want wrapping %v", err, wantErr)
-	}
-}
-
 func TestClose_ClosesUnderlyingConnection(t *testing.T) {
 	reg := newTestRegistry(&fakeConn{})
 	if err := reg.Close(); err != nil {
@@ -579,10 +502,8 @@ func TestNoStatementUsesSQLiteNow(t *testing.T) {
 	_ = reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
 	_, _ = reg.GetRNICsByToR(ctx, "tor-1")
 	_, _ = reg.GetActiveRNICsInOtherToRs(ctx, "tor-1")
-	_, _ = reg.GetRNICInfo(ctx, "", "gid-1")
-	_, _ = reg.GetRNICInfo(ctx, "10.0.0.1", "")
+	_, _ = reg.GetRNICByGID(ctx, "gid-1")
 	_ = reg.CleanupStaleEntries(ctx)
-	_, _ = reg.ListAllRNICs(ctx)
 
 	var stmts []gorqlite.ParameterizedStatement
 	for _, batch := range fake.writeParameterizedCalls {
@@ -590,8 +511,8 @@ func TestNoStatementUsesSQLiteNow(t *testing.T) {
 	}
 	stmts = append(stmts, fake.queryOneParameterizedCalls...)
 	stmts = append(stmts, fake.writeOneParameterizedCalls...)
-	if len(stmts) < 8 {
-		t.Fatalf("captured %d statements, want at least 8", len(stmts))
+	if len(stmts) < 6 {
+		t.Fatalf("captured %d statements, want at least 6", len(stmts))
 	}
 	for _, st := range stmts {
 		if strings.Contains(strings.ToLower(st.Query), "'now'") {
@@ -666,11 +587,9 @@ func TestReadQueriesSelectPlaneID(t *testing.T) {
 	_, _ = reg.GetRNICsByToR(ctx, "tor-1")
 	_, _ = reg.GetActiveRNICsInOtherToRs(ctx, "tor-1")
 	_, _ = reg.GetRNICByGID(ctx, "gid-1")
-	_, _ = reg.GetRNICInfo(ctx, "10.0.0.1", "")
-	_, _ = reg.ListAllRNICs(ctx)
 
-	if len(fake.queryOneParameterizedCalls) != 5 {
-		t.Fatalf("captured %d queries, want 5", len(fake.queryOneParameterizedCalls))
+	if len(fake.queryOneParameterizedCalls) != 3 {
+		t.Fatalf("captured %d queries, want 3", len(fake.queryOneParameterizedCalls))
 	}
 	for _, q := range fake.queryOneParameterizedCalls {
 		if !strings.Contains(q.Query, "device_name, plane_id, netdev") {

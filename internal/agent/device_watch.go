@@ -92,26 +92,38 @@ func inode(path string) (uint64, error) {
 // mounted in a container) is not watched, so a missing sysfs never makes a
 // healthy agent exit.
 func (a *Agent) recordWatchedDevices() {
-	a.watchedDevices = nil
-	for i, dev := range a.devices {
-		path, err := findUverbsNode(a.sysfsRoot, dev.Info.DeviceName)
+	for _, r := range a.rnics {
+		path, err := findUverbsNode(a.sysfsRoot, r.dev.Info.DeviceName)
 		var ino uint64
 		if err == nil {
 			ino, err = inode(path)
 		}
 		if err != nil {
 			a.logger.Warn().Err(err).
-				Str("device", dev.Info.DeviceName).
+				Str("device", r.dev.Info.DeviceName).
 				Msg("Cannot find the device's uverbs node in sysfs; its removal will not be detected")
+			r.watch = nil
 			continue
 		}
-		a.watchedDevices = append(a.watchedDevices, watchedDevice{
-			name:   dev.Info.DeviceName,
-			netdev: a.cachedNetdev(i),
+		r.watch = &watchedDevice{
+			name:   r.dev.Info.DeviceName,
+			netdev: r.netdev,
 			uverbs: path,
 			ino:    ino,
-		})
+		}
 	}
+}
+
+// watchedDevices returns the watch identities of the devices whose uverbs
+// node was found.
+func (a *Agent) watchedDevices() []*watchedDevice {
+	var watched []*watchedDevice
+	for _, r := range a.rnics {
+		if r.watch != nil {
+			watched = append(watched, r.watch)
+		}
+	}
+	return watched
 }
 
 // checkWatchedDevice returns a non-nil error when the device was
@@ -120,7 +132,7 @@ func (a *Agent) recordWatchedDevices() {
 // device_plane_ids, the device filters, and the source_rdma_device label
 // are keyed by name, so the agent restarts to apply them to the new name.
 // Any other read error is not treated as a loss.
-func checkWatchedDevice(d watchedDevice) error {
+func checkWatchedDevice(d *watchedDevice) error {
 	ino, err := inode(d.uverbs)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -146,7 +158,8 @@ func checkWatchedDevice(d watchedDevice) error {
 // that could ever work again: a RoCE LAG change, NIC reset, driver reload,
 // or hot unplug re-registers the device, often under another name.
 func (a *Agent) startDeviceWatch(ctx context.Context) {
-	if len(a.watchedDevices) == 0 {
+	watched := a.watchedDevices()
+	if len(watched) == 0 {
 		return
 	}
 	a.deviceWatchStopCh = make(chan struct{})
@@ -162,7 +175,7 @@ func (a *Agent) startDeviceWatch(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				for _, d := range a.watchedDevices {
+				for _, d := range watched {
 					if err := checkWatchedDevice(d); err != nil {
 						a.logger.Warn().
 							Str("device", d.name).

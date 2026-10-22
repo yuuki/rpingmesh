@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
@@ -65,7 +64,7 @@ func TestPerTypeRateLimit_Independent(t *testing.T) {
 		typedTargets(controller_agent.PinglistType_INTER_TOR, "int", nInter)...,
 	)
 
-	p := &Prober{logger: zerolog.Nop()}
+	p := newTestProber()
 	p.UpdateTargets(targets)
 	p.SetPerTypeRateLimit(torPPS, interPPS)
 
@@ -89,7 +88,7 @@ func TestPerTypeRateLimit_FollowsPinglistSize(t *testing.T) {
 		interPPS = 2.0
 	)
 
-	p := &Prober{logger: zerolog.Nop()}
+	p := newTestProber()
 	p.UpdateTargets(append(
 		typedTargets(controller_agent.PinglistType_TOR_MESH, "tor", 2),
 		typedTargets(controller_agent.PinglistType_INTER_TOR, "int", 3)...,
@@ -122,7 +121,7 @@ func TestSetPerTargetRateLimit_Fallback(t *testing.T) {
 	const nTor = 3
 	const nInter = 2
 
-	p := &Prober{logger: zerolog.Nop()}
+	p := newTestProber()
 	p.UpdateTargets(append(
 		typedTargets(controller_agent.PinglistType_TOR_MESH, "tor", nTor),
 		typedTargets(controller_agent.PinglistType_INTER_TOR, "int", nInter)...,
@@ -152,7 +151,7 @@ func TestPerTypeRateLimit_UnstampedTargetsAreTorMesh(t *testing.T) {
 		{TargetGid: "fe80::2"},
 	}
 
-	p := &Prober{logger: zerolog.Nop()}
+	p := newTestProber()
 	p.UpdateTargets(targets)
 	p.SetPerTypeRateLimit(pps, pps)
 
@@ -171,7 +170,7 @@ func TestPerTypeRateLimit_UnstampedTargetsAreTorMesh(t *testing.T) {
 // guards against a data race or a lock-order regression (all writers take
 // targetsMu -> rateMu; the reader takes only rateMu) that would deadlock.
 func TestPerTypeRateLimit_LockOrderRace(t *testing.T) {
-	p := &Prober{logger: zerolog.Nop()}
+	p := newTestProber()
 	p.UpdateTargets(typedTargets(controller_agent.PinglistType_TOR_MESH, "tor", 4))
 
 	var wg sync.WaitGroup

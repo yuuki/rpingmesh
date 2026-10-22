@@ -3,10 +3,12 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/spf13/pflag"
 	"github.com/yuuki/rpingmesh/internal/logging"
+	"github.com/yuuki/rpingmesh/internal/testutil/tlscerts"
 )
 
 // writeYAML writes content to a temp file named name inside t.TempDir() and
@@ -18,6 +20,36 @@ func writeYAML(t *testing.T, name, content string) string {
 		t.Fatalf("failed to write temp config file: %v", err)
 	}
 	return path
+}
+
+// validControllerConfig is the smallest ControllerConfig literal that passes
+// Validate; Validate tables mutate one field of it per case.
+func validControllerConfig() ControllerConfig {
+	return ControllerConfig{
+		ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
+		ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
+		EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+	}
+}
+
+// validAgentConfig is the smallest AgentConfig literal that passes Validate
+// (the zero value fails only on the two fields that must be positive).
+func validAgentConfig() AgentConfig {
+	return AgentConfig{ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600}
+}
+
+// checkErr asserts that err is nil when want is empty and otherwise contains
+// want, so a table case pins which validation rule fired first.
+func checkErr(t *testing.T, err error, want string) {
+	t.Helper()
+	switch {
+	case want == "" && err != nil:
+		t.Errorf("unexpected error: %v", err)
+	case want != "" && err == nil:
+		t.Errorf("got nil error, want one containing %q", want)
+	case want != "" && !strings.Contains(err.Error(), want):
+		t.Errorf("error %q does not contain %q", err, want)
+	}
 }
 
 // --- ControllerConfig ---
@@ -37,6 +69,9 @@ func TestLoadControllerConfig_Defaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want info", cfg.LogLevel)
 	}
+	if cfg.LogFormat != logging.FormatConsole {
+		t.Errorf("LogFormat = %q, want %q", cfg.LogFormat, logging.FormatConsole)
+	}
 	if cfg.ActiveThresholdSec != DefaultActiveThresholdSec {
 		t.Errorf("ActiveThresholdSec = %d, want %d", cfg.ActiveThresholdSec, DefaultActiveThresholdSec)
 	}
@@ -48,6 +83,9 @@ func TestLoadControllerConfig_Defaults(t *testing.T) {
 	}
 	if cfg.UnspecifiedMeshMaxTargets != DefaultUnspecifiedMeshMaxTargets {
 		t.Errorf("UnspecifiedMeshMaxTargets = %d, want %d", cfg.UnspecifiedMeshMaxTargets, DefaultUnspecifiedMeshMaxTargets)
+	}
+	if cfg.AnalyzerSLANetworkRTTP99Ns != DefaultAnalyzerSLANetworkRTTP99Ns {
+		t.Errorf("AnalyzerSLANetworkRTTP99Ns = %d, want %d", cfg.AnalyzerSLANetworkRTTP99Ns, DefaultAnalyzerSLANetworkRTTP99Ns)
 	}
 	if cfg.TLSMode != TLSModeDisabled {
 		t.Errorf("TLSMode = %q, want %q (backward-compatible default)", cfg.TLSMode, TLSModeDisabled)
@@ -72,8 +110,7 @@ func TestLoadControllerConfig_FileOverridesDefault(t *testing.T) {
 
 func TestLoadControllerConfig_ExplicitMissingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "does-not-exist.yaml")
-	_, err := LoadControllerConfig(path, nil)
-	if err == nil {
+	if _, err := LoadControllerConfig(path, nil); err == nil {
 		t.Fatal("expected error for missing explicit --config path")
 	}
 }
@@ -134,27 +171,24 @@ func TestLoadControllerConfig_UnsetFlagDoesNotOverrideEnv(t *testing.T) {
 	}
 }
 
-func TestLoadControllerConfig_OTLPAddrWithSchemeRejected(t *testing.T) {
-	t.Setenv("RPINGMESH_OTEL_COLLECTOR_ADDR", "http://collector:4317")
-
-	if _, err := LoadControllerConfig("", nil); err == nil {
-		t.Fatal("expected an error for an otel_collector_addr with a URL scheme, got nil")
-	}
-}
-
-func TestLoadControllerConfig_InvalidLogLevel(t *testing.T) {
-	t.Setenv("RPINGMESH_LOG_LEVEL", "not-a-level")
-
-	if _, err := LoadControllerConfig("", nil); err == nil {
-		t.Fatal("expected an error for an invalid log_level, got nil")
-	}
-}
-
-func TestLoadControllerConfig_InvalidDatabaseURI(t *testing.T) {
-	t.Setenv("RPINGMESH_DATABASE_URI", "not a url")
-
-	if _, err := LoadControllerConfig("", nil); err == nil {
-		t.Fatal("expected an error for an invalid database_uri, got nil")
+// TestLoadControllerConfig_EnvValidation feeds single RPINGMESH_* values
+// through the whole load path (env parsing, struct assembly, Validate).
+func TestLoadControllerConfig_EnvValidation(t *testing.T) {
+	for _, tc := range []struct {
+		env, value string
+		wantErr    string
+	}{
+		{"RPINGMESH_OTEL_COLLECTOR_ADDR", "http://collector:4317", "otel_collector_addr"},
+		{"RPINGMESH_LOG_LEVEL", "not-a-level", "log_level"},
+		{"RPINGMESH_LOG_FORMAT", "logfmt", "log_format"},
+		{"RPINGMESH_DATABASE_URI", "not a url", "database_uri"},
+		{"RPINGMESH_ECMP_MAX_FLOW_LABELS", "4096", ""},
+	} {
+		t.Run(tc.env+"="+tc.value, func(t *testing.T) {
+			t.Setenv(tc.env, tc.value)
+			_, err := LoadControllerConfig("", nil)
+			checkErr(t, err, tc.wantErr)
+		})
 	}
 }
 
@@ -165,211 +199,74 @@ func TestLoadControllerConfig_EmptyListenAddr(t *testing.T) {
 	// come from the config file to exercise this validation path.
 	path := writeYAML(t, "controller.yaml", "listen_addr: \"\"\n")
 
-	if _, err := LoadControllerConfig(path, nil); err == nil {
-		t.Fatal("expected an error for an empty listen_addr, got nil")
-	}
+	_, err := LoadControllerConfig(path, nil)
+	checkErr(t, err, "listen_addr must not be empty")
 }
 
 func TestControllerConfig_Validate(t *testing.T) {
 	tests := []struct {
 		name    string
-		cfg     ControllerConfig
-		wantErr bool
+		mutate  func(c *ControllerConfig)
+		wantErr string
 	}{
+		{"valid", func(c *ControllerConfig) {}, ""},
+		{"empty listen addr", func(c *ControllerConfig) { c.ListenAddr = " " }, "listen_addr must not be empty"},
+		{"invalid listen addr", func(c *ControllerConfig) { c.ListenAddr = "not-a-valid-addr-no-colon" }, "listen_addr"},
+		{"empty database uri", func(c *ControllerConfig) { c.DatabaseURI = "" }, "database_uri must not be empty"},
+		{"database uri without scheme", func(c *ControllerConfig) { c.DatabaseURI = "localhost:4001" }, "database_uri"},
+		{"zero database connect timeout disables retries", func(c *ControllerConfig) { c.DatabaseConnectTimeoutSec = 0 }, ""},
+		{"negative database connect timeout", func(c *ControllerConfig) { c.DatabaseConnectTimeoutSec = -1 }, "database_connect_timeout_sec"},
+		{"unknown log level", func(c *ControllerConfig) { c.LogLevel = "loud" }, "log_level"},
+		{"unknown log format", func(c *ControllerConfig) { c.LogFormat = "logfmt" }, "log_format"},
+		{"non-positive active threshold", func(c *ControllerConfig) { c.ActiveThresholdSec = 0 }, "active_threshold_sec"},
+		{"non-positive stale threshold", func(c *ControllerConfig) { c.StaleThresholdSec = -1 }, "stale_threshold_sec must be > 0"},
+		{"stale threshold below active threshold", func(c *ControllerConfig) { c.StaleThresholdSec = 60 }, "must be >= active_threshold_sec"},
+		{"stale threshold equals active threshold", func(c *ControllerConfig) { c.StaleThresholdSec = 300 }, ""},
+		{"non-positive inter-tor sample size", func(c *ControllerConfig) { c.InterTorSampleSize = 0 }, "inter_tor_sample_size"},
+		{"negative unspecified mesh max", func(c *ControllerConfig) { c.UnspecifiedMeshMaxTargets = -1 }, "unspecified_mesh_max_targets"},
+		{"zero unspecified mesh max is unlimited", func(c *ControllerConfig) { c.UnspecifiedMeshMaxTargets = 0 }, ""},
+		{"zero ecmp paths assumed", func(c *ControllerConfig) { c.EcmpPathsAssumed = 0 }, "ecmp_paths_assumed"},
+		{"coverage probability out of range", func(c *ControllerConfig) { c.EcmpCoverageProbability = 1.0 }, "ecmp_coverage_probability"},
+		{"zero ecmp max flow labels", func(c *ControllerConfig) { c.EcmpMaxFlowLabels = 0 }, "ecmp_max_flow_labels must be >= 1"},
 		{
-			name: "valid",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
+			// A cap above the operational ceiling could reach a PingTarget
+			// and stall the agent's distinct-label generation.
+			"ecmp max flow labels exceeds ceiling",
+			func(c *ControllerConfig) { c.EcmpMaxFlowLabels = MaxEcmpFlowLabels + 1 },
+			"ecmp_max_flow_labels must be <=",
+		},
+		{"ecmp max flow labels at ceiling", func(c *ControllerConfig) { c.EcmpMaxFlowLabels = MaxEcmpFlowLabels }, ""},
+		{
+			"analyzer enabled rejects loss ratio above one",
+			func(c *ControllerConfig) {
+				c.AnalyzerEnabled = true
+				c.AnalyzerSLALossRatio = 1.5
+				c.AnalyzerWindowRetention = 20
 			},
-			wantErr: false,
+			"analyzer_sla_loss_ratio",
 		},
 		{
-			name: "zero ecmp paths assumed",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 0, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
-			},
-			wantErr: true,
+			"analyzer enabled rejects zero window retention",
+			func(c *ControllerConfig) { c.AnalyzerEnabled = true; c.AnalyzerSLALossRatio = 0.02 },
+			"analyzer_window_retention",
 		},
 		{
-			name: "coverage probability out of range",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 1.0, EcmpMaxFlowLabels: 64,
-			},
-			wantErr: true,
+			"analyzer disabled ignores its thresholds",
+			func(c *ControllerConfig) { c.AnalyzerEnabled = false; c.AnalyzerSLALossRatio = -1 },
+			"",
 		},
-		{
-			name: "zero ecmp max flow labels",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 0,
-			},
-			wantErr: true,
-		},
-		{
-			// A cap above the 20-bit flow-label space (2^20) could reach a
-			// PingTarget and hang the agent's distinct-label generation.
-			name: "ecmp max flow labels exceeds 20-bit space",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: MaxEcmpFlowLabels + 1,
-			},
-			wantErr: true,
-		},
-		{
-			name: "ecmp max flow labels at 20-bit boundary",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: MaxEcmpFlowLabels,
-			},
-			wantErr: false,
-		},
-		{
-			name: "invalid listen addr",
-			cfg: ControllerConfig{
-				ListenAddr: "not-a-valid-addr-no-colon", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-			},
-			wantErr: true,
-		},
-		{
-			name: "zero database connect timeout disables retries",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				DatabaseConnectTimeoutSec: 0,
-				ActiveThresholdSec:        300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
-			},
-			wantErr: false,
-		},
-		{
-			name: "negative database connect timeout",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				DatabaseConnectTimeoutSec: -1,
-				ActiveThresholdSec:        300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
-			},
-			wantErr: true,
-		},
-		{
-			name: "non-positive active threshold",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 0, StaleThresholdSec: 900, InterTorSampleSize: 5,
-			},
-			wantErr: true,
-		},
-		{
-			name: "non-positive stale threshold",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: -1, InterTorSampleSize: 5,
-			},
-			wantErr: true,
-		},
-		{
-			name: "stale threshold below active threshold",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 60, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
-			},
-			wantErr: true,
-		},
-		{
-			name: "stale threshold equals active threshold",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 300, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
-			},
-			wantErr: false,
-		},
-		{
-			name: "non-positive inter-tor sample size",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 0,
-			},
-			wantErr: true,
-		},
-		{
-			name: "negative unspecified mesh max",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				UnspecifiedMeshMaxTargets: -1,
-				EcmpPathsAssumed:          16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
-			},
-			wantErr: true,
-		},
-		{
-			name: "zero unspecified mesh max is unlimited",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				UnspecifiedMeshMaxTargets: 0,
-				EcmpPathsAssumed:          16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
-			},
-			wantErr: false,
-		},
-		{
-			name: "tls_mode disabled requires no certificate files",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
-				TLSMode: TLSModeDisabled,
-			},
-			wantErr: false,
-		},
-		{
-			name: "unknown tls_mode is rejected",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
-				TLSMode: "bogus",
-			},
-			wantErr: true,
-		},
-		{
-			name: "tls_mode=tls without server cert/key is rejected",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
-				TLSMode: TLSModeTLS,
-			},
-			wantErr: true,
-		},
-		{
-			name: "tls_mode=mtls without ca/cert/key is rejected",
-			cfg: ControllerConfig{
-				ListenAddr: ":50051", DatabaseURI: "http://localhost:4001", LogLevel: "info",
-				ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
-				EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
-				TLSMode: TLSModeMTLS,
-			},
-			wantErr: true,
-		},
+		{"otel collector addr with scheme", func(c *ControllerConfig) { c.OtelCollectorAddr = "grpc://collector:4317" }, "otel_collector_addr"},
+		{"tls_mode disabled requires no certificate files", func(c *ControllerConfig) { c.TLSMode = TLSModeDisabled }, ""},
+		{"unknown tls_mode is rejected", func(c *ControllerConfig) { c.TLSMode = "bogus" }, "tls_mode must be one of"},
+		{"tls_mode=tls without server cert/key is rejected", func(c *ControllerConfig) { c.TLSMode = TLSModeTLS }, "tls_cert_file is required"},
+		{"tls_mode=mtls without ca/cert/key is rejected", func(c *ControllerConfig) { c.TLSMode = TLSModeMTLS }, "tls_ca_file is required"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.cfg.Validate()
-			if (err != nil) != tc.wantErr {
-				t.Errorf("Validate() error = %v, wantErr %v", err, tc.wantErr)
-			}
+			cfg := validControllerConfig()
+			tc.mutate(&cfg)
+			checkErr(t, cfg.Validate(), tc.wantErr)
 		})
 	}
 }
@@ -387,6 +284,9 @@ func TestLoadAgentConfig_Defaults(t *testing.T) {
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want info", cfg.LogLevel)
+	}
+	if cfg.LogFormat != logging.FormatConsole {
+		t.Errorf("LogFormat = %q, want %q", cfg.LogFormat, logging.FormatConsole)
 	}
 	if cfg.ProbeIntervalMS != 500 {
 		t.Errorf("ProbeIntervalMS = %d, want 500", cfg.ProbeIntervalMS)
@@ -412,6 +312,61 @@ func TestLoadAgentConfig_Defaults(t *testing.T) {
 	if cfg.TLSMode != TLSModeDisabled {
 		t.Errorf("TLSMode = %q, want %q (backward-compatible default)", cfg.TLSMode, TLSModeDisabled)
 	}
+	if cfg.ServiceLevel != 0 || cfg.TrafficClass != 0 || cfg.GIDIndex != 0 {
+		t.Errorf("ServiceLevel/TrafficClass/GIDIndex = %d/%d/%d, want 0/0/0", cfg.ServiceLevel, cfg.TrafficClass, cfg.GIDIndex)
+	}
+	if cfg.CQPollMode != CQPollModeAuto {
+		t.Errorf("CQPollMode = %q, want %q", cfg.CQPollMode, CQPollModeAuto)
+	}
+	if cfg.EventRingCapacity != DefaultEventRingCapacity {
+		t.Errorf("EventRingCapacity = %d, want %d", cfg.EventRingCapacity, DefaultEventRingCapacity)
+	}
+
+	// Metrics labels default to the ToR-level-only shape (see CLAUDE.md on
+	// attribute cardinality).
+	if cfg.MetricsTargetRnicLabels != MetricsTargetRnicLabelsOff {
+		t.Errorf("MetricsTargetRnicLabels = %q, want %q", cfg.MetricsTargetRnicLabels, MetricsTargetRnicLabelsOff)
+	}
+	if cfg.MetricsTargetRnicLabelsScope != MetricsTargetRnicLabelsScopeStable {
+		t.Errorf("MetricsTargetRnicLabelsScope = %q, want %q",
+			cfg.MetricsTargetRnicLabelsScope, MetricsTargetRnicLabelsScopeStable)
+	}
+	if cfg.MetricsCardinalityLimit != 0 {
+		t.Errorf("MetricsCardinalityLimit = %d, want 0", cfg.MetricsCardinalityLimit)
+	}
+	if cfg.MetricsProberDelayTargetTor {
+		t.Error("MetricsProberDelayTargetTor = true, want false")
+	}
+	if !cfg.MetricsResponderDelayTargetTor {
+		t.Error("MetricsResponderDelayTargetTor = false, want true")
+	}
+
+	// Device selection and topology default to "every device, untagged".
+	if len(cfg.DeviceTorIDs) != 0 || len(cfg.DevicePlaneIDs) != 0 || len(cfg.ExcludedDeviceNames) != 0 {
+		t.Errorf("DeviceTorIDs=%v DevicePlaneIDs=%v ExcludedDeviceNames=%v, want all empty",
+			cfg.DeviceTorIDs, cfg.DevicePlaneIDs, cfg.ExcludedDeviceNames)
+	}
+	if got := cfg.TorIDForDevice("mlx5_0"); got != "" {
+		t.Errorf("TorIDForDevice = %q, want empty (untagged)", got)
+	}
+	if cfg.PlaneID != "" || cfg.PlaneIDForDevice("mlx5_0") != "" {
+		t.Errorf("PlaneID = %q, PlaneIDForDevice = %q; want empty (no plane restriction)", cfg.PlaneID, cfg.PlaneIDForDevice("mlx5_0"))
+	}
+	if cfg.IsDeviceExcluded("mlx5_0") {
+		t.Error("IsDeviceExcluded should be false with no exclusions")
+	}
+	if cfg.MappedDevicesOnly {
+		t.Error("MappedDevicesOnly should default to false")
+	}
+	if cfg.LLDPTorDiscovery {
+		t.Error("LLDPTorDiscovery should default to false")
+	}
+	if cfg.LLDPTorIDField != "system_name" || cfg.LLDPCLIPath != "lldpcli" ||
+		cfg.LLDPDiscoveryTimeoutSec != DefaultLLDPDiscoveryTimeoutSec {
+		t.Errorf("unexpected LLDP defaults: field=%q path=%q timeout=%d",
+			cfg.LLDPTorIDField, cfg.LLDPCLIPath, cfg.LLDPDiscoveryTimeoutSec)
+	}
+
 	// Self-protection is opt-in: disabled by default, with sane threshold
 	// defaults so that merely enabling it needs no other settings.
 	if cfg.SelfProtectionEnabled != DefaultSelfProtectionEnabled {
@@ -436,104 +391,8 @@ func TestLoadAgentConfig_Defaults(t *testing.T) {
 
 func TestLoadAgentConfig_ExplicitMissingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "does-not-exist.yaml")
-	_, err := LoadAgentConfig(path, nil)
-	if err == nil {
+	if _, err := LoadAgentConfig(path, nil); err == nil {
 		t.Fatal("expected error for missing explicit --config path")
-	}
-}
-
-// TestEffectiveProbeRates verifies the per-pinglist-type rate resolution,
-// including the backward-compatible fallback: when a type-specific rate is 0
-// (unset) it inherits the legacy target_probe_rate_per_second.
-func TestEffectiveProbeRates(t *testing.T) {
-	cases := []struct {
-		name         string
-		target       int
-		torMesh      int
-		interTor     int
-		wantTorMesh  int
-		wantInterTor int
-	}{
-		{
-			name:         "both_unset_falls_back_to_target",
-			target:       10,
-			torMesh:      0,
-			interTor:     0,
-			wantTorMesh:  10,
-			wantInterTor: 10,
-		},
-		{
-			name:         "differentiated_paper_rates",
-			target:       10,
-			torMesh:      10,
-			interTor:     1,
-			wantTorMesh:  10,
-			wantInterTor: 1,
-		},
-		{
-			name:         "only_inter_tor_set_tor_mesh_inherits",
-			target:       8,
-			torMesh:      0,
-			interTor:     5,
-			wantTorMesh:  8,
-			wantInterTor: 5,
-		},
-		{
-			name:         "only_tor_mesh_set_inter_tor_inherits",
-			target:       7,
-			torMesh:      12,
-			interTor:     0,
-			wantTorMesh:  12,
-			wantInterTor: 7,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := &AgentConfig{
-				TargetProbeRatePerSecond:   tc.target,
-				TorMeshProbeRatePerSecond:  tc.torMesh,
-				InterTorProbeRatePerSecond: tc.interTor,
-			}
-			if got := cfg.EffectiveTorMeshProbeRate(); got != tc.wantTorMesh {
-				t.Errorf("EffectiveTorMeshProbeRate() = %d, want %d", got, tc.wantTorMesh)
-			}
-			if got := cfg.EffectiveInterTorProbeRate(); got != tc.wantInterTor {
-				t.Errorf("EffectiveInterTorProbeRate() = %d, want %d", got, tc.wantInterTor)
-			}
-		})
-	}
-}
-
-// TestValidate_RejectsNegativePerTypeProbeRates verifies that a negative
-// per-type probe rate is rejected (a negative rate would be silently read as
-// "disabled" by the limiter, defeating the intended cap).
-func TestValidate_RejectsNegativePerTypeProbeRates(t *testing.T) {
-	base := func() *AgentConfig {
-		return &AgentConfig{
-			ProbeIntervalMS:            500,
-			FlowLabelRotationPeriodSec: 3600,
-			TLSMode:                    TLSModeDisabled,
-		}
-	}
-
-	neg := base()
-	neg.TorMeshProbeRatePerSecond = -1
-	if err := neg.Validate(); err == nil {
-		t.Error("Validate() accepted negative tor_mesh_probe_rate_per_second, want error")
-	}
-
-	neg = base()
-	neg.InterTorProbeRatePerSecond = -1
-	if err := neg.Validate(); err == nil {
-		t.Error("Validate() accepted negative inter_tor_probe_rate_per_second, want error")
-	}
-
-	ok := base()
-	ok.TorMeshProbeRatePerSecond = 10
-	ok.InterTorProbeRatePerSecond = 1
-	if err := ok.Validate(); err != nil {
-		t.Errorf("Validate() rejected valid per-type rates: %v", err)
 	}
 }
 
@@ -569,58 +428,70 @@ func TestLoadAgentConfig_EnvOverridesFile(t *testing.T) {
 	}
 }
 
-func TestLoadAgentConfig_OTLPAddrWithSchemeRejected(t *testing.T) {
-	t.Setenv("RPINGMESH_OTEL_COLLECTOR_ADDR", "grpc://collector:4317")
-
-	if _, err := LoadAgentConfig("", nil); err == nil {
-		t.Fatal("expected an error for an otel_collector_addr with a URL scheme, got nil")
+// TestLoadAgentConfig_EnvValidation feeds single RPINGMESH_* values through
+// the whole load path (env parsing, struct assembly, Validate). Boundary
+// values that must be accepted sit next to the values just past them.
+func TestLoadAgentConfig_EnvValidation(t *testing.T) {
+	for _, tc := range []struct {
+		env, value string
+		wantErr    string
+	}{
+		{"RPINGMESH_OTEL_COLLECTOR_ADDR", "grpc://collector:4317", "otel_collector_addr"},
+		{"RPINGMESH_LOG_FORMAT", "logfmt", "log_format"},
+		{"RPINGMESH_GID_INDEX", "-1", "gid_index"},
+		{"RPINGMESH_GID_INDEX", "255", ""},
+		{"RPINGMESH_GID_INDEX", "256", "gid_index"},
+		{"RPINGMESH_SERVICE_LEVEL", "-1", "service_level"},
+		{"RPINGMESH_SERVICE_LEVEL", "8", "service_level"},
+		{"RPINGMESH_TRAFFIC_CLASS", "-1", "traffic_class"},
+		{"RPINGMESH_TRAFFIC_CLASS", "256", "traffic_class"},
+		{"RPINGMESH_CQ_POLL_MODE", "spin", "cq_poll_mode"},
+		{"RPINGMESH_EVENT_RING_CAPACITY", "8192", ""},
+		{"RPINGMESH_EVENT_RING_CAPACITY", "3000", "event_ring_capacity"},
+		{"RPINGMESH_METRICS_TARGET_RNIC_LABELS", "histograms", "metrics_target_rnic_labels"},
+		{"RPINGMESH_METRICS_TARGET_RNIC_LABELS_SCOPE", "inter_tor", "metrics_target_rnic_labels_scope"},
+		// A limit below the SDK default would also cap the default
+		// instruments; only 0 or a raised limit is accepted.
+		{"RPINGMESH_METRICS_CARDINALITY_LIMIT", "-1", "metrics_cardinality_limit"},
+		{"RPINGMESH_METRICS_CARDINALITY_LIMIT", "1", "metrics_cardinality_limit"},
+		{"RPINGMESH_METRICS_CARDINALITY_LIMIT", "1999", "metrics_cardinality_limit"},
+		{"RPINGMESH_METRICS_CARDINALITY_LIMIT", "2000", ""},
+		// probe_interval_ms=0 would panic time.NewTicker.
+		{"RPINGMESH_PROBE_INTERVAL_MS", "0", "probe_interval_ms"},
+		{"RPINGMESH_TLS_MODE", TLSModeMTLS, "tls_ca_file is required"},
+		{"RPINGMESH_TLS_MODE", "bogus", "tls_mode must be one of"},
+	} {
+		t.Run(tc.env+"="+tc.value, func(t *testing.T) {
+			t.Setenv(tc.env, tc.value)
+			_, err := LoadAgentConfig("", nil)
+			checkErr(t, err, tc.wantErr)
+		})
 	}
 }
 
-func TestLoadAgentConfig_NegativeGIDIndex(t *testing.T) {
-	t.Setenv("RPINGMESH_GID_INDEX", "-1")
-
-	if _, err := LoadAgentConfig("", nil); err == nil {
-		t.Fatal("expected an error for a negative gid_index, got nil")
-	}
-}
-
-func TestLoadAgentConfig_GIDIndexExceedsMax(t *testing.T) {
-	t.Setenv("RPINGMESH_GID_INDEX", "256")
-
-	if _, err := LoadAgentConfig("", nil); err == nil {
-		t.Fatal("expected an error for gid_index=256 (max is 255), got nil")
-	}
-}
-
-func TestLoadAgentConfig_GIDIndexAtMax(t *testing.T) {
-	t.Setenv("RPINGMESH_GID_INDEX", "255")
-
-	if _, err := LoadAgentConfig("", nil); err != nil {
-		t.Fatalf("unexpected error for gid_index=255 (max allowed): %v", err)
-	}
-}
-
-func TestLoadAgentConfig_ServiceLevelAndTrafficClassDefaults(t *testing.T) {
-	cfg, err := LoadAgentConfig("", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.ServiceLevel != 0 {
-		t.Errorf("ServiceLevel = %d, want 0", cfg.ServiceLevel)
-	}
-	if cfg.TrafficClass != 0 {
-		t.Errorf("TrafficClass = %d, want 0", cfg.TrafficClass)
-	}
-}
-
-func TestLoadAgentConfig_CQPollModeDefaultIsAuto(t *testing.T) {
-	cfg, err := LoadAgentConfig("", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.CQPollMode != CQPollModeAuto {
-		t.Errorf("CQPollMode = %q, want %q", cfg.CQPollMode, CQPollModeAuto)
+// TestLoadAgentConfig_YAMLValidation covers rules on list and map keys,
+// which environment variables cannot express.
+func TestLoadAgentConfig_YAMLValidation(t *testing.T) {
+	for name, tc := range map[string]struct {
+		yaml, wantErr string
+	}{
+		"device_tor_ids empty value":    {"device_tor_ids:\n  mlx5_0: \"  \"\n", "device_tor_ids[mlx5_0] must not be empty"},
+		"device_tor_ids reserved value": {"device_tor_ids:\n  mlx5_0: \"unspecified\"\n", "is reserved for untagged agents"},
+		"device_plane_ids empty value":  {"device_plane_ids:\n  mlx5_0: \"  \"\n", "device_plane_ids[mlx5_0] must not be empty"},
+		"excluded_device_names empty":   {"excluded_device_names: [\"  \"]\n", "excluded_device_names has an empty device name"},
+		"device both allowed and excluded": {
+			"allowed_device_names: [mlx5_0, mlx5_1]\nexcluded_device_names: [MLX5_1]\n",
+			"listed in both allowed_device_names and excluded_device_names",
+		},
+		"excluded_gid_cidrs bare address": {"excluded_gid_cidrs: [10.0.0.1]\n", "excluded_gid_cidrs"},
+		"excluded_gid_cidrs garbage":      {"excluded_gid_cidrs: [mgmt]\n", "excluded_gid_cidrs"},
+		"mapped_devices_only without map": {"mapped_devices_only: true\n", "mapped_devices_only requires"},
+		"lldp_tor_id_field unknown":       {"lldp_tor_id_field: port_id\n", "lldp_tor_id_field"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := LoadAgentConfig(writeYAML(t, "agent.yaml", tc.yaml), nil)
+			checkErr(t, err, tc.wantErr)
+		})
 	}
 }
 
@@ -636,81 +507,6 @@ func TestLoadAgentConfig_CQPollModeFromEnv(t *testing.T) {
 				t.Errorf("CQPollMode = %q, want %q", cfg.CQPollMode, mode)
 			}
 		})
-	}
-}
-
-func TestLoadAgentConfig_InvalidCQPollMode(t *testing.T) {
-	t.Setenv("RPINGMESH_CQ_POLL_MODE", "spin")
-
-	if _, err := LoadAgentConfig("", nil); err == nil {
-		t.Fatal("expected an error for cq_poll_mode=spin, got nil")
-	}
-}
-
-func TestLoadAgentConfig_EventRingCapacity(t *testing.T) {
-	cfg, err := LoadAgentConfig("", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.EventRingCapacity != DefaultEventRingCapacity {
-		t.Errorf("EventRingCapacity = %d, want %d", cfg.EventRingCapacity, DefaultEventRingCapacity)
-	}
-
-	t.Setenv("RPINGMESH_EVENT_RING_CAPACITY", "8192")
-	cfg, err = LoadAgentConfig("", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got := cfg.EffectiveEventRingCapacity(); got != 8192 {
-		t.Errorf("EffectiveEventRingCapacity = %d, want 8192", got)
-	}
-}
-
-func TestAgentConfig_EventRingCapacityValidation(t *testing.T) {
-	base := AgentConfig{ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600}
-	for _, tc := range []struct {
-		capacity uint32
-		wantErr  bool
-	}{
-		{0, false}, // unset: the default
-		{MinEventRingCapacity, false},
-		{4096, false},
-		{MaxEventRingCapacity, false},
-		{MinEventRingCapacity / 2, true},
-		{MaxEventRingCapacity * 2, true},
-		{3000, true}, // not a power of two
-	} {
-		cfg := base
-		cfg.EventRingCapacity = tc.capacity
-		if err := cfg.Validate(); (err != nil) != tc.wantErr {
-			t.Errorf("Validate(event_ring_capacity=%d) error = %v, wantErr %v", tc.capacity, err, tc.wantErr)
-		}
-	}
-	if got := base.EffectiveEventRingCapacity(); got != DefaultEventRingCapacity {
-		t.Errorf("EffectiveEventRingCapacity of a zero value = %d, want %d", got, DefaultEventRingCapacity)
-	}
-}
-
-func TestLoadAgentConfig_MetricsTargetRnicLabelsDefaults(t *testing.T) {
-	cfg, err := LoadAgentConfig("", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.MetricsTargetRnicLabels != MetricsTargetRnicLabelsOff {
-		t.Errorf("MetricsTargetRnicLabels = %q, want %q", cfg.MetricsTargetRnicLabels, MetricsTargetRnicLabelsOff)
-	}
-	if cfg.MetricsTargetRnicLabelsScope != MetricsTargetRnicLabelsScopeStable {
-		t.Errorf("MetricsTargetRnicLabelsScope = %q, want %q",
-			cfg.MetricsTargetRnicLabelsScope, MetricsTargetRnicLabelsScopeStable)
-	}
-	if cfg.MetricsCardinalityLimit != 0 {
-		t.Errorf("MetricsCardinalityLimit = %d, want 0", cfg.MetricsCardinalityLimit)
-	}
-	if cfg.MetricsProberDelayTargetTor {
-		t.Error("MetricsProberDelayTargetTor = true, want false")
-	}
-	if !cfg.MetricsResponderDelayTargetTor {
-		t.Error("MetricsResponderDelayTargetTor = false, want true")
 	}
 }
 
@@ -743,324 +539,151 @@ func TestLoadAgentConfig_MetricsTargetRnicLabelsFromEnv(t *testing.T) {
 	}
 }
 
-func TestLoadAgentConfig_InvalidMetricsTargetRnicLabels(t *testing.T) {
-	cases := map[string]string{
-		"RPINGMESH_METRICS_TARGET_RNIC_LABELS":       "histograms",
-		"RPINGMESH_METRICS_TARGET_RNIC_LABELS_SCOPE": "inter_tor",
-		"RPINGMESH_METRICS_CARDINALITY_LIMIT":        "-1",
+func TestLoadAgentConfig_EventRingCapacityFromEnv(t *testing.T) {
+	t.Setenv("RPINGMESH_EVENT_RING_CAPACITY", "8192")
+	cfg, err := LoadAgentConfig("", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	// A limit below the SDK default would also cap the default instruments.
-	for _, value := range []string{"-1", "1", "1999"} {
-		t.Run("cardinality_limit_"+value, func(t *testing.T) {
-			t.Setenv("RPINGMESH_METRICS_CARDINALITY_LIMIT", value)
-			if _, err := LoadAgentConfig("", nil); err == nil {
-				t.Fatalf("expected an error for metrics_cardinality_limit=%s, got nil", value)
+	if got := cfg.EffectiveEventRingCapacity(); got != 8192 {
+		t.Errorf("EffectiveEventRingCapacity = %d, want 8192", got)
+	}
+	if got := (&AgentConfig{}).EffectiveEventRingCapacity(); got != DefaultEventRingCapacity {
+		t.Errorf("EffectiveEventRingCapacity of a zero value = %d, want %d", got, DefaultEventRingCapacity)
+	}
+}
+
+// TestEffectiveProbeRates verifies the per-pinglist-type rate resolution,
+// including the backward-compatible fallback: when a type-specific rate is 0
+// (unset) it inherits the legacy target_probe_rate_per_second.
+func TestEffectiveProbeRates(t *testing.T) {
+	cases := []struct {
+		name                      string
+		target, torMesh, interTor int
+		wantTorMesh, wantInterTor int
+	}{
+		{"both_unset_falls_back_to_target", 10, 0, 0, 10, 10},
+		{"differentiated_paper_rates", 10, 10, 1, 10, 1},
+		{"only_inter_tor_set_tor_mesh_inherits", 8, 0, 5, 8, 5},
+		{"only_tor_mesh_set_inter_tor_inherits", 7, 12, 0, 12, 7},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &AgentConfig{
+				TargetProbeRatePerSecond:   tc.target,
+				TorMeshProbeRatePerSecond:  tc.torMesh,
+				InterTorProbeRatePerSecond: tc.interTor,
+			}
+			if got := cfg.EffectiveTorMeshProbeRate(); got != tc.wantTorMesh {
+				t.Errorf("EffectiveTorMeshProbeRate() = %d, want %d", got, tc.wantTorMesh)
+			}
+			if got := cfg.EffectiveInterTorProbeRate(); got != tc.wantInterTor {
+				t.Errorf("EffectiveInterTorProbeRate() = %d, want %d", got, tc.wantInterTor)
 			}
 		})
-	}
-	for env, value := range cases {
-		t.Run(env, func(t *testing.T) {
-			t.Setenv(env, value)
-			if _, err := LoadAgentConfig("", nil); err == nil {
-				t.Fatalf("expected an error for %s=%s, got nil", env, value)
-			}
-		})
-	}
-}
-
-func TestLoadAgentConfig_NegativeServiceLevel(t *testing.T) {
-	t.Setenv("RPINGMESH_SERVICE_LEVEL", "-1")
-
-	if _, err := LoadAgentConfig("", nil); err == nil {
-		t.Fatal("expected an error for a negative service_level, got nil")
-	}
-}
-
-func TestLoadAgentConfig_ServiceLevelExceedsMax(t *testing.T) {
-	t.Setenv("RPINGMESH_SERVICE_LEVEL", "8")
-
-	if _, err := LoadAgentConfig("", nil); err == nil {
-		t.Fatal("expected an error for service_level=8 (max is 7), got nil")
-	}
-}
-
-func TestLoadAgentConfig_NegativeTrafficClass(t *testing.T) {
-	t.Setenv("RPINGMESH_TRAFFIC_CLASS", "-1")
-
-	if _, err := LoadAgentConfig("", nil); err == nil {
-		t.Fatal("expected an error for a negative traffic_class, got nil")
-	}
-}
-
-func TestLoadAgentConfig_TrafficClassExceedsMax(t *testing.T) {
-	t.Setenv("RPINGMESH_TRAFFIC_CLASS", "256")
-
-	if _, err := LoadAgentConfig("", nil); err == nil {
-		t.Fatal("expected an error for traffic_class=256 (max is 255), got nil")
-	}
-}
-
-func TestLoadAgentConfig_ZeroProbeInterval(t *testing.T) {
-	t.Setenv("RPINGMESH_PROBE_INTERVAL_MS", "0")
-
-	if _, err := LoadAgentConfig("", nil); err == nil {
-		t.Fatal("expected an error for probe_interval_ms=0 (would panic time.NewTicker), got nil")
-	}
-}
-
-func TestLoadAgentConfig_MTLSMissingFiles(t *testing.T) {
-	t.Setenv("RPINGMESH_TLS_MODE", TLSModeMTLS)
-
-	if _, err := LoadAgentConfig("", nil); err == nil {
-		t.Fatal("expected an error for tls_mode=mtls with no cert/key/ca configured, got nil")
-	}
-}
-
-func TestLoadAgentConfig_InvalidTLSMode(t *testing.T) {
-	t.Setenv("RPINGMESH_TLS_MODE", "bogus")
-
-	if _, err := LoadAgentConfig("", nil); err == nil {
-		t.Fatal("expected an error for an unknown tls_mode, got nil")
 	}
 }
 
 func TestAgentConfig_Validate(t *testing.T) {
 	tests := []struct {
 		name    string
-		cfg     AgentConfig
-		wantErr bool
+		mutate  func(c *AgentConfig)
+		wantErr string
 	}{
+		{"valid", func(c *AgentConfig) {}, ""},
+		{"reserved tor_id", func(c *AgentConfig) { c.TorID = "unspecified" }, "tor_id"},
+		{"reserved tor_id with surrounding whitespace", func(c *AgentConfig) { c.TorID = " unspecified " }, "tor_id"},
+		{"unknown is a valid named ToR", func(c *AgentConfig) { c.TorID = "unknown" }, ""},
 		{
-			name:    "valid",
-			cfg:     AgentConfig{GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600},
-			wantErr: false,
+			"device_tor_ids empty device name",
+			func(c *AgentConfig) { c.DeviceTorIDs = map[string]string{" ": "leaf-a"} },
+			"device_tor_ids has an empty device name",
 		},
 		{
-			name: "reserved tor_id",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				TorID: "unspecified",
-			},
-			wantErr: true,
+			"device_plane_ids empty device name",
+			func(c *AgentConfig) { c.DevicePlaneIDs = map[string]string{" ": "rail0"} },
+			"device_plane_ids has an empty device name",
+		},
+		{"negative gid index", func(c *AgentConfig) { c.GIDIndex = -1 }, "gid_index"},
+		{"gid index at max is valid", func(c *AgentConfig) { c.GIDIndex = MaxGIDIndex }, ""},
+		{"gid index exceeds max", func(c *AgentConfig) { c.GIDIndex = MaxGIDIndex + 1 }, "gid_index"},
+		{"valid service level and traffic class at bounds", func(c *AgentConfig) { c.ServiceLevel = 7; c.TrafficClass = 255 }, ""},
+		{"negative service level", func(c *AgentConfig) { c.ServiceLevel = -1 }, "service_level"},
+		{"service level exceeds max", func(c *AgentConfig) { c.ServiceLevel = 8 }, "service_level"},
+		{"negative traffic class", func(c *AgentConfig) { c.TrafficClass = -1 }, "traffic_class"},
+		{"traffic class exceeds max", func(c *AgentConfig) { c.TrafficClass = 256 }, "traffic_class"},
+		{"invalid cq poll mode", func(c *AgentConfig) { c.CQPollMode = "spin" }, "cq_poll_mode"},
+		{"busy cq poll mode", func(c *AgentConfig) { c.CQPollMode = CQPollModeBusy }, ""},
+		{"event ring capacity at min", func(c *AgentConfig) { c.EventRingCapacity = MinEventRingCapacity }, ""},
+		{"event ring capacity at max", func(c *AgentConfig) { c.EventRingCapacity = MaxEventRingCapacity }, ""},
+		{"event ring capacity below min", func(c *AgentConfig) { c.EventRingCapacity = MinEventRingCapacity / 2 }, "event_ring_capacity"},
+		{"event ring capacity above max", func(c *AgentConfig) { c.EventRingCapacity = MaxEventRingCapacity * 2 }, "event_ring_capacity"},
+		{"event ring capacity not a power of two", func(c *AgentConfig) { c.EventRingCapacity = 3000 }, "event_ring_capacity"},
+		{"zero probe interval", func(c *AgentConfig) { c.ProbeIntervalMS = 0 }, "probe_interval_ms"},
+		{"zero flow label rotation period", func(c *AgentConfig) { c.FlowLabelRotationPeriodSec = 0 }, "flow_label_rotation_period_sec"},
+		// A negative per-type rate would be silently read as "disabled" by
+		// the limiter, defeating the intended cap.
+		{"negative tor-mesh probe rate", func(c *AgentConfig) { c.TorMeshProbeRatePerSecond = -1 }, "tor_mesh_probe_rate_per_second"},
+		{"negative inter-tor probe rate", func(c *AgentConfig) { c.InterTorProbeRatePerSecond = -1 }, "inter_tor_probe_rate_per_second"},
+		{"differentiated probe rates", func(c *AgentConfig) { c.TorMeshProbeRatePerSecond = 10; c.InterTorProbeRatePerSecond = 1 }, ""},
+		{"analysis reporting needs a window", func(c *AgentConfig) { c.AnalysisReportEnabled = true }, "analysis_window_sec"},
+		{"analysis reporting with a window", func(c *AgentConfig) { c.AnalysisReportEnabled = true; c.AnalysisWindowSec = 30 }, ""},
+		{"tls_mode disabled requires no certificate files", func(c *AgentConfig) { c.TLSMode = TLSModeDisabled }, ""},
+		{"unknown tls_mode is rejected", func(c *AgentConfig) { c.TLSMode = "bogus" }, "tls_mode must be one of"},
+		{"tls_mode=tls without ca file is rejected", func(c *AgentConfig) { c.TLSMode = TLSModeTLS }, "tls_ca_file is required"},
+		{"tls_mode=mtls without ca/cert/key is rejected", func(c *AgentConfig) { c.TLSMode = TLSModeMTLS }, "tls_ca_file is required"},
+		{
+			"self-protection enabled with valid thresholds",
+			func(c *AgentConfig) { enableSelfProtection(c) },
+			"",
 		},
 		{
-			name: "reserved tor_id with surrounding whitespace",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				TorID: " unspecified ",
-			},
-			wantErr: true,
+			"self-protection enabled rejects zero watchdog interval",
+			func(c *AgentConfig) { enableSelfProtection(c); c.WatchdogIntervalSec = 0 },
+			"watchdog_interval_sec",
 		},
 		{
-			name: "unknown is a valid named ToR",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				TorID: "unknown",
-			},
-			wantErr: false,
+			"self-protection enabled rejects memory ratio of zero",
+			func(c *AgentConfig) { enableSelfProtection(c); c.ThrottleMemoryRatio = 0 },
+			"throttle_memory_ratio",
 		},
 		{
-			name:    "negative gid index",
-			cfg:     AgentConfig{GIDIndex: -1, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600},
-			wantErr: true,
+			"self-protection enabled rejects memory ratio above one",
+			func(c *AgentConfig) { enableSelfProtection(c); c.ThrottleMemoryRatio = 1.5 },
+			"throttle_memory_ratio",
 		},
 		{
-			name:    "gid index at max is valid",
-			cfg:     AgentConfig{GIDIndex: MaxGIDIndex, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600},
-			wantErr: false,
+			"self-protection enabled rejects cpu percent of zero",
+			func(c *AgentConfig) { enableSelfProtection(c); c.ThrottleCPUPercent = 0 },
+			"throttle_cpu_percent",
 		},
 		{
-			name:    "gid index exceeds max",
-			cfg:     AgentConfig{GIDIndex: MaxGIDIndex + 1, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600},
-			wantErr: true,
+			"self-protection enabled rejects cpu percent above 100",
+			func(c *AgentConfig) { enableSelfProtection(c); c.ThrottleCPUPercent = 101 },
+			"throttle_cpu_percent",
 		},
-		{
-			name:    "zero probe interval",
-			cfg:     AgentConfig{GIDIndex: 0, ProbeIntervalMS: 0, FlowLabelRotationPeriodSec: 3600},
-			wantErr: true,
-		},
-		{
-			name:    "zero flow label rotation period",
-			cfg:     AgentConfig{GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 0},
-			wantErr: true,
-		},
-		{
-			name: "valid service level and traffic class at bounds",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				ServiceLevel: 7, TrafficClass: 255,
-			},
-			wantErr: false,
-		},
-		{
-			name: "invalid cq poll mode",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				CQPollMode: "spin",
-			},
-			wantErr: true,
-		},
-		{
-			name: "busy cq poll mode",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				CQPollMode: CQPollModeBusy,
-			},
-			wantErr: false,
-		},
-		{
-			name: "negative service level",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				ServiceLevel: -1,
-			},
-			wantErr: true,
-		},
-		{
-			name: "service level exceeds max",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				ServiceLevel: 8,
-			},
-			wantErr: true,
-		},
-		{
-			name: "negative traffic class",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				TrafficClass: -1,
-			},
-			wantErr: true,
-		},
-		{
-			name: "traffic class exceeds max",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				TrafficClass: 256,
-			},
-			wantErr: true,
-		},
-		{
-			name: "tls_mode disabled requires no certificate files",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				TLSMode: TLSModeDisabled,
-			},
-			wantErr: false,
-		},
-		{
-			name: "unknown tls_mode is rejected",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				TLSMode: "bogus",
-			},
-			wantErr: true,
-		},
-		{
-			name: "tls_mode=tls without ca file is rejected",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				TLSMode: TLSModeTLS,
-			},
-			wantErr: true,
-		},
-		{
-			name: "tls_mode=mtls without ca/cert/key is rejected",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				TLSMode: TLSModeMTLS,
-			},
-			wantErr: true,
-		},
-		{
-			name: "self-protection enabled with valid thresholds",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				SelfProtectionEnabled: true, WatchdogIntervalSec: 5,
-				ThrottleMemoryRatio: 0.9, ThrottleCPUPercent: 90,
-			},
-			wantErr: false,
-		},
-		{
-			name: "self-protection enabled rejects zero watchdog interval",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				SelfProtectionEnabled: true, WatchdogIntervalSec: 0,
-				ThrottleMemoryRatio: 0.9, ThrottleCPUPercent: 90,
-			},
-			wantErr: true,
-		},
-		{
-			name: "self-protection enabled rejects memory ratio of zero",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				SelfProtectionEnabled: true, WatchdogIntervalSec: 5,
-				ThrottleMemoryRatio: 0, ThrottleCPUPercent: 90,
-			},
-			wantErr: true,
-		},
-		{
-			name: "self-protection enabled rejects memory ratio above one",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				SelfProtectionEnabled: true, WatchdogIntervalSec: 5,
-				ThrottleMemoryRatio: 1.5, ThrottleCPUPercent: 90,
-			},
-			wantErr: true,
-		},
-		{
-			name: "self-protection enabled rejects cpu percent of zero",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				SelfProtectionEnabled: true, WatchdogIntervalSec: 5,
-				ThrottleMemoryRatio: 0.9, ThrottleCPUPercent: 0,
-			},
-			wantErr: true,
-		},
-		{
-			name: "self-protection enabled rejects cpu percent above 100",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				SelfProtectionEnabled: true, WatchdogIntervalSec: 5,
-				ThrottleMemoryRatio: 0.9, ThrottleCPUPercent: 101,
-			},
-			wantErr: true,
-		},
-		{
-			name: "self-protection disabled ignores throttle knobs",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				SelfProtectionEnabled: false, WatchdogIntervalSec: 0,
-				ThrottleMemoryRatio: 0, ThrottleCPUPercent: 0,
-			},
-			wantErr: false,
-		},
-		{
-			name: "negative max_memory_mb rejected regardless of self-protection",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				MaxMemoryMB: -1,
-			},
-			wantErr: true,
-		},
-		{
-			name: "negative max_procs rejected regardless of self-protection",
-			cfg: AgentConfig{
-				GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-				MaxProcs: -1,
-			},
-			wantErr: true,
-		},
+		{"self-protection disabled ignores throttle knobs", func(c *AgentConfig) { c.SelfProtectionEnabled = false }, ""},
+		{"negative max_memory_mb rejected regardless of self-protection", func(c *AgentConfig) { c.MaxMemoryMB = -1 }, "max_memory_mb"},
+		{"negative max_procs rejected regardless of self-protection", func(c *AgentConfig) { c.MaxProcs = -1 }, "max_procs"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.cfg.Validate()
-			if (err != nil) != tc.wantErr {
-				t.Errorf("Validate() error = %v, wantErr %v", err, tc.wantErr)
-			}
+			cfg := validAgentConfig()
+			tc.mutate(&cfg)
+			checkErr(t, cfg.Validate(), tc.wantErr)
 		})
 	}
+}
+
+// enableSelfProtection turns the watchdog on with thresholds that pass
+// Validate; cases then break one of them.
+func enableSelfProtection(c *AgentConfig) {
+	c.SelfProtectionEnabled = true
+	c.WatchdogIntervalSec = 5
+	c.ThrottleMemoryRatio = 0.9
+	c.ThrottleCPUPercent = 90
 }
 
 // TestAgentConfig_Validate_MTLSWithRealFiles verifies that tls_mode=mtls
@@ -1068,19 +691,19 @@ func TestAgentConfig_Validate(t *testing.T) {
 // disk, using freshly generated test certificates rather than a hard-coded
 // stub path (real existence checking is the behavior under test).
 func TestAgentConfig_Validate_MTLSWithRealFiles(t *testing.T) {
-	certs := newTestCertSet(t)
+	certs := tlscerts.WriteFileSet(t)
 
-	cfg := AgentConfig{
-		GIDIndex: 0, ProbeIntervalMS: 500, FlowLabelRotationPeriodSec: 3600,
-		TLSMode:     TLSModeMTLS,
-		TLSCertFile: certs.clientCertFile,
-		TLSKeyFile:  certs.clientKeyFile,
-		TLSCAFile:   certs.caFile,
-	}
+	cfg := validAgentConfig()
+	cfg.TLSMode = TLSModeMTLS
+	cfg.TLSCertFile = certs.ClientCertFile
+	cfg.TLSKeyFile = certs.ClientKeyFile
+	cfg.TLSCAFile = certs.CAFile
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() = %v, want nil when all tls files exist", err)
 	}
 }
+
+// --- device selection and topology ---
 
 func TestLoadAgentConfig_DeviceTorIDs(t *testing.T) {
 	path := writeYAML(t, "agent.yaml", `tor_id: "host-tor"
@@ -1102,32 +725,6 @@ device_tor_ids:
 		if got := cfg.TorIDForDevice(dev); got != want {
 			t.Errorf("TorIDForDevice(%q) = %q, want %q", dev, got, want)
 		}
-	}
-}
-
-func TestLoadAgentConfig_DeviceTorIDsDefaultEmpty(t *testing.T) {
-	cfg, err := LoadAgentConfig("", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(cfg.DeviceTorIDs) != 0 {
-		t.Errorf("DeviceTorIDs = %v, want empty", cfg.DeviceTorIDs)
-	}
-	if got := cfg.TorIDForDevice("mlx5_0"); got != "" {
-		t.Errorf("TorIDForDevice = %q, want empty (untagged)", got)
-	}
-}
-
-func TestLoadAgentConfig_DeviceTorIDsRejectsInvalid(t *testing.T) {
-	for name, content := range map[string]string{
-		"empty value":    "device_tor_ids:\n  mlx5_0: \"  \"\n",
-		"reserved value": "device_tor_ids:\n  mlx5_0: \"unspecified\"\n",
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := LoadAgentConfig(writeYAML(t, "agent.yaml", content), nil); err == nil {
-				t.Error("expected a validation error, got nil")
-			}
-		})
 	}
 }
 
@@ -1154,21 +751,11 @@ func TestLoadAgentConfig_ExcludedDeviceNames(t *testing.T) {
 	}
 }
 
-func TestLoadAgentConfig_ExcludedDeviceNamesDefaultEmpty(t *testing.T) {
-	cfg, err := LoadAgentConfig("", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(cfg.ExcludedDeviceNames) != 0 {
-		t.Errorf("ExcludedDeviceNames = %v, want empty", cfg.ExcludedDeviceNames)
-	}
-	if cfg.IsDeviceExcluded("mlx5_0") {
-		t.Error("IsDeviceExcluded should be false with no exclusions")
-	}
-}
-
-func TestLoadAgentConfig_ExcludedDeviceNamesEnv(t *testing.T) {
+// Whitespace-separated env lists are a Viper convention this package relies
+// on for every []string key.
+func TestLoadAgentConfig_ListsFromEnv(t *testing.T) {
 	t.Setenv("RPINGMESH_EXCLUDED_DEVICE_NAMES", "mlx5_4 mlx5_5")
+	t.Setenv("RPINGMESH_EXCLUDED_GID_CIDRS", "10.0.0.0/24 192.168.0.0/16")
 	cfg, err := LoadAgentConfig("", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1176,19 +763,8 @@ func TestLoadAgentConfig_ExcludedDeviceNamesEnv(t *testing.T) {
 	if !cfg.IsDeviceExcluded("mlx5_4") || !cfg.IsDeviceExcluded("mlx5_5") {
 		t.Errorf("ExcludedDeviceNames = %v, want mlx5_4 and mlx5_5", cfg.ExcludedDeviceNames)
 	}
-}
-
-func TestLoadAgentConfig_ExcludedDeviceNamesRejectsInvalid(t *testing.T) {
-	for name, content := range map[string]string{
-		"empty name": "excluded_device_names: [\"  \"]\n",
-		"overlap with allowed": "allowed_device_names: [mlx5_0, mlx5_1]\n" +
-			"excluded_device_names: [MLX5_1]\n",
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := LoadAgentConfig(writeYAML(t, "agent.yaml", content), nil); err == nil {
-				t.Error("expected a validation error, got nil")
-			}
-		})
+	if _, ok := cfg.ExcludedGIDCIDR("192.168.3.4"); !ok {
+		t.Errorf("ExcludedGIDCIDRs = %v, want 192.168.0.0/16 included", cfg.ExcludedGIDCIDRs)
 	}
 }
 
@@ -1218,62 +794,14 @@ func TestLoadAgentConfig_ExcludedGIDCIDRs(t *testing.T) {
 	}
 }
 
-func TestLoadAgentConfig_ExcludedGIDCIDRsEnv(t *testing.T) {
-	t.Setenv("RPINGMESH_EXCLUDED_GID_CIDRS", "10.0.0.0/24 192.168.0.0/16")
-	cfg, err := LoadAgentConfig("", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, ok := cfg.ExcludedGIDCIDR("192.168.3.4"); !ok {
-		t.Errorf("ExcludedGIDCIDRs = %v, want 192.168.0.0/16 included", cfg.ExcludedGIDCIDRs)
-	}
-}
-
 func TestLoadAgentConfig_MappedDevicesOnly(t *testing.T) {
-	cfg, err := LoadAgentConfig("", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.MappedDevicesOnly {
-		t.Error("MappedDevicesOnly should default to false")
-	}
-
 	path := writeYAML(t, "agent.yaml", "mapped_devices_only: true\ndevice_tor_ids:\n  mlx5_0: leaf-a\n")
-	cfg, err = LoadAgentConfig(path, nil)
+	cfg, err := LoadAgentConfig(path, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !cfg.MappedDevicesOnly {
 		t.Error("MappedDevicesOnly = false, want true")
-	}
-}
-
-func TestLoadAgentConfig_DeviceSelectionRejectsInvalid(t *testing.T) {
-	for name, content := range map[string]string{
-		"bare address":               "excluded_gid_cidrs: [10.0.0.1]\n",
-		"garbage":                    "excluded_gid_cidrs: [mgmt]\n",
-		"mapped_devices_only no map": "mapped_devices_only: true\n",
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := LoadAgentConfig(writeYAML(t, "agent.yaml", content), nil); err == nil {
-				t.Error("expected a validation error, got nil")
-			}
-		})
-	}
-}
-
-func TestLoadAgentConfig_LLDPDefaults(t *testing.T) {
-	cfg, err := LoadAgentConfig("", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.LLDPTorDiscovery {
-		t.Error("LLDPTorDiscovery should default to false")
-	}
-	if cfg.LLDPTorIDField != "system_name" || cfg.LLDPCLIPath != "lldpcli" ||
-		cfg.LLDPDiscoveryTimeoutSec != DefaultLLDPDiscoveryTimeoutSec {
-		t.Errorf("unexpected LLDP defaults: field=%q path=%q timeout=%d",
-			cfg.LLDPTorIDField, cfg.LLDPCLIPath, cfg.LLDPDiscoveryTimeoutSec)
 	}
 }
 
@@ -1293,107 +821,6 @@ lldp_discovery_timeout_sec: 0
 	}
 	if _, ok := cfg.DeviceTorID("mlx5_0"); ok {
 		t.Error("DeviceTorID should report no entry without device_tor_ids")
-	}
-}
-
-func TestLoadAgentConfig_LLDPFieldRejectsInvalid(t *testing.T) {
-	path := writeYAML(t, "agent.yaml", "lldp_tor_id_field: port_id\n")
-	if _, err := LoadAgentConfig(path, nil); err == nil {
-		t.Error("expected a validation error, got nil")
-	}
-}
-
-// --- log_format ---
-
-func TestLoadConfig_LogFormatDefaultIsConsole(t *testing.T) {
-	agentCfg, err := LoadAgentConfig("", nil)
-	if err != nil {
-		t.Fatalf("LoadAgentConfig: %v", err)
-	}
-	if agentCfg.LogFormat != logging.FormatConsole {
-		t.Errorf("agent LogFormat = %q, want %q", agentCfg.LogFormat, logging.FormatConsole)
-	}
-	ctrlCfg, err := LoadControllerConfig("", nil)
-	if err != nil {
-		t.Fatalf("LoadControllerConfig: %v", err)
-	}
-	if ctrlCfg.LogFormat != logging.FormatConsole {
-		t.Errorf("controller LogFormat = %q, want %q", ctrlCfg.LogFormat, logging.FormatConsole)
-	}
-}
-
-// TestLoadConfig_LogFormatPrecedence checks flag > env > YAML > default for
-// log_format on both binaries.
-func TestLoadConfig_LogFormatPrecedence(t *testing.T) {
-	type loader func(path string, flags *pflag.FlagSet) (string, error)
-	loaders := map[string]struct {
-		bind func(*pflag.FlagSet)
-		load loader
-	}{
-		"agent": {BindAgentFlags, func(p string, f *pflag.FlagSet) (string, error) {
-			c, err := LoadAgentConfig(p, f)
-			if err != nil {
-				return "", err
-			}
-			return c.LogFormat, nil
-		}},
-		"controller": {BindControllerFlags, func(p string, f *pflag.FlagSet) (string, error) {
-			c, err := LoadControllerConfig(p, f)
-			if err != nil {
-				return "", err
-			}
-			return c.LogFormat, nil
-		}},
-	}
-	for name, l := range loaders {
-		t.Run(name, func(t *testing.T) {
-			path := writeYAML(t, "cfg.yaml", "log_format: json\n")
-			if got, err := l.load(path, nil); err != nil || got != "json" {
-				t.Fatalf("YAML: got %q, %v; want json", got, err)
-			}
-
-			t.Setenv("RPINGMESH_LOG_FORMAT", "console")
-			if got, err := l.load(path, nil); err != nil || got != "console" {
-				t.Fatalf("env over YAML: got %q, %v; want console", got, err)
-			}
-
-			flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
-			l.bind(flags)
-			if got, err := l.load(path, flags); err != nil || got != "console" {
-				t.Fatalf("unset flag must not override env: got %q, %v", got, err)
-			}
-			if err := flags.Set("log-format", "json"); err != nil {
-				t.Fatalf("flags.Set: %v", err)
-			}
-			if got, err := l.load(path, flags); err != nil || got != "json" {
-				t.Fatalf("flag over env: got %q, %v; want json", got, err)
-			}
-		})
-	}
-}
-
-func TestLoadConfig_LogFormatRejectsInvalid(t *testing.T) {
-	t.Setenv("RPINGMESH_LOG_FORMAT", "logfmt")
-	if _, err := LoadAgentConfig("", nil); err == nil {
-		t.Error("LoadAgentConfig: expected an error for log_format=logfmt, got nil")
-	}
-	if _, err := LoadControllerConfig("", nil); err == nil {
-		t.Error("LoadControllerConfig: expected an error for log_format=logfmt, got nil")
-	}
-}
-
-// --- plane_id / device_plane_ids ---
-
-func TestLoadAgentConfig_PlaneDefaultsEmpty(t *testing.T) {
-	cfg, err := LoadAgentConfig("", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.PlaneID != "" || len(cfg.DevicePlaneIDs) != 0 {
-		t.Errorf("PlaneID = %q, DevicePlaneIDs = %v; want empty", cfg.PlaneID, cfg.DevicePlaneIDs)
-	}
-	if got := cfg.PlaneIDForDevice("mlx5_0"); got != "" {
-		t.Errorf("PlaneIDForDevice = %q, want empty (no plane restriction)", got)
 	}
 }
 
@@ -1449,20 +876,6 @@ func TestLoadAgentConfig_PlaneIDPrecedence(t *testing.T) {
 	}
 }
 
-func TestLoadAgentConfig_DevicePlaneIDsRejectsInvalid(t *testing.T) {
-	if _, err := LoadAgentConfig(writeYAML(t, "agent.yaml", "device_plane_ids:\n  mlx5_0: \"  \"\n"), nil); err == nil {
-		t.Error("expected a validation error for an empty device_plane_ids value, got nil")
-	}
-	cfg := &AgentConfig{
-		ProbeIntervalMS:            1,
-		FlowLabelRotationPeriodSec: 1,
-		DevicePlaneIDs:             map[string]string{" ": "rail0"},
-	}
-	if err := cfg.Validate(); err == nil {
-		t.Error("expected a validation error for an empty device_plane_ids key, got nil")
-	}
-}
-
 // TestLoadAgentConfig_DevicePlaneIDsToleratesExcludedDevices checks that a
 // fleet-wide device_plane_ids map naming a device this host excludes (or does
 // not allow) still loads; the agent only warns about such entries.
@@ -1484,5 +897,57 @@ device_plane_ids:
 	}
 	if !(&AgentConfig{}).IsDeviceAllowed("anything") {
 		t.Error("IsDeviceAllowed with no allowed_device_names should be true")
+	}
+}
+
+// --- log_format ---
+
+// TestLoadConfig_LogFormatPrecedence checks flag > env > YAML > default for
+// log_format on both binaries.
+func TestLoadConfig_LogFormatPrecedence(t *testing.T) {
+	type loader func(path string, flags *pflag.FlagSet) (string, error)
+	loaders := map[string]struct {
+		bind func(*pflag.FlagSet)
+		load loader
+	}{
+		"agent": {BindAgentFlags, func(p string, f *pflag.FlagSet) (string, error) {
+			c, err := LoadAgentConfig(p, f)
+			if err != nil {
+				return "", err
+			}
+			return c.LogFormat, nil
+		}},
+		"controller": {BindControllerFlags, func(p string, f *pflag.FlagSet) (string, error) {
+			c, err := LoadControllerConfig(p, f)
+			if err != nil {
+				return "", err
+			}
+			return c.LogFormat, nil
+		}},
+	}
+	for name, l := range loaders {
+		t.Run(name, func(t *testing.T) {
+			path := writeYAML(t, "cfg.yaml", "log_format: json\n")
+			if got, err := l.load(path, nil); err != nil || got != "json" {
+				t.Fatalf("YAML: got %q, %v; want json", got, err)
+			}
+
+			t.Setenv("RPINGMESH_LOG_FORMAT", "console")
+			if got, err := l.load(path, nil); err != nil || got != "console" {
+				t.Fatalf("env over YAML: got %q, %v; want console", got, err)
+			}
+
+			flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+			l.bind(flags)
+			if got, err := l.load(path, flags); err != nil || got != "console" {
+				t.Fatalf("unset flag must not override env: got %q, %v", got, err)
+			}
+			if err := flags.Set("log-format", "json"); err != nil {
+				t.Fatalf("flags.Set: %v", err)
+			}
+			if got, err := l.load(path, flags); err != nil || got != "json" {
+				t.Fatalf("flag over env: got %q, %v; want json", got, err)
+			}
+		})
 	}
 }

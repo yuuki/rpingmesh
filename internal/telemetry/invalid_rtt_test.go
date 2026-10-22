@@ -1,60 +1,13 @@
 package telemetry
 
 import (
-	"context"
 	"testing"
 	"time"
 
 	"github.com/yuuki/rpingmesh/internal/probe"
-	"go.opentelemetry.io/otel/attribute"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"github.com/yuuki/rpingmesh/internal/testutil/otelmetrics"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
-
-// newTestCollector returns a MetricsCollector backed by a ManualReader.
-func newTestCollector(t *testing.T, opts ...Option) (*MetricsCollector, *sdkmetric.ManualReader) {
-	t.Helper()
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
-	mc, err := NewMetricsCollectorWithProvider(provider, opts...)
-	if err != nil {
-		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-	}
-	return mc, reader
-}
-
-// collect gathers the current metrics of reader.
-func collect(t *testing.T, reader *sdkmetric.ManualReader) *metricdata.ResourceMetrics {
-	t.Helper()
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("ManualReader.Collect: %v", err)
-	}
-	return &rm
-}
-
-// countsByAttr sums an int64 counter's data points by the value of attr.
-func countsByAttr(t *testing.T, rm *metricdata.ResourceMetrics, name, attr string) map[string]int64 {
-	t.Helper()
-	m := findMetric(rm, name)
-	if m == nil {
-		return nil
-	}
-	sum, ok := m.Data.(metricdata.Sum[int64])
-	if !ok {
-		t.Fatalf("%s is %T, want Sum[int64]", name, m.Data)
-	}
-	got := map[string]int64{}
-	for _, dp := range sum.DataPoints {
-		v, ok := dp.Attributes.Value(attribute.Key(attr))
-		if !ok {
-			t.Fatalf("%s data point missing %s attribute: %+v", name, attr, dp)
-		}
-		got[v.AsString()] += dp.Value
-	}
-	return got
-}
 
 // TestRecordProbeResult_InvalidKind verifies that rejected measurements are
 // counted on rpingmesh.probe_invalid_total by probe.InvalidKind, while
@@ -77,8 +30,8 @@ func TestRecordProbeResult_InvalidKind(t *testing.T) {
 		mc.RecordProbeResult(r, probe.CalculateRTT(r), "tor-a")
 	}
 
-	rm := collect(t, reader)
-	got := countsByAttr(t, rm, "rpingmesh.probe_invalid_total", "kind")
+	rm := otelmetrics.Collect(t, reader)
+	got := otelmetrics.TotalByAttr(t, rm, "rpingmesh.probe_invalid_total", "kind")
 	want := map[string]int64{
 		string(probe.InvalidKindResponderDelayTooLarge): 2,
 		string(probe.InvalidKindNegativeNetworkRTT):     1,
@@ -91,7 +44,7 @@ func TestRecordProbeResult_InvalidKind(t *testing.T) {
 			t.Errorf("probe_invalid_total{kind=%q} = %d, want %d", k, got[k], v)
 		}
 	}
-	failed := countsByAttr(t, rm, "rpingmesh.probe_failed_total", "reason")
+	failed := otelmetrics.TotalByAttr(t, rm, "rpingmesh.probe_failed_total", "reason")
 	if failed[reasonInvalidRTT] != 3 || failed[reasonTimeout] != 1 {
 		t.Errorf("probe_failed_total by reason = %v, want invalid_rtt=3 timeout=1", failed)
 	}
@@ -107,17 +60,17 @@ func TestRecordProbeResult_InvalidKindTargetRnic(t *testing.T) {
 	}
 	mc.RecordProbeResult(r, probe.CalculateRTT(r), "tor-a")
 
-	rm := collect(t, reader)
-	got := countsByAttr(t, rm, targetRnicMetricPrefix+"probe_invalid_total", "kind")
+	rm := otelmetrics.Collect(t, reader)
+	got := otelmetrics.TotalByAttr(t, rm, targetRnicMetricPrefix+"probe_invalid_total", "kind")
 	if got[string(probe.InvalidKindNegativeResponderDelay)] != 1 || len(got) != 1 {
 		t.Fatalf("target_rnic.probe_invalid_total by kind = %v", got)
 	}
-	hosts := countsByAttr(t, rm, targetRnicMetricPrefix+"probe_invalid_total", "target_hostname")
+	hosts := otelmetrics.TotalByAttr(t, rm, targetRnicMetricPrefix+"probe_invalid_total", "target_hostname")
 	if hosts["host-b"] != 1 {
 		t.Errorf("target_rnic.probe_invalid_total by target_hostname = %v", hosts)
 	}
 	// The failed counter's attribute set must not have picked up "kind".
-	m := findMetric(rm, targetRnicMetricPrefix+"probe_failed_total")
+	m := otelmetrics.Find(rm, targetRnicMetricPrefix+"probe_failed_total")
 	for _, dp := range m.Data.(metricdata.Sum[int64]).DataPoints {
 		if _, ok := dp.Attributes.Value("kind"); ok {
 			t.Errorf("target_rnic.probe_failed_total carries a kind attribute: %+v", dp)
@@ -162,7 +115,7 @@ func TestRegisterEventRingOccupancyCallback(t *testing.T) {
 	}
 
 	gauge := func(rm *metricdata.ResourceMetrics, name string) int64 {
-		m := findMetric(rm, name)
+		m := otelmetrics.Find(rm, name)
 		if m == nil {
 			t.Fatalf("%s not found", name)
 		}
@@ -176,14 +129,14 @@ func TestRegisterEventRingOccupancyCallback(t *testing.T) {
 		return g.DataPoints[0].Value
 	}
 
-	rm := collect(t, reader)
+	rm := otelmetrics.Collect(t, reader)
 	if v := gauge(rm, "rpingmesh.event_ring_occupancy_max"); v != 700 {
 		t.Errorf("occupancy_max = %d, want 700", v)
 	}
 	if v := gauge(rm, "rpingmesh.event_ring_capacity"); v != 1024 {
 		t.Errorf("capacity = %d, want 1024", v)
 	}
-	rm = collect(t, reader)
+	rm = otelmetrics.Collect(t, reader)
 	if v := gauge(rm, "rpingmesh.event_ring_occupancy_max"); v != 0 {
 		t.Errorf("occupancy_max after reset = %d, want 0", v)
 	}
@@ -205,7 +158,7 @@ func TestRegisterTimestampModeCallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RegisterTimestampModeCallback: %v", err)
 	}
-	m := findMetric(collect(t, reader), "rpingmesh.agent.hw_timestamps")
+	m := otelmetrics.Find(otelmetrics.Collect(t, reader), "rpingmesh.agent.hw_timestamps")
 	if m == nil {
 		t.Fatal("rpingmesh.agent.hw_timestamps not found")
 	}

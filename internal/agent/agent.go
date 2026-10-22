@@ -1,6 +1,7 @@
-// Package agent implements the R-Pingmesh agent lifecycle, orchestrating RDMA
-// device management, probe responders, active probing, controller registration,
-// cluster monitoring, and telemetry collection.
+// Package agent implements the R-Pingmesh agent: it opens the host's RDMA
+// devices and, on each of them, runs a Responder, a Prober and a
+// ClusterMonitor, registers the RNICs with the controller and exports probe
+// results as metrics and per-path analysis reports.
 package agent
 
 import (
@@ -24,156 +25,121 @@ import (
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
-// Timing constants for shutdown operations.
 const (
 	metricsShutdownTimeout = 5 * time.Second
 
-	// heartbeatInterval is the period between periodic re-registration
-	// heartbeats sent to the controller. The controller's liveness check
-	// considers an agent dead once last_updated_epoch is older than 300s,
-	// so this must be well under that threshold.
+	// heartbeatInterval is the period of the re-registration heartbeat. The
+	// controller considers an agent dead once last_updated_epoch is older
+	// than 300s, so this must be well under that.
 	heartbeatInterval = 60 * time.Second
 
 	// heartbeatFailureEscalationThreshold is the number of consecutive
-	// heartbeat failures after which log severity is escalated from Warn
-	// to Error, to surface sustained controller unreachability without
-	// being noisy about single transient failures.
+	// heartbeat failures after which the log level escalates from Warn to
+	// Error.
 	heartbeatFailureEscalationThreshold = 3
 
-	// Initial registration retry parameters: exponential backoff starting
-	// at registerRetryInitialBackoff, doubling up to registerRetryMaxBackoff,
-	// for up to registerRetryMaxAttempts total attempts.
+	// Initial registration retries with exponential backoff.
 	registerRetryInitialBackoff = 1 * time.Second
 	registerRetryMaxBackoff     = 30 * time.Second
 	registerRetryMaxAttempts    = 6
 )
 
-// Agent orchestrates all R-Pingmesh agent components: RDMA context, devices,
-// responders, probers, cluster monitors, and telemetry. It handles
-// initialization, registration with the controller, and graceful shutdown.
-//
-// One Prober, one ClusterMonitor, and one prober EventRing are created per
-// opened RDMA device so that every RNIC on a multi-rail host actively probes
-// (not just the first device), matching the fact that every device is
-// registered with the controller and can be targeted by other agents'
-// pinglists.
-type Agent struct {
-	cfg         *config.AgentConfig
-	rdmaCtx     *rdmabridge.Context
-	devices     []*rdmabridge.Device
-	responders  []*Responder
-	probers     []*Prober
-	monitors    []*ClusterMonitor
-	grpcClient  *controller_client.GRPCControllerClient
-	metrics     *telemetry.MetricsCollector
-	proberRings []*rdmabridge.EventRing
-	respRings   []*rdmabridge.EventRing
-	logger      zerolog.Logger
+// rnic is one opened RDMA device together with everything the agent runs on
+// it. Every RNIC of a multi-rail host probes actively and is registered with
+// the controller, so each one gets its own prober, responder, event rings
+// and cluster monitor.
+type rnic struct {
+	dev *rdmabridge.Device
 
-	// results is the fan-in destination for every prober's Results()
-	// channel (see createResultsFanIn), consumed by the metrics result
-	// consumer as a single stream.
+	// torID is the device's canonical ToR: its device_tor_ids entry, else
+	// its LLDP-discovered ToR, else the host-wide tor_id. Empty means
+	// untagged.
+	torID string
+	// netdev is the netdev bound to the device's active port/GID ("" when
+	// it cannot be resolved). It feeds LLDP discovery, the source_netdev
+	// metric attribute and the registration.
+	netdev string
+	// planeID is the device's canonical plane (rail): its device_plane_ids
+	// entry, else the host-wide plane_id. Empty means no plane restriction.
+	planeID string
+
+	proberRing *rdmabridge.EventRing
+	respRing   *rdmabridge.EventRing
+	prober     *Prober
+	responder  *Responder
+	monitor    *ClusterMonitor
+
+	// watch identifies the device's uverbs node so its removal can be
+	// detected; nil when the node could not be found (see device_watch.go).
+	watch *watchedDevice
+}
+
+// Agent orchestrates all agent components and handles initialization,
+// registration with the controller, and graceful shutdown.
+type Agent struct {
+	cfg        *config.AgentConfig
+	rdmaCtx    *rdmabridge.Context
+	rnics      []*rnic
+	grpcClient *controller_client.GRPCControllerClient
+	metrics    *telemetry.MetricsCollector
+	logger     zerolog.Logger
+
+	// results is the fan-in of every prober's Results() channel, consumed
+	// by the metrics result consumer as one stream (see createResultsFanIn).
 	results   chan *probe.ProbeResult
 	resultsWg sync.WaitGroup
 
-	// resultsDone is closed by stopResultsFanIn (called from Stop) to tell
-	// every fan-in goroutine to stop forwarding immediately, even if it is
-	// currently blocked trying to send on a full results channel. Without
-	// this, a fan-in goroutine has no way to unblock when nothing drains
-	// a.results (e.g. metrics disabled, or MetricsCollector creation
-	// failed), which would leak the goroutine and any buffered results
-	// forever instead of letting Stop complete deterministically.
+	// resultsDone is closed by stopResultsFanIn so every fan-in goroutine
+	// stops forwarding at once, even one blocked on a full results channel
+	// that nothing drains any more.
 	resultsDone chan struct{}
 
-	// analysisResults is the secondary fan-out branch of the results fan-in,
-	// feeding the AnalysisReporter (per-path window aggregation). It is nil
-	// when analysis reporting is disabled. The fan-in tees onto it with a
-	// non-blocking send so a backed-up aggregator can never stall the primary
-	// metrics path; it is closed by stopResultsFanIn after every fan-in
-	// goroutine has exited (so no send races the close).
-	analysisResults chan *probe.ProbeResult
-
-	// analysisReporter drives the PathAggregator and ships completed window
-	// summaries to the controller via ReportProbeAnalysis. nil when analysis
-	// reporting is disabled.
+	// analysisResults is the secondary branch of the fan-in feeding the
+	// AnalysisReporter; nil when analysis reporting is disabled. The fan-in
+	// tees onto it non-blockingly so a backed-up aggregator can never stall
+	// the metrics path.
+	analysisResults  chan *probe.ProbeResult
 	analysisReporter *AnalysisReporter
 
-	// watchdog samples this process's CPU/memory and throttles every prober's
-	// send rate (fail-slow) under pressure. nil when self-protection is
-	// disabled (the default).
+	// watchdog throttles every prober under CPU/memory pressure; nil when
+	// self-protection is disabled.
 	watchdog *Watchdog
 
-	// metricsResultsActive records whether a metrics result consumer will drain
-	// a.results (i.e. a.metrics != nil). It is decided before createResultsFanIn
-	// and read by each fan-in goroutine: when false, the fan-in does NOT send on
-	// a.results at all. Otherwise a full a.results (which nobody drains when
-	// metrics are disabled or MetricsCollector creation failed) would block the
-	// fan-in, stopping it reading from the probers and starving the independent
-	// analysis tee. Analysis reporting can be enabled without metrics, so the
-	// two branches must not be coupled.
+	// metricsResultsActive records whether a metrics consumer will drain
+	// a.results. When false the fan-in never sends on it: a full channel
+	// nobody drains would block the fan-in and starve the analysis tee.
 	metricsResultsActive bool
 
-	// agentIP is the host's outbound IP toward the controller, reported in the
-	// registration request's agent_ip field. Best-effort: empty if it cannot be
-	// determined, which never blocks registration.
+	// agentIP is the host's outbound IP toward the controller, reported in
+	// the registration. Best-effort: empty if undetermined.
 	agentIP string
 
-	// canonicalTorID is cfg.TorID after whitespace trim. Empty means untagged
-	// (registry storage key ""); OTel/PathSummary use probe.TorMetricLabel.
+	// canonicalTorID is cfg.TorID after whitespace trim; empty means
+	// untagged (registry storage key "").
 	canonicalTorID string
 
-	// deviceTorIDs holds the canonical ToR of each opened device, parallel to
-	// devices: the device's device_tor_ids entry, else its LLDP-discovered
-	// ToR, else canonicalTorID. Filled by resolveDeviceTorIDs right after the
-	// devices are opened.
-	deviceTorIDs []string
-
-	// deviceNetdevs holds the netdev bound to each opened device's active
-	// port/GID, parallel to devices ("" when it cannot be resolved). Used by
-	// LLDP ToR discovery and stamped onto probe results as the source_netdev
-	// metric attribute. Filled by resolveDeviceNetdevs right after the devices
-	// are opened.
-	deviceNetdevs []string
-
-	// devicePlaneIDs holds the canonical plane (rail) of each opened device,
-	// parallel to devices: its device_plane_ids entry, else plane_id. Empty
-	// means no plane restriction. Filled by resolveDevicePlaneIDs.
-	devicePlaneIDs []string
-
-	// lldpQuerier and sysfsRoot are the LLDP discovery dependencies used when
-	// lldp_tor_discovery is enabled. NewAgent sets the production values;
-	// tests replace them.
+	// lldpQuerier and sysfsRoot are the discovery dependencies; tests
+	// replace them.
 	lldpQuerier lldp.Querier
 	sysfsRoot   string
 
-	// perRnicTorLossWarned records that a heartbeat found the controller no
-	// longer honoring per-RNIC ToRs, so the error is logged once, not every
-	// heartbeat.
+	// perRnicTorLossWarned and planeSupportWarned make the "controller lacks
+	// feature" errors log once, not every heartbeat.
 	perRnicTorLossWarned bool
+	planeSupportWarned   bool
 
-	// planeSupportWarned records that the controller was found not to
-	// support plane_id, so the warning is logged once, not every heartbeat.
-	planeSupportWarned bool
-
-	// heartbeatStopCh and heartbeatWg control the lifecycle of the
-	// background heartbeat goroutine that periodically re-registers with
-	// the controller to keep the agent's registry entry alive.
 	heartbeatStopCh chan struct{}
 	heartbeatWg     sync.WaitGroup
 
-	// watchedDevices, recorded by recordWatchedDevices, are the opened
-	// devices whose removal startDeviceWatch detects; deviceLost carries the
-	// first loss to Run. deviceWatchPeriod overrides deviceWatchInterval in
-	// tests.
-	watchedDevices    []watchedDevice
+	// deviceLost carries the first lost device to Run; deviceWatchPeriod
+	// overrides deviceWatchInterval in tests.
 	deviceLost        chan error
 	deviceWatchStopCh chan struct{}
 	deviceWatchWg     sync.WaitGroup
 	deviceWatchPeriod time.Duration
 }
 
-// NewAgent creates a new Agent instance with the given configuration.
-// The agent is not started until Initialize and Start are called.
+// NewAgent creates an Agent; it is not started until Initialize and Start.
 func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("agent config must not be nil")
@@ -193,31 +159,292 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 		deviceLost:     make(chan error, 1),
 	}
 
-	// Apply optional hard runtime caps as early as possible (before any heavy
-	// allocation) so a soft memory limit governs the whole process lifetime.
+	// As early as possible, so a soft memory limit governs the whole
+	// process lifetime.
 	applyRuntimeLimits(cfg, a.logger)
-
 	return a, nil
 }
 
-// Plane sources reported in the "Resolved device plane" log.
+// Sources reported in the "Resolved device plane" / "Resolved device ToR"
+// logs.
 const (
 	planeSourceDeviceMap = "device_plane_ids"
 	planeSourceAgent     = "plane_id"
-)
 
-// ToR sources reported in the "Resolved device ToR" log.
-const (
 	torSourceDeviceMap = "device_tor_ids"
 	torSourceLLDP      = "lldp"
 	torSourceAgent     = "tor_id"
 )
 
-// discoverLLDPTorIDs returns, parallel to devices, the ToR each device's LLDP
+// applyRuntimeLimits applies the optional soft memory limit (GOMEMLIMIT) and
+// GOMAXPROCS cap. Both are opt-in (0 leaves the Go default) and independent
+// of self_protection_enabled; the memory limit is also the budget the
+// watchdog throttles against.
+func applyRuntimeLimits(cfg *config.AgentConfig, logger zerolog.Logger) {
+	if cfg.MaxMemoryMB > 0 {
+		limit := int64(cfg.MaxMemoryMB) * bytesPerMiB
+		debug.SetMemoryLimit(limit)
+		logger.Info().
+			Int("max_memory_mb", cfg.MaxMemoryMB).
+			Int64("gomemlimit_bytes", limit).
+			Msg("Applied soft memory limit (GOMEMLIMIT)")
+	}
+	if cfg.MaxProcs > 0 {
+		prev := runtime.GOMAXPROCS(cfg.MaxProcs)
+		logger.Info().
+			Int("max_procs", cfg.MaxProcs).
+			Int("previous_gomaxprocs", prev).
+			Msg("Capped GOMAXPROCS")
+	}
+}
+
+// Initialize opens the RDMA devices and builds every component, registers
+// with the controller and creates the cluster monitors. Stop releases
+// whatever was allocated when it fails part-way.
+func (a *Agent) Initialize(ctx context.Context) error {
+	a.logger.Info().Msg("Initializing RDMA context")
+	rdmaCtx, err := rdmabridge.Init()
+	if err != nil {
+		return fmt.Errorf("failed to initialize RDMA context: %w", err)
+	}
+	a.rdmaCtx = rdmaCtx
+
+	a.logger.Info().Msg("Opening RDMA devices")
+	if err := a.openDevices(); err != nil {
+		return fmt.Errorf("failed to open RDMA devices: %w", err)
+	}
+	if len(a.rnics) == 0 {
+		if len(a.cfg.ExcludedDeviceNames) > 0 || len(a.cfg.ExcludedGIDCIDRs) > 0 || a.cfg.MappedDevicesOnly {
+			return fmt.Errorf("no RDMA devices available (excluded_device_names: %v, excluded_gid_cidrs: %v, mapped_devices_only: %v)",
+				a.cfg.ExcludedDeviceNames, a.cfg.ExcludedGIDCIDRs, a.cfg.MappedDevicesOnly)
+		}
+		return fmt.Errorf("no RDMA devices available")
+	}
+	a.logger.Info().Int("device_count", len(a.rnics)).Msg("RDMA devices opened")
+	a.resolveDeviceNetdevs()
+	a.recordWatchedDevices()
+	a.resolveDeviceTorIDs(a.discoverLLDPTorIDs(ctx))
+	a.resolveDevicePlaneIDs()
+
+	a.logger.Info().
+		Str("controller_addr", a.cfg.ControllerAddr).
+		Msg("Creating gRPC controller client")
+	grpcClient, err := controller_client.NewGRPCControllerClient(a.cfg.ControllerAddr, &config.TLSClientConfig{
+		Mode:       a.cfg.TLSMode,
+		CertFile:   a.cfg.TLSCertFile,
+		KeyFile:    a.cfg.TLSKeyFile,
+		CAFile:     a.cfg.TLSCAFile,
+		ServerName: a.cfg.TLSServerName,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create gRPC controller client: %w", err)
+	}
+	a.grpcClient = grpcClient
+
+	if err := a.createEventRings(); err != nil {
+		return fmt.Errorf("failed to create event rings: %w", err)
+	}
+	if err := a.createProbers(); err != nil {
+		return err
+	}
+
+	// The metrics collector must exist before the fan-in so the fan-in
+	// knows whether a metrics consumer will drain a.results.
+	a.createMetricsCollector(ctx)
+	a.metricsResultsActive = a.metrics != nil
+	a.createResultsFanIn()
+	a.createAnalysisReporter()
+	a.createWatchdog()
+
+	if err := a.createResponders(); err != nil {
+		return err
+	}
+	a.registerTimestampModeMetric()
+
+	a.agentIP = outboundIP(a.cfg.ControllerAddr)
+	if a.agentIP != "" {
+		a.logger.Info().Str("agent_ip", a.agentIP).Msg("Determined agent outbound IP")
+	} else {
+		a.logger.Warn().
+			Str("controller_addr", a.cfg.ControllerAddr).
+			Msg("Could not determine agent outbound IP; registering without agent_ip")
+	}
+
+	a.logger.Info().Msg("Registering with controller")
+	if err := a.registerWithController(ctx); err != nil {
+		return fmt.Errorf("failed to register with controller: %w", err)
+	}
+
+	// After registration: applyRegistrationTorSupport may have changed the
+	// ToRs the monitors capture.
+	a.createClusterMonitors()
+
+	a.logger.Info().Msg("Agent initialization complete")
+	return nil
+}
+
+// deviceOpener opens one candidate RDMA device; desc names it in logs.
+type deviceOpener struct {
+	desc string
+	open func() (*rdmabridge.Device, error)
+}
+
+// deviceOpeners lists the devices to open: the allowed_device_names by name
+// when set, else every device by index. excluded_device_names are dropped
+// here, before any verbs resources are allocated on them.
+func (a *Agent) deviceOpeners(gidIndex int, sl, tc uint8) ([]deviceOpener, error) {
+	var openers []deviceOpener
+	if len(a.cfg.AllowedDeviceNames) > 0 {
+		for _, name := range a.cfg.AllowedDeviceNames {
+			// Config.Validate rejects overlaps; kept so an unvalidated
+			// config still honours the exclusion.
+			if a.cfg.IsDeviceExcluded(name) {
+				a.logger.Info().Str("device_name", name).Msg("Skipping excluded RDMA device")
+				continue
+			}
+			openers = append(openers, deviceOpener{desc: name, open: func() (*rdmabridge.Device, error) {
+				return a.rdmaCtx.OpenDeviceByName(name, gidIndex, sl, tc)
+			}})
+		}
+		return openers, nil
+	}
+
+	count := a.rdmaCtx.GetDeviceCount()
+	if count == 0 {
+		return nil, fmt.Errorf("no RDMA devices found on this host")
+	}
+	for i := 0; i < count; i++ {
+		if len(a.cfg.ExcludedDeviceNames) > 0 {
+			name, err := a.rdmaCtx.GetDeviceName(i)
+			if err != nil {
+				// Without a name the exclusion cannot be checked; skip rather
+				// than risk opening an excluded device.
+				a.logger.Warn().Err(err).Int("index", i).Msg("Failed to read RDMA device name, skipping")
+				continue
+			}
+			if a.cfg.IsDeviceExcluded(name) {
+				a.logger.Info().Str("device_name", name).Int("index", i).Msg("Skipping excluded RDMA device")
+				continue
+			}
+		}
+		openers = append(openers, deviceOpener{desc: fmt.Sprintf("index %d", i), open: func() (*rdmabridge.Device, error) {
+			return a.rdmaCtx.OpenDevice(i, gidIndex, sl, tc)
+		}})
+	}
+	return openers, nil
+}
+
+// openDevices opens the configured RDMA devices. A device that fails to open
+// is skipped with a warning; one rejected by excluded_gid_cidrs or
+// mapped_devices_only is closed right after opening (see admitDevice).
+func (a *Agent) openDevices() error {
+	// Config.Validate guarantees ServiceLevel in [0,7] and TrafficClass in
+	// [0,255], so both narrow to uint8 without loss.
+	sl := uint8(a.cfg.ServiceLevel)
+	tc := uint8(a.cfg.TrafficClass)
+	cqMode, err := rdmabridge.ParseCQPollMode(a.cfg.CQPollMode)
+	if err != nil {
+		return err
+	}
+	openers, err := a.deviceOpeners(a.cfg.GIDIndex, sl, tc)
+	if err != nil {
+		return err
+	}
+	for _, o := range openers {
+		dev, err := o.open()
+		if err != nil {
+			a.logger.Warn().Err(err).Str("device", o.desc).Msg("Failed to open RDMA device, skipping")
+			continue
+		}
+		if !a.admitDevice(dev) {
+			continue
+		}
+		dev.CQPollMode = cqMode
+		a.rnics = append(a.rnics, &rnic{dev: dev})
+		a.logger.Info().
+			Str("device_name", dev.Info.DeviceName).
+			Str("gid", dev.Info.GID).
+			Str("ip", dev.Info.IPAddr).
+			Msg("Opened RDMA device")
+	}
+	return nil
+}
+
+// deviceSkipReason reports why an opened device must not be used, or "" to
+// keep it. These filters need the device's GID, so unlike
+// excluded_device_names they run after the device is opened.
+func deviceSkipReason(cfg *config.AgentConfig, info rdmabridge.DeviceInfo) string {
+	if cidr, ok := cfg.ExcludedGIDCIDR(info.IPAddr); ok {
+		return "excluded_gid_cidrs:" + cidr
+	}
+	if cfg.MappedDevicesOnly {
+		if _, ok := cfg.DeviceTorID(info.DeviceName); !ok {
+			return "mapped_devices_only"
+		}
+	}
+	return ""
+}
+
+// admitDevice applies deviceSkipReason to a freshly opened device, closing
+// and logging a skipped one. A device missing from device_tor_ids is logged
+// at Warn: in a mapped deployment it usually means a device was renamed or
+// appeared unexpectedly (e.g. a bond's RDMA device registered before RoCE
+// LAG formed).
+func (a *Agent) admitDevice(dev *rdmabridge.Device) bool {
+	reason := deviceSkipReason(a.cfg, dev.Info)
+	if reason == "" {
+		return true
+	}
+	netdev, _ := a.lookupNetdev(dev)
+	event := a.logger.Info()
+	msg := "Skipping RDMA device whose GID is in excluded_gid_cidrs"
+	if reason == "mapped_devices_only" {
+		event = a.logger.Warn()
+		msg = "Skipping RDMA device without a device_tor_ids entry (mapped_devices_only); " +
+			"check whether a device was renamed or registered unexpectedly"
+	}
+	event.
+		Str("device_name", dev.Info.DeviceName).
+		Str("netdev", netdev).
+		Str("gid", dev.Info.GID).
+		Str("ip", dev.Info.IPAddr).
+		Str("reason", reason).
+		Msg(msg)
+	dev.Close()
+	return false
+}
+
+// lookupNetdev resolves the netdev bound to dev's active port/GID from sysfs.
+func (a *Agent) lookupNetdev(dev *rdmabridge.Device) (string, error) {
+	return lldp.NetdevForRDMAPort(a.sysfsRoot, dev.Info.DeviceName, dev.Info.ActivePort, dev.Info.ActiveGIDIndex)
+}
+
+// resolveDeviceNetdevs resolves each device's netdev. Best-effort: a device
+// without an unambiguous netdev (e.g. a bonded RNIC) keeps "" and its probe
+// metrics carry the "unspecified" source_netdev label.
+func (a *Agent) resolveDeviceNetdevs() {
+	for _, r := range a.rnics {
+		netdev, err := a.lookupNetdev(r.dev)
+		if err != nil {
+			a.logger.Warn().Err(err).
+				Str("device", r.dev.Info.DeviceName).
+				Msg("Cannot resolve the device's netdev; source_netdev metric label will be unspecified")
+			continue
+		}
+		r.netdev = netdev
+		a.logger.Info().
+			Str("device", r.dev.Info.DeviceName).
+			Str("netdev", netdev).
+			Msg("Resolved device netdev")
+	}
+}
+
+// discoverLLDPTorIDs returns, parallel to rnics, the ToR each device's LLDP
 // neighbor names when lldp_tor_discovery is enabled (nil otherwise). Devices
 // with a device_tor_ids entry are skipped, since that entry wins anyway.
-// Failures are logged and leave the affected devices empty, so they fall back
-// to tor_id; LLDP problems never stop the agent.
+// Failures are logged and leave the affected devices empty, so they fall
+// back to tor_id; LLDP problems never stop the agent. Requires
+// resolveDeviceNetdevs to have run.
 func (a *Agent) discoverLLDPTorIDs(ctx context.Context) []string {
 	if !a.cfg.LLDPTorDiscovery {
 		return nil
@@ -229,17 +456,16 @@ func (a *Agent) discoverLLDPTorIDs(ctx context.Context) []string {
 
 	var targets []lldp.Device
 	var targetIdx []int
-	for i, dev := range a.devices {
-		if _, ok := a.cfg.DeviceTorID(dev.Info.DeviceName); ok {
+	for i, r := range a.rnics {
+		if _, ok := a.cfg.DeviceTorID(r.dev.Info.DeviceName); ok {
 			continue
 		}
-		netdev, err := a.netdevForDevice(i)
-		if err != nil {
-			a.logger.Warn().Err(err).
-				Str("device", dev.Info.DeviceName).
+		if r.netdev == "" {
+			a.logger.Warn().
+				Str("device", r.dev.Info.DeviceName).
 				Msg("LLDP ToR discovery: cannot find the device's netdev; using tor_id")
 		}
-		targets = append(targets, lldp.Device{Name: dev.Info.DeviceName, Netdev: netdev})
+		targets = append(targets, lldp.Device{Name: r.dev.Info.DeviceName, Netdev: r.netdev})
 		targetIdx = append(targetIdx, i)
 	}
 	if len(targets) == 0 {
@@ -252,16 +478,13 @@ func (a *Agent) discoverLLDPTorIDs(ctx context.Context) []string {
 		Str("field", field).
 		Dur("timeout", timeout).
 		Msg("Discovering device ToRs from LLDP neighbors")
-	results, err := lldp.Discover(ctx, a.lldpQuerier, targets, lldp.DiscoverOptions{
-		Field:   field,
-		Timeout: timeout,
-	})
+	results, err := lldp.Discover(ctx, a.lldpQuerier, targets, lldp.DiscoverOptions{Field: field, Timeout: timeout})
 	if err != nil {
 		a.logger.Warn().Err(err).
 			Msg("LLDP ToR discovery failed (is lldpd running and its socket accessible?); using tor_id")
 	}
 
-	tors := make([]string, len(a.devices))
+	tors := make([]string, len(a.rnics))
 	for k, r := range results {
 		tor := probe.CanonicalTorID(r.TorID)
 		ev := a.logger.Info()
@@ -288,81 +511,43 @@ func (a *Agent) discoverLLDPTorIDs(ctx context.Context) []string {
 	return tors
 }
 
-// resolveDeviceNetdevs resolves, parallel to devices, the netdev bound to
-// each device's active port/GID. Resolution is best-effort: a device without
-// an unambiguous netdev (e.g. a bonded RNIC) keeps "" and is logged, and its
-// probe metrics then carry the "unspecified" source_netdev label.
-func (a *Agent) resolveDeviceNetdevs() {
-	a.deviceNetdevs = make([]string, len(a.devices))
-	for i, dev := range a.devices {
-		netdev, err := lldp.NetdevForRDMAPort(a.sysfsRoot, dev.Info.DeviceName,
-			dev.Info.ActivePort, dev.Info.ActiveGIDIndex)
-		if err != nil {
-			a.logger.Warn().Err(err).
-				Str("device", dev.Info.DeviceName).
-				Msg("Cannot resolve the device's netdev; source_netdev metric label will be unspecified")
-			continue
+// unmatchedKeys returns the keys of m that match no opened device name.
+func (a *Agent) unmatchedKeys(m map[string]string) []string {
+	var unmatched []string
+	for key := range m {
+		found := false
+		for _, r := range a.rnics {
+			if strings.EqualFold(strings.TrimSpace(key), r.dev.Info.DeviceName) {
+				found = true
+				break
+			}
 		}
-		a.deviceNetdevs[i] = netdev
-		a.logger.Info().
-			Str("device", dev.Info.DeviceName).
-			Str("netdev", netdev).
-			Msg("Resolved device netdev")
-	}
-}
-
-// cachedNetdev returns the netdev cached for devices[i] by
-// resolveDeviceNetdevs, or "" when it is unknown or not resolved yet. The
-// source_netdev label and the netdev registered with the controller both use
-// it, so they always agree.
-func (a *Agent) cachedNetdev(i int) string {
-	if i < len(a.deviceNetdevs) {
-		return a.deviceNetdevs[i]
-	}
-	return ""
-}
-
-// netdevForDevice returns the netdev of devices[i]: the value cached by
-// resolveDeviceNetdevs when it has run, else a fresh sysfs lookup.
-func (a *Agent) netdevForDevice(i int) (string, error) {
-	if i < len(a.deviceNetdevs) {
-		if netdev := a.cachedNetdev(i); netdev != "" {
-			return netdev, nil
+		if !found {
+			unmatched = append(unmatched, key)
 		}
-		return "", fmt.Errorf("no netdev resolved for RDMA device %s", a.devices[i].Info.DeviceName)
 	}
-	dev := a.devices[i]
-	return lldp.NetdevForRDMAPort(a.sysfsRoot, dev.Info.DeviceName,
-		dev.Info.ActivePort, dev.Info.ActiveGIDIndex)
+	return unmatched
 }
 
-// resolveDeviceTorIDs assigns each opened device its ToR and logs the result.
-// Precedence: the device's device_tor_ids entry, then lldpTors[i] (the
-// LLDP-discovered ToR; lldpTors may be nil), then the host-wide tor_id.
-// device_tor_ids keys that match no opened device are warned about, since a
-// typo there silently leaves that RNIC under the host-wide ToR.
+// resolveDeviceTorIDs assigns each device its ToR: its device_tor_ids entry,
+// then lldpTors[i] (may be nil), then the host-wide tor_id. device_tor_ids
+// keys matching no opened device are warned about, since a typo there
+// silently leaves that RNIC under the host-wide ToR.
 func (a *Agent) resolveDeviceTorIDs(lldpTors []string) {
-	a.deviceTorIDs = make([]string, len(a.devices))
-	matched := make(map[string]bool, len(a.cfg.DeviceTorIDs))
 	untagged := 0
-	for i, dev := range a.devices {
+	for i, r := range a.rnics {
 		tor, source := a.canonicalTorID, torSourceAgent
-		if t, ok := a.cfg.DeviceTorID(dev.Info.DeviceName); ok {
+		if t, ok := a.cfg.DeviceTorID(r.dev.Info.DeviceName); ok {
 			tor, source = t, torSourceDeviceMap
 		} else if i < len(lldpTors) && lldpTors[i] != "" {
 			tor, source = lldpTors[i], torSourceLLDP
 		}
-		a.deviceTorIDs[i] = tor
-		for key := range a.cfg.DeviceTorIDs {
-			if strings.EqualFold(strings.TrimSpace(key), dev.Info.DeviceName) {
-				matched[key] = true
-			}
-		}
+		r.torID = tor
 		if tor == "" {
 			untagged++
 		}
 		a.logger.Info().
-			Str("device", dev.Info.DeviceName).
+			Str("device", r.dev.Info.DeviceName).
 			Str("tor_id", tor).
 			Str("source", source).
 			Msg("Resolved device ToR")
@@ -371,20 +556,18 @@ func (a *Agent) resolveDeviceTorIDs(lldpTors []string) {
 			// was renamed or registered unexpectedly, and tor_id is often a
 			// placeholder, so its probes would be attributed to the wrong ToR.
 			a.logger.Warn().
-				Str("device", dev.Info.DeviceName).
-				Str("netdev", a.cachedNetdev(i)).
-				Str("gid", dev.Info.GID).
+				Str("device", r.dev.Info.DeviceName).
+				Str("netdev", r.netdev).
+				Str("gid", r.dev.Info.GID).
 				Str("tor_id", tor).
 				Msg("Device has no device_tor_ids entry and falls back to tor_id; " +
 					"check whether it was renamed, or set mapped_devices_only to skip it")
 		}
 	}
-	for key := range a.cfg.DeviceTorIDs {
-		if !matched[key] {
-			a.logger.Warn().
-				Str("device", key).
-				Msg("device_tor_ids entry matches no opened RDMA device; ignored")
-		}
+	for _, key := range a.unmatchedKeys(a.cfg.DeviceTorIDs) {
+		a.logger.Warn().
+			Str("device", key).
+			Msg("device_tor_ids entry matches no opened RDMA device; ignored")
 	}
 	if untagged > 0 {
 		a.logger.Warn().
@@ -394,39 +577,27 @@ func (a *Agent) resolveDeviceTorIDs(lldpTors []string) {
 	}
 }
 
-// resolveDevicePlaneIDs assigns each opened device its plane (rail):
-// its device_plane_ids entry, else the host-wide plane_id (empty = none).
-// device_plane_ids keys that match no opened device are warned about, with
-// the reason when the device is excluded or not allowed, since a typo there
-// silently leaves that RNIC on the host-wide plane.
+// resolveDevicePlaneIDs assigns each device its plane (rail): its
+// device_plane_ids entry, else the host-wide plane_id (empty = none).
+// device_plane_ids keys matching no opened device are warned about, with the
+// reason when the device is excluded or not allowed.
 func (a *Agent) resolveDevicePlaneIDs() {
-	a.devicePlaneIDs = make([]string, len(a.devices))
 	configured := probe.CanonicalPlaneID(a.cfg.PlaneID) != "" || len(a.cfg.DevicePlaneIDs) > 0
-	matched := make(map[string]bool, len(a.cfg.DevicePlaneIDs))
-	for i, dev := range a.devices {
-		plane := a.cfg.PlaneIDForDevice(dev.Info.DeviceName)
+	for _, r := range a.rnics {
+		r.planeID = a.cfg.PlaneIDForDevice(r.dev.Info.DeviceName)
 		source := planeSourceAgent
-		if _, ok := a.cfg.DevicePlaneID(dev.Info.DeviceName); ok {
+		if _, ok := a.cfg.DevicePlaneID(r.dev.Info.DeviceName); ok {
 			source = planeSourceDeviceMap
-		}
-		a.devicePlaneIDs[i] = plane
-		for key := range a.cfg.DevicePlaneIDs {
-			if strings.EqualFold(strings.TrimSpace(key), dev.Info.DeviceName) {
-				matched[key] = true
-			}
 		}
 		if configured {
 			a.logger.Info().
-				Str("device", dev.Info.DeviceName).
-				Str("plane_id", plane).
+				Str("device", r.dev.Info.DeviceName).
+				Str("plane_id", r.planeID).
 				Str("source", source).
 				Msg("Resolved device plane")
 		}
 	}
-	for key := range a.cfg.DevicePlaneIDs {
-		if matched[key] {
-			continue
-		}
+	for _, key := range a.unmatchedKeys(a.cfg.DevicePlaneIDs) {
 		reason := "device_plane_ids entry matches no opened RDMA device; ignored"
 		switch {
 		case a.cfg.IsDeviceExcluded(key):
@@ -437,30 +608,21 @@ func (a *Agent) resolveDevicePlaneIDs() {
 		a.logger.Warn().Str("device", key).Msg(reason)
 	}
 	if configured {
-		for i, plane := range a.devicePlaneIDs {
-			if plane == "" {
+		for _, r := range a.rnics {
+			if r.planeID == "" {
 				a.logger.Warn().
-					Str("device", a.devices[i].Info.DeviceName).
+					Str("device", r.dev.Info.DeviceName).
 					Msg("Device has no plane while others do; its pinglists are not plane-restricted")
 			}
 		}
 	}
 }
 
-// planeIDForDevice returns the canonical plane of devices[i], falling back to
-// the host-wide plane_id when per-device planes have not been resolved.
-func (a *Agent) planeIDForDevice(i int) string {
-	if i >= 0 && i < len(a.devicePlaneIDs) {
-		return a.devicePlaneIDs[i]
-	}
-	return probe.CanonicalPlaneID(a.cfg.PlaneID)
-}
-
 // usesPlanes reports whether any device has a plane, i.e. whether pinglists
 // depend on the controller supporting plane_id.
 func (a *Agent) usesPlanes() bool {
-	for i := range a.devices {
-		if a.planeIDForDevice(i) != "" {
+	for _, r := range a.rnics {
+		if r.planeID != "" {
 			return true
 		}
 	}
@@ -469,9 +631,8 @@ func (a *Agent) usesPlanes() bool {
 
 // checkRegistrationPlaneSupport warns (once) when devices have planes but the
 // controller predates plane support. Nothing needs to fall back: an older
-// controller ignores plane_id, so registration and pinglists keep working,
-// but its pinglists may include cross-plane targets, which time out on
-// fabrics whose rails are not routed to each other.
+// controller ignores plane_id, but its pinglists may include cross-plane
+// targets, which time out on fabrics whose rails are not routed to each other.
 func (a *Agent) checkRegistrationPlaneSupport(resp *controller_agent.AgentRegistrationResponse) {
 	if resp.GetPerRnicPlaneId() || !a.usesPlanes() || a.planeSupportWarned {
 		return
@@ -483,11 +644,10 @@ func (a *Agent) checkRegistrationPlaneSupport(resp *controller_agent.AgentRegist
 }
 
 // usesPerDeviceTorIDs reports whether any device's ToR differs from the
-// host-wide tor_id, i.e. whether registration depends on the controller
-// keeping each RNIC's own tor_id.
+// host-wide tor_id.
 func (a *Agent) usesPerDeviceTorIDs() bool {
-	for _, tor := range a.deviceTorIDs {
-		if tor != a.canonicalTorID {
+	for _, r := range a.rnics {
+		if r.torID != a.canonicalTorID {
 			return true
 		}
 	}
@@ -498,8 +658,8 @@ func (a *Agent) usesPerDeviceTorIDs() bool {
 // device when the controller did not keep per-RNIC ToRs (an older controller
 // overwrites them with the request-wide value and still reports success).
 // Without the fallback each device would request pinglists for a ToR under
-// which no RNIC is registered and silently get an empty ToR-mesh. It must run
-// before the cluster monitors are created, since they capture the ToR.
+// which no RNIC is registered and get an empty ToR-mesh. It must run before
+// the cluster monitors are created, since they capture the ToR.
 func (a *Agent) applyRegistrationTorSupport(resp *controller_agent.AgentRegistrationResponse) {
 	if resp.GetPerRnicTorId() || !a.usesPerDeviceTorIDs() {
 		return
@@ -508,298 +668,163 @@ func (a *Agent) applyRegistrationTorSupport(resp *controller_agent.AgentRegistra
 		Str("tor_id", a.canonicalTorID).
 		Msg("Controller does not support per-RNIC ToR IDs (it predates them); " +
 			"every device falls back to tor_id. Upgrade the controller, then restart the agent")
-	for i := range a.deviceTorIDs {
-		a.deviceTorIDs[i] = a.canonicalTorID
-	}
-	for _, p := range a.probers {
-		if p != nil {
-			p.SetSourceTorID(a.canonicalTorID)
+	for _, r := range a.rnics {
+		r.torID = a.canonicalTorID
+		if r.prober != nil {
+			r.prober.SetSourceTorID(a.canonicalTorID)
 		}
 	}
 }
 
-// torIDForDevice returns the canonical ToR of devices[i], falling back to the
-// host-wide tor_id when per-device ToRs have not been resolved.
-func (a *Agent) torIDForDevice(i int) string {
-	if i >= 0 && i < len(a.deviceTorIDs) {
-		return a.deviceTorIDs[i]
-	}
-	return a.canonicalTorID
-}
-
-// applyRuntimeLimits applies the optional hard runtime caps from config: a soft
-// memory limit (GOMEMLIMIT, via debug.SetMemoryLimit) and a GOMAXPROCS cap.
-// Both are opt-in (0 leaves the Go default) and applied independently of
-// self_protection_enabled, so they can serve as plain runtime tuning knobs. The
-// memory limit also acts as the reference budget the watchdog throttles against.
-func applyRuntimeLimits(cfg *config.AgentConfig, logger zerolog.Logger) {
-	if cfg.MaxMemoryMB > 0 {
-		limit := int64(cfg.MaxMemoryMB) * bytesPerMiB
-		debug.SetMemoryLimit(limit)
-		logger.Info().
-			Int("max_memory_mb", cfg.MaxMemoryMB).
-			Int64("gomemlimit_bytes", limit).
-			Msg("Applied soft memory limit (GOMEMLIMIT)")
-	}
-	if cfg.MaxProcs > 0 {
-		prev := runtime.GOMAXPROCS(cfg.MaxProcs)
-		logger.Info().
-			Int("max_procs", cfg.MaxProcs).
-			Int("previous_gomaxprocs", prev).
-			Msg("Capped GOMAXPROCS")
-	}
-}
-
-// Initialize performs all setup steps required before the agent can be started.
-// It initializes the RDMA subsystem, opens devices, creates the gRPC client,
-// builds event rings for the prober and responders, registers with the controller,
-// and creates the cluster monitor.
-func (a *Agent) Initialize(ctx context.Context) error {
-	// Step 1: Initialize RDMA context.
-	a.logger.Info().Msg("Initializing RDMA context")
-	rdmaCtx, err := rdmabridge.Init()
-	if err != nil {
-		return fmt.Errorf("failed to initialize RDMA context: %w", err)
-	}
-	a.rdmaCtx = rdmaCtx
-
-	// Step 2: Open RDMA devices.
-	a.logger.Info().Msg("Opening RDMA devices")
-	if err := a.openDevices(); err != nil {
-		return fmt.Errorf("failed to open RDMA devices: %w", err)
-	}
-	if len(a.devices) == 0 {
-		if len(a.cfg.ExcludedDeviceNames) > 0 || len(a.cfg.ExcludedGIDCIDRs) > 0 || a.cfg.MappedDevicesOnly {
-			return fmt.Errorf("no RDMA devices available (excluded_device_names: %v, excluded_gid_cidrs: %v, mapped_devices_only: %v)",
-				a.cfg.ExcludedDeviceNames, a.cfg.ExcludedGIDCIDRs, a.cfg.MappedDevicesOnly)
+// createEventRings creates one prober ring and one responder ring per
+// device: lock-free SPSC buffers delivering CQ completion events from the
+// Zig poller thread to Go.
+func (a *Agent) createEventRings() error {
+	capacity := a.cfg.EffectiveEventRingCapacity()
+	for _, r := range a.rnics {
+		var err error
+		if r.proberRing, err = rdmabridge.NewEventRing(capacity); err != nil {
+			return fmt.Errorf("failed to create prober event ring for device %s: %w", r.dev.Info.DeviceName, err)
 		}
-		return fmt.Errorf("no RDMA devices available")
+		if r.respRing, err = rdmabridge.NewEventRing(capacity); err != nil {
+			return fmt.Errorf("failed to create responder event ring for device %s: %w", r.dev.Info.DeviceName, err)
+		}
 	}
-	a.logger.Info().Int("device_count", len(a.devices)).Msg("RDMA devices opened")
-	a.resolveDeviceNetdevs()
-	a.recordWatchedDevices()
-	a.resolveDeviceTorIDs(a.discoverLLDPTorIDs(ctx))
-	a.resolveDevicePlaneIDs()
-
-	// Step 3: Create gRPC client for controller communication.
 	a.logger.Info().
-		Str("controller_addr", a.cfg.ControllerAddr).
-		Msg("Creating gRPC controller client")
-	grpcClient, err := controller_client.NewGRPCControllerClient(a.cfg.ControllerAddr, &config.TLSClientConfig{
-		Mode:       a.cfg.TLSMode,
-		CertFile:   a.cfg.TLSCertFile,
-		KeyFile:    a.cfg.TLSKeyFile,
-		CAFile:     a.cfg.TLSCAFile,
-		ServerName: a.cfg.TLSServerName,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create gRPC controller client: %w", err)
-	}
-	a.grpcClient = grpcClient
+		Int("devices", len(a.rnics)).
+		Int("capacity", capacity).
+		Msg("Event rings created")
+	return nil
+}
 
-	// Step 4: Create event rings (one prober ring and one responder ring per device).
-	a.logger.Info().Msg("Creating event rings")
-	if err := a.createEventRings(); err != nil {
-		return fmt.Errorf("failed to create event rings: %w", err)
-	}
-
-	// Step 5: Create one prober per device, so every RNIC actively probes
-	// instead of only the first one. This closes the multi-rail monitoring
-	// blind spot where every device is registered and probed BY other agents
-	// but only devices[0] ever probed anyone.
-	a.logger.Info().Int("device_count", len(a.devices)).Msg("Creating probers")
-	for i, dev := range a.devices {
-		prober, err := NewProber(dev, a.proberRings[i], a.cfg.ProbeIntervalMS)
+// createProbers creates one prober per device with the configured per-type
+// rate caps and flow-label rotation period.
+func (a *Agent) createProbers() error {
+	torMeshRate := a.cfg.EffectiveTorMeshProbeRate()
+	interTorRate := a.cfg.EffectiveInterTorProbeRate()
+	for _, r := range a.rnics {
+		prober, err := NewProber(r.dev, r.proberRing, a.cfg.ProbeIntervalMS)
 		if err != nil {
-			return fmt.Errorf("failed to create prober for device %s: %w",
-				dev.Info.DeviceName, err)
+			return fmt.Errorf("failed to create prober for device %s: %w", r.dev.Info.DeviceName, err)
 		}
-		prober.SetSourceTorID(a.torIDForDevice(i))
-		prober.SetSourceNetdev(a.cachedNetdev(i))
-		torMeshRate := a.cfg.EffectiveTorMeshProbeRate()
-		interTorRate := a.cfg.EffectiveInterTorProbeRate()
+		prober.SetSourceTorID(r.torID)
+		prober.SetSourceNetdev(r.netdev)
 		if torMeshRate > 0 || interTorRate > 0 {
-			// Per-target rate caps, differentiated by pinglist type (the prober
-			// scales each type's aggregate limit with that type's target count).
-			// When both per-type keys are unset they inherit the legacy
-			// target_probe_rate_per_second, reproducing a single uniform cap.
-			// Note the cap is per TARGET, not per flow label: a target's ECMP
+			// The cap is per TARGET, not per flow label: a target's ECMP
 			// label set shares this budget, bounding probe amplification.
 			prober.SetPerTypeRateLimit(float64(torMeshRate), float64(interTorRate))
 		}
-		// Configure the ECMP flow-label rotation period (time-based rotation of
-		// the rotating ~20% of each target's label set).
 		prober.SetFlowLabelRotationPeriod(a.cfg.FlowLabelRotationPeriodSec)
-		a.probers = append(a.probers, prober)
+		r.prober = prober
 		a.logger.Info().
-			Str("device", dev.Info.DeviceName).
+			Str("device", r.dev.Info.DeviceName).
 			Uint32("qpn", prober.GetQueueInfo().QPN).
 			Msg("Prober created")
 	}
+	return nil
+}
 
-	// Create the metrics collector (if enabled) BEFORE the results fan-in, so
-	// the fan-in knows whether a metrics result consumer will actually drain
-	// a.results. If none will (metrics disabled, or MetricsCollector creation
-	// failed), the fan-in must not send on a.results -- once its buffer filled,
-	// the fan-in would block, stop reading from the probers, and starve the
-	// independent analysis tee too.
-	a.createMetricsCollector(ctx)
-	a.metricsResultsActive = a.metrics != nil
-
-	// Fan-in every prober's Results() channel into a single stream so the
-	// rest of Initialize/Start can keep treating "the" probe result stream
-	// as one channel, as before. When analysis reporting is enabled this also
-	// creates the secondary analysis branch that the fan-in tees onto.
-	a.createResultsFanIn()
-
-	// Create the analysis reporter (per-path window aggregation + SLA
-	// reporting to the controller) if enabled. It consumes the analysis branch
-	// created by createResultsFanIn and reports on this agent's behalf.
-	if a.cfg.AnalysisReportEnabled {
-		a.analysisReporter = NewAnalysisReporter(
-			a.grpcClient,
-			a.cfg.AgentID,
-			probe.TorMetricLabel(a.canonicalTorID),
-			a.cfg.AnalysisWindowSec,
-			a.analysisResults,
-		)
-		a.logger.Info().
-			Uint32("window_sec", a.cfg.AnalysisWindowSec).
-			Msg("Analysis reporter created")
-	}
-
-	// Create the resource watchdog (self-protection) if enabled. It throttles
-	// every prober's send rate (fail-slow) when this process's CPU/memory
-	// crosses the configured thresholds. Created after the probers (which it
-	// drives) and the metrics collector (whose self_throttle gauge reads its
-	// live multiplier).
-	if a.cfg.SelfProtectionEnabled {
-		throttlers := make([]rateThrottler, 0, len(a.probers))
-		for _, p := range a.probers {
-			throttlers = append(throttlers, p)
-		}
-		a.watchdog = NewWatchdog(a.cfg, throttlers)
-		if a.metrics != nil {
-			if err := a.metrics.RegisterSelfThrottleCallback(a.watchdog.CurrentMultiplier); err != nil {
-				a.logger.Warn().Err(err).
-					Msg("Failed to register self-throttle metric callback")
-			}
-		}
-		a.logger.Info().
-			Int("prober_count", len(a.probers)).
-			Msg("Self-protection watchdog created")
-	}
-
-	// Step 6: Create one responder per device.
-	a.logger.Info().Int("device_count", len(a.devices)).Msg("Creating responders")
-	for i, dev := range a.devices {
-		resp, err := NewResponder(dev, a.respRings[i])
+// createResponders creates one responder per device.
+func (a *Agent) createResponders() error {
+	for _, r := range a.rnics {
+		resp, err := NewResponder(r.dev, r.respRing)
 		if err != nil {
-			return fmt.Errorf("failed to create responder for device %s: %w",
-				dev.Info.DeviceName, err)
+			return fmt.Errorf("failed to create responder for device %s: %w", r.dev.Info.DeviceName, err)
 		}
-		a.responders = append(a.responders, resp)
+		r.responder = resp
 		a.logger.Info().
-			Str("device", dev.Info.DeviceName).
+			Str("device", r.dev.Info.DeviceName).
 			Uint32("qpn", resp.GetQueueInfo().QPN).
 			Msg("Responder created")
 	}
-	a.registerTimestampModeMetric()
-
-	// (The metrics collector is created earlier, before the results fan-in; see
-	// createMetricsCollector above.)
-
-	// Determine the host's outbound IP toward the controller so it can be
-	// reported in the registration. Best-effort: on failure agentIP stays
-	// empty and registration proceeds unaffected.
-	a.agentIP = outboundIP(a.cfg.ControllerAddr)
-	if a.agentIP != "" {
-		a.logger.Info().Str("agent_ip", a.agentIP).Msg("Determined agent outbound IP")
-	} else {
-		a.logger.Warn().
-			Str("controller_addr", a.cfg.ControllerAddr).
-			Msg("Could not determine agent outbound IP; registering without agent_ip")
-	}
-
-	// Step 8: Register with the controller.
-	a.logger.Info().Msg("Registering with controller")
-	if err := a.registerWithController(ctx); err != nil {
-		return fmt.Errorf("failed to register with controller: %w", err)
-	}
-
-	// Step 9: Create one cluster monitor per device for periodic pinglist
-	// updates, each requesting its pinglist with that device's own GID as
-	// requester_gid and feeding targets to that device's prober.
-	a.createClusterMonitors()
-
-	a.logger.Info().Msg("Agent initialization complete")
 	return nil
+}
+
+// createAnalysisReporter creates the per-path window aggregation and SLA
+// reporting to the controller, if enabled. It consumes the analysis branch
+// created by createResultsFanIn.
+func (a *Agent) createAnalysisReporter() {
+	if !a.cfg.AnalysisReportEnabled {
+		return
+	}
+	a.analysisReporter = NewAnalysisReporter(
+		a.grpcClient,
+		a.cfg.AgentID,
+		probe.TorMetricLabel(a.canonicalTorID),
+		a.cfg.AnalysisWindowSec,
+		a.analysisResults,
+	)
+	a.logger.Info().
+		Uint32("window_sec", a.cfg.AnalysisWindowSec).
+		Msg("Analysis reporter created")
+}
+
+// createWatchdog creates the self-protection watchdog, if enabled. It is
+// created after the probers (which it throttles) and the metrics collector
+// (whose self_throttle gauge reads its multiplier).
+func (a *Agent) createWatchdog() {
+	if !a.cfg.SelfProtectionEnabled {
+		return
+	}
+	throttlers := make([]rateThrottler, 0, len(a.rnics))
+	for _, r := range a.rnics {
+		throttlers = append(throttlers, r.prober)
+	}
+	a.watchdog = NewWatchdog(a.cfg, throttlers)
+	if a.metrics != nil {
+		if err := a.metrics.RegisterSelfThrottleCallback(a.watchdog.CurrentMultiplier); err != nil {
+			a.logger.Warn().Err(err).Msg("Failed to register self-throttle metric callback")
+		}
+	}
+	a.logger.Info().
+		Int("prober_count", len(throttlers)).
+		Msg("Self-protection watchdog created")
 }
 
 // createClusterMonitors creates one ClusterMonitor per device, each
 // requesting its pinglist with that device's own GID as requester_gid and
-// feeding fetched targets to that device's prober (a.probers[i]). This keeps
-// each RNIC's probe targets scoped to requests made on its own behalf,
-// matching how the controller's registry associates pinglists with GIDs, and
-// closes the multi-rail blind spot where only devices[0] ever requested a
-// pinglist. Requires a.probers to already be populated one-to-one with
-// a.devices.
+// feeding the targets to that device's prober. Requires the probers.
 func (a *Agent) createClusterMonitors() {
-	a.logger.Info().Int("device_count", len(a.devices)).Msg("Creating cluster monitors")
-	for i, dev := range a.devices {
-		requesterGID := dev.Info.GID
+	a.logger.Info().Int("device_count", len(a.rnics)).Msg("Creating cluster monitors")
+	for _, r := range a.rnics {
 		a.logger.Info().
-			Str("device", dev.Info.DeviceName).
-			Str("requester_gid", requesterGID).
-			Str("tor_id", a.torIDForDevice(i)).
-			Str("plane_id", a.planeIDForDevice(i)).
+			Str("device", r.dev.Info.DeviceName).
+			Str("requester_gid", r.dev.Info.GID).
+			Str("tor_id", r.torID).
+			Str("plane_id", r.planeID).
 			Uint32("update_interval_sec", a.cfg.PinglistUpdateIntervalSec).
 			Msg("Creating cluster monitor")
-		monitor := NewClusterMonitor(
-			a.grpcClient,
-			a.probers[i],
-			a.cfg.AgentID,
-			a.torIDForDevice(i),
-			requesterGID,
-			a.cfg.PinglistUpdateIntervalSec,
-		)
-		monitor.SetPlaneID(a.planeIDForDevice(i))
-		a.monitors = append(a.monitors, monitor)
+		r.monitor = NewClusterMonitor(a.grpcClient, r.prober, a.cfg.AgentID, r.torID, r.dev.Info.GID, a.cfg.PinglistUpdateIntervalSec)
+		r.monitor.SetPlaneID(r.planeID)
 	}
 }
 
-// buildRegistrationRequest builds a registration request from the agent's
-// configuration and device/responder state. It is used both for the initial
-// registration and for periodic heartbeat re-registrations.
+// buildRegistrationRequest builds the registration request from the agent's
+// configuration and RNIC state. Used for the initial registration and for
+// the heartbeats.
 func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRequest {
-	rnics := make([]*controller_agent.RnicInfo, 0, len(a.responders))
-
-	for i, resp := range a.responders {
-		dev := a.devices[i]
-		queueInfo := resp.GetQueueInfo()
-
-		rnic := &controller_agent.RnicInfo{
-			Gid:        dev.Info.GID,
-			Qpn:        queueInfo.QPN,
-			IpAddress:  dev.Info.IPAddr,
+	rnics := make([]*controller_agent.RnicInfo, 0, len(a.rnics))
+	for _, r := range a.rnics {
+		info := &controller_agent.RnicInfo{
+			Gid:        r.dev.Info.GID,
+			Qpn:        r.responder.GetQueueInfo().QPN,
+			IpAddress:  r.dev.Info.IPAddr,
 			HostName:   a.cfg.HostName,
-			TorId:      a.torIDForDevice(i),
-			DeviceName: dev.Info.DeviceName,
-			PlaneId:    a.planeIDForDevice(i),
-			Netdev:     a.cachedNetdev(i),
+			TorId:      r.torID,
+			DeviceName: r.dev.Info.DeviceName,
+			PlaneId:    r.planeID,
+			Netdev:     r.netdev,
 		}
-		rnics = append(rnics, rnic)
-
+		rnics = append(rnics, info)
 		a.logger.Debug().
-			Str("gid", rnic.Gid).
-			Uint32("qpn", rnic.Qpn).
-			Str("ip", rnic.IpAddress).
-			Str("device", rnic.DeviceName).
-			Str("tor_id", rnic.TorId).
-			Str("plane_id", rnic.PlaneId).
+			Str("gid", info.Gid).
+			Uint32("qpn", info.Qpn).
+			Str("ip", info.IpAddress).
+			Str("device", info.DeviceName).
+			Str("tor_id", info.TorId).
+			Str("plane_id", info.PlaneId).
 			Msg("Prepared RNIC info for registration")
 	}
-
 	return &controller_agent.AgentRegistrationRequest{
 		AgentId:  a.cfg.AgentID,
 		AgentIp:  a.agentIP,
@@ -810,10 +835,9 @@ func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRe
 }
 
 // outboundIP returns the local source IP the kernel would use to reach
-// controllerAddr, via the classic connectionless UDP-dial trick: dialing a UDP
-// address performs a route lookup and binds a local address but sends no
-// packets, so LocalAddr() reveals the outbound interface IP. It is best-effort
-// and returns "" on any error (e.g. an addr with no host such as ":50051").
+// controllerAddr: dialing a UDP address performs a route lookup and binds a
+// local address but sends nothing. Best-effort; "" on any error (e.g. an
+// addr with no host such as ":50051").
 func outboundIP(controllerAddr string) string {
 	conn, err := net.Dial("udp", controllerAddr)
 	if err != nil {
@@ -826,11 +850,9 @@ func outboundIP(controllerAddr string) string {
 	return ""
 }
 
-// registerAttemptErr builds an error describing why a single registration
-// attempt was considered a failure, checking both the RPC error and the
-// resp.Success field. The controller contract allows it to signal failure
-// via either channel (a gRPC error, e.g. codes.Internal, or a false Success
-// with a populated Message), so both must be checked.
+// registerAttemptErr describes why one registration attempt failed. The
+// controller may signal failure through a gRPC error or a false Success with
+// a Message, so both are checked.
 func registerAttemptErr(resp *controller_agent.AgentRegistrationResponse, err error) error {
 	if err != nil {
 		return fmt.Errorf("RegisterAgent failed: %w", err)
@@ -841,22 +863,17 @@ func registerAttemptErr(resp *controller_agent.AgentRegistrationResponse, err er
 	return nil
 }
 
-// registerWithController sends the agent's registration request to the
-// controller, retrying with exponential backoff on failure. A failure is
-// anything that fails either the err or the resp.Success check, since the
-// controller may report a rejected registration via a gRPC error, a
-// Success=false response, or both. It returns an error only if every
-// attempt fails.
+// registerWithController registers the agent, retrying with exponential
+// backoff; it errors only when every attempt fails.
 func (a *Agent) registerWithController(ctx context.Context) error {
 	req := a.buildRegistrationRequest()
-
 	backoff := registerRetryInitialBackoff
 	var lastErr error
 
 	for attempt := 1; attempt <= registerRetryMaxAttempts; attempt++ {
 		resp, err := a.grpcClient.RegisterAgent(ctx, req)
-		attemptErr := registerAttemptErr(resp, err)
-		if attemptErr == nil {
+		lastErr = registerAttemptErr(resp, err)
+		if lastErr == nil {
 			a.applyRegistrationTorSupport(resp)
 			a.checkRegistrationPlaneSupport(resp)
 			a.logger.Info().
@@ -866,83 +883,56 @@ func (a *Agent) registerWithController(ctx context.Context) error {
 				Msg("Agent registered with controller")
 			return nil
 		}
-		lastErr = attemptErr
-
 		if attempt == registerRetryMaxAttempts {
 			break
 		}
-
 		a.logger.Warn().Err(lastErr).
 			Int("attempt", attempt).
 			Int("max_attempts", registerRetryMaxAttempts).
 			Dur("backoff", backoff).
 			Msg("Agent registration attempt failed, retrying")
-
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("registration cancelled: %w", ctx.Err())
 		case <-time.After(backoff):
 		}
-
-		backoff *= 2
-		if backoff > registerRetryMaxBackoff {
-			backoff = registerRetryMaxBackoff
-		}
+		backoff = min(backoff*2, registerRetryMaxBackoff)
 	}
-
 	return fmt.Errorf("agent registration failed after %d attempts: %w", registerRetryMaxAttempts, lastErr)
 }
 
-// Start begins all agent components: responders, probers, cluster monitors,
-// and the metrics result consumer. All components must be initialized via
-// Initialize() before calling Start().
+// Start starts every component; Initialize must have succeeded.
 func (a *Agent) Start(ctx context.Context) error {
-	// Start all responders.
-	for i, resp := range a.responders {
-		if err := resp.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start responder %d: %w", i, err)
+	for _, r := range a.rnics {
+		if err := r.responder.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start responder for %s: %w", r.dev.Info.DeviceName, err)
+		}
+	}
+	for _, r := range a.rnics {
+		if err := r.prober.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start prober for %s: %w", r.dev.Info.DeviceName, err)
+		}
+	}
+	for _, r := range a.rnics {
+		if err := r.monitor.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start cluster monitor for %s: %w", r.dev.Info.DeviceName, err)
 		}
 	}
 
-	// Start all probers (one per device).
-	for i, prober := range a.probers {
-		if err := prober.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start prober %d: %w", i, err)
-		}
-	}
-
-	// Start all cluster monitors for periodic pinglist updates.
-	for i, monitor := range a.monitors {
-		if err := monitor.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start cluster monitor %d: %w", i, err)
-		}
-	}
-
-	// Start the heartbeat goroutine to periodically re-register with the
-	// controller, keeping the agent's registry entry alive.
 	a.startHeartbeat(ctx)
 
-	// Watch the opened devices so that a device the kernel removes (RoCE
-	// LAG change, NIC reset, driver reload) stops the agent instead of
-	// leaving it probing through a dead context.
+	// A device the kernel removes (RoCE LAG change, NIC reset, driver
+	// reload) stops the agent instead of leaving it probing through a dead
+	// context.
 	a.startDeviceWatch(ctx)
 
-	// Start the metrics result consumer if metrics are enabled. It reads from
-	// the fan-in channel that merges every prober's results (see
-	// createResultsFanIn), so results from every device are recorded.
 	if a.metrics != nil {
 		a.metrics.StartResultConsumer(ctx, a.results, probe.TorMetricLabel(a.canonicalTorID))
 		a.logger.Info().Msg("Metrics result consumer started")
 	}
-
-	// Start the analysis reporter if enabled. It consumes the secondary
-	// analysis branch of the fan-in independently of the metrics consumer.
 	if a.analysisReporter != nil {
 		a.analysisReporter.Start(ctx)
 	}
-
-	// Start the resource watchdog if enabled. It runs independently, sampling
-	// on its own interval and throttling the probers under load.
 	if a.watchdog != nil {
 		a.watchdog.Start(ctx)
 	}
@@ -951,63 +941,52 @@ func (a *Agent) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop gracefully shuts down all agent components in reverse order of startup.
-// It stops the cluster monitors, probers, and responders, then tears down
-// infrastructure resources (metrics, gRPC, queues, devices, RDMA context,
-// and event rings).
+// Stop shuts every component down in reverse order of startup. Every step is
+// nil-guarded, so it is safe after a partial Initialize.
 func (a *Agent) Stop(ctx context.Context) {
 	a.logger.Info().Msg("Stopping agent")
 
 	a.stopDeviceWatch()
 
-	// Stop all cluster monitors first to prevent new pinglist updates.
-	for _, monitor := range a.monitors {
-		if monitor != nil {
-			monitor.Stop()
+	// Monitors first so no new pinglists arrive; the heartbeat before the
+	// gRPC client closes, since both use it.
+	for _, r := range a.rnics {
+		if r.monitor != nil {
+			r.monitor.Stop()
 		}
 	}
-
-	// Stop the heartbeat goroutine before closing the gRPC client, since
-	// both it and the cluster monitors depend on grpcClient being open.
 	a.stopHeartbeat()
 
-	// Stop the resource watchdog before tearing down the probers, since it
-	// calls SetRateMultiplier on them.
+	// The watchdog before the probers, since it calls SetRateMultiplier on
+	// them.
 	if a.watchdog != nil {
 		a.watchdog.Stop()
 	}
 
-	// Stop all probers to cease outgoing probes. Destroy() closes each
-	// prober's own Results() channel, letting each fan-in goroutine's range
-	// loop finish once it has drained any buffered values.
-	for _, prober := range a.probers {
-		if prober != nil {
-			prober.Destroy()
+	// Destroy closes each prober's Results() channel, letting the fan-in
+	// goroutines finish once they drained any buffered values.
+	for _, r := range a.rnics {
+		if r.prober != nil {
+			r.prober.Destroy()
 		}
 	}
 
-	// Deterministically wind down the results fan-in: signal every fan-in
-	// goroutine to stop forwarding, wait for all of them to exit, and close
-	// the shared results channel exactly once. This must happen here in
-	// Stop (not a fire-and-forget background goroutine) so shutdown never
-	// leaves a fan-in goroutine blocked forever on a full a.results with
-	// nothing draining it (e.g. metrics disabled), which in turn lets the
-	// metrics result consumer's range loop finish.
+	// Wind the fan-in down here, deterministically, so shutdown never leaves
+	// a fan-in goroutine blocked on a full a.results that nothing drains.
 	a.stopResultsFanIn()
 
-	// Wait for the analysis reporter to drain the now-closed analysis branch
-	// and ship its final window summary. This must happen before the gRPC
-	// client is closed below, since the final flush is sent over it.
+	// The reporter drains the now-closed analysis branch and ships its final
+	// window over the gRPC client, so it must finish before the client closes.
 	if a.analysisReporter != nil {
 		a.analysisReporter.Wait()
 	}
 
-	// Stop all responders.
-	for _, resp := range a.responders {
-		resp.Destroy()
+	for _, r := range a.rnics {
+		if r.responder != nil {
+			r.responder.Destroy()
+		}
 	}
 
-	// Shutdown metrics collector, flushing any buffered data.
 	if a.metrics != nil {
 		shutdownCtx, cancel := context.WithTimeout(ctx, metricsShutdownTimeout)
 		defer cancel()
@@ -1016,52 +995,45 @@ func (a *Agent) Stop(ctx context.Context) {
 		}
 	}
 
-	// Close the gRPC client connection.
 	if a.grpcClient != nil {
 		if err := a.grpcClient.Close(); err != nil {
 			a.logger.Error().Err(err).Msg("Failed to close gRPC controller client")
 		}
 	}
 
-	// Close all RDMA devices.
-	for _, dev := range a.devices {
-		dev.Close()
+	for _, r := range a.rnics {
+		if r.dev != nil {
+			r.dev.Close()
+		}
 	}
-	a.devices = nil
-
-	// Destroy the RDMA context.
 	if a.rdmaCtx != nil {
 		a.rdmaCtx.Destroy()
 		a.rdmaCtx = nil
 	}
-
-	// Destroy event rings.
-	for _, ring := range a.proberRings {
-		ring.Destroy()
+	for _, r := range a.rnics {
+		if r.proberRing != nil {
+			r.proberRing.Destroy()
+		}
+		if r.respRing != nil {
+			r.respRing.Destroy()
+		}
 	}
-	a.proberRings = nil
-	for _, ring := range a.respRings {
-		ring.Destroy()
-	}
-	a.respRings = nil
+	a.rnics = nil
 
 	a.logger.Info().Msg("Agent stopped")
 }
 
-// startHeartbeat launches the background goroutine that periodically
-// re-sends the agent's registration to the controller. This refreshes the
-// controller's last_updated_epoch liveness field, without which the
-// controller's registry considers the agent dead ~5 minutes after startup
-// and drops it from distributed pinglists (and evicts it entirely after
-// ~15 minutes).
+// startHeartbeat launches the goroutine that periodically re-sends the
+// registration. This refreshes the controller's last_updated_epoch, without
+// which the registry considers the agent dead ~5 minutes after startup and
+// drops it from pinglists.
 func (a *Agent) startHeartbeat(ctx context.Context) {
 	a.heartbeatStopCh = make(chan struct{})
 	a.heartbeatWg.Add(1)
 	go a.heartbeatLoop(ctx)
 }
 
-// stopHeartbeat signals the heartbeat goroutine to exit and waits for it to
-// finish. It is a no-op if the heartbeat was never started.
+// stopHeartbeat stops the heartbeat goroutine; no-op if never started.
 func (a *Agent) stopHeartbeat() {
 	if a.heartbeatStopCh == nil {
 		return
@@ -1070,11 +1042,9 @@ func (a *Agent) stopHeartbeat() {
 	a.heartbeatWg.Wait()
 }
 
-// heartbeatLoop periodically re-sends the agent's registration to the
-// controller until the context is cancelled or stopHeartbeat is called.
-// Failures are logged but never terminate the process: a transient
-// controller outage should not bring down an otherwise healthy agent, and
-// the next tick will simply retry.
+// heartbeatLoop re-registers every heartbeatInterval. Failures are logged
+// but never terminate the process: a transient controller outage should not
+// bring down a healthy agent, and the next tick retries.
 func (a *Agent) heartbeatLoop(ctx context.Context) {
 	defer a.heartbeatWg.Done()
 
@@ -1082,7 +1052,6 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 	defer ticker.Stop()
 
 	consecutiveFailures := 0
-
 	for {
 		select {
 		case <-a.heartbeatStopCh:
@@ -1090,66 +1059,49 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			req := a.buildRegistrationRequest()
-			resp, err := a.grpcClient.RegisterAgent(ctx, req)
-			if attemptErr := registerAttemptErr(resp, err); attemptErr != nil {
-				consecutiveFailures++
-				a.logHeartbeatFailure(consecutiveFailures, attemptErr)
-				continue
-			}
-			consecutiveFailures = 0
-			if !resp.GetPerRnicTorId() && a.usesPerDeviceTorIDs() && !a.perRnicTorLossWarned {
-				// The controller was replaced by an older one while running.
-				// The monitors keep their per-device ToRs, so ToR-meshes go
-				// empty until the agent restarts (and falls back to tor_id).
-				a.perRnicTorLossWarned = true
-				a.logger.Error().
-					Msg("Controller no longer supports per-RNIC ToR IDs; ToR-mesh pinglists will be empty. Restart the agent or upgrade the controller")
-			}
-			// The controller may have been replaced by an older one.
-			a.checkRegistrationPlaneSupport(resp)
-			a.logger.Debug().
-				Str("agent_id", a.cfg.AgentID).
-				Msg("Heartbeat re-registration succeeded")
 		}
+
+		resp, err := a.grpcClient.RegisterAgent(ctx, a.buildRegistrationRequest())
+		if attemptErr := registerAttemptErr(resp, err); attemptErr != nil {
+			consecutiveFailures++
+			event := a.logger.Warn()
+			if consecutiveFailures >= heartbeatFailureEscalationThreshold {
+				event = a.logger.Error()
+			}
+			event.Err(attemptErr).
+				Int("consecutive_failures", consecutiveFailures).
+				Msg("Heartbeat re-registration failed, agent continues running")
+			continue
+		}
+		consecutiveFailures = 0
+		if !resp.GetPerRnicTorId() && a.usesPerDeviceTorIDs() && !a.perRnicTorLossWarned {
+			// The controller was replaced by an older one while running. The
+			// monitors keep their per-device ToRs, so ToR-meshes go empty
+			// until the agent restarts (and falls back to tor_id).
+			a.perRnicTorLossWarned = true
+			a.logger.Error().
+				Msg("Controller no longer supports per-RNIC ToR IDs; ToR-mesh pinglists will be empty. Restart the agent or upgrade the controller")
+		}
+		a.checkRegistrationPlaneSupport(resp)
+		a.logger.Debug().
+			Str("agent_id", a.cfg.AgentID).
+			Msg("Heartbeat re-registration succeeded")
 	}
 }
 
-// logHeartbeatFailure logs a heartbeat failure, escalating the log level
-// from Warn to Error once consecutive failures reach the escalation
-// threshold, to surface sustained controller unreachability.
-func (a *Agent) logHeartbeatFailure(consecutiveFailures int, err error) {
-	event := a.logger.Warn()
-	if consecutiveFailures >= heartbeatFailureEscalationThreshold {
-		event = a.logger.Error()
-	}
-	event.Err(err).
-		Int("consecutive_failures", consecutiveFailures).
-		Msg("Heartbeat re-registration failed, agent continues running")
-}
-
-// Run is the main lifecycle method. It initializes the agent, starts all
-// components, blocks until the context is cancelled (e.g., by a signal),
-// and then performs a graceful shutdown.
-//
-// Stop is always called after a successful (even partial) Initialize so that
-// any resources allocated before a failure are released.
+// Run initializes and starts the agent, blocks until ctx is cancelled or an
+// opened device disappears, then stops it. Stop also runs after a failed
+// Initialize or Start so partially allocated resources are released.
 func (a *Agent) Run(ctx context.Context) error {
 	if err := a.Initialize(ctx); err != nil {
-		// Stop is safe to call with partially initialised state because
-		// every resource field in Stop is guarded by a nil check.
 		a.Stop(ctx)
 		return fmt.Errorf("agent initialization failed: %w", err)
 	}
-
 	if err := a.Start(ctx); err != nil {
-		// Clean up partially started components.
 		a.Stop(ctx)
 		return fmt.Errorf("agent start failed: %w", err)
 	}
 
-	// Block until the context is cancelled (signal handler, etc.) or an
-	// opened device disappears.
 	select {
 	case <-ctx.Done():
 	case err := <-a.deviceLost:
@@ -1157,19 +1109,16 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	a.logger.Info().Msg("Context cancelled, initiating shutdown")
 
-	// Use a fresh context for shutdown operations since the parent is cancelled.
-	shutdownCtx := context.Background()
-	a.Stop(shutdownCtx)
-
+	// The parent context is cancelled, so shut down on a fresh one.
+	a.Stop(context.Background())
 	return nil
 }
 
-// stopAfterDeviceLoss stops the agent after an opened device disappeared
-// and returns an error, so the process exits non-zero and systemd
-// (Restart=on-failure) restarts it; the restart re-evaluates the
-// configuration against the current devices. The stop is bounded by
-// deviceLostStopTimeout so a teardown stuck on the removed device cannot
-// keep the process alive.
+// stopAfterDeviceLoss stops the agent after an opened device disappeared and
+// returns an error, so the process exits non-zero and systemd
+// (Restart=on-failure) restarts it against the current devices. The stop is
+// bounded by deviceLostStopTimeout so a teardown stuck on the removed device
+// cannot keep the process alive.
 func (a *Agent) stopAfterDeviceLoss(lost error) error {
 	a.logger.Error().Err(lost).Msg("RDMA device lost, shutting down")
 	done := make(chan struct{})
@@ -1187,179 +1136,8 @@ func (a *Agent) stopAfterDeviceLoss(lost error) error {
 	return fmt.Errorf("RDMA device lost: %w", lost)
 }
 
-// deviceSkipReason reports why an opened device must not be used, or "" to
-// keep it. These filters need the device's GID, so unlike
-// excluded_device_names they run after the device is opened (but before any
-// queue is created on it).
-func deviceSkipReason(cfg *config.AgentConfig, info rdmabridge.DeviceInfo) string {
-	if cidr, ok := cfg.ExcludedGIDCIDR(info.IPAddr); ok {
-		return "excluded_gid_cidrs:" + cidr
-	}
-	if cfg.MappedDevicesOnly {
-		if _, ok := cfg.DeviceTorID(info.DeviceName); !ok {
-			return "mapped_devices_only"
-		}
-	}
-	return ""
-}
-
-// admitDevice applies deviceSkipReason to a freshly opened device. A skipped
-// device is logged with its netdev and GID and closed, and admitDevice
-// returns false. A device missing from device_tor_ids is logged at warn
-// level: in a mapped deployment it usually means a device was renamed or
-// appeared unexpectedly (e.g. a bond's RDMA device registered before RoCE
-// LAG formed).
-func (a *Agent) admitDevice(dev *rdmabridge.Device) bool {
-	reason := deviceSkipReason(a.cfg, dev.Info)
-	if reason == "" {
-		return true
-	}
-	netdev, _ := lldp.NetdevForRDMAPort(a.sysfsRoot, dev.Info.DeviceName,
-		dev.Info.ActivePort, dev.Info.ActiveGIDIndex)
-	event := a.logger.Info()
-	msg := "Skipping RDMA device whose GID is in excluded_gid_cidrs"
-	if reason == "mapped_devices_only" {
-		event = a.logger.Warn()
-		msg = "Skipping RDMA device without a device_tor_ids entry (mapped_devices_only); " +
-			"check whether a device was renamed or registered unexpectedly"
-	}
-	event.
-		Str("device_name", dev.Info.DeviceName).
-		Str("netdev", netdev).
-		Str("gid", dev.Info.GID).
-		Str("ip", dev.Info.IPAddr).
-		Str("reason", reason).
-		Msg(msg)
-	dev.Close()
-	return false
-}
-
-// openDevices opens RDMA devices based on configuration. If AllowedDeviceNames
-// is configured, only those devices are opened by name. Otherwise, all available
-// devices are opened by index. Devices in ExcludedDeviceNames are skipped before
-// they are opened, so no verbs resources are ever allocated on them. Devices
-// rejected by excluded_gid_cidrs or mapped_devices_only are closed right
-// after opening (see admitDevice).
-func (a *Agent) openDevices() error {
-	gidIndex := a.cfg.GIDIndex
-	// Config.Validate() guarantees ServiceLevel is in [0,7] and TrafficClass
-	// is in [0,255], so both narrow to uint8 without loss.
-	sl := uint8(a.cfg.ServiceLevel)
-	tc := uint8(a.cfg.TrafficClass)
-	cqMode, err := rdmabridge.ParseCQPollMode(a.cfg.CQPollMode)
-	if err != nil {
-		return err
-	}
-
-	if len(a.cfg.AllowedDeviceNames) > 0 {
-		// Open only the explicitly allowed devices by name.
-		for _, name := range a.cfg.AllowedDeviceNames {
-			// Unreachable after Config.Validate(), which rejects overlaps;
-			// kept so an unvalidated config still honours the exclusion.
-			if a.cfg.IsDeviceExcluded(name) {
-				a.logger.Info().Str("device_name", name).Msg("Skipping excluded RDMA device")
-				continue
-			}
-			dev, err := a.rdmaCtx.OpenDeviceByName(name, gidIndex, sl, tc)
-			if err != nil {
-				a.logger.Warn().Err(err).
-					Str("device_name", name).
-					Msg("Failed to open allowed RDMA device, skipping")
-				continue
-			}
-			if !a.admitDevice(dev) {
-				continue
-			}
-			dev.CQPollMode = cqMode
-			a.devices = append(a.devices, dev)
-			a.logger.Info().
-				Str("device_name", dev.Info.DeviceName).
-				Str("gid", dev.Info.GID).
-				Str("ip", dev.Info.IPAddr).
-				Msg("Opened RDMA device by name")
-		}
-	} else {
-		// Open all available devices by index.
-		count := a.rdmaCtx.GetDeviceCount()
-		if count == 0 {
-			return fmt.Errorf("no RDMA devices found on this host")
-		}
-
-		for i := 0; i < count; i++ {
-			if len(a.cfg.ExcludedDeviceNames) > 0 {
-				name, err := a.rdmaCtx.GetDeviceName(i)
-				if err != nil {
-					// Without a name the exclusion cannot be checked; skip
-					// rather than risk opening an excluded device.
-					a.logger.Warn().Err(err).
-						Int("index", i).
-						Msg("Failed to read RDMA device name, skipping")
-					continue
-				}
-				if a.cfg.IsDeviceExcluded(name) {
-					a.logger.Info().
-						Str("device_name", name).
-						Int("index", i).
-						Msg("Skipping excluded RDMA device")
-					continue
-				}
-			}
-			dev, err := a.rdmaCtx.OpenDevice(i, gidIndex, sl, tc)
-			if err != nil {
-				a.logger.Warn().Err(err).
-					Int("index", i).
-					Msg("Failed to open RDMA device by index, skipping")
-				continue
-			}
-			if !a.admitDevice(dev) {
-				continue
-			}
-			dev.CQPollMode = cqMode
-			a.devices = append(a.devices, dev)
-			a.logger.Info().
-				Str("device_name", dev.Info.DeviceName).
-				Str("gid", dev.Info.GID).
-				Str("ip", dev.Info.IPAddr).
-				Int("index", i).
-				Msg("Opened RDMA device by index")
-		}
-	}
-
-	return nil
-}
-
-// createEventRings creates one prober event ring and one responder event
-// ring per device. Each ring is a lock-free SPSC buffer used to deliver CQ
-// completion events from the Zig poller thread to Go.
-func (a *Agent) createEventRings() error {
-	for i, dev := range a.devices {
-		proberRing, err := rdmabridge.NewEventRing(a.cfg.EffectiveEventRingCapacity())
-		if err != nil {
-			return fmt.Errorf("failed to create prober event ring for device %d (%s): %w",
-				i, dev.Info.DeviceName, err)
-		}
-		a.proberRings = append(a.proberRings, proberRing)
-
-		respRing, err := rdmabridge.NewEventRing(a.cfg.EffectiveEventRingCapacity())
-		if err != nil {
-			return fmt.Errorf("failed to create responder event ring for device %d (%s): %w",
-				i, dev.Info.DeviceName, err)
-		}
-		a.respRings = append(a.respRings, respRing)
-	}
-
-	a.logger.Info().
-		Int("prober_rings", len(a.proberRings)).
-		Int("responder_rings", len(a.respRings)).
-		Int("capacity", a.cfg.EffectiveEventRingCapacity()).
-		Msg("Event rings created")
-	return nil
-}
-
 // createMetricsCollector creates the OTel MetricsCollector when metrics are
-// enabled, leaving a.metrics nil (and logging) if metrics are disabled or if
-// creation fails. It is called before createResultsFanIn so the fan-in can
-// tell, via a.metrics != nil, whether a metrics result consumer will run.
+// enabled, leaving a.metrics nil (and logging) when disabled or on failure.
 func (a *Agent) createMetricsCollector(ctx context.Context) {
 	if !a.cfg.MetricsEnabled {
 		a.logger.Info().Msg("Metrics collection is disabled")
@@ -1381,50 +1159,77 @@ func (a *Agent) createMetricsCollector(ctx context.Context) {
 	}
 	a.metrics = mc
 
-	// Surface event-ring drop counts (rings were created earlier) as an OTel
-	// observable counter. A growing count means the Go poller goroutine is not
-	// draining rdma_event_ring_poll fast enough and completion events are being
-	// silently discarded. Both readers aggregate across all per-device rings
-	// under a single label ("prober"/"responder") to keep metric cardinality
-	// low (matching the source_tor/target_tor-only convention used elsewhere),
-	// rather than reporting one data point per device.
+	// Ring drops and occupancy are aggregated across every device's rings
+	// under one "prober"/"responder" label to keep cardinality low. A growing
+	// drop count means the Go consumer is not draining the ring fast enough.
 	if err := a.metrics.RegisterEventRingDropCallback(map[string]func() uint64{
-		"prober":    a.proberRingDropCount,
-		"responder": a.responderRingDropCount,
+		"prober":    func() uint64 { return ringDropCount(a.proberRings()) },
+		"responder": func() uint64 { return ringDropCount(a.responderRings()) },
 	}); err != nil {
-		a.logger.Warn().Err(err).
-			Msg("Failed to register event ring drop count callback")
+		a.logger.Warn().Err(err).Msg("Failed to register event ring drop count callback")
 	}
 	if err := a.metrics.RegisterEventRingOccupancyCallback(map[string]func() telemetry.EventRingOccupancy{
-		"prober":    func() telemetry.EventRingOccupancy { return takeRingOccupancy(a.proberRings) },
-		"responder": func() telemetry.EventRingOccupancy { return takeRingOccupancy(a.respRings) },
+		"prober":    func() telemetry.EventRingOccupancy { return takeRingOccupancy(a.proberRings()) },
+		"responder": func() telemetry.EventRingOccupancy { return takeRingOccupancy(a.responderRings()) },
 	}); err != nil {
-		a.logger.Warn().Err(err).
-			Msg("Failed to register event ring occupancy callback")
+		a.logger.Warn().Err(err).Msg("Failed to register event ring occupancy callback")
 	}
 }
 
-// registerTimestampModeMetric warns about every prober and responder queue
-// that uses software timestamps and, with metrics enabled, reports each
-// queue's timestamp source on rpingmesh.agent.hw_timestamps. A queue's mode is fixed
-// when the queue is created, so it is captured once here, after every queue
-// exists, and the callback only returns that snapshot: it never touches the
+func (a *Agent) proberRings() []*rdmabridge.EventRing {
+	rings := make([]*rdmabridge.EventRing, 0, len(a.rnics))
+	for _, r := range a.rnics {
+		if r.proberRing != nil {
+			rings = append(rings, r.proberRing)
+		}
+	}
+	return rings
+}
+
+func (a *Agent) responderRings() []*rdmabridge.EventRing {
+	rings := make([]*rdmabridge.EventRing, 0, len(a.rnics))
+	for _, r := range a.rnics {
+		if r.respRing != nil {
+			rings = append(rings, r.respRing)
+		}
+	}
+	return rings
+}
+
+// ringDropCount sums the drop counters of rings.
+func ringDropCount(rings []*rdmabridge.EventRing) uint64 {
+	var total uint64
+	for _, ring := range rings {
+		total += ring.DropCount()
+	}
+	return total
+}
+
+// takeRingOccupancy samples rings for rpingmesh.event_ring_occupancy_max:
+// the highest occupancy of any ring since the previous sample (resetting
+// each ring's mark) and the capacity. The fullest ring is the one that
+// matters.
+func takeRingOccupancy(rings []*rdmabridge.EventRing) telemetry.EventRingOccupancy {
+	var sample telemetry.EventRingOccupancy
+	for _, ring := range rings {
+		sample.Max = max(sample.Max, ring.TakeMaxOccupancy())
+		sample.Capacity = max(sample.Capacity, ring.Capacity())
+	}
+	return sample
+}
+
+// registerTimestampModeMetric warns about every queue that uses software
+// timestamps and, with metrics enabled, reports each queue's timestamp
+// source on rpingmesh.agent.hw_timestamps. The modes are captured once here
+// (they are fixed at queue creation), so the callback never touches the
 // queues, which Stop destroys before the final metrics flush.
 func (a *Agent) registerTimestampModeMetric() {
-	modes := make([]telemetry.QueueTimestampMode, 0, len(a.probers)+len(a.responders))
-	for i, p := range a.probers {
-		modes = append(modes, telemetry.QueueTimestampMode{
-			RdmaDevice:   a.devices[i].Info.DeviceName,
-			Queue:        "prober",
-			HWTimestamps: !p.GetQueueInfo().UsesSWTimestamps,
-		})
-	}
-	for i, r := range a.responders {
-		modes = append(modes, telemetry.QueueTimestampMode{
-			RdmaDevice:   a.devices[i].Info.DeviceName,
-			Queue:        "responder",
-			HWTimestamps: !r.GetQueueInfo().UsesSWTimestamps,
-		})
+	modes := make([]telemetry.QueueTimestampMode, 0, 2*len(a.rnics))
+	for _, r := range a.rnics {
+		modes = append(modes,
+			telemetry.QueueTimestampMode{RdmaDevice: r.dev.Info.DeviceName, Queue: "prober", HWTimestamps: !r.prober.GetQueueInfo().UsesSWTimestamps},
+			telemetry.QueueTimestampMode{RdmaDevice: r.dev.Info.DeviceName, Queue: "responder", HWTimestamps: !r.responder.GetQueueInfo().UsesSWTimestamps},
+		)
 	}
 	for _, m := range modes {
 		if !m.HWTimestamps {
@@ -1438,28 +1243,12 @@ func (a *Agent) registerTimestampModeMetric() {
 		return
 	}
 	if err := a.metrics.RegisterTimestampModeCallback(func() []telemetry.QueueTimestampMode { return modes }); err != nil {
-		a.logger.Warn().Err(err).
-			Msg("Failed to register timestamp mode callback")
+		a.logger.Warn().Err(err).Msg("Failed to register timestamp mode callback")
 	}
 }
 
-// takeRingOccupancy samples a group of per-device rings for
-// rpingmesh.event_ring_occupancy_max: the highest occupancy of any ring
-// since the previous sample (resetting each ring's mark) and the capacity.
-// Like the drop counters, the rings of every device share one ring label to
-// keep cardinality low; the fullest ring is the one that matters.
-func takeRingOccupancy(rings []*rdmabridge.EventRing) telemetry.EventRingOccupancy {
-	var sample telemetry.EventRingOccupancy
-	for _, ring := range rings {
-		sample.Max = max(sample.Max, ring.TakeMaxOccupancy())
-		sample.Capacity = max(sample.Capacity, ring.Capacity())
-	}
-	return sample
-}
-
-// targetRnicLabels maps the metrics_target_rnic_labels and
-// metrics_target_rnic_labels_scope settings onto telemetry.TargetRnicLabels.
-// Empty values (a zero-value config) mean the defaults, off and stable.
+// targetRnicLabels maps metrics_target_rnic_labels(_scope) onto
+// telemetry.TargetRnicLabels. Empty values mean the defaults, off and stable.
 func targetRnicLabels(cfg *config.AgentConfig) telemetry.TargetRnicLabels {
 	mode := cfg.MetricsTargetRnicLabels
 	return telemetry.TargetRnicLabels{
@@ -1469,21 +1258,14 @@ func targetRnicLabels(cfg *config.AgentConfig) telemetry.TargetRnicLabels {
 	}
 }
 
-// createResultsFanIn creates the shared results channel and starts one
-// fan-in goroutine per prober that forwards its Results() into the shared
-// channel. This lets Start() and the metrics result consumer keep treating
-// "the" probe result stream as a single channel even though every device now
-// has its own Prober.
+// createResultsFanIn creates the shared results channel and one goroutine
+// per prober forwarding its Results() into it, plus the analysis branch when
+// analysis reporting is enabled.
 //
-// When a.metricsResultsActive is true, each fan-in goroutine selects between
-// sending on a.results and reading from resultsDone, so it can always return
-// promptly once Stop calls stopResultsFanIn -- whether or not anything is (or
-// ever was) draining a.results (e.g. metrics active but the consumer has
-// already stopped during shutdown). When it is false (no metrics consumer will
-// run), the fan-in skips the a.results send entirely: sending on a channel
-// nobody drains would, once full, block the goroutine, stop it reading from the
-// prober, and starve the independent analysis tee. Analysis can be enabled
-// without metrics, so the two branches must stay decoupled.
+// The tee onto the analysis branch is non-blocking (dropped when full) so a
+// slow aggregator can never stall the metrics path. The metrics send is
+// skipped entirely when no consumer will drain a.results, and otherwise
+// selects on resultsDone so stopResultsFanIn can always unblock it.
 func (a *Agent) createResultsFanIn() {
 	a.results = make(chan *probe.ProbeResult, resultChanSize)
 	a.resultsDone = make(chan struct{})
@@ -1491,58 +1273,39 @@ func (a *Agent) createResultsFanIn() {
 		a.analysisResults = make(chan *probe.ProbeResult, resultChanSize)
 	}
 
-	for _, prober := range a.probers {
+	for _, r := range a.rnics {
+		if r.prober == nil {
+			continue
+		}
 		a.resultsWg.Add(1)
 		go func(p *Prober) {
 			defer a.resultsWg.Done()
 			for result := range p.Results() {
-				// Secondary, best-effort tee to the analysis path. The send is
-				// non-blocking (dropped if the analysis buffer is full) so a
-				// slow or backed-up aggregator/reporter can never stall the
-				// primary metrics path below. Done first so a full a.results
-				// (e.g. metrics slow) does not also starve analysis of this
-				// result.
 				if a.analysisResults != nil {
 					select {
 					case a.analysisResults <- result:
 					default:
 					}
 				}
-				// Primary metrics path. Skipped entirely when no metrics
-				// consumer will drain a.results, so a slow/absent metrics
-				// consumer cannot stall the fan-in (and thus the analysis tee).
 				if !a.metricsResultsActive {
 					continue
 				}
 				select {
 				case a.results <- result:
 				case <-a.resultsDone:
-					// Stop is shutting down and nothing is guaranteed to
-					// drain a.results; stop forwarding immediately instead
-					// of risking a permanent block. Any results not yet
-					// forwarded (this one, and anything still buffered in
-					// p.Results()) are dropped.
+					// Shutting down with nothing guaranteed to drain
+					// a.results: stop forwarding; remaining results drop.
 					return
 				}
 			}
-		}(prober)
+		}(r.prober)
 	}
 }
 
-// stopResultsFanIn signals every fan-in goroutine started by
-// createResultsFanIn to stop forwarding, waits for all of them to exit, and
-// then closes the shared results channel exactly once. It is a no-op if
-// createResultsFanIn was never called (e.g. Initialize failed before
-// reaching it), matching the nil-guard pattern used throughout Stop.
-//
-// Closing resultsDone before waiting is what makes this deterministic: it
-// guarantees every fan-in goroutine can return -- even one currently blocked
-// trying to send on a full a.results -- regardless of whether the metrics
-// result consumer (or anything else) is draining it. Callers must invoke
-// this only after every prober has been destroyed (which closes that
-// prober's own Results() channel), so fan-in goroutines waiting for the
-// *next* value (rather than blocked on the send) also observe closure and
-// exit their range loop.
+// stopResultsFanIn stops every fan-in goroutine, waits for them, and closes
+// the shared channels exactly once. No-op if createResultsFanIn never ran.
+// Call it only after every prober has been destroyed (closing its Results()
+// channel), so goroutines waiting for the next value also exit.
 func (a *Agent) stopResultsFanIn() {
 	if a.resultsDone == nil {
 		return
@@ -1550,37 +1313,9 @@ func (a *Agent) stopResultsFanIn() {
 	close(a.resultsDone)
 	a.resultsWg.Wait()
 	close(a.results)
-	// Close the analysis branch too (only after every fan-in goroutine has
-	// exited, so no tee send can race this close). This is what ends the
-	// AnalysisReporter's run loop and triggers its final-window flush.
+	// Only after every fan-in goroutine exited, so no tee send races the
+	// close. This ends the AnalysisReporter's loop and final flush.
 	if a.analysisResults != nil {
 		close(a.analysisResults)
 	}
-}
-
-// proberRingDropCount sums EventRing.DropCount() across every prober ring
-// (one per device). Used as the "prober" reader for
-// telemetry.MetricsCollector.RegisterEventRingDropCallback; see
-// responderRingDropCount for why this aggregates rather than reporting per
-// device.
-func (a *Agent) proberRingDropCount() uint64 {
-	var total uint64
-	for _, ring := range a.proberRings {
-		total += ring.DropCount()
-	}
-	return total
-}
-
-// responderRingDropCount sums EventRing.DropCount() across every responder
-// ring (one per device). Used as the "responder" reader for
-// telemetry.MetricsCollector.RegisterEventRingDropCallback, which reports a
-// single ring="responder" data point rather than one per device to keep
-// metric cardinality low (matching the source_tor/target_tor-only
-// convention used elsewhere in this package).
-func (a *Agent) responderRingDropCount() uint64 {
-	var total uint64
-	for _, ring := range a.respRings {
-		total += ring.DropCount()
-	}
-	return total
 }

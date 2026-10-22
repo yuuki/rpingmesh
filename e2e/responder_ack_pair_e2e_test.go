@@ -113,7 +113,7 @@ func runResponderAckPairBurst(t *testing.T, mode int) {
 		complete = make(chan struct{})
 		done     int
 	)
-	proberQueue.StartEventPoller(ctx, func(ev rdmabridge.CompletionEvent) {
+	startEventPoller(ctx, proberQueue, proberRing, func(ev rdmabridge.CompletionEvent) {
 		if ev.IsSend || !ev.IsAck || ev.Status != 0 {
 			return
 		}

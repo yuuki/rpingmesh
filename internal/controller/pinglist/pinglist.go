@@ -172,6 +172,24 @@ func (rc requesterContext) shouldProbe(target *controller_agent.RnicInfo) bool {
 	return probe.GIDFamily(target.GetGid()) == rc.family
 }
 
+// eligible reports whether target passes shouldProbe and, when planeRestricted,
+// samePlane: the per-candidate filter both pinglist types apply.
+func (rc requesterContext) eligible(target *controller_agent.RnicInfo, planeRestricted bool) bool {
+	return rc.shouldProbe(target) && (!planeRestricted || rc.samePlane(target))
+}
+
+// logGenerated emits the per-request summary both generators end with. torKey
+// names the ToR field: "torID" for ToR-mesh, "excludeTorID" for inter-ToR.
+func (rc requesterContext) logGenerated(msg, torKey, torID string, targetCount int) {
+	log.Info().
+		Str("requesterGID", rc.gid).
+		Str(torKey, torID).
+		Str("planeID", rc.plane).
+		Str("planeSource", rc.planeSource).
+		Int("targetCount", targetCount).
+		Msg(msg)
+}
+
 // GenerateTorMeshPinglist returns PingTargets for the RNICs in the same ToR
 // that the requester should probe: its own RNIC and every other RNIC on the
 // same host are excluded (issue #39), and cross-address-family targets are
@@ -201,10 +219,7 @@ func (g *PinglistGenerator) GenerateTorMeshPinglist(
 
 	targets := make([]*controller_agent.PingTarget, 0, len(rnics))
 	for _, rnic := range rnics {
-		if !rc.shouldProbe(rnic) {
-			continue
-		}
-		if unspecified && !rc.samePlane(rnic) {
+		if !rc.eligible(rnic, unspecified) {
 			continue
 		}
 		targets = append(targets, g.buildPingTarget(requesterGID, rnic, controller_agent.PinglistType_TOR_MESH))
@@ -229,14 +244,7 @@ func (g *PinglistGenerator) GenerateTorMeshPinglist(
 			Msg("Capped untagged ToR-mesh pinglist")
 	}
 
-	log.Info().
-		Str("requesterGID", requesterGID).
-		Str("torID", torID).
-		Str("planeID", rc.plane).
-		Str("planeSource", rc.planeSource).
-		Int("targetCount", len(targets)).
-		Msg("Generated ToR-mesh pinglist")
-
+	rc.logGenerated("Generated ToR-mesh pinglist", "torID", torID, len(targets))
 	return targets, nil
 }
 
@@ -265,10 +273,7 @@ func (g *PinglistGenerator) GenerateInterTorPinglist(
 	seenToRs := make(map[string]bool, g.interTorSampleSize)
 	targets := make([]*controller_agent.PingTarget, 0, g.interTorSampleSize)
 	for _, rnic := range rnics {
-		if !rc.shouldProbe(rnic) || !rc.samePlane(rnic) {
-			continue
-		}
-		if seenToRs[rnic.GetTorId()] {
+		if !rc.eligible(rnic, true) || seenToRs[rnic.GetTorId()] {
 			continue
 		}
 		seenToRs[rnic.GetTorId()] = true
@@ -278,14 +283,7 @@ func (g *PinglistGenerator) GenerateInterTorPinglist(
 		}
 	}
 
-	log.Info().
-		Str("requesterGID", requesterGID).
-		Str("excludeTorID", torID).
-		Str("planeID", rc.plane).
-		Str("planeSource", rc.planeSource).
-		Int("targetCount", len(targets)).
-		Msg("Generated Inter-ToR pinglist")
-
+	rc.logGenerated("Generated Inter-ToR pinglist", "excludeTorID", torID, len(targets))
 	return targets, nil
 }
 
@@ -335,7 +333,7 @@ func (g *PinglistGenerator) buildPingTarget(requesterGID string, rnic *controlle
 		Sampled:          ptype == controller_agent.PinglistType_INTER_TOR,
 		// FlowLabel is the legacy base label (low 20 bits of the seed), kept
 		// for backward compatibility and used verbatim when FlowLabelCount<=1.
-		FlowLabel: seed & 0xFFFFF,
+		FlowLabel: seed & flowLabelMask,
 		// FlowLabelSeed/FlowLabelCount let the agent derive FlowLabelCount
 		// distinct 20-bit labels without the controller enumerating them.
 		FlowLabelSeed:  seed,
@@ -345,39 +343,36 @@ func (g *PinglistGenerator) buildPingTarget(requesterGID string, rnic *controlle
 	}
 }
 
-// flowLabelSeed is the full 32-bit FNV-1a hash of requesterGID+targetGID. It
-// seeds agent-side flow-label expansion; its low 20 bits double as the legacy
-// single flow label (see deterministicFlowLabel).
-func flowLabelSeed(requesterGID, targetGID string) uint32 {
+// flowLabelMask keeps the low 20 bits of a hash, the width of
+// ibv_ah_attr.grh.flow_label.
+const flowLabelMask = 0xFFFFF
+
+// gidPairHash is the 32-bit FNV-1a hash of requesterGID, salt and targetGID.
+// The pair order matters, so A->B and B->A get different values, and distinct
+// salts keep the flow-label, source-port and priority hashes independent.
+func gidPairHash(requesterGID, salt, targetGID string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(requesterGID))
+	h.Write([]byte(salt))
 	h.Write([]byte(targetGID))
 	return h.Sum32()
 }
 
-// deterministicFlowLabel generates a deterministic flow label for ECMP path
-// diversity: the low 20 bits (0-0xFFFFF) of flowLabelSeed. Retained so the
-// legacy single-label semantics and its tests are preserved unchanged.
-func deterministicFlowLabel(requesterGID, targetGID string) uint32 {
-	return flowLabelSeed(requesterGID, targetGID) & 0xFFFFF // 20-bit mask
+// flowLabelSeed is the unsalted hash of the GID pair. It seeds agent-side
+// flow-label expansion; its low 20 bits (flowLabelMask) double as the legacy
+// single flow label stamped by buildPingTarget.
+func flowLabelSeed(requesterGID, targetGID string) uint32 {
+	return gidPairHash(requesterGID, "", targetGID)
 }
 
 // deterministicSourcePort generates a deterministic source port (metadata only).
 // NOT enforced at the RDMA layer -- RoCEv2 UD source_port is driver-generated.
 // Range: 49152-65535 (ephemeral ports).
 func deterministicSourcePort(requesterGID, targetGID string) uint32 {
-	h := fnv.New32a()
-	h.Write([]byte(requesterGID))
-	h.Write([]byte("port")) // salt to differentiate from flow label hash
-	h.Write([]byte(targetGID))
-	return (h.Sum32() % 16384) + 49152
+	return (gidPairHash(requesterGID, "port", targetGID) % 16384) + 49152
 }
 
 // deterministicPriority generates a deterministic priority value (0-7).
 func deterministicPriority(requesterGID, targetGID string) uint32 {
-	h := fnv.New32a()
-	h.Write([]byte(requesterGID))
-	h.Write([]byte("prio")) // salt to differentiate from other hashes
-	h.Write([]byte(targetGID))
-	return h.Sum32() % 8
+	return gidPairHash(requesterGID, "prio", targetGID) % 8
 }

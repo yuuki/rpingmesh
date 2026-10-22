@@ -1,44 +1,17 @@
 package telemetry
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
 	"github.com/yuuki/rpingmesh/internal/probe"
+	"github.com/yuuki/rpingmesh/internal/testutil/otelmetrics"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 var targetRnicLabelKeys = []attribute.Key{"target_hostname", "target_rdma_device", "target_netdev"}
-
-// collectFrom records results on a collector configured with opts, built on a
-// provider with providerOpts, and returns the collected metrics.
-func collectFrom(t *testing.T, providerOpts []sdkmetric.Option, opts []Option, results ...*probe.ProbeResult) *metricdata.ResourceMetrics {
-	t.Helper()
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(append([]sdkmetric.Option{sdkmetric.WithReader(reader)}, providerOpts...)...)
-	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
-
-	mc, err := NewMetricsCollectorWithProvider(provider, opts...)
-	if err != nil {
-		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-	}
-	for _, r := range results {
-		mc.RecordProbeResult(r, probe.CalculateRTT(r), "tor-a")
-	}
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("ManualReader.Collect: %v", err)
-	}
-	return &rm
-}
-
-func recordAndCollect(t *testing.T, opts []Option, results ...*probe.ProbeResult) *metricdata.ResourceMetrics {
-	t.Helper()
-	return collectFrom(t, nil, opts, results...)
-}
 
 // successfulResult returns a successful probe to the given target RNIC.
 func successfulResult(host, device, netdev string, sampled bool) *probe.ProbeResult {
@@ -53,30 +26,6 @@ func successfulResult(host, device, netdev string, sampled bool) *probe.ProbeRes
 		T1:               1, T2: 100, T3: 1000, T4: 1300, T5: 2400, T6: 2500,
 		Success: true,
 	}
-}
-
-// dataPointAttrs returns the attribute set of every data point of metric
-// name, or nil when the metric was not exported.
-func dataPointAttrs(t *testing.T, rm *metricdata.ResourceMetrics, name string) []attribute.Set {
-	t.Helper()
-	m := findMetric(rm, name)
-	if m == nil {
-		return nil
-	}
-	var sets []attribute.Set
-	switch data := m.Data.(type) {
-	case metricdata.Sum[int64]:
-		for _, dp := range data.DataPoints {
-			sets = append(sets, dp.Attributes)
-		}
-	case metricdata.Histogram[int64]:
-		for _, dp := range data.DataPoints {
-			sets = append(sets, dp.Attributes)
-		}
-	default:
-		t.Fatalf("%s: unexpected data type %T", name, m.Data)
-	}
-	return sets
 }
 
 func hasTargetRnicLabels(set attribute.Set) bool {
@@ -117,7 +66,7 @@ var (
 func assertDefaultMetricsUnlabelled(t *testing.T, rm *metricdata.ResourceMetrics) {
 	t.Helper()
 	for _, name := range defaultProbeMetrics {
-		for _, set := range dataPointAttrs(t, rm, name) {
+		for _, set := range otelmetrics.DataPointAttrs(t, rm, name) {
 			if hasTargetRnicLabels(set) {
 				t.Errorf("%s has destination-RNIC labels: %v", name, set.ToSlice())
 			}
@@ -131,7 +80,7 @@ func TestRecordProbeResult_TargetRnicMetricsOffByDefault(t *testing.T) {
 	rm := recordAndCollect(t, nil, successfulResult("host-b", "mlx5_1", "ens2f0", false))
 
 	for _, name := range append(targetCounterMetrics, targetHistogramMetrics...) {
-		if m := findMetric(rm, name); m != nil {
+		if m := otelmetrics.Find(rm, name); m != nil {
 			t.Errorf("%s exported by default: %+v", name, m.Data)
 		}
 	}
@@ -155,21 +104,21 @@ func TestRecordProbeResult_TargetRnicCounters(t *testing.T) {
 		"rpingmesh.target_rnic.probe_failed_total":  {"host-c", "mlx5_2", "ens3f0"},
 	}
 	for name, vals := range want {
-		sets := dataPointAttrs(t, rm, name)
+		sets := otelmetrics.DataPointAttrs(t, rm, name)
 		if len(sets) != 1 || targetRnicValues(sets[0]) != vals {
 			t.Errorf("%s attributes = %v, want target labels %v", name, sets, vals)
 		}
 	}
-	if sets := dataPointAttrs(t, rm, "rpingmesh.target_rnic.probe_failed_total"); len(sets) == 1 {
+	if sets := otelmetrics.DataPointAttrs(t, rm, "rpingmesh.target_rnic.probe_failed_total"); len(sets) == 1 {
 		if v, _ := sets[0].Value("reason"); v.AsString() != reasonTimeout {
 			t.Errorf("target_rnic.probe_failed_total reason = %q, want %q", v.AsString(), reasonTimeout)
 		}
 	}
-	if sets := dataPointAttrs(t, rm, "rpingmesh.target_rnic.probe_total"); len(sets) != 2 {
+	if sets := otelmetrics.DataPointAttrs(t, rm, "rpingmesh.target_rnic.probe_total"); len(sets) != 2 {
 		t.Errorf("target_rnic.probe_total has %d series, want one per target RNIC (2)", len(sets))
 	}
 	for _, name := range targetHistogramMetrics {
-		if m := findMetric(rm, name); m != nil {
+		if m := otelmetrics.Find(rm, name); m != nil {
 			t.Errorf("%s exported in counters mode", name)
 		}
 	}
@@ -183,7 +132,7 @@ func TestRecordProbeResult_TargetRnicHistograms(t *testing.T) {
 		successfulResult("host-b", "mlx5_1", "ens2f0", false))
 
 	for _, name := range targetHistogramMetrics {
-		sets := dataPointAttrs(t, rm, name)
+		sets := otelmetrics.DataPointAttrs(t, rm, name)
 		if len(sets) != 1 || targetRnicValues(sets[0]) != [3]string{"host-b", "mlx5_1", "ens2f0"} {
 			t.Errorf("%s attributes = %v, want destination-RNIC labels", name, sets)
 		}
@@ -210,7 +159,7 @@ func TestRecordProbeResult_TargetRnicScope(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rm := recordAndCollect(t, []Option{WithTargetRnicLabels(tc.labels)}, sampled)
-			sets := dataPointAttrs(t, rm, "rpingmesh.target_rnic.probe_total")
+			sets := otelmetrics.DataPointAttrs(t, rm, "rpingmesh.target_rnic.probe_total")
 			if len(sets) != 1 || targetRnicValues(sets[0]) != tc.want {
 				t.Errorf("target_rnic.probe_total attributes = %v, want target labels %v", sets, tc.want)
 			}
@@ -231,7 +180,7 @@ func TestRecordProbeResult_TargetRnicOverflowIsolated(t *testing.T) {
 		[]Option{WithTargetRnicLabels(TargetRnicLabels{Enabled: true})}, results...)
 
 	overflow := attribute.Key("otel.metric.overflow")
-	targetSets := dataPointAttrs(t, rm, "rpingmesh.target_rnic.probe_total")
+	targetSets := otelmetrics.DataPointAttrs(t, rm, "rpingmesh.target_rnic.probe_total")
 	var sawOverflow bool
 	for _, set := range targetSets {
 		if _, ok := set.Value(overflow); ok {
@@ -242,7 +191,7 @@ func TestRecordProbeResult_TargetRnicOverflowIsolated(t *testing.T) {
 		t.Fatalf("target_rnic.probe_total did not overflow at limit %d: %v", limit, targetSets)
 	}
 
-	sets := dataPointAttrs(t, rm, "rpingmesh.probe_total")
+	sets := otelmetrics.DataPointAttrs(t, rm, "rpingmesh.probe_total")
 	if len(sets) != 1 {
 		t.Fatalf("probe_total has %d series, want 1 ToR-level series", len(sets))
 	}

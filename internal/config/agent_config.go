@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/spf13/pflag"
-	"github.com/spf13/viper"
 	"github.com/yuuki/rpingmesh/internal/lldp"
 	"github.com/yuuki/rpingmesh/internal/logging"
 	"github.com/yuuki/rpingmesh/internal/probe"
@@ -299,97 +298,73 @@ type AgentConfig struct {
 	ThrottleCPUPercent float64 `mapstructure:"throttle_cpu_percent"`
 }
 
+// agentKeys is the single source of agent config keys, defaults and flag
+// help. Order matches the AgentConfig field order; it does not affect
+// --help, which pflag sorts by name.
+var agentKeys = []keySpec{
+	{key: "agent_id", def: "", help: "Agent ID (defaults to hostname if empty)"},
+	{key: "hostname", def: "", noFlag: true},
+	{key: "tor_id", def: "", help: "Top-of-Rack switch identifier"},
+	{key: "device_tor_ids", def: map[string]string{}, noFlag: true},
+	{key: "plane_id", def: "", help: "Network plane (rail) of this host's RNICs; restricts inter-ToR and untagged pinglists to the same plane (empty = no restriction)"},
+	{key: "device_plane_ids", def: map[string]string{}, noFlag: true},
+	{key: "lldp_tor_discovery", def: false, help: "Derive each RDMA device's ToR ID from its LLDP neighbor (lldpd) at startup"},
+	{key: "lldp_tor_id_field", def: lldp.FieldSystemName, help: "LLDP neighbor attribute used as the ToR ID: system_name or chassis_id"},
+	{key: "lldpcli_path", def: lldp.DefaultCLIPath, help: "Path to the lldpd client used for LLDP ToR discovery"},
+	{key: "lldp_discovery_timeout_sec", def: uint32(DefaultLLDPDiscoveryTimeoutSec), help: "Max startup wait for LLDP neighbors on every RDMA device (0 = query once)"},
+	{key: "controller_addr", def: "localhost:50051", help: "Controller gRPC address"},
+	{key: "log_level", def: "info", help: "Log level (debug, info, warn, error)"},
+	{key: "log_format", def: logging.DefaultFormat, help: "Log output format: console or json"},
+	{key: "probe_interval_ms", def: uint32(500), help: "Minimum interval in milliseconds between two probes to the same target (per-target rate ceiling)"},
+	{key: "otel_collector_addr", def: "localhost:4317", help: "OpenTelemetry collector address"},
+	{key: "metrics_enabled", def: true, help: "Enable OpenTelemetry metrics export"},
+	{key: "metrics_target_rnic_labels", def: DefaultMetricsTargetRnicLabels, noFlag: true},
+	{key: "metrics_target_rnic_labels_scope", def: DefaultMetricsTargetRnicLabelsScope, noFlag: true},
+	{key: "metrics_cardinality_limit", def: 0, noFlag: true},
+	{key: "metrics_prober_delay_target_tor", def: false, noFlag: true},
+	{key: "metrics_responder_delay_target_tor", def: true, noFlag: true},
+	{key: "allowed_device_names", def: []string{}, help: "List of allowed RDMA device names (empty = all)"},
+	{key: "excluded_device_names", def: []string{}, help: "List of RDMA device names never to open (applied after allowed-device-names)"},
+	{key: "excluded_gid_cidrs", def: []string{}, help: "Networks (CIDRs) whose RDMA devices are never used, matched against each device's GID at gid-index"},
+	{key: "mapped_devices_only", def: false, help: "Use only the RDMA devices listed in device_tor_ids (requires a non-empty device_tor_ids)"},
+	{key: "gid_index", def: 0, help: "GID index to use for RDMA devices (0-255)"},
+	{key: "service_level", def: 0, help: "Service Level (SL, PFC priority) for Address Handles (0-7)"},
+	{key: "traffic_class", def: 0, help: "GRH traffic class (DSCP << 2) for Address Handles (0-255)"},
+	{key: "cq_poll_mode", def: DefaultCQPollMode, help: "CQ poller wait mode: auto, event or busy"},
+	{key: "event_ring_capacity", def: uint32(DefaultEventRingCapacity), help: "Completion events each prober/responder event ring holds (power of two, 64-65536)"},
+	{key: "pinglist_update_interval_sec", def: uint32(300), help: "Pinglist update interval in seconds"},
+	{key: "target_probe_rate_per_second", def: DefaultTargetProbeRatePerSecond, help: "Legacy uniform probe rate per second per target (fallback for the per-type rates below when they are 0)"},
+	{key: "tor_mesh_probe_rate_per_second", def: DefaultTorMeshProbeRatePerSecond, help: "Probe rate per second per ToR-mesh target (0 = inherit target-probe-rate-per-second)"},
+	{key: "inter_tor_probe_rate_per_second", def: DefaultInterTorProbeRatePerSecond, help: "Probe rate per second per inter-ToR target (0 = inherit target-probe-rate-per-second)"},
+	{key: "flow_label_rotation_period_sec", def: uint32(DefaultFlowLabelRotationPeriodSec), help: "Period (seconds) over which the rotating ~20% of each target's ECMP flow-label set is refreshed"},
+	{key: "analysis_report_enabled", def: true, help: "Enable per-path window aggregation and SLA reporting to the controller"},
+	{key: "analysis_window_sec", def: uint32(DefaultAnalysisWindowSec), help: "Per-path aggregation window length in seconds"},
+	{key: "tls_mode", def: TLSModeDisabled, help: "gRPC transport security mode for the controller connection (disabled|tls|mtls)"},
+	{key: "tls_cert_file", def: "", help: "Client certificate file (required when tls-mode=mtls)"},
+	{key: "tls_key_file", def: "", help: "Client private key file (required when tls-mode=mtls)"},
+	{key: "tls_ca_file", def: "", help: "CA file used to verify the controller's certificate (required when tls-mode is tls or mtls)"},
+	{key: "tls_server_name", def: "", help: "Server name for TLS SNI/verification (optional; defaults to the name derived from controller-addr)"},
+	{key: "self_protection_enabled", def: DefaultSelfProtectionEnabled, help: "Enable the resource watchdog that throttles probing (fail-slow) under local CPU/memory pressure"},
+	{key: "watchdog_interval_sec", def: uint32(DefaultWatchdogIntervalSec), help: "How often the self-protection watchdog samples resource usage (seconds)"},
+	{key: "max_memory_mb", def: 0, help: "Soft runtime memory limit in MiB (GOMEMLIMIT via debug.SetMemoryLimit; 0 = disabled). Also the reference budget for memory throttling"},
+	{key: "max_procs", def: 0, help: "Cap runtime.GOMAXPROCS to this many cores (0 = Go default: all cores)"},
+	{key: "throttle_memory_ratio", def: DefaultThrottleMemoryRatio, help: "Fraction of max-memory-mb at which memory throttling engages (0-1; only when max-memory-mb > 0)"},
+	{key: "throttle_cpu_percent", def: float64(DefaultThrottleCPUPercent), help: "Percentage of available CPU capacity (GOMAXPROCS cores) at which CPU throttling engages (0-100)"},
+}
+
 // LoadAgentConfig loads agent configuration from a YAML file, environment
 // variables, CLI flags, and applies defaults. Precedence (highest to
 // lowest) is: CLI flag > environment variable > YAML file > default.
-// Environment variables use the prefix RPINGMESH_ and replace hyphens with
-// underscores (e.g., RPINGMESH_CONTROLLER_ADDR). If flags is non-nil, it is
-// bound to viper so that explicitly-set flags take priority; pass the same
-// FlagSet given to BindAgentFlags.
+// Environment variables are RPINGMESH_ plus the upper-cased config key
+// (e.g., RPINGMESH_CONTROLLER_ADDR). If flags is non-nil, it is bound to
+// viper so that explicitly-set flags take priority; pass the same FlagSet
+// given to BindAgentFlags.
 func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, error) {
-	v := viper.New()
-
-	// Set defaults
-	v.SetDefault("agent_id", "")
-	v.SetDefault("hostname", "")
-	v.SetDefault("tor_id", "")
-	v.SetDefault("device_tor_ids", map[string]string{})
-	v.SetDefault("plane_id", "")
-	v.SetDefault("device_plane_ids", map[string]string{})
-	v.SetDefault("lldp_tor_discovery", false)
-	v.SetDefault("lldp_tor_id_field", lldp.FieldSystemName)
-	v.SetDefault("lldpcli_path", lldp.DefaultCLIPath)
-	v.SetDefault("lldp_discovery_timeout_sec", DefaultLLDPDiscoveryTimeoutSec)
-	v.SetDefault("controller_addr", "localhost:50051")
-	v.SetDefault("log_level", "info")
-	v.SetDefault("log_format", logging.DefaultFormat)
-	v.SetDefault("probe_interval_ms", 500)
-	v.SetDefault("otel_collector_addr", "localhost:4317")
-	v.SetDefault("metrics_enabled", true)
-	v.SetDefault("metrics_target_rnic_labels", DefaultMetricsTargetRnicLabels)
-	v.SetDefault("metrics_target_rnic_labels_scope", DefaultMetricsTargetRnicLabelsScope)
-	v.SetDefault("metrics_cardinality_limit", 0)
-	v.SetDefault("metrics_prober_delay_target_tor", false)
-	v.SetDefault("metrics_responder_delay_target_tor", true)
-	v.SetDefault("allowed_device_names", []string{})
-	v.SetDefault("excluded_device_names", []string{})
-	v.SetDefault("excluded_gid_cidrs", []string{})
-	v.SetDefault("mapped_devices_only", false)
-	v.SetDefault("gid_index", 0)
-	v.SetDefault("service_level", 0)
-	v.SetDefault("traffic_class", 0)
-	v.SetDefault("cq_poll_mode", DefaultCQPollMode)
-	v.SetDefault("event_ring_capacity", DefaultEventRingCapacity)
-	v.SetDefault("pinglist_update_interval_sec", 300)
-	v.SetDefault("target_probe_rate_per_second", DefaultTargetProbeRatePerSecond)
-	v.SetDefault("tor_mesh_probe_rate_per_second", DefaultTorMeshProbeRatePerSecond)
-	v.SetDefault("inter_tor_probe_rate_per_second", DefaultInterTorProbeRatePerSecond)
-	v.SetDefault("flow_label_rotation_period_sec", DefaultFlowLabelRotationPeriodSec)
-	v.SetDefault("analysis_report_enabled", true)
-	v.SetDefault("analysis_window_sec", DefaultAnalysisWindowSec)
-	v.SetDefault("tls_mode", TLSModeDisabled)
-	v.SetDefault("tls_cert_file", "")
-	v.SetDefault("tls_key_file", "")
-	v.SetDefault("tls_ca_file", "")
-	v.SetDefault("tls_server_name", "")
-	v.SetDefault("self_protection_enabled", DefaultSelfProtectionEnabled)
-	v.SetDefault("watchdog_interval_sec", DefaultWatchdogIntervalSec)
-	v.SetDefault("max_memory_mb", 0)
-	v.SetDefault("max_procs", 0)
-	v.SetDefault("throttle_memory_ratio", DefaultThrottleMemoryRatio)
-	v.SetDefault("throttle_cpu_percent", DefaultThrottleCPUPercent)
-
-	// Enable environment variable override with RPINGMESH_ prefix.
-	// Underscores in env var names map to underscores in config keys.
-	v.SetEnvPrefix("RPINGMESH")
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	v.AutomaticEnv()
-
-	// Bind CLI flags so that explicitly-set flags take precedence over
-	// environment variables, config file values, and defaults.
-	if flags != nil {
-		if err := bindPFlags(v, flags); err != nil {
-			return nil, err
-		}
-	}
-
-	// Load config file if a path was provided
-	if configPath != "" {
-		v.SetConfigFile(configPath)
-	} else {
-		// Search default locations when no explicit path is given
-		v.SetConfigName("agent")
-		v.SetConfigType("yaml")
-		v.AddConfigPath(".")
-		v.AddConfigPath("$HOME/.rpingmesh")
-		v.AddConfigPath("/etc/rpingmesh")
-	}
-
-	if err := readConfigFile(v, configPath); err != nil {
+	v, err := newViper("agent", configPath, flags, agentKeys)
+	if err != nil {
 		return nil, err
 	}
 
-	// Auto-detect hostname if not explicitly configured
 	hostname := v.GetString("hostname")
 	if hostname == "" {
 		h, err := os.Hostname()
@@ -399,7 +374,6 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		hostname = h
 	}
 
-	// Fall back to hostname if agent_id is not set
 	agentID := v.GetString("agent_id")
 	if agentID == "" {
 		agentID = hostname
@@ -409,9 +383,9 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		AgentID:                        agentID,
 		HostName:                       hostname,
 		TorID:                          v.GetString("tor_id"),
-		DeviceTorIDs:                   canonicalDeviceTorIDs(v.GetStringMapString("device_tor_ids")),
+		DeviceTorIDs:                   canonicalDeviceMap(v.GetStringMapString("device_tor_ids"), probe.CanonicalTorID),
 		PlaneID:                        probe.CanonicalPlaneID(v.GetString("plane_id")),
-		DevicePlaneIDs:                 canonicalDevicePlaneIDs(v.GetStringMapString("device_plane_ids")),
+		DevicePlaneIDs:                 canonicalDeviceMap(v.GetStringMapString("device_plane_ids"), probe.CanonicalPlaneID),
 		LLDPTorDiscovery:               v.GetBool("lldp_tor_discovery"),
 		LLDPTorIDField:                 v.GetString("lldp_tor_id_field"),
 		LLDPCLIPath:                    v.GetString("lldpcli_path"),
@@ -463,9 +437,51 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	return config, nil
 }
 
+// BindAgentFlags binds common agent CLI flags to a pflag.FlagSet.
+// These flags can later be bound to a viper instance for unified config resolution.
+func BindAgentFlags(flags *pflag.FlagSet) {
+	registerFlags(flags, agentKeys)
+}
+
 // Validate checks that the agent configuration is well-formed. It returns
-// an error describing the first invalid field encountered.
+// an error describing the first invalid field encountered. The helpers run
+// in a fixed order so that the first error for a given input is stable.
 func (c *AgentConfig) Validate() error {
+	if err := c.validateTorAndPlaneIDs(); err != nil {
+		return err
+	}
+	if err := c.validateDeviceSelection(); err != nil {
+		return err
+	}
+	if err := c.validateRDMAAddressing(); err != nil {
+		return err
+	}
+	if err := logging.ValidateFormat(c.LogFormat); err != nil {
+		return err
+	}
+	if err := c.validateCompletionPolling(); err != nil {
+		return err
+	}
+	if err := c.validateMetrics(); err != nil {
+		return err
+	}
+	if err := c.validateProbing(); err != nil {
+		return err
+	}
+	if err := c.validateSelfProtection(); err != nil {
+		return err
+	}
+	if err := validateOTLPEndpoint(c.OtelCollectorAddr); err != nil {
+		return err
+	}
+	// The agent is the gRPC client of the controller connection: fail fast
+	// if the certificate files required by tls_mode are missing, rather
+	// than at the first dial attempt.
+	return validateTLSFiles(tlsRoleClient, c.TLSMode, c.TLSCertFile, c.TLSKeyFile, c.TLSCAFile)
+}
+
+// validateTorAndPlaneIDs checks tor_id, device_tor_ids and device_plane_ids.
+func (c *AgentConfig) validateTorAndPlaneIDs() error {
 	// The display label for unset ToRs must not be used as a real rack name:
 	// an older controller would persist it as a named ToR and collide with
 	// untagged metric series after upgrade.
@@ -495,7 +511,12 @@ func (c *AgentConfig) Validate() error {
 			return fmt.Errorf("device_plane_ids[%s] must not be empty; omit the device to use plane_id", dev)
 		}
 	}
+	return nil
+}
 
+// validateDeviceSelection checks the device allow/exclude lists,
+// excluded_gid_cidrs, mapped_devices_only and the LLDP ToR-discovery field.
+func (c *AgentConfig) validateDeviceSelection() error {
 	for _, dev := range c.ExcludedDeviceNames {
 		if strings.TrimSpace(dev) == "" {
 			return fmt.Errorf("excluded_device_names has an empty device name")
@@ -523,8 +544,12 @@ func (c *AgentConfig) Validate() error {
 		return fmt.Errorf("lldp_tor_id_field must be %q or %q, got: %q",
 			lldp.FieldSystemName, lldp.FieldChassisID, c.LLDPTorIDField)
 	}
+	return nil
+}
 
-	// GID index must be non-negative; it indexes into the RNIC's GID table.
+// validateRDMAAddressing checks gid_index, service_level and traffic_class,
+// the values the agent puts into every Address Handle.
+func (c *AgentConfig) validateRDMAAddressing() error {
 	// The upper bound is a coarse sanity check, not the real device limit
 	// (which is only known at device-open time): it exists purely to reject
 	// obviously-bogus values (e.g. a typo like 100000) before they reach the
@@ -544,11 +569,11 @@ func (c *AgentConfig) Validate() error {
 	if c.TrafficClass < 0 || c.TrafficClass > 255 {
 		return fmt.Errorf("traffic_class must be between 0 and 255, got: %d", c.TrafficClass)
 	}
+	return nil
+}
 
-	if err := logging.ValidateFormat(c.LogFormat); err != nil {
-		return err
-	}
-
+// validateCompletionPolling checks cq_poll_mode and event_ring_capacity.
+func (c *AgentConfig) validateCompletionPolling() error {
 	// An empty mode (a zero-value AgentConfig) means the default, auto.
 	switch c.CQPollMode {
 	case "", CQPollModeAuto, CQPollModeEvent, CQPollModeBusy:
@@ -563,7 +588,12 @@ func (c *AgentConfig) Validate() error {
 		return fmt.Errorf("event_ring_capacity must be a power of two between %d and %d, got: %d",
 			MinEventRingCapacity, MaxEventRingCapacity, n)
 	}
+	return nil
+}
 
+// validateMetrics checks the metrics_target_rnic_labels* and
+// metrics_cardinality_limit knobs.
+func (c *AgentConfig) validateMetrics() error {
 	// Empty values (a zero-value AgentConfig) mean the defaults, off and
 	// stable.
 	switch c.MetricsTargetRnicLabels {
@@ -587,9 +617,14 @@ func (c *AgentConfig) Validate() error {
 		return fmt.Errorf("metrics_cardinality_limit must be 0 (OTel SDK default) or >= %d, got: %d",
 			MinMetricsCardinalityLimit, c.MetricsCardinalityLimit)
 	}
+	return nil
+}
 
-	// A zero or negative probe interval would make time.NewTicker panic at
-	// runtime, so reject it up front instead of failing deep in the prober.
+// validateProbing checks the probe interval, flow-label rotation, per-type
+// probe rates and the analysis window.
+func (c *AgentConfig) validateProbing() error {
+	// A zero probe interval would make time.NewTicker panic at runtime, so
+	// reject it up front instead of failing deep in the prober.
 	if c.ProbeIntervalMS == 0 {
 		return fmt.Errorf("probe_interval_ms must be > 0, got: %d", c.ProbeIntervalMS)
 	}
@@ -599,10 +634,10 @@ func (c *AgentConfig) Validate() error {
 		return fmt.Errorf("flow_label_rotation_period_sec must be > 0, got: %d", c.FlowLabelRotationPeriodSec)
 	}
 
-	// Per-pinglist-type probe rates must be non-negative; 0 selects the
-	// backward-compatible fallback to target_probe_rate_per_second. A negative
-	// value is meaningless (the limiter treats <=0 as "disabled", which would
-	// silently defeat the intended cap), so reject it up front.
+	// 0 selects the backward-compatible fallback to
+	// target_probe_rate_per_second. A negative value is meaningless (the
+	// limiter treats <=0 as "disabled", which would silently defeat the
+	// intended cap), so reject it up front.
 	if c.TorMeshProbeRatePerSecond < 0 {
 		return fmt.Errorf("tor_mesh_probe_rate_per_second must be >= 0, got: %d", c.TorMeshProbeRatePerSecond)
 	}
@@ -615,7 +650,12 @@ func (c *AgentConfig) Validate() error {
 	if c.AnalysisReportEnabled && c.AnalysisWindowSec == 0 {
 		return fmt.Errorf("analysis_window_sec must be > 0 when analysis_report_enabled, got: %d", c.AnalysisWindowSec)
 	}
+	return nil
+}
 
+// validateSelfProtection checks the runtime limits and, only when the
+// watchdog is enabled, its thresholds.
+func (c *AgentConfig) validateSelfProtection() error {
 	// Hard runtime limits are honored regardless of self-protection, so range
 	// checks always apply. Negative values are meaningless (the runtime APIs
 	// take non-negative sizes/counts), so reject them up front.
@@ -629,35 +669,24 @@ func (c *AgentConfig) Validate() error {
 	// The throttle thresholds only drive behavior when self-protection is
 	// enabled; validate them only then so a disabled feature never blocks
 	// startup over a knob it does not use.
-	if c.SelfProtectionEnabled {
-		// The interval drives a time.Ticker, which panics on a non-positive
-		// period.
-		if c.WatchdogIntervalSec == 0 {
-			return fmt.Errorf("watchdog_interval_sec must be > 0 when self_protection_enabled, got: %d", c.WatchdogIntervalSec)
-		}
-		// The memory ratio is a fraction of the limit; a value outside (0, 1]
-		// would trigger either never or only after exceeding the limit.
-		if c.ThrottleMemoryRatio <= 0 || c.ThrottleMemoryRatio > 1 {
-			return fmt.Errorf("throttle_memory_ratio must be in (0, 1] when self_protection_enabled, got: %g", c.ThrottleMemoryRatio)
-		}
-		// CPU is measured as a percentage of GOMAXPROCS-core capacity, so the
-		// threshold lives in (0, 100].
-		if c.ThrottleCPUPercent <= 0 || c.ThrottleCPUPercent > 100 {
-			return fmt.Errorf("throttle_cpu_percent must be in (0, 100] when self_protection_enabled, got: %g", c.ThrottleCPUPercent)
-		}
+	if !c.SelfProtectionEnabled {
+		return nil
 	}
-
-	if err := validateOTLPEndpoint(c.OtelCollectorAddr); err != nil {
-		return err
+	// The interval drives a time.Ticker, which panics on a non-positive
+	// period.
+	if c.WatchdogIntervalSec == 0 {
+		return fmt.Errorf("watchdog_interval_sec must be > 0 when self_protection_enabled, got: %d", c.WatchdogIntervalSec)
 	}
-
-	// The agent is the gRPC client of the controller connection: fail fast
-	// if the certificate files required by tls_mode are missing, rather
-	// than at the first dial attempt.
-	if err := validateTLSFiles(tlsRoleClient, c.TLSMode, c.TLSCertFile, c.TLSKeyFile, c.TLSCAFile); err != nil {
-		return err
+	// The memory ratio is a fraction of the limit; a value outside (0, 1]
+	// would trigger either never or only after exceeding the limit.
+	if c.ThrottleMemoryRatio <= 0 || c.ThrottleMemoryRatio > 1 {
+		return fmt.Errorf("throttle_memory_ratio must be in (0, 1] when self_protection_enabled, got: %g", c.ThrottleMemoryRatio)
 	}
-
+	// CPU is measured as a percentage of GOMAXPROCS-core capacity, so the
+	// threshold lives in (0, 100].
+	if c.ThrottleCPUPercent <= 0 || c.ThrottleCPUPercent > 100 {
+		return fmt.Errorf("throttle_cpu_percent must be in (0, 100] when self_protection_enabled, got: %g", c.ThrottleCPUPercent)
+	}
 	return nil
 }
 
@@ -682,73 +711,47 @@ func (c *AgentConfig) EffectiveInterTorProbeRate() int {
 	return c.TargetProbeRatePerSecond
 }
 
-// BindAgentFlags binds common agent CLI flags to a pflag.FlagSet.
-// These flags can later be bound to a viper instance for unified config resolution.
-func BindAgentFlags(flags *pflag.FlagSet) {
-	flags.String("agent-id", "", "Agent ID (defaults to hostname if empty)")
-	flags.String("tor-id", "", "Top-of-Rack switch identifier")
-	flags.String("plane-id", "", "Network plane (rail) of this host's RNICs; restricts inter-ToR and untagged pinglists to the same plane (empty = no restriction)")
-	flags.Bool("lldp-tor-discovery", false, "Derive each RDMA device's ToR ID from its LLDP neighbor (lldpd) at startup")
-	flags.String("lldp-tor-id-field", lldp.FieldSystemName, "LLDP neighbor attribute used as the ToR ID: system_name or chassis_id")
-	flags.String("lldpcli-path", lldp.DefaultCLIPath, "Path to the lldpd client used for LLDP ToR discovery")
-	flags.Uint32("lldp-discovery-timeout-sec", DefaultLLDPDiscoveryTimeoutSec, "Max startup wait for LLDP neighbors on every RDMA device (0 = query once)")
-	flags.String("controller-addr", "localhost:50051", "Controller gRPC address")
-	flags.String("log-level", "info", "Log level (debug, info, warn, error)")
-	flags.String("log-format", logging.DefaultFormat, "Log output format: console or json")
-	flags.Uint32("probe-interval-ms", 500, "Minimum interval in milliseconds between two probes to the same target (per-target rate ceiling)")
-	flags.String("otel-collector-addr", "localhost:4317", "OpenTelemetry collector address")
-	flags.Bool("metrics-enabled", true, "Enable OpenTelemetry metrics export")
-	flags.StringSlice("allowed-device-names", []string{}, "List of allowed RDMA device names (empty = all)")
-	flags.StringSlice("excluded-device-names", []string{}, "List of RDMA device names never to open (applied after allowed-device-names)")
-	flags.StringSlice("excluded-gid-cidrs", []string{}, "Networks (CIDRs) whose RDMA devices are never used, matched against each device's GID at gid-index")
-	flags.Bool("mapped-devices-only", false, "Use only the RDMA devices listed in device_tor_ids (requires a non-empty device_tor_ids)")
-	flags.Int("gid-index", 0, "GID index to use for RDMA devices (0-255)")
-	flags.Int("service-level", 0, "Service Level (SL, PFC priority) for Address Handles (0-7)")
-	flags.Int("traffic-class", 0, "GRH traffic class (DSCP << 2) for Address Handles (0-255)")
-	flags.String("cq-poll-mode", DefaultCQPollMode, "CQ poller wait mode: auto, event or busy")
-	flags.Uint32("event-ring-capacity", DefaultEventRingCapacity, "Completion events each prober/responder event ring holds (power of two, 64-65536)")
-	flags.Uint32("pinglist-update-interval-sec", 300, "Pinglist update interval in seconds")
-	flags.Int("target-probe-rate-per-second", DefaultTargetProbeRatePerSecond, "Legacy uniform probe rate per second per target (fallback for the per-type rates below when they are 0)")
-	flags.Int("tor-mesh-probe-rate-per-second", DefaultTorMeshProbeRatePerSecond, "Probe rate per second per ToR-mesh target (0 = inherit target-probe-rate-per-second)")
-	flags.Int("inter-tor-probe-rate-per-second", DefaultInterTorProbeRatePerSecond, "Probe rate per second per inter-ToR target (0 = inherit target-probe-rate-per-second)")
-	flags.Uint32("flow-label-rotation-period-sec", DefaultFlowLabelRotationPeriodSec, "Period (seconds) over which the rotating ~20% of each target's ECMP flow-label set is refreshed")
-	flags.Bool("analysis-report-enabled", true, "Enable per-path window aggregation and SLA reporting to the controller")
-	flags.Uint32("analysis-window-sec", DefaultAnalysisWindowSec, "Per-path aggregation window length in seconds")
-	flags.String("tls-mode", TLSModeDisabled, "gRPC transport security mode for the controller connection (disabled|tls|mtls)")
-	flags.String("tls-cert-file", "", "Client certificate file (required when tls-mode=mtls)")
-	flags.String("tls-key-file", "", "Client private key file (required when tls-mode=mtls)")
-	flags.String("tls-ca-file", "", "CA file used to verify the controller's certificate (required when tls-mode is tls or mtls)")
-	flags.String("tls-server-name", "", "Server name for TLS SNI/verification (optional; defaults to the name derived from controller-addr)")
-	flags.Bool("self-protection-enabled", DefaultSelfProtectionEnabled, "Enable the resource watchdog that throttles probing (fail-slow) under local CPU/memory pressure")
-	flags.Uint32("watchdog-interval-sec", DefaultWatchdogIntervalSec, "How often the self-protection watchdog samples resource usage (seconds)")
-	flags.Int("max-memory-mb", 0, "Soft runtime memory limit in MiB (GOMEMLIMIT via debug.SetMemoryLimit; 0 = disabled). Also the reference budget for memory throttling")
-	flags.Int("max-procs", 0, "Cap runtime.GOMAXPROCS to this many cores (0 = Go default: all cores)")
-	flags.Float64("throttle-memory-ratio", DefaultThrottleMemoryRatio, "Fraction of max-memory-mb at which memory throttling engages (0-1; only when max-memory-mb > 0)")
-	flags.Float64("throttle-cpu-percent", DefaultThrottleCPUPercent, "Percentage of available CPU capacity (GOMAXPROCS cores) at which CPU throttling engages (0-100)")
+// deviceNameMatches reports whether a configured device name refers to
+// deviceName. Both sides are trimmed and compared case-insensitively, so
+// YAML spacing and the casing of a kernel device name never cause a miss.
+func deviceNameMatches(configured, deviceName string) bool {
+	return strings.EqualFold(strings.TrimSpace(configured), strings.TrimSpace(deviceName))
 }
 
-// canonicalDeviceTorIDs lower-cases device-name keys and canonicalizes ToR
-// values so lookups in TorIDForDevice are case-insensitive and whitespace-safe.
-func canonicalDeviceTorIDs(in map[string]string) map[string]string {
+// containsDeviceName reports whether names lists deviceName (see
+// deviceNameMatches).
+func containsDeviceName(names []string, deviceName string) bool {
+	for _, n := range names {
+		if deviceNameMatches(n, deviceName) {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupDeviceName returns the value keyed by deviceName in a device map
+// (see deviceNameMatches) and whether one exists. It scans rather than
+// indexing so that maps built by hand (not through canonicalDeviceMap)
+// still match case-insensitively.
+func lookupDeviceName(m map[string]string, deviceName string) (string, bool) {
+	for dev, val := range m {
+		if deviceNameMatches(dev, deviceName) {
+			return val, true
+		}
+	}
+	return "", false
+}
+
+// canonicalDeviceMap lower-cases device-name keys and canonicalizes values
+// with canon (probe.CanonicalTorID or probe.CanonicalPlaneID). An empty
+// input yields nil.
+func canonicalDeviceMap(in map[string]string, canon func(string) string) map[string]string {
 	if len(in) == 0 {
 		return nil
 	}
 	out := make(map[string]string, len(in))
-	for dev, tor := range in {
-		out[strings.ToLower(strings.TrimSpace(dev))] = probe.CanonicalTorID(tor)
-	}
-	return out
-}
-
-// canonicalDevicePlaneIDs lower-cases device-name keys and trims plane values
-// so lookups in PlaneIDForDevice are case-insensitive and whitespace-safe.
-func canonicalDevicePlaneIDs(in map[string]string) map[string]string {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for dev, plane := range in {
-		out[strings.ToLower(strings.TrimSpace(dev))] = probe.CanonicalPlaneID(plane)
+	for dev, val := range in {
+		out[strings.ToLower(strings.TrimSpace(dev))] = canon(val)
 	}
 	return out
 }
@@ -759,25 +762,13 @@ func (c *AgentConfig) IsDeviceAllowed(deviceName string) bool {
 	if len(c.AllowedDeviceNames) == 0 {
 		return true
 	}
-	name := strings.TrimSpace(deviceName)
-	for _, allowed := range c.AllowedDeviceNames {
-		if strings.EqualFold(strings.TrimSpace(allowed), name) {
-			return true
-		}
-	}
-	return false
+	return containsDeviceName(c.AllowedDeviceNames, deviceName)
 }
 
 // IsDeviceExcluded reports whether an RDMA device is listed in
 // excluded_device_names. Device names match case-insensitively.
 func (c *AgentConfig) IsDeviceExcluded(deviceName string) bool {
-	name := strings.TrimSpace(deviceName)
-	for _, excluded := range c.ExcludedDeviceNames {
-		if strings.EqualFold(strings.TrimSpace(excluded), name) {
-			return true
-		}
-	}
-	return false
+	return containsDeviceName(c.ExcludedDeviceNames, deviceName)
 }
 
 // ExcludedGIDCIDR returns the excluded_gid_cidrs entry that contains ip (a
@@ -801,13 +792,11 @@ func (c *AgentConfig) ExcludedGIDCIDR(ip string) (string, bool) {
 // DeviceTorID returns the canonical device_tor_ids entry for an RDMA device
 // and whether one exists. Device names match case-insensitively.
 func (c *AgentConfig) DeviceTorID(deviceName string) (string, bool) {
-	name := strings.TrimSpace(deviceName)
-	for dev, tor := range c.DeviceTorIDs {
-		if strings.EqualFold(strings.TrimSpace(dev), name) {
-			return probe.CanonicalTorID(tor), true
-		}
+	tor, ok := lookupDeviceName(c.DeviceTorIDs, deviceName)
+	if !ok {
+		return "", false
 	}
-	return "", false
+	return probe.CanonicalTorID(tor), true
 }
 
 // TorIDForDevice returns the canonical ToR ID for an RDMA device: its
@@ -822,13 +811,11 @@ func (c *AgentConfig) TorIDForDevice(deviceName string) string {
 // DevicePlaneID returns the canonical device_plane_ids entry for an RDMA
 // device and whether one exists. Device names match case-insensitively.
 func (c *AgentConfig) DevicePlaneID(deviceName string) (string, bool) {
-	name := strings.TrimSpace(deviceName)
-	for dev, plane := range c.DevicePlaneIDs {
-		if strings.EqualFold(strings.TrimSpace(dev), name) {
-			return probe.CanonicalPlaneID(plane), true
-		}
+	plane, ok := lookupDeviceName(c.DevicePlaneIDs, deviceName)
+	if !ok {
+		return "", false
 	}
-	return "", false
+	return probe.CanonicalPlaneID(plane), true
 }
 
 // PlaneIDForDevice returns the canonical plane of an RDMA device: its

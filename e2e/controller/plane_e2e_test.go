@@ -44,44 +44,13 @@ func executeSQL(t *testing.T, stmts ...string) {
 	}
 }
 
-func registerPlaned(t *testing.T, agentID, host string, rnics ...*controller_agent.RnicInfo) *controller_agent.AgentRegistrationResponse {
-	t.Helper()
-	client := newClient(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	resp, err := client.RegisterAgent(ctx, &controller_agent.AgentRegistrationRequest{
-		AgentId: agentID, Hostname: host, Rnics: rnics,
-	})
-	if err != nil || !resp.GetSuccess() {
-		t.Fatalf("RegisterAgent(%s): resp=%v err=%v", agentID, resp, err)
-	}
-	return resp
-}
-
-func planedRNIC(gid string, qpn uint32, host, tor, device, plane string) *controller_agent.RnicInfo {
-	r := makeRNIC(gid, qpn, "10.9.0.1", host, tor, device)
-	r.PlaneId = plane
-	return r
-}
-
-func planedPinglist(t *testing.T, requesterGID, torID, planeID string, ptype controller_agent.PinglistType) []*controller_agent.PingTarget {
-	t.Helper()
-	client := newClient(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	targets, err := client.GetPinglist(ctx, "plane-requester", torID, requesterGID, planeID, ptype)
-	if err != nil {
-		t.Fatalf("GetPinglist: %v", err)
-	}
-	return targets
-}
-
 // TestPlaneRestrictedPinglists drives a rail-optimized topology (two rails,
 // two leaves per rail) through the real controller and rqlite, so the
 // plane_id column round-trips through registration, storage, and the
 // pinglist queries.
 func TestPlaneRestrictedPinglists(t *testing.T) {
 	cleanDatabase(t)
+	client := newClient(t)
 
 	for h := 1; h <= 4; h++ {
 		host := fmt.Sprintf("plane-host-%d", h)
@@ -89,7 +58,7 @@ func TestPlaneRestrictedPinglists(t *testing.T) {
 		if h > 2 {
 			leaf = "b"
 		}
-		resp := registerPlaned(t, fmt.Sprintf("plane-agent-%d", h), host,
+		resp := registerAgent(t, client, fmt.Sprintf("plane-agent-%d", h), "", host, "",
 			planedRNIC(fmt.Sprintf("fe80::%d0", h), uint32(500+h), host, "leaf-r0-"+leaf, "mlx5_0", "rail0"),
 			planedRNIC(fmt.Sprintf("fe80::%d1", h), uint32(600+h), host, "leaf-r1-"+leaf, "mlx5_1", "rail1"),
 		)
@@ -99,7 +68,7 @@ func TestPlaneRestrictedPinglists(t *testing.T) {
 	}
 
 	// Registered plane: rail0 requester samples only rail0 leaves.
-	targets := planedPinglist(t, "fe80::10", "leaf-r0-a", "", controller_agent.PinglistType_INTER_TOR)
+	targets := getPinglist(t, client, "plane-requester", "leaf-r0-a", "fe80::10", "", controller_agent.PinglistType_INTER_TOR)
 	if len(targets) == 0 {
 		t.Fatal("rail0 requester got no inter-ToR targets")
 	}
@@ -110,13 +79,13 @@ func TestPlaneRestrictedPinglists(t *testing.T) {
 	}
 
 	// Unregistered requester: the plane in the request applies.
-	targets = planedPinglist(t, "fe80::99", "leaf-r1-a", "rail1", controller_agent.PinglistType_INTER_TOR)
+	targets = getPinglist(t, client, "plane-requester", "leaf-r1-a", "fe80::99", "rail1", controller_agent.PinglistType_INTER_TOR)
 	if len(targets) != 1 || targets[0].GetTargetTorId() != "leaf-r1-b" {
 		t.Errorf("request-plane fallback: got %v, want one target on leaf-r1-b", targets)
 	}
 
 	// No plane anywhere (legacy requester): every foreign leaf, any rail.
-	targets = planedPinglist(t, "fe80::98", "leaf-r0-a", "", controller_agent.PinglistType_INTER_TOR)
+	targets = getPinglist(t, client, "plane-requester", "leaf-r0-a", "fe80::98", "", controller_agent.PinglistType_INTER_TOR)
 	if !containsTorID(targets, "leaf-r1-a") || !containsTorID(targets, "leaf-r1-b") || !containsTorID(targets, "leaf-r0-b") {
 		t.Errorf("legacy requester: got ToRs %v, want leaf-r0-b, leaf-r1-a and leaf-r1-b", targets)
 	}
@@ -126,14 +95,15 @@ func TestPlaneRestrictedPinglists(t *testing.T) {
 // with a plane, only same-plane RNICs of other hosts are returned.
 func TestPlaneRestrictedUntaggedMesh(t *testing.T) {
 	cleanDatabase(t)
+	client := newClient(t)
 	for h := 1; h <= 3; h++ {
 		host := fmt.Sprintf("untagged-host-%d", h)
-		registerPlaned(t, fmt.Sprintf("untagged-agent-%d", h), host,
+		registerAgent(t, client, fmt.Sprintf("untagged-agent-%d", h), "", host, "",
 			planedRNIC(fmt.Sprintf("fe80::e%d0", h), uint32(700+h), host, "", "mlx5_0", "rail0"),
 			planedRNIC(fmt.Sprintf("fe80::e%d1", h), uint32(800+h), host, "", "mlx5_1", "rail1"),
 		)
 	}
-	targets := planedPinglist(t, "fe80::e10", "", "", controller_agent.PinglistType_TOR_MESH)
+	targets := getPinglist(t, client, "plane-requester", "", "fe80::e10", "", controller_agent.PinglistType_TOR_MESH)
 	if len(targets) != 2 || !containsGID(targets, "fe80::e20") || !containsGID(targets, "fe80::e30") {
 		t.Errorf("untagged rail0 mesh = %v, want fe80::e20 and fe80::e30", targets)
 	}
@@ -186,7 +156,7 @@ func TestRegistryPlaneMigration(t *testing.T) {
 	}
 
 	// The running controller writes through the migrated table.
-	registerPlaned(t, "migrated-agent", "migrated-host",
+	registerAgent(t, newClient(t), "migrated-agent", "", "migrated-host", "",
 		planedRNIC("fe80::f2", 901, "migrated-host", "tor-new", "mlx5_0", "rail0"))
 	row, err := reg.GetRNICByGID(ctx, "fe80::f2")
 	if err != nil || row == nil {

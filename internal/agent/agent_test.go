@@ -45,10 +45,53 @@ func fakeDevice(deviceName, gid string) *rdmabridge.Device {
 // below (logger and resultChan) populated, bypassing NewProber (which
 // requires a real RDMA device and queue).
 func fakeProber(resultChanBuf int) *Prober {
-	return &Prober{
-		logger:     zerolog.Nop(),
-		resultChan: make(chan *probe.ProbeResult, resultChanBuf),
+	p := newTestProber()
+	p.resultChan = make(chan *probe.ProbeResult, resultChanBuf)
+	return p
+}
+
+// setRnics wires fake devices and probers into a (one rnic per index, the
+// longer list wins) with a zero Responder each, for tests that exercise the
+// agent's wiring logic without real RDMA resources.
+func (a *Agent) setRnics(devices []*rdmabridge.Device, probers []*Prober) {
+	a.rnics = nil
+	for i := 0; i < max(len(devices), len(probers)); i++ {
+		r := &rnic{responder: &Responder{}}
+		if i < len(devices) {
+			r.dev = devices[i]
+		}
+		if i < len(probers) {
+			r.prober = probers[i]
+		}
+		a.rnics = append(a.rnics, r)
 	}
+}
+
+// fakeDevices builds one fake device per name, with GIDs "0", "1", ...
+func fakeDevices(names ...string) []*rdmabridge.Device {
+	devices := make([]*rdmabridge.Device, 0, len(names))
+	for i, name := range names {
+		devices = append(devices, fakeDevice(name, string(rune('0'+i))))
+	}
+	return devices
+}
+
+// fakeProbers builds n probers with a one-element result buffer.
+func fakeProbers(n int) []*Prober {
+	probers := make([]*Prober, 0, n)
+	for i := 0; i < n; i++ {
+		probers = append(probers, fakeProber(1))
+	}
+	return probers
+}
+
+// deviceTorIDs returns each rnic's resolved ToR, in order.
+func (a *Agent) deviceTorIDs() []string {
+	tors := make([]string, 0, len(a.rnics))
+	for _, r := range a.rnics {
+		tors = append(tors, r.torID)
+	}
+	return tors
 }
 
 // newTestAgent builds an Agent with the given fake devices and probers
@@ -60,13 +103,13 @@ func newTestAgent(devices []*rdmabridge.Device, probers []*Prober) *Agent {
 		TorID:                     "tor-1",
 		PinglistUpdateIntervalSec: 3600,
 	}
-	return &Agent{
+	a := &Agent{
 		cfg:            cfg,
 		canonicalTorID: probe.CanonicalTorID(cfg.TorID),
-		devices:        devices,
-		probers:        probers,
 		logger:         zerolog.Nop(),
 	}
+	a.setRnics(devices, probers)
+	return a
 }
 
 func TestAgent_CreateClusterMonitors_OnePerDeviceWithMatchingRequesterGID(t *testing.T) {
@@ -79,26 +122,22 @@ func TestAgent_CreateClusterMonitors_OnePerDeviceWithMatchingRequesterGID(t *tes
 	a := newTestAgent(devices, probers)
 	a.createClusterMonitors()
 
-	if len(a.monitors) != 2 {
-		t.Fatalf("expected 2 cluster monitors (one per device), got %d", len(a.monitors))
-	}
-
-	for i, dev := range devices {
-		monitor := a.monitors[i]
-		if monitor.requesterGID != dev.Info.GID {
-			t.Errorf("monitor[%d].requesterGID = %q, want device GID %q", i, monitor.requesterGID, dev.Info.GID)
+	for i, r := range a.rnics {
+		if r.monitor == nil {
+			t.Fatalf("rnic[%d] has no cluster monitor", i)
 		}
-		if monitor.prober != probers[i] {
+		if r.monitor.requesterGID != devices[i].Info.GID {
+			t.Errorf("monitor[%d].requesterGID = %q, want device GID %q", i, r.monitor.requesterGID, devices[i].Info.GID)
+		}
+		if r.monitor.prober != probers[i] {
 			t.Errorf("monitor[%d].prober is not wired to probers[%d]", i, i)
 		}
 	}
 
-	// The two monitors must use distinct requester GIDs, matching the two
-	// distinct devices -- this is the core multi-rail fix: every RNIC
-	// requests its own pinglist instead of all devices sharing devices[0]'s
-	// GID.
-	if a.monitors[0].requesterGID == a.monitors[1].requesterGID {
-		t.Errorf("expected distinct requester GIDs per device, both monitors use %q", a.monitors[0].requesterGID)
+	// Every RNIC requests its own pinglist instead of all devices sharing
+	// the first device's GID.
+	if a.rnics[0].monitor.requesterGID == a.rnics[1].monitor.requesterGID {
+		t.Errorf("expected distinct requester GIDs per device, both monitors use %q", a.rnics[0].monitor.requesterGID)
 	}
 }
 
@@ -390,14 +429,10 @@ func TestAgent_EmptyTorIDUsesStorageForm(t *testing.T) {
 		t.Errorf("registration TorId = %q, want empty", req.GetTorId())
 	}
 
-	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "gid-0")}
-	a.probers = []*Prober{fakeProber(1)}
+	a.setRnics(fakeDevices("rxe0"), fakeProbers(1))
 	a.createClusterMonitors()
-	if len(a.monitors) != 1 {
-		t.Fatalf("monitors = %d, want 1", len(a.monitors))
-	}
-	if a.monitors[0].torID != "" {
-		t.Errorf("monitor.torID = %q, want empty", a.monitors[0].torID)
+	if a.rnics[0].monitor.torID != "" {
+		t.Errorf("monitor.torID = %q, want empty", a.rnics[0].monitor.torID)
 	}
 }
 
@@ -423,13 +458,7 @@ func TestAgent_PerDeviceTorIDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	a.devices = []*rdmabridge.Device{
-		fakeDevice("rxe0", "gid-0"),
-		fakeDevice("rxe1", "gid-1"),
-		fakeDevice("rxe2", "gid-2"),
-	}
-	a.probers = []*Prober{fakeProber(1), fakeProber(1), fakeProber(1)}
-	a.responders = []*Responder{{}, {}, {}}
+	a.setRnics(fakeDevices("rxe0", "rxe1", "rxe2"), fakeProbers(3))
 
 	a.resolveDeviceTorIDs(nil)
 	want := []string{"leaf-a", "leaf-b", "host-tor"}
@@ -448,16 +477,13 @@ func TestAgent_PerDeviceTorIDs(t *testing.T) {
 	}
 
 	a.createClusterMonitors()
-	for i, m := range a.monitors {
-		if m.torID != want[i] {
-			t.Errorf("monitor[%d].torID = %q, want %q", i, m.torID, want[i])
+	for i, r := range a.rnics {
+		if r.monitor.torID != want[i] {
+			t.Errorf("monitor[%d].torID = %q, want %q", i, r.monitor.torID, want[i])
 		}
-	}
-
-	for i, p := range a.probers {
-		p.SetSourceTorID(a.torIDForDevice(i))
-		p.emitResult(&probe.ProbeResult{})
-		if got := (<-p.resultChan).SourceTorID; got != want[i] {
+		r.prober.SetSourceTorID(r.torID)
+		r.prober.emitResult(&probe.ProbeResult{})
+		if got := (<-r.prober.resultChan).SourceTorID; got != want[i] {
 			t.Errorf("prober[%d] result SourceTorID = %q, want %q", i, got, want[i])
 		}
 	}
@@ -503,18 +529,18 @@ func TestAgent_LLDPTorDiscovery(t *testing.T) {
 		"eth2": {SystemName: probe.UnspecifiedTorLabel},
 		// eth3: no neighbor; rxe4: no netdev in sysfs.
 	}
-	a.devices = []*rdmabridge.Device{}
-	for i, name := range []string{"rxe0", "rxe1", "rxe2", "rxe3", "rxe4"} {
-		d := fakeDevice(name, string(rune('0'+i)))
+	devices := fakeDevices("rxe0", "rxe1", "rxe2", "rxe3", "rxe4")
+	for _, d := range devices {
 		d.Info.ActivePort = 1
-		a.devices = append(a.devices, d)
 	}
+	a.setRnics(devices, nil)
 
+	a.resolveDeviceNetdevs()
 	a.resolveDeviceTorIDs(a.discoverLLDPTorIDs(context.Background()))
 	want := []string{"pinned", "leaf-b", "host-tor", "host-tor", "host-tor"}
 	for i, w := range want {
-		if got := a.torIDForDevice(i); got != w {
-			t.Errorf("device %s ToR = %q, want %q", a.devices[i].Info.DeviceName, got, w)
+		if got := a.rnics[i].torID; got != w {
+			t.Errorf("device %s ToR = %q, want %q", devices[i].Info.DeviceName, got, w)
 		}
 	}
 }
@@ -538,25 +564,23 @@ func TestAgent_ResolveDeviceNetdevs(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 	a.sysfsRoot = sysfs
-	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0"), fakeDevice("rxe1", "1")}
-	for _, d := range a.devices {
+	devices := fakeDevices("rxe0", "rxe1")
+	for _, d := range devices {
 		d.Info.ActivePort = 1
 	}
+	a.setRnics(devices, nil)
 
 	a.resolveDeviceNetdevs()
 	want := []string{"eth0", ""}
 	for i, w := range want {
-		if got := a.deviceNetdevs[i]; got != w {
-			t.Errorf("device %s netdev = %q, want %q", a.devices[i].Info.DeviceName, got, w)
+		if got := a.rnics[i].netdev; got != w {
+			t.Errorf("device %s netdev = %q, want %q", devices[i].Info.DeviceName, got, w)
 		}
-	}
-	if _, err := a.netdevForDevice(1); err == nil {
-		t.Error("netdevForDevice(1) error = nil, want an error for the unresolved netdev")
 	}
 
 	p := fakeProber(1)
-	p.sourceRdmaDevice = a.devices[0].Info.DeviceName
-	p.SetSourceNetdev(a.deviceNetdevs[0])
+	p.sourceRdmaDevice = a.rnics[0].dev.Info.DeviceName
+	p.SetSourceNetdev(a.rnics[0].netdev)
 	p.emitResult(&probe.ProbeResult{})
 	got := <-p.resultChan
 	if got.SourceRdmaDevice != "rxe0" || got.SourceNetdev != "eth0" {
@@ -572,7 +596,7 @@ func TestAgent_LLDPTorDiscoveryDisabled(t *testing.T) {
 		t.Fatalf("NewAgent: %v", err)
 	}
 	a.lldpQuerier = nil // would panic if used
-	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0")}
+	a.setRnics(fakeDevices("rxe0"), nil)
 	if got := a.discoverLLDPTorIDs(context.Background()); got != nil {
 		t.Errorf("discoverLLDPTorIDs = %v, want nil", got)
 	}
@@ -601,12 +625,10 @@ func TestAgent_RegistrationTorSupport(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewAgent: %v", err)
 			}
-			a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0"), fakeDevice("rxe1", "1")}
-			a.probers = []*Prober{fakeProber(1), fakeProber(1)}
-			a.responders = []*Responder{{}, {}}
+			a.setRnics(fakeDevices("rxe0", "rxe1"), fakeProbers(2))
 			a.resolveDeviceTorIDs(nil)
-			for i, p := range a.probers {
-				p.SetSourceTorID(a.torIDForDevice(i))
+			for _, r := range a.rnics {
+				r.prober.SetSourceTorID(r.torID)
 			}
 
 			a.applyRegistrationTorSupport(&controller_agent.AgentRegistrationResponse{
@@ -619,14 +641,12 @@ func TestAgent_RegistrationTorSupport(t *testing.T) {
 					t.Errorf("rnic[%d] TorId = %q, want %q", i, rnic.GetTorId(), tc.want[i])
 				}
 			}
-			for i, m := range a.monitors {
-				if m.torID != tc.want[i] {
-					t.Errorf("monitor[%d].torID = %q, want %q", i, m.torID, tc.want[i])
+			for i, r := range a.rnics {
+				if r.monitor.torID != tc.want[i] {
+					t.Errorf("monitor[%d].torID = %q, want %q", i, r.monitor.torID, tc.want[i])
 				}
-			}
-			for i, p := range a.probers {
-				p.emitResult(&probe.ProbeResult{})
-				if got := (<-p.resultChan).SourceTorID; got != tc.want[i] {
+				r.prober.emitResult(&probe.ProbeResult{})
+				if got := (<-r.prober.resultChan).SourceTorID; got != tc.want[i] {
 					t.Errorf("prober[%d] SourceTorID = %q, want %q", i, got, tc.want[i])
 				}
 			}
@@ -662,9 +682,7 @@ func TestAgent_PerDevicePlaneIDs(t *testing.T) {
 	}
 	var logs bytes.Buffer
 	a.logger = zerolog.New(&logs)
-	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "gid-0"), fakeDevice("rxe1", "gid-1"), fakeDevice("rxe2", "gid-2")}
-	a.probers = []*Prober{fakeProber(1), fakeProber(1), fakeProber(1)}
-	a.responders = []*Responder{{}, {}, {}}
+	a.setRnics(fakeDevices("rxe0", "rxe1", "rxe2"), fakeProbers(3))
 
 	a.resolveDevicePlaneIDs()
 	want := []string{"rail0", "rail1", "host-plane"}
@@ -675,9 +693,9 @@ func TestAgent_PerDevicePlaneIDs(t *testing.T) {
 		}
 	}
 	a.createClusterMonitors()
-	for i, m := range a.monitors {
-		if m.planeID != want[i] {
-			t.Errorf("monitor[%d].planeID = %q, want %q", i, m.planeID, want[i])
+	for i, r := range a.rnics {
+		if r.monitor.planeID != want[i] {
+			t.Errorf("monitor[%d].planeID = %q, want %q", i, r.monitor.planeID, want[i])
 		}
 	}
 	out := logs.String()
@@ -696,10 +714,8 @@ func TestAgent_RegistersDeviceNetdevs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "gid-0"), fakeDevice("rxe1", "gid-1")}
-	a.probers = []*Prober{fakeProber(1), fakeProber(1)}
-	a.responders = []*Responder{{}, {}}
-	a.deviceNetdevs = []string{"eth0", ""}
+	a.setRnics(fakeDevices("rxe0", "rxe1"), fakeProbers(2))
+	a.rnics[0].netdev = "eth0"
 
 	want := []string{"eth0", ""}
 	for i, rnic := range a.buildRegistrationRequest().GetRnics() {
@@ -743,7 +759,7 @@ func TestFillTargetMetadata_CopiesTargetRnicIdentity(t *testing.T) {
 		TargetHostname:   "host-b",
 		TargetDeviceName: "mlx5_1",
 		TargetNetdev:     "ens2f0",
-	}, 0, "send failed")
+	}, 0, probe.FailureSendError, "send failed")
 	if result.TargetHostname != "host-b" || result.TargetRdmaDevice != "mlx5_1" ||
 		result.TargetNetdev != "ens2f0" || result.TargetSampled {
 		t.Errorf("result target identity = (%q, %q, %q, sampled=%v), want (host-b, mlx5_1, ens2f0, sampled=false)",
@@ -754,7 +770,7 @@ func TestFillTargetMetadata_CopiesTargetRnicIdentity(t *testing.T) {
 		"flagged":   {Sampled: true},
 		"inter_tor": {PinglistType: controller_agent.PinglistType_INTER_TOR},
 	} {
-		if !newFailedResult(1, target, 0, "send failed").TargetSampled {
+		if !newFailedResult(1, target, 0, probe.FailureSendError, "send failed").TargetSampled {
 			t.Errorf("%s target: TargetSampled = false, want true", name)
 		}
 	}
@@ -770,9 +786,7 @@ func TestAgent_NoPlaneKeepsLegacyRegistration(t *testing.T) {
 	}
 	var logs bytes.Buffer
 	a.logger = zerolog.New(&logs)
-	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "gid-0")}
-	a.probers = []*Prober{fakeProber(1)}
-	a.responders = []*Responder{{}}
+	a.setRnics(fakeDevices("rxe0"), fakeProbers(1))
 
 	a.resolveDevicePlaneIDs()
 	if got := a.buildRegistrationRequest().GetRnics()[0].GetPlaneId(); got != "" {
@@ -808,7 +822,7 @@ func TestAgent_RegistrationPlaneSupport(t *testing.T) {
 			}
 			var logs bytes.Buffer
 			a.logger = zerolog.New(&logs)
-			a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0")}
+			a.setRnics(fakeDevices("rxe0"), nil)
 			a.resolveDevicePlaneIDs()
 			resp := &controller_agent.AgentRegistrationResponse{Success: true, PerRnicTorId: true, PerRnicPlaneId: tc.supported}
 			for i := 0; i < 3; i++ { // initial registration + heartbeats

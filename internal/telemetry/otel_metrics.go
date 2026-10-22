@@ -124,22 +124,30 @@ const invalidRTTWarnInterval = 10 * time.Second
 
 // probeFailureReason classifies a non-successful probe outcome into one of
 // the fixed reason buckets documented above. It is the single place that
-// derives the "reason" metric attribute so RecordProbeResult and any future
-// callers cannot diverge on the classification logic.
-func probeFailureReason(result *probe.ProbeResult, rtt *probe.RTTResult) string {
+// derives the "reason" metric attribute so callers cannot diverge on the
+// classification logic.
+func probeFailureReason(result *probe.ProbeResult) string {
 	if !result.Success {
-		switch {
-		case strings.Contains(result.ErrorMessage, "timed out"):
+		switch result.FailureReason {
+		case probe.FailureTimeout:
 			return reasonTimeout
-		case strings.Contains(result.ErrorMessage, "send failed"):
+		case probe.FailureSendError:
 			return reasonSendError
-		default:
-			return reasonUnknown
+		case "":
+			// Results built without a classification (e.g. by older code
+			// paths or tests) fall back to their error message.
+			switch {
+			case strings.Contains(result.ErrorMessage, "timed out"):
+				return reasonTimeout
+			case strings.Contains(result.ErrorMessage, "send failed"):
+				return reasonSendError
+			}
 		}
+		return reasonUnknown
 	}
-	// result.Success == true means all 6 timestamps were collected
-	// (see PendingMeasurement.Complete()); a non-success path here means
-	// CalculateRTT rejected the measurement itself.
+	// result.Success means all 6 timestamps were collected (see
+	// PendingMeasurement.Complete), so CalculateRTT rejected the measurement
+	// itself.
 	return reasonInvalidRTT
 }
 
@@ -276,17 +284,10 @@ func WithCardinalityLimit(limit int) Option {
 // goes only to the opt-in target instruments. GID-level detail is emitted
 // only in debug logs.
 type MetricsCollector struct {
-	meterProvider  *sdkmetric.MeterProvider
-	meter          metric.Meter
-	networkRTT     metric.Int64Histogram // nanoseconds
-	proberDelay    metric.Int64Histogram // nanoseconds
-	responderDelay metric.Int64Histogram // nanoseconds
-	probeSuccess   metric.Int64Counter
-	probeFailed    metric.Int64Counter
-	probeTotal     metric.Int64Counter
-	// probeInvalid splits the reason="invalid_rtt" failures by
-	// probe.InvalidKind (attribute "kind").
-	probeInvalid       metric.Int64Counter
+	meterProvider *sdkmetric.MeterProvider
+	meter         metric.Meter
+	// probeInstruments are the default ToR-level rpingmesh.* instruments.
+	probeInstruments
 	eventRingDropped   metric.Int64ObservableCounter
 	eventRingOccupancy metric.Int64ObservableGauge
 	eventRingCapacity  metric.Int64ObservableGauge
@@ -296,7 +297,7 @@ type MetricsCollector struct {
 	invalidWarn invalidRTTWarnLimiter
 	// target holds the rpingmesh.target_rnic.* instruments; nil unless
 	// WithTargetRnicLabels enabled them.
-	target           *targetInstruments
+	target           *probeInstruments
 	targetRnicLabels TargetRnicLabels
 	// proberDelayTargetTor and responderDelayTargetTor keep target_tor on
 	// the delay histograms (see WithProberDelayTargetTor,
@@ -306,17 +307,20 @@ type MetricsCollector struct {
 	logger                  zerolog.Logger
 }
 
-// targetInstruments are the destination-RNIC-labelled counterparts of the
-// default probe instruments. The histograms are nil unless
-// TargetRnicLabels.Histograms is set.
-type targetInstruments struct {
-	networkRTT     metric.Int64Histogram
-	proberDelay    metric.Int64Histogram
-	responderDelay metric.Int64Histogram
+// probeInstruments are the seven per-probe instruments. They exist as the
+// default ToR-level set (rpingmesh.*) and, when WithTargetRnicLabels enables
+// them, as the destination-RNIC-labelled rpingmesh.target_rnic.* set, whose
+// histograms stay nil unless TargetRnicLabels.Histograms is set.
+type probeInstruments struct {
+	networkRTT     metric.Int64Histogram // nanoseconds
+	proberDelay    metric.Int64Histogram // nanoseconds
+	responderDelay metric.Int64Histogram // nanoseconds
 	probeSuccess   metric.Int64Counter
 	probeFailed    metric.Int64Counter
 	probeTotal     metric.Int64Counter
-	probeInvalid   metric.Int64Counter
+	// probeInvalid splits the reason="invalid_rtt" failures by
+	// probe.InvalidKind (attribute "kind").
+	probeInvalid metric.Int64Counter
 }
 
 // invalidRTTWarnLimiter lets one Warn log through per invalidRTTWarnInterval
@@ -395,12 +399,8 @@ func buildResource(serviceName string) (*resource.Resource, error) {
 }
 
 // NewMetricsCollector creates a MetricsCollector that exports OTLP metrics
-// to the given gRPC collector address (e.g., "localhost:4317"). It sets up:
-//   - An OTLP gRPC exporter (insecure) targeting collectorAddr
-//   - A MeterProvider with a periodic reader flushing every 10 seconds
-//   - Histogram instruments for network RTT, prober delay, responder delay,
-//     with separate bucket ladders for RTT and the two delays
-//   - Counter instruments for probe success, failure, and total counts
+// over insecure gRPC to collectorAddr (e.g., "localhost:4317"), flushing
+// every periodicReaderInterval, and registers every instrument on it.
 //
 // By default the OTel resource reports service.name="rpingmesh-agent"; pass
 // WithServiceName to override it (e.g. for non-agent processes reusing this
@@ -447,7 +447,6 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 // registers its own instruments on the returned provider. The caller owns the
 // provider's lifecycle (Shutdown).
 func NewMeterProvider(ctx context.Context, collectorAddr, serviceName string, opts ...sdkmetric.Option) (*sdkmetric.MeterProvider, error) {
-	// Create OTLP gRPC exporter targeting the collector.
 	exporter, err := otlpmetricgrpc.New(
 		ctx,
 		otlpmetricgrpc.WithEndpoint(collectorAddr),
@@ -457,14 +456,11 @@ func NewMeterProvider(ctx context.Context, collectorAddr, serviceName string, op
 		return nil, err
 	}
 
-	// Build the OTel resource identifying this service.
 	res, err := buildResource(serviceName)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create a MeterProvider with a periodic reader that flushes metrics
-	// to the collector at a fixed interval.
 	providerOpts := append([]sdkmetric.Option{
 		sdkmetric.WithResource(res),
 		sdkmetric.WithReader(
@@ -491,217 +487,233 @@ func NewMetricsCollectorWithProvider(provider *sdkmetric.MeterProvider, opts ...
 	return registerInstruments(provider, options)
 }
 
-// registerInstruments creates histogram and counter instruments on the given
-// provider's meter and returns a MetricsCollector with all instruments wired
-// up, including the target instruments that options enable.
-func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOptions) (*MetricsCollector, error) {
-	meter := provider.Meter("rpingmesh.agent")
+// defaultMetricPrefix prefixes the default ToR-level instruments.
+const defaultMetricPrefix = "rpingmesh."
 
-	// Register histogram instruments with explicit bucket boundaries sized
-	// per histogram (see networkRTTBucketBoundaries, delayBucketBoundaries).
-	networkRTT, err := meter.Int64Histogram(
-		"rpingmesh.network_rtt_ns",
-		metric.WithDescription("Network round-trip time in nanoseconds"),
-		metric.WithUnit("ns"),
-		metric.WithExplicitBucketBoundaries(networkRTTBucketBoundaries...),
-	)
-	if err != nil {
-		return nil, err
-	}
+// instrumentRegistrar creates instruments on one meter and keeps the first
+// error, so a registration sequence reads as straight-line assignments and
+// is checked once at the end.
+type instrumentRegistrar struct {
+	meter metric.Meter
+	err   error
+}
 
-	proberDelay, err := meter.Int64Histogram(
-		"rpingmesh.prober_delay_ns",
-		metric.WithDescription("Prober-side processing delay in nanoseconds"),
-		metric.WithUnit("ns"),
-		metric.WithExplicitBucketBoundaries(delayBucketBoundaries...),
-	)
-	if err != nil {
-		return nil, err
+func (r *instrumentRegistrar) keep(err error) {
+	if r.err == nil {
+		r.err = err
 	}
+}
 
-	responderDelay, err := meter.Int64Histogram(
-		"rpingmesh.responder_delay_ns",
-		metric.WithDescription("Responder-side processing delay in nanoseconds"),
-		metric.WithUnit("ns"),
-		metric.WithExplicitBucketBoundaries(delayBucketBoundaries...),
-	)
-	if err != nil {
-		return nil, err
-	}
+func (r *instrumentRegistrar) histogram(name, desc string, boundaries []float64) metric.Int64Histogram {
+	h, err := r.meter.Int64Histogram(name, metric.WithDescription(desc), metric.WithUnit("ns"),
+		metric.WithExplicitBucketBoundaries(boundaries...))
+	r.keep(err)
+	return h
+}
 
-	// Register counter instruments for probe outcome tracking.
-	probeSuccess, err := meter.Int64Counter(
-		"rpingmesh.probe_success_total",
-		metric.WithDescription("Total number of successful probes with valid RTT"),
-		metric.WithUnit("{probe}"),
-	)
-	if err != nil {
-		return nil, err
-	}
+func (r *instrumentRegistrar) counter(name, desc, unit string) metric.Int64Counter {
+	c, err := r.meter.Int64Counter(name, metric.WithDescription(desc), metric.WithUnit(unit))
+	r.keep(err)
+	return c
+}
 
-	probeFailed, err := meter.Int64Counter(
-		"rpingmesh.probe_failed_total",
-		metric.WithDescription("Total number of failed probes or probes with invalid RTT"),
-		metric.WithUnit("{probe}"),
-	)
-	if err != nil {
-		return nil, err
-	}
+func (r *instrumentRegistrar) observableCounter(name, desc, unit string) metric.Int64ObservableCounter {
+	c, err := r.meter.Int64ObservableCounter(name, metric.WithDescription(desc), metric.WithUnit(unit))
+	r.keep(err)
+	return c
+}
 
-	probeTotal, err := meter.Int64Counter(
-		"rpingmesh.probe_total",
-		metric.WithDescription("Total number of probes recorded"),
-		metric.WithUnit("{probe}"),
-	)
-	if err != nil {
-		return nil, err
-	}
+func (r *instrumentRegistrar) gauge(name, desc, unit string) metric.Int64ObservableGauge {
+	g, err := r.meter.Int64ObservableGauge(name, metric.WithDescription(desc), metric.WithUnit(unit))
+	r.keep(err)
+	return g
+}
 
-	probeInvalid, err := meter.Int64Counter(
-		"rpingmesh.probe_invalid_total",
-		metric.WithDescription("Total number of probes whose 6 timestamps arrived but whose RTT was rejected, by rejection kind"),
-		metric.WithUnit("{probe}"),
-	)
-	if err != nil {
-		return nil, err
-	}
+func (r *instrumentRegistrar) float64Gauge(name, desc, unit string) metric.Float64ObservableGauge {
+	g, err := r.meter.Float64ObservableGauge(name, metric.WithDescription(desc), metric.WithUnit(unit))
+	r.keep(err)
+	return g
+}
 
-	// Registered without a callback here: the EventRing values it reads are
-	// owned by the agent package (internal/agent/agent.go), not telemetry.
-	// RegisterEventRingDropCallback wires the callback in once the agent has
-	// created its rings.
-	eventRingDropped, err := meter.Int64ObservableCounter(
-		"rpingmesh.event_ring_dropped_total",
-		metric.WithDescription("Total number of completion events dropped because an event ring was full"),
-		metric.WithUnit("{event}"),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	// The ring occupancy, ring capacity and timestamp-mode gauges are, like
-	// eventRingDropped, owned by the agent package and wired in later by
-	// RegisterEventRingOccupancyCallback and RegisterTimestampModeCallback.
-	eventRingOccupancy, err := meter.Int64ObservableGauge(
-		"rpingmesh.event_ring_occupancy_max",
-		metric.WithDescription("Highest number of completion events waiting in an event ring since the previous collection"),
-		metric.WithUnit("{event}"),
-	)
-	if err != nil {
-		return nil, err
-	}
-	eventRingCapacity, err := meter.Int64ObservableGauge(
-		"rpingmesh.event_ring_capacity",
-		metric.WithDescription("Number of completion events an event ring can hold"),
-		metric.WithUnit("{event}"),
-	)
-	if err != nil {
-		return nil, err
-	}
-	hwTimestamps, err := meter.Int64ObservableGauge(
-		"rpingmesh.agent.hw_timestamps",
-		metric.WithDescription("Whether a queue reads NIC hardware completion timestamps (1) or falls back to software timestamps taken when the CQ is polled (0)"),
-		metric.WithUnit("1"),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	// Registered without a callback here for the same reason as
-	// eventRingDropped: the value it reports (the current self-protection rate
-	// multiplier) is owned by the agent package's Watchdog, not telemetry.
-	// RegisterSelfThrottleCallback wires the reader in once the agent has
-	// created its watchdog. The gauge carries no attributes: it is a single
-	// process-wide value (1.0 = unthrottled, down to 0.1 = maximally throttled).
-	selfThrottle, err := meter.Float64ObservableGauge(
-		"rpingmesh.agent.self_throttle",
-		metric.WithDescription("Current self-protection probe-rate multiplier (1.0 = unthrottled, lower = throttled to protect local CPU/memory)"),
-		metric.WithUnit("1"),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	var target *targetInstruments
-	if options.targetRnicLabels.Enabled {
-		target, err = registerTargetInstruments(meter, options.targetRnicLabels.Histograms)
-		if err != nil {
-			return nil, err
+// register creates p's instruments under prefix. In the target set (target
+// is true) every description gets a ", per target RNIC" suffix unless the
+// row names its own targetDesc, and the histograms are created only when
+// histograms is set. The RTT histogram and the two delay histograms have
+// separate bucket ladders (see networkRTTBucketBoundaries,
+// delayBucketBoundaries).
+func (p *probeInstruments) register(r *instrumentRegistrar, prefix string, target, histograms bool) {
+	describe := func(desc, targetDesc string) string {
+		switch {
+		case !target:
+			return desc
+		case targetDesc != "":
+			return targetDesc
+		default:
+			return desc + ", per target RNIC"
 		}
 	}
+	if histograms {
+		for _, h := range []struct {
+			dst        *metric.Int64Histogram
+			name, desc string
+			boundaries []float64
+		}{
+			{&p.networkRTT, "network_rtt_ns", "Network round-trip time in nanoseconds", networkRTTBucketBoundaries},
+			{&p.proberDelay, "prober_delay_ns", "Prober-side processing delay in nanoseconds", delayBucketBoundaries},
+			{&p.responderDelay, "responder_delay_ns", "Responder-side processing delay in nanoseconds", delayBucketBoundaries},
+		} {
+			*h.dst = r.histogram(prefix+h.name, describe(h.desc, ""), h.boundaries)
+		}
+	}
+	for _, c := range []struct {
+		dst                    *metric.Int64Counter
+		name, desc, targetDesc string
+	}{
+		{&p.probeSuccess, "probe_success_total", "Total number of successful probes with valid RTT", ""},
+		{&p.probeFailed, "probe_failed_total", "Total number of failed probes or probes with invalid RTT", ""},
+		{&p.probeTotal, "probe_total", "Total number of probes recorded", ""},
+		{&p.probeInvalid, "probe_invalid_total",
+			"Total number of probes whose 6 timestamps arrived but whose RTT was rejected, by rejection kind",
+			"Total number of probes whose RTT was rejected, by rejection kind, per target RNIC"},
+	} {
+		*c.dst = r.counter(prefix+c.name, describe(c.desc, c.targetDesc), "{probe}")
+	}
+}
 
-	return &MetricsCollector{
+// registerInstruments creates every instrument on the given provider's meter
+// and returns a MetricsCollector with them wired up, including the target
+// instruments that options enable.
+func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOptions) (*MetricsCollector, error) {
+	r := &instrumentRegistrar{meter: provider.Meter("rpingmesh.agent")}
+	mc := &MetricsCollector{
 		meterProvider:           provider,
-		meter:                   meter,
-		networkRTT:              networkRTT,
-		proberDelay:             proberDelay,
-		responderDelay:          responderDelay,
-		probeSuccess:            probeSuccess,
-		probeFailed:             probeFailed,
-		probeTotal:              probeTotal,
-		probeInvalid:            probeInvalid,
-		eventRingDropped:        eventRingDropped,
-		eventRingOccupancy:      eventRingOccupancy,
-		eventRingCapacity:       eventRingCapacity,
-		hwTimestamps:            hwTimestamps,
-		selfThrottle:            selfThrottle,
-		target:                  target,
+		meter:                   r.meter,
 		targetRnicLabels:        options.targetRnicLabels,
 		proberDelayTargetTor:    options.proberDelayTargetTor,
 		responderDelayTargetTor: options.responderDelayTargetTor,
 		logger:                  log.With().Str("component", "telemetry").Logger(),
-	}, nil
+	}
+	mc.probeInstruments.register(r, defaultMetricPrefix, false, true)
+
+	// The observable instruments are registered without callbacks: the
+	// values they report are owned by the agent package (the EventRings in
+	// internal/agent/agent.go, the Watchdog's rate multiplier), not
+	// telemetry. The Register*Callback methods wire them in once the agent
+	// has created those objects.
+	mc.eventRingDropped = r.observableCounter("rpingmesh.event_ring_dropped_total",
+		"Total number of completion events dropped because an event ring was full", "{event}")
+	mc.eventRingOccupancy = r.gauge("rpingmesh.event_ring_occupancy_max",
+		"Highest number of completion events waiting in an event ring since the previous collection", "{event}")
+	mc.eventRingCapacity = r.gauge("rpingmesh.event_ring_capacity",
+		"Number of completion events an event ring can hold", "{event}")
+	mc.hwTimestamps = r.gauge("rpingmesh.agent.hw_timestamps",
+		"Whether a queue reads NIC hardware completion timestamps (1) or falls back to software timestamps taken when the CQ is polled (0)", "1")
+	// The self-throttle gauge carries no attributes: it is a single
+	// process-wide value (1.0 = unthrottled, down to 0.1 = maximally throttled).
+	mc.selfThrottle = r.float64Gauge("rpingmesh.agent.self_throttle",
+		"Current self-protection probe-rate multiplier (1.0 = unthrottled, lower = throttled to protect local CPU/memory)", "1")
+
+	if options.targetRnicLabels.Enabled {
+		mc.target = &probeInstruments{}
+		mc.target.register(r, targetRnicMetricPrefix, true, options.targetRnicLabels.Histograms)
+	}
+	if r.err != nil {
+		return nil, r.err
+	}
+	return mc, nil
 }
 
-// registerTargetInstruments creates the rpingmesh.target_rnic.* counters
-// and, when withHistograms is set, the matching RTT histograms.
-func registerTargetInstruments(meter metric.Meter, withHistograms bool) (*targetInstruments, error) {
-	var t targetInstruments
-	var err error
-	counters := []struct {
-		dst  *metric.Int64Counter
-		name string
-		desc string
-	}{
-		{&t.probeTotal, "probe_total", "Total number of probes recorded, per target RNIC"},
-		{&t.probeSuccess, "probe_success_total", "Total number of successful probes with valid RTT, per target RNIC"},
-		{&t.probeFailed, "probe_failed_total", "Total number of failed probes or probes with invalid RTT, per target RNIC"},
-		{&t.probeInvalid, "probe_invalid_total", "Total number of probes whose RTT was rejected, by rejection kind, per target RNIC"},
+// probeLabels are the attribute values every default probe instrument
+// carries: the ToR pair plus the local (source) RNIC. The source RNIC labels
+// are bounded by the RNICs on this host, and device and netdev map 1:1, so
+// together they multiply series only by the local RNIC count. NEVER use GIDs
+// or any destination-RNIC identity as attributes of the default instruments;
+// that goes only to the opt-in target instruments.
+type probeLabels struct {
+	sourceTor, targetTor, sourceRdmaDevice, sourceNetdev string
+}
+
+func newProbeLabels(result *probe.ProbeResult, sourceTorID string) probeLabels {
+	return probeLabels{
+		sourceTor:        probe.TorMetricLabel(sourceTorID),
+		targetTor:        probe.TorMetricLabel(result.TargetTorID),
+		sourceRdmaDevice: deviceMetricLabel(result.SourceRdmaDevice),
+		sourceNetdev:     deviceMetricLabel(result.SourceNetdev),
 	}
-	for _, c := range counters {
-		if *c.dst, err = meter.Int64Counter(targetRnicMetricPrefix+c.name,
-			metric.WithDescription(c.desc), metric.WithUnit("{probe}")); err != nil {
-			return nil, err
+}
+
+// attributes returns the default attribute set. withTargetTor is false for
+// the delay histograms that drop target_tor (see WithProberDelayTargetTor,
+// WithResponderDelayTargetTor).
+func (l probeLabels) attributes(withTargetTor bool) []attribute.KeyValue {
+	attrs := make([]attribute.KeyValue, 0, 4)
+	attrs = append(attrs, attribute.String("source_tor", l.sourceTor))
+	if withTargetTor {
+		attrs = append(attrs, attribute.String("target_tor", l.targetTor))
+	}
+	return append(attrs,
+		attribute.String("source_rdma_device", l.sourceRdmaDevice),
+		attribute.String("source_netdev", l.sourceNetdev))
+}
+
+// probeOutcome is the classification of one probe that the default and the
+// target instruments both record.
+type probeOutcome struct {
+	rtt *probe.RTTResult
+	// success is true when all six timestamps arrived and probe.CalculateRTT
+	// accepted the measurement.
+	success bool
+	// reason is the probe_failed_total "reason" attribute (see
+	// probeFailureReason); "" on success.
+	reason string
+}
+
+func classifyProbe(result *probe.ProbeResult, rtt *probe.RTTResult) probeOutcome {
+	if result.Success && rtt != nil && rtt.Valid {
+		return probeOutcome{rtt: rtt, success: true}
+	}
+	return probeOutcome{rtt: rtt, reason: probeFailureReason(result)}
+}
+
+// invalid reports whether the measurement was rejected by CalculateRTT.
+func (o probeOutcome) invalid() bool { return o.reason == reasonInvalidRTT }
+
+// withAttribute returns attrSet plus one attribute as a measurement option.
+// The three-index slice forces a copy so attrSet's backing array is never
+// aliased by the appended set.
+func withAttribute(attrSet []attribute.KeyValue, key, value string) metric.MeasurementOption {
+	return metric.WithAttributes(append(attrSet[:len(attrSet):len(attrSet)], attribute.String(key, value))...)
+}
+
+// record counts o on p's counters with attrSet: probe_total always, then
+// probe_success_total, or probe_failed_total with the reason and, for a
+// rejected measurement, probe_invalid_total with the kind. On a success it
+// also records the histograms when p has them; the two delay histograms take
+// their own attributes because the default set may drop target_tor from them.
+func (p *probeInstruments) record(ctx context.Context, o probeOutcome, attrSet []attribute.KeyValue,
+	proberDelayAttrs, responderDelayAttrs metric.MeasurementOption) {
+	attrs := metric.WithAttributes(attrSet...)
+	p.probeTotal.Add(ctx, 1, attrs)
+	if !o.success {
+		p.probeFailed.Add(ctx, 1, withAttribute(attrSet, "reason", o.reason))
+		if o.invalid() {
+			p.probeInvalid.Add(ctx, 1, withAttribute(attrSet, "kind", invalidKindLabel(o.rtt)))
 		}
+		return
 	}
-	if !withHistograms {
-		return &t, nil
+	p.probeSuccess.Add(ctx, 1, attrs)
+	if p.networkRTT != nil {
+		p.networkRTT.Record(ctx, o.rtt.NetworkRTT, attrs)
+		p.proberDelay.Record(ctx, o.rtt.ProberDelay, proberDelayAttrs)
+		p.responderDelay.Record(ctx, o.rtt.ResponderDelay, responderDelayAttrs)
 	}
-	histograms := []struct {
-		dst        *metric.Int64Histogram
-		name       string
-		desc       string
-		boundaries []float64
-	}{
-		{&t.networkRTT, "network_rtt_ns", "Network round-trip time in nanoseconds, per target RNIC", networkRTTBucketBoundaries},
-		{&t.proberDelay, "prober_delay_ns", "Prober-side processing delay in nanoseconds, per target RNIC", delayBucketBoundaries},
-		{&t.responderDelay, "responder_delay_ns", "Responder-side processing delay in nanoseconds, per target RNIC", delayBucketBoundaries},
-	}
-	for _, h := range histograms {
-		if *h.dst, err = meter.Int64Histogram(targetRnicMetricPrefix+h.name,
-			metric.WithDescription(h.desc), metric.WithUnit("ns"),
-			metric.WithExplicitBucketBoundaries(h.boundaries...)); err != nil {
-			return nil, err
-		}
-	}
-	return &t, nil
 }
 
 // RecordProbeResult records metrics for a single completed probe.
 // It uses ToR-level attributes (source_tor, target_tor) and the local source
 // RNIC for metric dimensions to keep cardinality low. When enabled via
 // WithTargetRnicLabels it also records the rpingmesh.target_rnic.*
-// instruments with the destination RNIC (see recordTargetRnic). GID-level
+// instruments with the destination RNIC (see targetAttributes). GID-level
 // details are logged at Debug level for troubleshooting without inflating
 // metric series count.
 //
@@ -714,32 +726,13 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 	if result == nil {
 		return
 	}
-
-	sourceTor := probe.TorMetricLabel(sourceTorID)
-	targetTor := probe.TorMetricLabel(result.TargetTorID)
-
 	ctx := context.Background()
+	labels := newProbeLabels(result, sourceTorID)
+	outcome := classifyProbe(result, rtt)
 
-	sourceRdmaDevice := deviceMetricLabel(result.SourceRdmaDevice)
-	sourceNetdev := deviceMetricLabel(result.SourceNetdev)
-
-	// Build low-cardinality attribute set: ToR IDs plus the local (source)
-	// RNIC. The source RNIC labels are bounded by the RNICs on this host,
-	// and device and netdev map 1:1, so together they multiply series only
-	// by the local RNIC count. NEVER use GIDs or any destination-RNIC
-	// identity as attributes of these instruments to avoid cardinality
-	// explosion; that goes only to the opt-in target instruments.
-	attrSet := []attribute.KeyValue{
-		attribute.String("source_tor", sourceTor),
-		attribute.String("target_tor", targetTor),
-		attribute.String("source_rdma_device", sourceRdmaDevice),
-		attribute.String("source_netdev", sourceNetdev),
-	}
+	attrSet := labels.attributes(true)
 	attrs := metric.WithAttributes(attrSet...)
-	// The delay histograms may drop target_tor (see
-	// WithProberDelayTargetTor, WithResponderDelayTargetTor). attrSet[1] is
-	// target_tor.
-	noTargetTorAttrs := metric.WithAttributes(attrSet[0], attrSet[2], attrSet[3])
+	noTargetTorAttrs := metric.WithAttributes(labels.attributes(false)...)
 	proberDelayAttrs, responderDelayAttrs := noTargetTorAttrs, noTargetTorAttrs
 	if mc.proberDelayTargetTor {
 		proberDelayAttrs = attrs
@@ -747,50 +740,60 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 	if mc.responderDelayTargetTor {
 		responderDelayAttrs = attrs
 	}
-
-	// Always increment total probe count.
-	mc.probeTotal.Add(ctx, 1, attrs)
-
-	success := result.Success && rtt != nil && rtt.Valid
-	var reason string
-	if success {
-		// Record RTT histogram values for successful probes.
-		mc.networkRTT.Record(ctx, rtt.NetworkRTT, attrs)
-		mc.proberDelay.Record(ctx, rtt.ProberDelay, proberDelayAttrs)
-		mc.responderDelay.Record(ctx, rtt.ResponderDelay, responderDelayAttrs)
-		mc.probeSuccess.Add(ctx, 1, attrs)
-	} else {
-		reason = probeFailureReason(result, rtt)
-		failedAttrs := append(attrSet[:len(attrSet):len(attrSet)],
-			attribute.String("reason", reason))
-		mc.probeFailed.Add(ctx, 1, metric.WithAttributes(failedAttrs...))
-		if reason == reasonInvalidRTT {
-			invalidAttrs := append(attrSet[:len(attrSet):len(attrSet)],
-				attribute.String("kind", invalidKindLabel(rtt)))
-			mc.probeInvalid.Add(ctx, 1, metric.WithAttributes(invalidAttrs...))
-			mc.logInvalidRTT(result, rtt, sourceTor, targetTor, sourceRdmaDevice)
-		}
+	mc.probeInstruments.record(ctx, outcome, attrSet, proberDelayAttrs, responderDelayAttrs)
+	if outcome.invalid() {
+		mc.logInvalidRTT(result, rtt, labels)
 	}
 
 	if mc.target != nil {
-		mc.recordTargetRnic(ctx, attrSet, result, rtt, success, reason)
+		targetAttrSet := mc.targetAttributes(attrSet, result)
+		targetAttrs := metric.WithAttributes(targetAttrSet...)
+		mc.target.record(ctx, outcome, targetAttrSet, targetAttrs, targetAttrs)
 	}
 
-	// Log GID-level detail at Debug level. This provides per-flow
-	// visibility without metric cardinality cost. invalid_kind and
-	// validation_error are set only for a rejected measurement
-	// (reason=invalid_rtt), not for a probe that never completed.
+	mc.logProbeResult(result, labels, outcome)
+}
+
+// targetAttributes returns baseAttrs (the default instruments' attributes)
+// plus target_hostname, target_rdma_device and target_netdev for the
+// rpingmesh.target_rnic.* instruments. An unknown value (e.g. a target
+// registered by an older agent that does not report its netdev) becomes
+// unspecifiedDeviceLabel. Sampled targets get sampledTargetLabel for all
+// three unless IncludeSampled is set.
+func (mc *MetricsCollector) targetAttributes(baseAttrs []attribute.KeyValue, result *probe.ProbeResult) []attribute.KeyValue {
+	host, device, netdev := sampledTargetLabel, sampledTargetLabel, sampledTargetLabel
+	if mc.targetRnicLabels.IncludeSampled || !result.TargetSampled {
+		host = deviceMetricLabel(result.TargetHostname)
+		device = deviceMetricLabel(result.TargetRdmaDevice)
+		netdev = deviceMetricLabel(result.TargetNetdev)
+	}
+	attrSet := make([]attribute.KeyValue, 0, len(baseAttrs)+3)
+	attrSet = append(attrSet, baseAttrs...)
+	return append(attrSet,
+		attribute.String("target_hostname", host),
+		attribute.String("target_rdma_device", device),
+		attribute.String("target_netdev", netdev),
+	)
+}
+
+// logProbeResult logs one probe with its GID-level detail at Debug level,
+// which gives per-flow visibility without metric cardinality cost.
+// scripts/topology/rtt_tor_check.py reads these records, so the field set is
+// a contract (pinned by probe_log_json_test.go). invalid_kind and
+// validation_error are set only for a rejected measurement
+// (reason=invalid_rtt), not for a probe that never completed.
+func (mc *MetricsCollector) logProbeResult(result *probe.ProbeResult, l probeLabels, o probeOutcome) {
 	var rejectedKind, rejectedError string
-	if reason == reasonInvalidRTT {
-		rejectedKind, rejectedError = invalidKindLabel(rtt), validationErrorOf(rtt)
+	if o.invalid() {
+		rejectedKind, rejectedError = invalidKindLabel(o.rtt), validationErrorOf(o.rtt)
 	}
 	mc.logger.Debug().
 		Str("source_gid", probe.FormatGID(result.SourceGID)).
 		Str("target_gid", probe.FormatGID(result.TargetGID)).
-		Str("source_tor", sourceTor).
-		Str("target_tor", targetTor).
-		Str("source_rdma_device", sourceRdmaDevice).
-		Str("source_netdev", sourceNetdev).
+		Str("source_tor", l.sourceTor).
+		Str("target_tor", l.targetTor).
+		Str("source_rdma_device", l.sourceRdmaDevice).
+		Str("source_netdev", l.sourceNetdev).
 		Str("target_ip", result.TargetIP).
 		Uint32("flow_label", result.FlowLabel).
 		Uint64("seq", result.SequenceNum).
@@ -802,18 +805,10 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 		Uint64("t6", result.T6).
 		Bool("success", result.Success).
 		Str("error", result.ErrorMessage).
-		Bool("rtt_valid", success).
+		Bool("rtt_valid", o.success).
 		Str("invalid_kind", rejectedKind).
 		Str("validation_error", rejectedError).
 		Msg("Probe result recorded")
-}
-
-// invalidKindOf returns rtt's InvalidKind as a string ("" when rtt is nil).
-func invalidKindOf(rtt *probe.RTTResult) string {
-	if rtt == nil {
-		return ""
-	}
-	return string(rtt.InvalidKind)
 }
 
 // validationErrorOf returns rtt's ValidationError ("" when rtt is nil).
@@ -829,8 +824,8 @@ func validationErrorOf(rtt *probe.RTTResult) string {
 // fallback keeps the attribute non-empty if a future validation path forgets
 // to set one.
 func invalidKindLabel(rtt *probe.RTTResult) string {
-	if kind := invalidKindOf(rtt); kind != "" {
-		return kind
+	if rtt != nil && rtt.InvalidKind != probe.InvalidKindNone {
+		return string(rtt.InvalidKind)
 	}
 	return reasonUnknown
 }
@@ -841,8 +836,7 @@ func invalidKindLabel(rtt *probe.RTTResult) string {
 // (responder_delay_too_large) from clock or timestamp trouble without
 // enabling debug logs. Per the cardinality convention, GIDs and IPs stay in
 // the Debug log; this one names the RNICs by hostname and device instead.
-func (mc *MetricsCollector) logInvalidRTT(result *probe.ProbeResult, rtt *probe.RTTResult,
-	sourceTor, targetTor, sourceRdmaDevice string) {
+func (mc *MetricsCollector) logInvalidRTT(result *probe.ProbeResult, rtt *probe.RTTResult, l probeLabels) {
 	ok, suppressed := mc.invalidWarn.allow(time.Now())
 	if !ok {
 		return
@@ -850,9 +844,9 @@ func (mc *MetricsCollector) logInvalidRTT(result *probe.ProbeResult, rtt *probe.
 	ev := mc.logger.Warn().
 		Str("invalid_kind", invalidKindLabel(rtt)).
 		Str("validation_error", validationErrorOf(rtt)).
-		Str("source_tor", sourceTor).
-		Str("target_tor", targetTor).
-		Str("source_rdma_device", sourceRdmaDevice).
+		Str("source_tor", l.sourceTor).
+		Str("target_tor", l.targetTor).
+		Str("source_rdma_device", l.sourceRdmaDevice).
 		Str("target_hostname", result.TargetHostname).
 		Str("target_rdma_device", result.TargetRdmaDevice).
 		Uint64("t1", result.T1).
@@ -868,48 +862,6 @@ func (mc *MetricsCollector) logInvalidRTT(result *probe.ProbeResult, rtt *probe.
 			Int64("responder_delay_ns", rtt.ResponderDelay)
 	}
 	ev.Msg("Probe measurement rejected (sampled; see rpingmesh.probe_invalid_total for the full count)")
-}
-
-// recordTargetRnic records one probe on the rpingmesh.target_rnic.*
-// instruments. Their attributes are baseAttrs (the default instruments'
-// attributes) plus target_hostname, target_rdma_device and target_netdev.
-// An unknown value (e.g. a target registered by an older agent that does not
-// report its netdev) becomes unspecifiedDeviceLabel. Sampled targets get
-// sampledTargetLabel for all three unless IncludeSampled is set.
-func (mc *MetricsCollector) recordTargetRnic(ctx context.Context, baseAttrs []attribute.KeyValue,
-	result *probe.ProbeResult, rtt *probe.RTTResult, success bool, reason string) {
-	host, device, netdev := sampledTargetLabel, sampledTargetLabel, sampledTargetLabel
-	if mc.targetRnicLabels.IncludeSampled || !result.TargetSampled {
-		host = deviceMetricLabel(result.TargetHostname)
-		device = deviceMetricLabel(result.TargetRdmaDevice)
-		netdev = deviceMetricLabel(result.TargetNetdev)
-	}
-	attrSet := make([]attribute.KeyValue, 0, len(baseAttrs)+4)
-	attrSet = append(attrSet, baseAttrs...)
-	attrSet = append(attrSet,
-		attribute.String("target_hostname", host),
-		attribute.String("target_rdma_device", device),
-		attribute.String("target_netdev", netdev),
-	)
-	attrs := metric.WithAttributes(attrSet...)
-
-	t := mc.target
-	t.probeTotal.Add(ctx, 1, attrs)
-	if !success {
-		failedAttrs := append(attrSet[:len(attrSet):len(attrSet)], attribute.String("reason", reason))
-		t.probeFailed.Add(ctx, 1, metric.WithAttributes(failedAttrs...))
-		if reason == reasonInvalidRTT {
-			invalidAttrs := append(attrSet[:len(attrSet):len(attrSet)], attribute.String("kind", invalidKindLabel(rtt)))
-			t.probeInvalid.Add(ctx, 1, metric.WithAttributes(invalidAttrs...))
-		}
-		return
-	}
-	t.probeSuccess.Add(ctx, 1, attrs)
-	if t.networkRTT != nil {
-		t.networkRTT.Record(ctx, rtt.NetworkRTT, attrs)
-		t.proberDelay.Record(ctx, rtt.ProberDelay, attrs)
-		t.responderDelay.Record(ctx, rtt.ResponderDelay, attrs)
-	}
 }
 
 // RegisterEventRingDropCallback registers an OTel callback that reports the
@@ -1072,7 +1024,6 @@ func (mc *MetricsCollector) StartResultConsumer(ctx context.Context, resultChan 
 					return
 				}
 
-				// Calculate RTT from the 6-timestamp probe result.
 				rtt := probe.CalculateRTT(result)
 				src := sourceTorID
 				if result != nil && result.SourceTorID != "" {

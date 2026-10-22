@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
@@ -78,7 +77,8 @@ func assertRate(t *testing.T, sends map[string][]time.Time, targets []*controlle
 }
 
 func newSimProber(interval time.Duration, tor, inter []*controller_agent.PingTarget) *Prober {
-	p := &Prober{logger: zerolog.Nop(), probeInterval: interval}
+	p := newTestProber()
+	p.probeInterval = interval
 	p.UpdateTargets(append(append([]*controller_agent.PingTarget{}, tor...), inter...))
 	return p
 }

@@ -50,9 +50,7 @@ func waitStopAfterRunningCleared(t *testing.T, running *atomic.Bool, wg *sync.Wa
 // Destroy could free the queue under that sibling. Stop must join remaining
 // goroutines even when running is already false.
 func TestProber_StopWaitsAfterRunningCleared(t *testing.T) {
-	p := &Prober{
-		stopCh: make(chan struct{}),
-	}
+	p := newTestProber()
 	p.running.Store(true)
 	waitStopAfterRunningCleared(t, &p.running, &p.wg, p.Stop)
 }
@@ -61,9 +59,8 @@ func TestProber_StopWaitsAfterRunningCleared(t *testing.T) {
 // responder: ctx.Done may clear running while processLoop is still unwinding
 // an in-flight ACK send.
 func TestResponder_StopWaitsAfterRunningCleared(t *testing.T) {
-	r := &Responder{
-		stopCh: make(chan struct{}),
-	}
+	r := &Responder{}
+	r.stopCh = make(chan struct{})
 	r.running.Store(true)
 	waitStopAfterRunningCleared(t, &r.running, &r.wg, r.Stop)
 }

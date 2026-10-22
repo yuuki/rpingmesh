@@ -210,23 +210,3 @@ func (a *Analyzer) retainLocked(s *controller_agent.PathSummary) {
 		a.ring = a.ring[len(a.ring)-a.cfg.WindowRetention:]
 	}
 }
-
-// RetainedWindows returns the number of distinct windows currently retained in
-// the ring. Exposed for tests and diagnostics.
-func (a *Analyzer) RetainedWindows() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return len(a.ring)
-}
-
-// RetainedSummaries returns the total number of PathSummary records currently
-// held across all retained windows. Exposed for tests and diagnostics.
-func (a *Analyzer) RetainedSummaries() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	n := 0
-	for _, b := range a.ring {
-		n += len(b.summaries)
-	}
-	return n
-}

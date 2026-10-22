@@ -2,10 +2,7 @@ package controller
 
 import (
 	"context"
-	"crypto/x509"
 	"net"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -40,44 +37,13 @@ type mtlsFixture struct {
 
 func newMTLSFixture(t *testing.T) mtlsFixture {
 	t.Helper()
-	dir := t.TempDir()
-
-	ca, err := tlscerts.NewCA()
-	if err != nil {
-		t.Fatalf("tlscerts.NewCA: %v", err)
-	}
-
-	write := func(name string, data []byte) string {
-		p := filepath.Join(dir, name)
-		if err := os.WriteFile(p, data, 0o600); err != nil {
-			t.Fatalf("write %s: %v", name, err)
-		}
-		return p
-	}
-
-	serverCertPEM, serverKeyPEM, err := ca.IssueLeaf(tlscerts.LeafOptions{
-		CommonName:  "controller",
-		DNSNames:    []string{"localhost"},
-		IPs:         []net.IP{net.ParseIP("127.0.0.1")},
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	})
-	if err != nil {
-		t.Fatalf("issue server leaf certificate: %v", err)
-	}
-	clientCertPEM, clientKeyPEM, err := ca.IssueLeaf(tlscerts.LeafOptions{
-		CommonName:  "agent",
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-	})
-	if err != nil {
-		t.Fatalf("issue client leaf certificate: %v", err)
-	}
-
+	files := tlscerts.WriteFileSet(t)
 	return mtlsFixture{
-		caFile:         write("ca.pem", ca.CAPEM()),
-		serverCertFile: write("server-cert.pem", serverCertPEM),
-		serverKeyFile:  write("server-key.pem", serverKeyPEM),
-		clientCertFile: write("client-cert.pem", clientCertPEM),
-		clientKeyFile:  write("client-key.pem", clientKeyPEM),
+		caFile:         files.CAFile,
+		serverCertFile: files.ServerCertFile,
+		serverKeyFile:  files.ServerKeyFile,
+		clientCertFile: files.ClientCertFile,
+		clientKeyFile:  files.ClientKeyFile,
 	}
 }
 

@@ -2,71 +2,11 @@ package config
 
 import (
 	"crypto/tls"
-	"crypto/x509"
-	"net"
-	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/yuuki/rpingmesh/internal/testutil/tlscerts"
 )
-
-// testCertSet holds file paths to a freshly generated, in-memory CA plus a
-// server and client leaf certificate signed by it -- everything
-// ServerTLSConfig/ClientTLSConfig need to build a real *tls.Config in tests,
-// without depending on committed fixture certificates that could expire.
-type testCertSet struct {
-	caFile         string
-	serverCertFile string
-	serverKeyFile  string
-	clientCertFile string
-	clientKeyFile  string
-}
-
-func newTestCertSet(t *testing.T) testCertSet {
-	t.Helper()
-	dir := t.TempDir()
-
-	ca, err := tlscerts.NewCA()
-	if err != nil {
-		t.Fatalf("tlscerts.NewCA: %v", err)
-	}
-	caFile := writeFile(t, dir, "ca.pem", ca.CAPEM())
-
-	serverCertPEM, serverKeyPEM, err := ca.IssueLeaf(tlscerts.LeafOptions{
-		CommonName:  "controller",
-		DNSNames:    []string{"localhost"},
-		IPs:         []net.IP{net.ParseIP("127.0.0.1")},
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	})
-	if err != nil {
-		t.Fatalf("IssueLeaf(server): %v", err)
-	}
-	clientCertPEM, clientKeyPEM, err := ca.IssueLeaf(tlscerts.LeafOptions{
-		CommonName:  "agent",
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-	})
-	if err != nil {
-		t.Fatalf("IssueLeaf(client): %v", err)
-	}
-
-	return testCertSet{
-		caFile:         caFile,
-		serverCertFile: writeFile(t, dir, "server-cert.pem", serverCertPEM),
-		serverKeyFile:  writeFile(t, dir, "server-key.pem", serverKeyPEM),
-		clientCertFile: writeFile(t, dir, "client-cert.pem", clientCertPEM),
-		clientKeyFile:  writeFile(t, dir, "client-key.pem", clientKeyPEM),
-	}
-}
-
-func writeFile(t *testing.T, dir, name string, data []byte) string {
-	t.Helper()
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("failed to write %s: %v", path, err)
-	}
-	return path
-}
 
 // --- ServerTLSConfig ---
 
@@ -81,9 +21,9 @@ func TestServerTLSConfig_Disabled(t *testing.T) {
 }
 
 func TestServerTLSConfig_TLS_LoadsCertificate(t *testing.T) {
-	certs := newTestCertSet(t)
+	certs := tlscerts.WriteFileSet(t)
 
-	cfg, err := ServerTLSConfig(TLSModeTLS, certs.serverCertFile, certs.serverKeyFile, "")
+	cfg, err := ServerTLSConfig(TLSModeTLS, certs.ServerCertFile, certs.ServerKeyFile, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -96,17 +36,17 @@ func TestServerTLSConfig_TLS_LoadsCertificate(t *testing.T) {
 }
 
 func TestServerTLSConfig_TLS_MissingCertFile(t *testing.T) {
-	certs := newTestCertSet(t)
+	certs := tlscerts.WriteFileSet(t)
 
-	if _, err := ServerTLSConfig(TLSModeTLS, filepath.Join(t.TempDir(), "missing.pem"), certs.serverKeyFile, ""); err == nil {
+	if _, err := ServerTLSConfig(TLSModeTLS, filepath.Join(t.TempDir(), "missing.pem"), certs.ServerKeyFile, ""); err == nil {
 		t.Fatal("expected an error for a missing server certificate file, got nil")
 	}
 }
 
 func TestServerTLSConfig_MTLS_SetsClientCAsAndRequiresClientCert(t *testing.T) {
-	certs := newTestCertSet(t)
+	certs := tlscerts.WriteFileSet(t)
 
-	cfg, err := ServerTLSConfig(TLSModeMTLS, certs.serverCertFile, certs.serverKeyFile, certs.caFile)
+	cfg, err := ServerTLSConfig(TLSModeMTLS, certs.ServerCertFile, certs.ServerKeyFile, certs.CAFile)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -122,9 +62,9 @@ func TestServerTLSConfig_MTLS_SetsClientCAsAndRequiresClientCert(t *testing.T) {
 }
 
 func TestServerTLSConfig_MTLS_MissingCAFile(t *testing.T) {
-	certs := newTestCertSet(t)
+	certs := tlscerts.WriteFileSet(t)
 
-	if _, err := ServerTLSConfig(TLSModeMTLS, certs.serverCertFile, certs.serverKeyFile, filepath.Join(t.TempDir(), "missing-ca.pem")); err == nil {
+	if _, err := ServerTLSConfig(TLSModeMTLS, certs.ServerCertFile, certs.ServerKeyFile, filepath.Join(t.TempDir(), "missing-ca.pem")); err == nil {
 		t.Fatal("expected an error for a missing CA file, got nil")
 	}
 }
@@ -148,9 +88,9 @@ func TestClientTLSConfig_Disabled(t *testing.T) {
 }
 
 func TestClientTLSConfig_TLS_SetsRootCAs(t *testing.T) {
-	certs := newTestCertSet(t)
+	certs := tlscerts.WriteFileSet(t)
 
-	cfg, err := ClientTLSConfig(TLSModeTLS, "", "", certs.caFile, "controller.example")
+	cfg, err := ClientTLSConfig(TLSModeTLS, "", "", certs.CAFile, "controller.example")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -172,9 +112,9 @@ func TestClientTLSConfig_TLS_MissingCAFile(t *testing.T) {
 }
 
 func TestClientTLSConfig_MTLS_SetsCertificateAndRootCAs(t *testing.T) {
-	certs := newTestCertSet(t)
+	certs := tlscerts.WriteFileSet(t)
 
-	cfg, err := ClientTLSConfig(TLSModeMTLS, certs.clientCertFile, certs.clientKeyFile, certs.caFile, "")
+	cfg, err := ClientTLSConfig(TLSModeMTLS, certs.ClientCertFile, certs.ClientKeyFile, certs.CAFile, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -187,9 +127,9 @@ func TestClientTLSConfig_MTLS_SetsCertificateAndRootCAs(t *testing.T) {
 }
 
 func TestClientTLSConfig_MTLS_MissingClientCert(t *testing.T) {
-	certs := newTestCertSet(t)
+	certs := tlscerts.WriteFileSet(t)
 
-	if _, err := ClientTLSConfig(TLSModeMTLS, filepath.Join(t.TempDir(), "missing.pem"), certs.clientKeyFile, certs.caFile, ""); err == nil {
+	if _, err := ClientTLSConfig(TLSModeMTLS, filepath.Join(t.TempDir(), "missing.pem"), certs.ClientKeyFile, certs.CAFile, ""); err == nil {
 		t.Fatal("expected an error for a missing client certificate file, got nil")
 	}
 }

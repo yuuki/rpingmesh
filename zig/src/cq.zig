@@ -150,9 +150,13 @@ fn recvByteLenOK(byte_len: u32) bool {
     return byte_len >= types.GRH_SIZE + types.PROBE_PACKET_SIZE;
 }
 
-/// Drop a receive completion without delivering it to Go and repost the slot.
-fn dropAndRepostRecv(queue: *types.UdQueue, slot_index: u32) void {
-    memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {};
+/// Return a recv slot to the hardware. Every recv completion, delivered or
+/// dropped, ends here; a slot that cannot be reposted is lost until the
+/// queue is recreated.
+fn repostRecv(queue: *types.UdQueue, slot_index: u32) void {
+    memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {
+        log.warn("@{x} failed to repost recv slot={d}", .{ @intFromPtr(queue), slot_index });
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -471,65 +475,18 @@ fn dispatchClassicWc(queue: *types.UdQueue, wc: *const c.ibv_wc, pending: *Pendi
 fn repostFailedRecv(queue: *types.UdQueue, wr_id: u64, status: i32) void {
     const slot_index = types.wrIdSlot(wr_id);
     log.warn("@{x} RECV completion error status={d}, reposting slot={d}", .{ @intFromPtr(queue), status, slot_index });
-    memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {
-        log.warn("@{x} failed to repost recv slot={d} after completion error", .{ @intFromPtr(queue), slot_index });
-    };
+    repostRecv(queue, slot_index);
 }
 
-/// Process a receive completion from the classic ibv_wc path.
-///
-/// Mirrors processRecvCompletion() but reads fields directly from ibv_wc
-/// instead of the extended CQ handle.
+/// Process a successful receive completion from the classic ibv_wc path.
 fn processRecvClassic(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
-    const slot_index = types.wrIdSlot(wc.wr_id);
-    const ts = swTimestampNs();
-    const src_qp: u32 = wc.src_qp;
-
-    const slot_ptr = memory.getSlotPtr(queue.recv_buf, slot_index, types.NUM_RECV_SLOTS) catch return;
-
-    // IBV_WC_GRH (bit 0) indicates the driver wrote a GRH into the receive
-    // buffer.  For RoCEv2 UD this should always be set, but if it is not we
-    // cannot determine the sender's GID — repost the buffer and drop.
-    if ((wc.wc_flags & c.IBV_WC_GRH) == 0) {
-        dropAndRepostRecv(queue, slot_index);
-        return;
-    }
-
-    if (!recvByteLenOK(wc.byte_len)) {
-        dropAndRepostRecv(queue, slot_index);
-        return;
-    }
-
-    const grh_info = parseGRH(slot_ptr);
-    const payload_ptr = slot_ptr + types.GRH_SIZE;
-    const payload = wire.deserializeProbePacket(@ptrCast(payload_ptr)) orelse {
-        dropAndRepostRecv(queue, slot_index);
-        return;
-    };
-
-    const event = ring.CompletionEvent{
-        .sequence_num = payload.sequence_num,
-        .t1 = payload.t1,
-        .t3 = payload.t3,
-        .t4 = payload.t4,
-        .is_ack = payload.msg_type,
-        .ack_type = payload.ack_type,
-        .flags = 0,
-        ._pad = 0,
-        .timestamp_ns = ts,
-        .source_gid = grh_info.source_gid,
-        .source_qpn = src_qp,
-        .flow_label = grh_info.flow_label,
-        .status = @intCast(wc.status),
-        .is_send = 0,
-        ._pad2 = [_]u8{ 0, 0, 0 },
-    };
-
-    if (queue.event_ring) |event_ring| {
-        _ = event_ring.push(&event);
-    }
-
-    memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {};
+    deliverRecv(queue, .{
+        .slot_index = types.wrIdSlot(wc.wr_id),
+        .timestamp_ns = swTimestampNs(),
+        .src_qp = wc.src_qp,
+        .has_grh = (wc.wc_flags & c.IBV_WC_GRH) != 0,
+        .byte_len = wc.byte_len,
+    });
 }
 
 /// Extended CQ polling using ibv_start_poll / ibv_next_poll / ibv_end_poll.
@@ -591,97 +548,71 @@ fn dispatchCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *Pending
 // Receive completion processing
 // ---------------------------------------------------------------------------
 
-/// Process a single receive completion.
+/// Process a successful receive completion from the extended CQ path.
 ///
-/// Extracts the slot index from wr_id, reads the timestamp (HW or SW),
-/// parses the GRH for source GID and flow label, parses the probe payload,
-/// builds a CompletionEvent, pushes it into the event ring, and reposts
-/// the receive buffer for reuse.
-pub fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
-    const slot_index = types.wrIdSlot(cq.wr_id);
+/// src_qp and byte_len are CQE fields requested at CQ creation
+/// (IBV_WC_EX_WITH_SRC_QP / _BYTE_LEN); wc_flags is a core field that
+/// ibv_wc_read_wc_flags() reads unconditionally.
+fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
+    deliverRecv(queue, .{
+        .slot_index = types.wrIdSlot(cq.wr_id),
+        .timestamp_ns = getCompletionTimestamp(queue, cq),
+        .src_qp = c.ibv_wc_read_src_qp(cq),
+        .has_grh = (c.ibv_wc_read_wc_flags(cq) & c.IBV_WC_GRH) != 0,
+        .byte_len = c.ibv_wc_read_byte_len(cq),
+    });
+}
 
-    // Get timestamp
-    const timestamp_ns: u64 = getCompletionTimestamp(queue, cq);
+/// The inputs of a successful recv completion that the classic and extended
+/// CQ APIs expose differently. Everything after reading them is shared.
+const RecvCompletion = struct {
+    slot_index: u32,
+    /// HW wallclock or SW CLOCK_MONOTONIC timestamp of the completion.
+    timestamp_ns: u64,
+    src_qp: u32,
+    /// IBV_WC_GRH: the driver wrote a GRH into the slot. Without it the
+    /// sender's GID is unknown.
+    has_grh: bool,
+    byte_len: u32,
+};
 
-    // Get source QPN from the extended completion
-    const src_qp: u32 = c.ibv_wc_read_src_qp(cq);
+/// Deliver a successful recv completion to Go: parse the GRH and the probe
+/// payload, push a CompletionEvent into the event ring, and repost the slot.
+/// A completion without a GRH, shorter than GRH + packet (the rest of the
+/// slot would be stale bytes from an earlier recv) or with an unknown wire
+/// version is dropped; its slot is reposted all the same.
+fn deliverRecv(queue: *types.UdQueue, rc: RecvCompletion) void {
+    const slot_ptr = memory.getSlotPtr(queue.recv_buf, rc.slot_index, types.NUM_RECV_SLOTS) catch return;
+    defer repostRecv(queue, rc.slot_index);
 
-    // Get the receive buffer slot pointer
-    const slot_ptr = memory.getSlotPtr(queue.recv_buf, slot_index, types.NUM_RECV_SLOTS) catch {
-        // Slot index out of bounds - cannot process
-        return;
-    };
-
-    // IBV_WC_GRH (bit 0) indicates the driver wrote a GRH into the receive
-    // buffer. This mirrors the defensive check already present in
-    // processRecvClassic() below, which soft-RoCE (rdma_rxe) exercises but
-    // this extended-CQ path did not previously check at all -- meaning a
-    // production Mellanox NIC completion that ever arrives without a GRH
-    // would have had the first 40 bytes of application payload silently
-    // misparsed as a GRH (corrupting the reported source GID/flow label)
-    // instead of being safely dropped.
-    //
-    // ibv_wc_read_wc_flags() is available unconditionally here: unlike
-    // src_qp or the timestamp fields (which are optional CQE metadata
-    // gated by IBV_WC_EX_WITH_* flags requested at CQ creation time),
-    // wc_flags has no corresponding IBV_WC_EX_WITH_* flag in libibverbs
-    // -- it is a core field, always populated the same way opcode/status
-    // are. byte_len is requested via IBV_WC_EX_WITH_BYTE_LEN and is read
-    // below.
-    const wc_flags = c.ibv_wc_read_wc_flags(cq);
-    if ((wc_flags & c.IBV_WC_GRH) == 0) {
-        dropAndRepostRecv(queue, slot_index);
-        return;
-    }
-
-    // IBV_WC_EX_WITH_BYTE_LEN is requested at CQ creation, so this read is
-    // valid. Reject completions shorter than GRH + probe payload: a UD send
-    // with the right QKEY can still complete with a short datagram, and the
-    // remainder of the slot would be stale bytes from a previous recv.
-    const byte_len = c.ibv_wc_read_byte_len(cq);
-    if (!recvByteLenOK(byte_len)) {
-        dropAndRepostRecv(queue, slot_index);
-        return;
-    }
-
-    // Parse GRH from the first 40 bytes of the receive buffer
+    if (!rc.has_grh or !recvByteLenOK(rc.byte_len)) return;
     const grh_info = parseGRH(slot_ptr);
+    const pkt = wire.deserializeProbePacket(@ptrCast(slot_ptr + types.GRH_SIZE)) orelse return;
 
-    // Parse probe payload from bytes after the GRH
-    const payload_ptr = slot_ptr + types.GRH_SIZE;
-    const payload = wire.deserializeProbePacket(@ptrCast(payload_ptr)) orelse {
-        dropAndRepostRecv(queue, slot_index);
-        return;
-    };
-
-    // Build the completion event
-    const event = ring.CompletionEvent{
-        .sequence_num = payload.sequence_num,
-        .t1 = payload.t1,
-        .t3 = payload.t3,
-        .t4 = payload.t4,
-        .is_ack = payload.msg_type,
-        .ack_type = payload.ack_type,
-        .flags = 0,
-        ._pad = 0,
-        .timestamp_ns = timestamp_ns,
-        .source_gid = grh_info.source_gid,
-        .source_qpn = src_qp,
-        .flow_label = grh_info.flow_label,
-        .status = @intCast(cq.status),
-        .is_send = 0,
-        ._pad2 = [_]u8{ 0, 0, 0 },
-    };
-
-    // Push the event into the ring buffer
+    const event = recvEvent(&pkt, &grh_info, &rc);
     if (queue.event_ring) |event_ring| {
         _ = event_ring.push(&event);
     }
+}
 
-    // Repost the receive buffer slot so the hardware can use it again
-    memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {
-        // Failed to repost - the slot will be lost until queue recreation.
-        // This is logged via setLastError in the postRecvBuffer function.
+/// Build the event Go receives for a probe or ACK.
+fn recvEvent(pkt: *const wire.ProbePacket, grh_info: *const GRHInfo, rc: *const RecvCompletion) ring.CompletionEvent {
+    return ring.CompletionEvent{
+        .sequence_num = pkt.sequence_num,
+        .t1 = pkt.t1,
+        .t3 = pkt.t3,
+        .t4 = pkt.t4,
+        .is_ack = pkt.msg_type,
+        .ack_type = pkt.ack_type,
+        .flags = 0,
+        ._pad = 0,
+        .timestamp_ns = rc.timestamp_ns,
+        .source_gid = grh_info.source_gid,
+        .source_qpn = rc.src_qp,
+        .flow_label = grh_info.flow_label,
+        .status = c.IBV_WC_SUCCESS,
+        .is_send = 0,
+        ._pad2 = [_]u8{ 0, 0, 0 },
     };
 }
 
@@ -944,4 +875,34 @@ test "a successful first-ACK completion queues the second ACK and keeps the slot
     try std.testing.expectEqual(@as(usize, 1), pending.len);
     try std.testing.expectEqual(slot, pending.slots[0]);
     try std.testing.expectEqual(@as(u64, 0), queue.async_ack_failures.load(.monotonic));
+}
+
+test "recvEvent maps the packet, GRH and completion onto the Go-facing event" {
+    const pkt = wire.ProbePacket{
+        .version = wire.PACKET_VERSION,
+        .msg_type = wire.MSG_TYPE_ACK,
+        .ack_type = wire.ACK_TYPE_SECOND,
+        .flags = 0x55,
+        .sequence_num = 0x1122334455667788,
+        .t1 = 1,
+        .t3 = 3,
+        .t4 = 4,
+    };
+    var grh_info = GRHInfo{ .source_gid = @splat(0), .dest_gid = @splat(0), .flow_label = 0xABCDE };
+    grh_info.source_gid[15] = 9;
+    const rc = RecvCompletion{ .slot_index = 7, .timestamp_ns = 555, .src_qp = 0x2A, .has_grh = true, .byte_len = 80 };
+
+    const ev = recvEvent(&pkt, &grh_info, &rc);
+    try std.testing.expectEqual(pkt.sequence_num, ev.sequence_num);
+    try std.testing.expectEqual(@as(u64, 1), ev.t1);
+    try std.testing.expectEqual(@as(u64, 3), ev.t3);
+    try std.testing.expectEqual(@as(u64, 4), ev.t4);
+    try std.testing.expectEqual(wire.MSG_TYPE_ACK, ev.is_ack);
+    try std.testing.expectEqual(wire.ACK_TYPE_SECOND, ev.ack_type);
+    try std.testing.expectEqual(@as(u64, 555), ev.timestamp_ns);
+    try std.testing.expectEqual(@as(u32, 0x2A), ev.source_qpn);
+    try std.testing.expectEqual(@as(u32, 0xABCDE), ev.flow_label);
+    try std.testing.expectEqual(@as(u8, 9), ev.source_gid[15]);
+    try std.testing.expectEqual(@as(i32, 0), ev.status);
+    try std.testing.expectEqual(@as(u8, 0), ev.is_send);
 }

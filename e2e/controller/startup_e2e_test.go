@@ -32,9 +32,7 @@ func TestControllerStartsBeforeRqlite(t *testing.T) {
 	t.Cleanup(func() { client.Close() })
 
 	registerAgent(t, client, "agent-early", "10.0.9.1", "host-early", "tor-early",
-		[]*controller_agent.RnicInfo{
-			makeRNIC("fe80::e1", 100, "10.0.9.1", "host-early", "tor-early", "mlx5_0"),
-		})
+		makeRNIC("fe80::e1", 100, "10.0.9.1", "host-early", "tor-early", "mlx5_0"))
 
-	getPinglist(t, client, "agent-early", "tor-early", "fe80::e1", controller_agent.PinglistType_TOR_MESH)
+	getPinglist(t, client, "agent-early", "tor-early", "fe80::e1", "", controller_agent.PinglistType_TOR_MESH)
 }

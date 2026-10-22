@@ -72,13 +72,11 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load configuration: %w", err)
 	}
 
-	// Switch to the configured log format (console or json) and level.
-	invalidLevel, err := logging.Setup(cfg.LogFormat, cfg.LogLevel)
-	if err != nil {
+	// Switch to the configured log format (console or json) and level. The
+	// level cannot be invalid here: LoadControllerConfig already rejects
+	// unknown levels.
+	if _, err := logging.Setup(cfg.LogFormat, cfg.LogLevel); err != nil {
 		return fmt.Errorf("failed to set up logging: %w", err)
-	}
-	if invalidLevel {
-		log.Warn().Str("logLevel", cfg.LogLevel).Msg("Invalid log level, defaulting to info")
 	}
 
 	log.Info().
@@ -97,18 +95,7 @@ func run(cmd *cobra.Command, args []string) error {
 		Str("tlsMode", cfg.TLSMode).
 		Msg("Starting rpingmesh-controller")
 
-	// Initialize RNIC registry backed by rqlite. The connection is retried
-	// until database_connect_timeout_sec elapses, so the controller tolerates
-	// an rqlite node that is still starting; a shutdown signal aborts the wait.
-	connectCtx, stopConnect := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	reg, err := registry.NewRnicRegistry(
-		connectCtx,
-		cfg.DatabaseURI,
-		cfg.ActiveThresholdSec,
-		cfg.StaleThresholdSec,
-		time.Duration(cfg.DatabaseConnectTimeoutSec)*time.Second,
-	)
-	stopConnect()
+	reg, err := openRegistry(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to initialize registry: %w", err)
 	}
@@ -126,36 +113,15 @@ func run(cmd *cobra.Command, args []string) error {
 		MaxFlowLabels:       cfg.EcmpMaxFlowLabels,
 	}, cfg.InterTorSampleSize, cfg.UnspecifiedMeshMaxTargets)
 
-	// Set up the Phase 1 analyzer if enabled: it ingests agent-reported
-	// per-path summaries and flags SLA violations. Its OTLP metrics are
-	// best-effort (service.name=rpingmesh-analyzer); a failure to build the
-	// meter provider degrades to log-only findings rather than failing startup.
-	// The provider is returned so it can be flushed on shutdown.
-	analyzerProvider := setupAnalyzer(cfg, svc)
-	if analyzerProvider != nil {
-		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := analyzerProvider.Shutdown(shutdownCtx); err != nil {
-				log.Error().Err(err).Msg("Failed to shut down analyzer metrics provider")
-			}
-		}()
+	// Set up the Phase 1 analyzer if enabled. Its meter provider (nil when
+	// metrics are unavailable) is flushed on shutdown.
+	if analyzerProvider := setupAnalyzer(cfg, svc); analyzerProvider != nil {
+		defer shutdownMeterProvider(analyzerProvider)
 	}
 
-	// Configure gRPC server transport security from tls_mode. disabled (the
-	// default) preserves the original plaintext behavior for backward
-	// compatibility.
-	var serverOpts []grpc.ServerOption
-	switch cfg.TLSMode {
-	case config.TLSModeDisabled, "":
-		log.Warn().Msg("gRPC server starting with tls_mode=disabled: controller-agent traffic is plaintext and unauthenticated; set tls_mode to tls or mtls for production deployments")
-	default:
-		tlsConfig, err := config.ServerTLSConfig(cfg.TLSMode, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile)
-		if err != nil {
-			return fmt.Errorf("failed to build server TLS configuration: %w", err)
-		}
-		serverOpts = append(serverOpts, grpc.Creds(credentials.NewTLS(tlsConfig)))
-		log.Info().Str("tlsMode", cfg.TLSMode).Msg("gRPC server TLS enabled")
+	serverOpts, err := buildServerOptions(cfg)
+	if err != nil {
+		return err
 	}
 
 	// Create and configure the gRPC server.
@@ -178,27 +144,88 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// Set up a cancellable context for background tasks.
+	// Background tasks run until run returns.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go runStaleEntryCleanup(ctx, reg, 5*time.Minute)
 
-	// Start periodic cleanup of stale RNIC entries (every 5 minutes).
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if err := reg.CleanupStaleEntries(ctx); err != nil {
-					log.Error().Err(err).Msg("Failed to cleanup stale entries")
-				}
-			case <-ctx.Done():
-				return
-			}
+	if err := waitForShutdown(grpcServer, errCh); err != nil {
+		return err
+	}
+
+	log.Info().Msg("Controller stopped")
+	return nil
+}
+
+// openRegistry connects the RNIC registry to rqlite. The connection is retried
+// until database_connect_timeout_sec elapses, so the controller tolerates an
+// rqlite node that is still starting; a shutdown signal aborts the wait.
+func openRegistry(cfg *config.ControllerConfig) (*registry.RnicRegistry, error) {
+	connectCtx, stopConnect := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopConnect()
+	return registry.NewRnicRegistry(
+		connectCtx,
+		cfg.DatabaseURI,
+		cfg.ActiveThresholdSec,
+		cfg.StaleThresholdSec,
+		time.Duration(cfg.DatabaseConnectTimeoutSec)*time.Second,
+	)
+}
+
+// shutdownMeterProvider flushes and shuts down the analyzer's meter provider,
+// bounded by a 5s timeout.
+func shutdownMeterProvider(provider *sdkmetric.MeterProvider) {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := provider.Shutdown(shutdownCtx); err != nil {
+		log.Error().Err(err).Msg("Failed to shut down analyzer metrics provider")
+	}
+}
+
+// buildServerOptions configures gRPC server transport security from tls_mode.
+// disabled (the default) preserves the original plaintext behavior for
+// backward compatibility and yields no options.
+func buildServerOptions(cfg *config.ControllerConfig) ([]grpc.ServerOption, error) {
+	switch cfg.TLSMode {
+	case config.TLSModeDisabled, "":
+		log.Warn().Msg("gRPC server starting with tls_mode=disabled: controller-agent traffic is plaintext and unauthenticated; set tls_mode to tls or mtls for production deployments")
+		return nil, nil
+	default:
+		tlsConfig, err := config.ServerTLSConfig(cfg.TLSMode, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build server TLS configuration: %w", err)
 		}
-	}()
+		log.Info().Str("tlsMode", cfg.TLSMode).Msg("gRPC server TLS enabled")
+		return []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsConfig))}, nil
+	}
+}
 
-	// Wait for shutdown signal (SIGINT or SIGTERM).
+// staleCleaner is the part of the registry the cleanup loop uses.
+type staleCleaner interface {
+	CleanupStaleEntries(ctx context.Context) error
+}
+
+// runStaleEntryCleanup removes stale RNIC entries every interval until ctx is
+// cancelled.
+func runStaleEntryCleanup(ctx context.Context, reg staleCleaner, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := reg.CleanupStaleEntries(ctx); err != nil {
+				log.Error().Err(err).Msg("Failed to cleanup stale entries")
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// waitForShutdown blocks until SIGINT/SIGTERM arrives or the gRPC server
+// reports a serve error on errCh. On a signal it drains in-flight requests
+// with GracefulStop and returns nil; a serve error is returned as is.
+func waitForShutdown(grpcServer *grpc.Server, errCh <-chan error) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -213,8 +240,6 @@ func run(cmd *cobra.Command, args []string) error {
 	// Gracefully stop the gRPC server to drain in-flight requests.
 	log.Info().Msg("Shutting down gRPC server gracefully")
 	grpcServer.GracefulStop()
-
-	log.Info().Msg("Controller stopped")
 	return nil
 }
 

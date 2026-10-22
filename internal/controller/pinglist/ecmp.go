@@ -24,14 +24,6 @@ type ECMPConfig struct {
 	MaxFlowLabels int
 }
 
-// DefaultECMP* mirror the controller config defaults so the two stay in sync
-// without the config package importing this one.
-const (
-	DefaultECMPPathsAssumed        = 16
-	DefaultECMPCoverageProbability = 0.9
-	DefaultECMPMaxFlowLabels       = 64
-)
-
 // ComputeFlowLabelCount returns n, the number of distinct random flow labels
 // required to cover all m equal-probability ECMP paths with probability at
 // least p, capped at maxLabels. It implements R-Pingmesh (SIGCOMM 2024)

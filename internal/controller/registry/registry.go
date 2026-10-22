@@ -2,7 +2,6 @@ package registry
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -49,14 +48,11 @@ type RnicRegistry struct {
 	// considered stale and removed or excluded.
 	staleThresholdSec int
 
-	// now is the clock used both to stamp last_updated_epoch and to compute
-	// the active/stale cutoffs (time.Now; injectable in tests). Cutoffs are
-	// computed here and bound as parameters instead of using SQLite's
-	// strftime('%s','now'): rqlite rewrites 'now' in write statements for
-	// Raft determinism and renders it in the server's local timezone, so on a
-	// non-UTC host the stale cleanup DELETE saw every row as hours old and
-	// wiped the whole registry. Using one clock for stamping and comparing
-	// also keeps reads and writes consistent.
+	// now stamps last_updated_epoch and computes the active/stale cutoffs
+	// (time.Now; injectable in tests). Cutoffs are bound as parameters rather
+	// than using SQLite's 'now': rqlite rewrites 'now' in write statements in
+	// the server's local timezone, so on a non-UTC host the stale cleanup once
+	// deleted every row.
 	now func() time.Time
 }
 
@@ -79,10 +75,7 @@ const (
 // URI. It initializes the database schema (table + indexes) before
 // returning. activeThresholdSec and staleThresholdSec configure the thresholds
 // described above; a value <= 0 falls back to the corresponding Default*
-// constant. Inter-ToR sampling (one representative RNIC per foreign ToR) is
-// performed by the pinglist generator, not here, because it must run after the
-// generator's same-host / same-address-family filtering so that a ToR is only
-// dropped when it has no valid target for the requester (see issues #39, #41).
+// constant.
 //
 // Opening the connection and initializing the schema are retried with
 // exponential backoff (1s doubling up to 30s) until they succeed, ctx is
@@ -304,25 +297,13 @@ func isDuplicateColumnErr(errs ...error) bool {
 	return false
 }
 
-// RegisterRNICs replaces the full set of RNIC entries registered for a
-// single agent as one atomic rqlite transaction (WriteParameterizedContext
-// executes all statements as a single transaction): it first deletes every
-// existing row for agentID, then inserts one row per entry in rnics. This
-// set-replacement semantics (rather than a per-RNIC upsert) ensures that
-// RNICs no longer reported by the agent (e.g. a NIC removed, an allowlist
-// change, or a QP recreated with a new QPN) are removed immediately instead
-// of lingering in the registry - and therefore in pinglists - until the
-// stale-threshold window expires. This holds even when rnics is empty (the
-// agent currently has no RNICs at all): the DELETE still runs, on its own,
-// so the agent's previously-registered rows don't linger either. This is
-// safe for the agent's periodic heartbeat re-registration too, since the
-// agent always sends its complete current RNIC set on every registration
-// and heartbeat call (see buildRegistrationRequest in
-// internal/agent/agent.go), never a partial delta. The whole operation
-// still runs in a single transaction, so a partial failure (e.g. a
-// constraint violation on one RNIC) never leaves the agent with some RNICs
-// deleted and none re-inserted. The last_updated_epoch field is set to the
-// current Unix timestamp (seconds) for every row.
+// RegisterRNICs replaces the full set of RNIC entries registered for agentID
+// in one rqlite transaction: it deletes every existing row for the agent and
+// inserts one row per entry in rnics. Set replacement (rather than a per-RNIC
+// upsert) drops RNICs the agent no longer reports as soon as it re-registers,
+// instead of after the stale-threshold window; the DELETE still runs when
+// rnics is empty. The agent always sends its complete RNIC set (see
+// buildRegistrationRequest in internal/agent/agent.go), never a delta.
 func (r *RnicRegistry) RegisterRNICs(
 	ctx context.Context,
 	agentID string,
@@ -381,6 +362,11 @@ func (r *RnicRegistry) RegisterRNICs(
 	if err != nil {
 		return fmt.Errorf("failed to replace RNICs: %w", err)
 	}
+	// gorqlite returns one result per statement; anything else means the
+	// response cannot be matched to the statements, so do not index into it.
+	if len(results) != len(statements) {
+		return fmt.Errorf("failed to replace RNICs: got %d results for %d statements", len(results), len(statements))
+	}
 
 	if results[0].Err != nil {
 		return fmt.Errorf("failed to delete stale RNICs for agent %s: %w", agentID, results[0].Err)
@@ -395,6 +381,27 @@ func (r *RnicRegistry) RegisterRNICs(
 	return nil
 }
 
+// rnicColumns is the column list selected by every RNIC read; scanRnicInfo
+// reads rows in this order.
+const rnicColumns = "rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id, netdev"
+
+// queryRnics runs `SELECT rnicColumns FROM rnics` followed by where (the WHERE
+// clause plus any trailing ORDER BY / LIMIT, terminated by ';') with the given
+// bound arguments, and scans every returned row.
+func (r *RnicRegistry) queryRnics(ctx context.Context, where string, args ...interface{}) ([]*controller_agent.RnicInfo, error) {
+	stmt := gorqlite.ParameterizedStatement{
+		Query:     "\n\tSELECT " + rnicColumns + "\n\tFROM rnics\n\t" + where,
+		Arguments: args,
+	}
+
+	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
+	if err != nil {
+		return nil, err
+	}
+
+	return scanRnicInfoRows(result)
+}
+
 // GetRNICsByToR returns all active RNICs (updated within the configured
 // active-threshold window) belonging to the specified ToR switch.
 func (r *RnicRegistry) GetRNICsByToR(
@@ -403,23 +410,12 @@ func (r *RnicRegistry) GetRNICsByToR(
 ) ([]*controller_agent.RnicInfo, error) {
 	log.Debug().Str("torID", torID).Msg("Getting RNICs by ToR")
 
-	querySQL := `
-	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id, netdev
-	FROM rnics
-	WHERE tor_id = ?
-	AND last_updated_epoch > ?;`
-
-	stmt := gorqlite.ParameterizedStatement{
-		Query:     querySQL,
-		Arguments: []interface{}{torID, r.cutoff(r.activeThresholdSec)},
-	}
-
-	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
+	rnics, err := r.queryRnics(ctx, `WHERE tor_id = ?
+	AND last_updated_epoch > ?;`, torID, r.cutoff(r.activeThresholdSec))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query RNICs by ToR: %w", err)
 	}
-
-	return scanRnicInfoRows(result)
+	return rnics, nil
 }
 
 // GetActiveRNICsInOtherToRs returns every active RNIC (updated within the
@@ -440,33 +436,22 @@ func (r *RnicRegistry) GetActiveRNICsInOtherToRs(
 ) ([]*controller_agent.RnicInfo, error) {
 	log.Debug().Str("excludeTorID", excludeTorID).Msg("Getting active RNICs in other ToRs")
 
-	querySQL := `
-	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id, netdev
-	FROM rnics
-	WHERE tor_id != ?
+	rnics, err := r.queryRnics(ctx, `WHERE tor_id != ?
 	AND last_updated_epoch > ?
-	ORDER BY RANDOM();`
-
-	stmt := gorqlite.ParameterizedStatement{
-		Query:     querySQL,
-		Arguments: []interface{}{excludeTorID, r.cutoff(r.activeThresholdSec)},
-	}
-
-	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
+	ORDER BY RANDOM();`, excludeTorID, r.cutoff(r.activeThresholdSec))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active RNICs in other ToRs: %w", err)
 	}
-
-	return scanRnicInfoRows(result)
+	return rnics, nil
 }
 
-// GetRNICByGID returns the active registry row of the RNIC identified by gid,
-// or (nil, nil) when gid is empty or no active entry matches (e.g. the
-// requester has not registered yet). The pinglist generator uses the row's
-// hostname for same-host filtering and its plane_id for plane restriction; a
-// nil result makes it fall back to GID-based self-exclusion and the plane
-// carried in the request. Genuine query errors are propagated. It reuses
-// GetRNICInfo's active-window GID lookup.
+// GetRNICByGID returns the active registry row (updated within the configured
+// active-threshold window) of the RNIC identified by gid, or (nil, nil) when
+// gid is empty or no active entry matches (e.g. the requester has not
+// registered yet). The pinglist generator uses the row's hostname for
+// same-host filtering and its plane_id for plane restriction; a nil result
+// makes it fall back to GID-based self-exclusion and the plane carried in the
+// request. Genuine query errors are propagated.
 func (r *RnicRegistry) GetRNICByGID(
 	ctx context.Context,
 	gid string,
@@ -474,69 +459,20 @@ func (r *RnicRegistry) GetRNICByGID(
 	if gid == "" {
 		return nil, nil
 	}
-	return r.GetRNICInfo(ctx, "", gid)
-}
 
-// GetRNICInfo looks up a single RNIC by GID (primary key) or IP address.
-// Only active entries (updated within the configured active-threshold
-// window) are returned. Returns (nil, nil) when no matching entry is found.
-func (r *RnicRegistry) GetRNICInfo(
-	ctx context.Context,
-	targetIP string,
-	targetGID string,
-) (*controller_agent.RnicInfo, error) {
-	log.Debug().
-		Str("targetIP", targetIP).
-		Str("targetGID", targetGID).
-		Msg("Getting RNIC info")
+	log.Debug().Str("targetGID", gid).Msg("Getting RNIC info")
 
-	if targetIP == "" && targetGID == "" {
-		return nil, errors.New("either targetIP or targetGID must be provided")
-	}
-
-	var stmt gorqlite.ParameterizedStatement
-
-	if targetGID != "" {
-		// Query by GID (primary key) for fastest lookup.
-		querySQL := `
-		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id, netdev
-		FROM rnics
-		WHERE rnic_gid = ?
-		AND last_updated_epoch > ?
-		LIMIT 1;`
-		stmt = gorqlite.ParameterizedStatement{
-			Query:     querySQL,
-			Arguments: []interface{}{targetGID, r.cutoff(r.activeThresholdSec)},
-		}
-	} else {
-		// Fallback to IP-based lookup.
-		querySQL := `
-		SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id, netdev
-		FROM rnics
-		WHERE rnic_ip = ?
-		AND last_updated_epoch > ?
-		LIMIT 1;`
-		stmt = gorqlite.ParameterizedStatement{
-			Query:     querySQL,
-			Arguments: []interface{}{targetIP, r.cutoff(r.activeThresholdSec)},
-		}
-	}
-
-	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
+	// rnic_gid is the primary key, so at most one row matches.
+	rnics, err := r.queryRnics(ctx, `WHERE rnic_gid = ?
+	AND last_updated_epoch > ?
+	LIMIT 1;`, gid, r.cutoff(r.activeThresholdSec))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query RNIC info: %w", err)
 	}
-
-	// Return nil when no matching row is found.
-	if !result.Next() {
+	if len(rnics) == 0 {
 		return nil, nil
 	}
-
-	info, err := scanRnicInfo(result)
-	if err != nil {
-		return nil, fmt.Errorf("failed to scan RNIC info row: %w", err)
-	}
-	return info, nil
+	return rnics[0], nil
 }
 
 // CleanupStaleEntries removes RNIC entries that have not been updated
@@ -565,32 +501,7 @@ func (r *RnicRegistry) CleanupStaleEntries(ctx context.Context) error {
 	return nil
 }
 
-// ListAllRNICs returns all active RNICs (updated within the configured
-// stale-threshold window), ordered by tor_id and hostname.
-func (r *RnicRegistry) ListAllRNICs(ctx context.Context) ([]*controller_agent.RnicInfo, error) {
-	log.Debug().Msg("Listing all active RNICs")
-
-	querySQL := `
-	SELECT rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id, netdev
-	FROM rnics
-	WHERE last_updated_epoch > ?
-	ORDER BY tor_id, hostname;`
-
-	stmt := gorqlite.ParameterizedStatement{
-		Query:     querySQL,
-		Arguments: []interface{}{r.cutoff(r.staleThresholdSec)},
-	}
-
-	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list RNICs: %w", err)
-	}
-
-	return scanRnicInfoRows(result)
-}
-
-// scanRnicInfoRows is a helper that iterates over query result rows and
-// converts them into a slice of RnicInfo proto messages.
+// scanRnicInfoRows converts every row of result into an RnicInfo.
 func scanRnicInfoRows(result gorqlite.QueryResult) ([]*controller_agent.RnicInfo, error) {
 	var rnics []*controller_agent.RnicInfo
 
@@ -605,9 +516,8 @@ func scanRnicInfoRows(result gorqlite.QueryResult) ([]*controller_agent.RnicInfo
 	return rnics, nil
 }
 
-// scanRnicInfo converts the current row of a query selecting
-// "rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id, netdev" into an
-// RnicInfo.
+// scanRnicInfo converts the current row of a query selecting rnicColumns into
+// an RnicInfo.
 func scanRnicInfo(result gorqlite.QueryResult) (*controller_agent.RnicInfo, error) {
 	var gid, ip, hostname, torID, deviceName, planeID, netdev string
 	var qpn int64

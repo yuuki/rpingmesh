@@ -12,8 +12,8 @@ import (
 )
 
 // Default thresholds used when the caller does not supply a positive value
-// to NewRnicRegistry. These mirror the values that were previously
-// hardcoded directly into the SQL queries.
+// to NewRnicRegistry. config.Default{Active,Stale}ThresholdSec carry the same
+// values (pinned equal by a test in internal/config).
 const (
 	// DefaultActiveThresholdSec is the window (in seconds) within which an
 	// RNIC entry's last_updated_epoch must fall to be considered "active"

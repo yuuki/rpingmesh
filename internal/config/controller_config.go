@@ -9,12 +9,15 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/spf13/pflag"
 	"github.com/yuuki/rpingmesh/internal/logging"
+	"github.com/yuuki/rpingmesh/internal/probe"
 )
 
 // Default threshold values for the controller's RNIC registry. These mirror
-// registry.Default{Active,Stale}ThresholdSec / DefaultInterTorSampleSize so
-// that config defaults and registry defaults stay in sync without the
-// config package importing the controller/registry package.
+// registry.Default{Active,Stale}ThresholdSec, pinglist.DefaultInterTorSampleSize
+// and pinglist.DefaultUnspecifiedMeshMaxTargets so that config defaults and
+// the packages' own fallbacks stay in sync without the config package
+// importing the controller packages; TestDefaultsMatchControllerPackages pins
+// them equal.
 const (
 	// DefaultActiveThresholdSec is the window (seconds) within which an
 	// RNIC entry is considered "active" for pinglist generation.
@@ -44,13 +47,9 @@ const (
 	// probe amplification.
 	DefaultEcmpMaxFlowLabels = 64
 
-	// MaxEcmpFlowLabels is the operational ceiling on ecmp_max_flow_labels.
-	// 4096 labels is ~16KB per target ([]uint32) and covers even extreme Eq.(1)
-	// configs (e.g. m=256, p=0.99 needs ~2600 labels). It is deliberately far
-	// below the 20-bit field's theoretical 2^20 maximum, which would make each
-	// target carry a ~1M-entry label set/map and stall or OOM the agent. The
-	// agent enforces the same 4096 clamp as defense in depth.
-	MaxEcmpFlowLabels = 4096
+	// MaxEcmpFlowLabels is the operational ceiling on ecmp_max_flow_labels;
+	// see probe.MaxDistinctFlowLabels, which the agent also clamps to.
+	MaxEcmpFlowLabels = probe.MaxDistinctFlowLabels
 
 	// DefaultAnalyzerSLALossRatio is the default per-path loss ratio
 	// (probe_failed / probe_total) above which the analyzer flags a window as

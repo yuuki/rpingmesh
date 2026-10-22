@@ -155,7 +155,7 @@ func TestRDMAE2ETwoDevices(t *testing.T) {
 	// and T3+T4 from AckTypeSecond payload.
 	// T4 is the responder's first-ACK send completion; it is NOT in the first ACK
 	// payload (unknown at send time) but IS in the second ACK payload.
-	proberQueue.StartEventPoller(testCtx, func(ev rdmabridge.CompletionEvent) {
+	startEventPoller(testCtx, proberQueue, proberRing, func(ev rdmabridge.CompletionEvent) {
 		t.Logf("prober  event: IsSend=%v IsAck=%v AckType=%d Status=%d TimestampNS=%d",
 			ev.IsSend, ev.IsAck, ev.AckType, ev.Status, ev.TimestampNS)
 		if ev.IsAck && ev.AckType == rdmabridge.AckTypeFirst {
@@ -171,7 +171,7 @@ func TestRDMAE2ETwoDevices(t *testing.T) {
 	})
 
 	// --- Responder event poller: receive probe, send first and second ACK ---
-	responderQueue.StartEventPoller(testCtx, func(ev rdmabridge.CompletionEvent) {
+	startEventPoller(testCtx, responderQueue, responderRing, func(ev rdmabridge.CompletionEvent) {
 		t.Logf("responder event: IsSend=%v IsAck=%v AckType=%d Status=%d TimestampNS=%d SourceQPN=%d",
 			ev.IsSend, ev.IsAck, ev.AckType, ev.Status, ev.TimestampNS, ev.SourceQPN)
 		// Skip send completions, ACK events, and any error events.

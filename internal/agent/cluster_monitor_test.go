@@ -79,7 +79,9 @@ func (m *mockControllerClient) GetPinglist(
 // bypasses NewProber (which requires a real RDMA device) since only the
 // unexported targets field, set via UpdateTargets, is exercised here.
 func newTestProber() *Prober {
-	return &Prober{logger: zerolog.Nop()}
+	p := newProberCore(0)
+	p.logger = zerolog.Nop()
+	return p
 }
 
 // newTestClusterMonitor builds a ClusterMonitor wired to the given mock

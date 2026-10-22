@@ -95,15 +95,20 @@ build-agent:
 	CGO_ENABLED=1 go build -ldflags "$(GO_LDFLAGS)" -o $(AGENT_BIN) ./cmd/agent/
 	@echo "==> Agent built: $(AGENT_BIN)"
 
-# Run Go tests. NOTE: this only covers internal/probe/... (pure Go, no RDMA
-# hardware needed). Use `make test-all` to run every package's tests (Linux,
-# full CGO/RDMA build env) or `make test-e2e` / `make test-e2e-controller`
-# for the Docker-based end-to-end suites.
+# Pure-Go packages: no Cgo, no RDMA hardware, runnable on any OS. The
+# controller packages need the generated protobuf bindings (`make
+# generate-proto` on a fresh checkout). internal/agent, internal/rdmabridge and
+# cmd/agent need the Cgo/RDMA build environment: use `make test-all` (Linux)
+# or `make test-e2e` / `make test-e2e-controller` for the Docker-based suites.
+PURE_GO_TEST_PKGS := ./internal/probe/... ./internal/config/... ./internal/telemetry/... \
+	./internal/lldp/... ./internal/logging/... ./internal/buildinfo/... \
+	./internal/controller/... ./internal/agent/controller_client/... ./cmd/controller/...
+
 test: test-go
 
 test-go:
-	@echo "==> Running Go tests..."
-	go test -v ./internal/probe/...
+	@echo "==> Running Go tests (pure-Go packages)..."
+	go test $(PURE_GO_TEST_PKGS)
 	@echo "==> Tests complete"
 
 # Run the Python tests of the scripts/topology tooling (stdlib only).

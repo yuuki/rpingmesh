@@ -28,7 +28,7 @@ After modifying Zig source in `zig/src/`: run `make build-zig` before `make buil
 ### Testing
 
 ```bash
-make test                                       # go test -v ./internal/probe/... (pure Go, no RDMA hardware needed)
+make test                                       # go test on every pure-Go package (no Cgo, no RDMA hardware)
 go test -v ./internal/probe/... -run TestName  # Run a specific test
 go test -race ./internal/probe/...             # Run with race detector
 make vet                                        # go vet ./...
@@ -37,7 +37,7 @@ make test-scripts                               # Python tests for scripts/topol
 make test-all                                   # test-zig + go test on all packages except ./e2e/... (Linux, full Cgo/RDMA build env)
 ```
 
-`make test` covers only `internal/probe/`. `internal/rdmabridge`, `internal/agent`, and `cmd/agent` need Cgo, libibverbs, and `librdmabridge.a` (the Linux environment of `make test-all`); the other packages are pure Go and can be tested anywhere with `go test`, but are not part of `make test`. `./e2e/...` is excluded from `test-all`; run it with `make test-e2e-controller` (Docker + rqlite) or `make test-e2e` (privileged Docker with soft-RoCE; on macOS run `make setup-colima` once).
+`make test` covers every pure-Go package (`internal/probe`, `internal/config`, `internal/telemetry`, `internal/lldp`, `internal/logging`, `internal/buildinfo`, `internal/controller/...`, `internal/agent/controller_client`, `cmd/controller`); the controller packages need `make generate-proto` first. `internal/rdmabridge`, `internal/agent`, and `cmd/agent` need Cgo, libibverbs, and `librdmabridge.a` (the Linux environment of `make test-all`). `./e2e/...` is excluded from `test-all`; run it with `make test-e2e-controller` (Docker + rqlite) or `make test-e2e` (privileged Docker with soft-RoCE; on macOS run `make setup-colima` once).
 
 ## Architecture
 

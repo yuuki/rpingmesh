@@ -29,7 +29,7 @@ func writeUverbsNode(t *testing.T, sysfs, node, device string) string {
 }
 
 // recordOne records the watch identity of a single device.
-func recordOne(t *testing.T, sysfs, device string) watchedDevice {
+func recordOne(t *testing.T, sysfs, device string) *watchedDevice {
 	t.Helper()
 	a, err := NewAgent(&config.AgentConfig{AgentID: "agent-1"})
 	if err != nil {
@@ -37,12 +37,12 @@ func recordOne(t *testing.T, sysfs, device string) watchedDevice {
 	}
 	a.logger = zerolog.Nop()
 	a.sysfsRoot = sysfs
-	a.devices = []*rdmabridge.Device{fakeDevice(device, "0")}
+	a.setRnics(fakeDevices(device), nil)
 	a.recordWatchedDevices()
-	if len(a.watchedDevices) != 1 {
-		t.Fatalf("watchedDevices = %+v, want one entry", a.watchedDevices)
+	if a.rnics[0].watch == nil {
+		t.Fatalf("device %s was not recorded for watching", device)
 	}
-	return a.watchedDevices[0]
+	return a.rnics[0].watch
 }
 
 // TestDeviceSkipReason verifies the post-open filters: a GID in
@@ -131,8 +131,8 @@ func TestAgent_UnmappedDeviceFallbackWarns(t *testing.T) {
 	}
 	var logs bytes.Buffer
 	a.logger = zerolog.New(&logs)
-	a.devices = []*rdmabridge.Device{fakeDevice("mlx5_0", "0"), fakeDevice("mlx5_2", "2")}
-	a.deviceNetdevs = []string{"enp1s0", "bond0"}
+	a.setRnics(fakeDevices("mlx5_0", "mlx5_2"), nil)
+	a.rnics[0].netdev, a.rnics[1].netdev = "enp1s0", "bond0"
 
 	a.resolveDeviceTorIDs(nil)
 
@@ -151,7 +151,7 @@ func TestAgent_UnmappedDeviceFallbackWarns(t *testing.T) {
 	b, _ := NewAgent(&config.AgentConfig{AgentID: "agent-1", TorID: "tor-1"})
 	logs.Reset()
 	b.logger = zerolog.New(&logs)
-	b.devices = []*rdmabridge.Device{fakeDevice("mlx5_0", "0")}
+	b.setRnics(fakeDevices("mlx5_0"), nil)
 	b.resolveDeviceTorIDs(nil)
 	if strings.Contains(logs.String(), "falls back to tor_id") {
 		t.Errorf("unexpected fallback warning without device_tor_ids:\n%s", logs.String())
@@ -215,22 +215,23 @@ func TestAgent_RecordWatchedDevicesSkipsUnknown(t *testing.T) {
 	}
 	a.logger = zerolog.Nop()
 	a.sysfsRoot = sysfs
-	a.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0"), fakeDevice("rxe1", "1")}
-	a.deviceNetdevs = []string{"eth0", "eth1"}
+	a.setRnics(fakeDevices("rxe0", "rxe1"), nil)
+	a.rnics[0].netdev, a.rnics[1].netdev = "eth0", "eth1"
 
 	a.recordWatchedDevices()
-	if len(a.watchedDevices) != 1 || a.watchedDevices[0].name != "rxe0" ||
-		a.watchedDevices[0].netdev != "eth0" || a.watchedDevices[0].uverbs != node {
-		t.Errorf("watchedDevices = %+v, want only rxe0", a.watchedDevices)
+	watched := a.watchedDevices()
+	if len(watched) != 1 || watched[0].name != "rxe0" ||
+		watched[0].netdev != "eth0" || watched[0].uverbs != node {
+		t.Errorf("watchedDevices = %+v, want only rxe0", watched)
 	}
 
 	b, _ := NewAgent(&config.AgentConfig{AgentID: "agent-1"})
 	b.logger = zerolog.Nop()
 	b.sysfsRoot = filepath.Join(sysfs, "missing")
-	b.devices = []*rdmabridge.Device{fakeDevice("rxe0", "0")}
+	b.setRnics(fakeDevices("rxe0"), nil)
 	b.recordWatchedDevices()
-	if len(b.watchedDevices) != 0 {
-		t.Errorf("watchedDevices without sysfs = %+v, want none", b.watchedDevices)
+	if got := b.watchedDevices(); len(got) != 0 {
+		t.Errorf("watchedDevices without sysfs = %+v, want none", got)
 	}
 }
 
@@ -249,8 +250,8 @@ func TestAgent_DeviceWatchReportsLoss(t *testing.T) {
 	a.logger = zerolog.Nop()
 	a.sysfsRoot = sysfs
 	a.deviceWatchPeriod = 10 * time.Millisecond
-	a.devices = []*rdmabridge.Device{fakeDevice("mlx5_0", "0"), fakeDevice("mlx5_2", "2")}
-	a.deviceNetdevs = []string{"enp1s0", "bond0"}
+	a.setRnics(fakeDevices("mlx5_0", "mlx5_2"), nil)
+	a.rnics[0].netdev, a.rnics[1].netdev = "enp1s0", "bond0"
 	a.recordWatchedDevices()
 
 	a.startDeviceWatch(context.Background())

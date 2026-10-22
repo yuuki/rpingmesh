@@ -1,12 +1,8 @@
-// Package agent implements the R-Pingmesh agent, including the Responder
-// that listens for incoming probe packets and sends back ACK replies.
 package agent
 
 import (
 	"context"
 	"errors"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -35,29 +31,18 @@ const (
 // cancellation interrupts its wait for a send slot. It is not logged.
 var errResponderStopping = errors.New("responder stopping")
 
-// Responder listens for incoming probe packets on a single RDMA UD queue
-// and sends back first and second ACK packets to complete the R-Pingmesh
-// 6-timestamp protocol.
+// Responder listens for incoming probes on a responder-type UD queue and
+// answers each with the ACK pair of the 6-timestamp protocol.
 //
-// The responder never waits for a send completion: each probe is answered
-// with Queue.SendAckPair, which posts the first ACK and leaves the second to
-// the queue's CQ poller (it needs the first ACK's completion timestamp, T4).
-// The processing goroutine therefore drains the event ring at the inbound
-// probe rate even when completions are slow, so a late completion delays
-// only its own probe instead of every probe queued behind it.
+// It never waits for a send completion: Queue.SendAckPair posts the first
+// ACK and leaves the second to the queue's CQ poller (which needs the first
+// ACK's completion timestamp, T4). The processing goroutine therefore drains
+// the event ring at the inbound probe rate even when completions are slow.
 type Responder struct {
-	queue   *rdmabridge.Queue
-	ring    *rdmabridge.EventRing
-	device  *rdmabridge.Device
-	running atomic.Bool
-	stopMu  sync.Mutex    // guards stopCh (re)creation across Start/Stop
-	stopCh  chan struct{} // closed by Stop() to wake the process loop immediately
-	wg      sync.WaitGroup
-
-	// queueMu guards access to the queue pointer so that GetQueueInfo cannot
-	// race with Destroy() setting queue to nil.
-	queueMu sync.RWMutex
-
+	lifecycle
+	queueHandle
+	ring   *rdmabridge.EventRing
+	device *rdmabridge.Device
 	logger zerolog.Logger
 
 	// reportedAckFailures and lastAckFailureCheck track the Warn log of
@@ -66,39 +51,29 @@ type Responder struct {
 	lastAckFailureCheck time.Time
 }
 
-// NewResponder creates a new Responder with a responder-type RDMA queue
-// bound to the given device and event ring. The queue is created immediately
-// so that its QPN can be registered with the controller before Start() is
-// called.
+// NewResponder creates a Responder with a responder-type RDMA queue bound to
+// device and ring. The queue is created immediately so its QPN can be
+// registered with the controller before Start.
 func NewResponder(device *rdmabridge.Device, ring *rdmabridge.EventRing) (*Responder, error) {
 	queue, err := device.CreateQueue(rdmabridge.QueueTypeResponder, ring)
 	if err != nil {
 		return nil, err
 	}
-
 	r := &Responder{
-		queue:  queue,
 		ring:   ring,
 		device: device,
 		logger: log.With().Str("component", "responder").Logger(),
 	}
+	r.queue = queue
 	return r, nil
 }
 
-// Start begins the responder event processing loop. The loop runs in a
-// background goroutine until Stop() is called or the context is cancelled.
+// Start launches the event processing loop; it runs until Stop is called or
+// ctx is cancelled.
 func (r *Responder) Start(ctx context.Context) error {
-	if !r.running.CompareAndSwap(false, true) {
-		return nil // already running
+	if !r.lifecycle.start() {
+		return nil
 	}
-
-	// Recreate stopCh so the responder can be restarted after a previous
-	// Stop() closed it. Stop() has already waited for the old goroutine to
-	// exit (running is false here), so nothing references the old channel.
-	r.stopMu.Lock()
-	r.stopCh = make(chan struct{})
-	r.stopMu.Unlock()
-
 	r.wg.Add(1)
 	go r.processLoop(ctx)
 
@@ -111,92 +86,29 @@ func (r *Responder) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop signals the responder to stop processing and waits for the
-// background goroutine to exit. Closing stopCh wakes the loop immediately
-// instead of waiting out an idle sleep or a long in-flight ACK batch.
+// Stop signals the loop to exit and waits for it. Safe to call more than once.
 func (r *Responder) Stop() {
-	// Always Wait, even when running is already false. ctx.Done in
-	// processLoop must not skip the join: Destroy tears down the queue
-	// immediately after Stop returns. Only the CAS winner closes stopCh.
-	signaled := r.running.CompareAndSwap(true, false)
-	if signaled {
-		r.stopMu.Lock()
-		close(r.stopCh)
-		r.stopMu.Unlock()
-	}
-	r.wg.Wait()
-	if signaled {
+	if r.lifecycle.stop() {
 		r.logger.Info().Msg("Responder stopped")
 	}
 }
 
-// processLoop is the main event processing loop. It drains the event ring
-// for recv completion events (incoming probes) and answers each with an ACK
-// pair (see handleEvent). Send completions and ACK recv events are
-// ignored since the responder only needs to react to incoming probes. While
-// the ring is empty the loop sleeps until the CQ poller signals new events
-// (see newRingIdleWait).
+// processLoop answers every incoming probe read from the event ring with an
+// ACK pair. Send completions and ACK recv events are ignored.
 func (r *Responder) processLoop(ctx context.Context) {
 	defer r.wg.Done()
-
-	const maxBatch = 32
-
-	wait, release := newRingIdleWait(ctx, r.stopCh, r.ring, r.queue.Info.UsesCQEvents, r.logger)
-	defer release()
-
 	defer r.logAsyncAckFailures(true)
-
-	for r.running.Load() {
+	runRingLoop(ctx, &r.lifecycle, r.ring, r.queue.Info.UsesCQEvents, r.logger, func(ev *rdmabridge.CompletionEvent) {
 		r.logAsyncAckFailures(false)
-
-		// Check for shutdown or context cancellation on every iteration.
-		select {
-		case <-ctx.Done():
-			// Do not Store(false): Stop() joins remaining work after CAS.
-			return
-		case <-r.stopCh:
-			return
-		default:
-		}
-
-		events := r.ring.Poll(maxBatch)
-		if len(events) == 0 {
-			// wait returns false as soon as Stop() or ctx cancellation
-			// happens, so Stop() is not delayed by an idle ring.
-			if !wait() {
-				return
-			}
-			continue
-		}
-
-		for i := range events {
-			// handleEvent normally returns as soon as the first ACK is
-			// posted, but it can wait up to ackSlotWaitTimeout for a send
-			// slot, so check for shutdown before every event to keep Stop()
-			// responsive.
-			select {
-			case <-ctx.Done():
-				return
-			case <-r.stopCh:
-				return
-			default:
-			}
-			r.handleEvent(ctx, &events[i])
-		}
-	}
+		r.handleEvent(ctx, ev)
+	})
 }
 
-// handleEvent processes a single completion event. Only recv events that
-// are NOT ACKs (i.e., incoming probe packets) are processed. All other
-// event types (send completions, ACK receives) are silently skipped.
+// handleEvent answers one incoming probe; other events are skipped.
 func (r *Responder) handleEvent(ctx context.Context, event *rdmabridge.CompletionEvent) {
-	// Only process recv completions that are incoming probes.
-	// Skip send completions and ACK receives.
 	if event.IsSend || event.IsAck {
 		return
 	}
-
-	// Check for completion errors from the hardware.
 	if event.Status != 0 {
 		r.logger.Warn().
 			Int32("status", event.Status).
@@ -204,38 +116,31 @@ func (r *Responder) handleEvent(ctx context.Context, event *rdmabridge.Completio
 		return
 	}
 
-	sourceQPN := event.SourceQPN
-	recvTimestamp := event.TimestampNS
-
-	// Reconstruct the received probe packet payload for the ACK functions.
-	// The Zig layer needs the original packet bytes to build the ACK.
-	recvPayload := buildRecvPacketPayload(event)
-
 	r.logger.Debug().
-		Uint32("source_qpn", sourceQPN).
+		Uint32("source_qpn", event.SourceQPN).
 		Uint64("seq", event.SequenceNum).
 		Uint32("flow_label", event.FlowLabel).
-		Uint64("recv_ts_ns", recvTimestamp).
+		Uint64("recv_ts_ns", event.TimestampNS).
 		Msg("Received probe, sending ACKs")
 
-	// Post the first ACK (echoes T1, carries T3 = recv time). The CQ poller
-	// sends the second ACK, carrying T3 and T4 (the first ACK's send
-	// completion time), once that completion arrives.
-	if err := r.sendAckPair(ctx, event, recvPayload); err != nil {
+	// The first ACK echoes T1 and carries T3 (the recv timestamp); the CQ
+	// poller sends the second ACK with T3 and T4 once the first ACK's send
+	// completion arrives.
+	if err := r.sendAckPair(ctx, event, buildRecvPacketPayload(event)); err != nil {
 		if errors.Is(err, errResponderStopping) {
 			return
 		}
 		r.logger.Error().Err(err).
-			Uint32("source_qpn", sourceQPN).
+			Uint32("source_qpn", event.SourceQPN).
 			Uint64("seq", event.SequenceNum).
 			Msg("Failed to send ACK pair")
 		return
 	}
 
 	r.logger.Debug().
-		Uint32("source_qpn", sourceQPN).
+		Uint32("source_qpn", event.SourceQPN).
 		Uint64("seq", event.SequenceNum).
-		Uint64("t3_ns", recvTimestamp).
+		Uint64("t3_ns", event.TimestampNS).
 		Msg("First ACK posted")
 }
 
@@ -267,12 +172,10 @@ func (r *Responder) sendAckPair(ctx context.Context, event *rdmabridge.Completio
 
 // logAsyncAckFailures logs a Warn when ACK pairs failed after SendAckPair
 // returned (see rdmabridge.Queue.AsyncAckFailures). It checks at most once
-// per asyncAckFailureLogInterval unless final is set. It runs when the loop
-// wakes for events and when the loop exits, so failures of the last pairs
-// before an idle period are reported with the next probe or at Stop. The
-// prober sees each
-// failure as a timeout; this log tells the operator that the responder
-// side, not the network, dropped the ACK.
+// per asyncAckFailureLogInterval unless final is set, so failures of the
+// last pairs before an idle period are reported with the next probe or at
+// Stop. The prober sees each failure as a timeout; this log tells the
+// operator that the responder side, not the network, dropped the ACK.
 func (r *Responder) logAsyncAckFailures(final bool) {
 	now := time.Now()
 	if !final && now.Sub(r.lastAckFailureCheck) < asyncAckFailureLogInterval {
@@ -291,56 +194,19 @@ func (r *Responder) logAsyncAckFailures(final bool) {
 	r.reportedAckFailures = total
 }
 
-// GetQueueInfo returns the queue metadata (QPN, timestamp mode) for
-// registration with the controller so that remote probers know where
-// to send probes. It is safe to call after Destroy(): a zero-valued QueueInfo
-// is returned once the queue has been torn down.
-func (r *Responder) GetQueueInfo() rdmabridge.QueueInfo {
-	r.queueMu.RLock()
-	defer r.queueMu.RUnlock()
-	if r.queue == nil {
-		return rdmabridge.QueueInfo{}
-	}
-	return r.queue.Info
-}
-
-// Destroy stops the responder if it is running and destroys the underlying
-// RDMA queue, freeing all associated resources (QP, CQ, MRs).
+// Destroy stops the responder and destroys its RDMA queue.
 func (r *Responder) Destroy() {
 	r.Stop()
-	r.queueMu.Lock()
-	if r.queue != nil {
-		r.queue.Destroy()
-		r.queue = nil
-	}
-	r.queueMu.Unlock()
+	r.destroyQueue()
 	r.logger.Info().Msg("Responder destroyed")
 }
 
-// buildRecvPacketPayload reconstructs the wire-format probe packet (40 bytes,
-// big-endian) from a CompletionEvent. This is needed because the Zig-side
-// ACK functions (SendAckPair, SendFirstAck, SendSecondAck) expect the
-// original received packet bytes to extract the sequence number and
-// original timestamps.
-//
-// Wire layout (40 bytes) — must match zig/src/packet.zig serializeProbePacket:
-//
-//	[0]      Version
-//	[1]      MsgType (0 = probe)
-//	[2]      AckType (0 = none)
-//	[3]      Flags
-//	[4:12]   SequenceNum (big-endian uint64)
-//	[12:20]  T1 (big-endian uint64)
-//	[20:28]  T3 (big-endian uint64)
-//	[28:36]  T4 (big-endian uint64)
-//	[36:40]  Reserved (zero padding)
+// buildRecvPacketPayload rebuilds the 40-byte wire-format probe the event
+// describes, which the Zig ACK path needs to build the ACKs. The layout lives
+// in rdmabridge.SerializeProbePacket (and zig/src/packet.zig).
 func buildRecvPacketPayload(event *rdmabridge.CompletionEvent) []byte {
 	buf := make([]byte, rdmabridge.ProbePacketSize)
-
-	// Reuse the single canonical wire-format serializer so the offset layout
-	// lives in exactly one place (rdmabridge.SerializeProbePacket) rather than
-	// being re-implemented here.
-	pkt := &rdmabridge.ProbePacket{
+	rdmabridge.SerializeProbePacket(&rdmabridge.ProbePacket{
 		Version:     rdmabridge.PacketVersion,
 		MsgType:     rdmabridge.MsgTypeProbe,
 		AckType:     rdmabridge.AckTypeNone,
@@ -349,8 +215,6 @@ func buildRecvPacketPayload(event *rdmabridge.CompletionEvent) []byte {
 		T1:          event.T1,
 		T3:          event.T3,
 		T4:          event.T4,
-	}
-	rdmabridge.SerializeProbePacket(pkt, buf)
-
+	}, buf)
 	return buf
 }

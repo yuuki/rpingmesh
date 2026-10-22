@@ -16,12 +16,10 @@ package rdmabridge
 import "C"
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"runtime"
-	"time"
 	"unsafe"
 )
 
@@ -77,9 +75,8 @@ type Context struct {
 	handle C.rdma_context_t
 }
 
-// Device wraps an opened RDMA device with its parent context reference.
+// Device wraps an opened RDMA device.
 type Device struct {
-	handle    C.rdma_context_t // parent context for device operations
 	devHandle C.rdma_device_t
 	Info      DeviceInfo
 	// CQPollMode is the CQPoll* mode applied to queues created on this
@@ -99,7 +96,6 @@ type DeviceInfo struct {
 // Queue wraps a UD Queue Pair with all associated resources (QP, CQ, MRs).
 type Queue struct {
 	handle C.rdma_queue_t
-	ring   *EventRing
 	Info   QueueInfo
 }
 
@@ -238,13 +234,7 @@ func (ctx *Context) OpenDevice(index int, gidIndex int, sl uint8, tc uint8) (*De
 		return nil, fmt.Errorf("rdma_open_device(index=%d, gid_index=%d) failed: %s",
 			index, gidIndex, GetLastError())
 	}
-
-	dev := &Device{
-		handle:    ctx.handle,
-		devHandle: devHandle,
-		Info:      convertDeviceInfo(&cInfo),
-	}
-	return dev, nil
+	return newDevice(devHandle, &cInfo), nil
 }
 
 // OpenDeviceByName opens an RDMA device by its name (e.g., "mlx5_0", "rxe0").
@@ -274,13 +264,11 @@ func (ctx *Context) OpenDeviceByName(name string, gidIndex int, sl uint8, tc uin
 		return nil, fmt.Errorf("rdma_open_device_by_name(%q, gid_index=%d) failed: %s",
 			name, gidIndex, GetLastError())
 	}
+	return newDevice(devHandle, &cInfo), nil
+}
 
-	dev := &Device{
-		handle:    ctx.handle,
-		devHandle: devHandle,
-		Info:      convertDeviceInfo(&cInfo),
-	}
-	return dev, nil
+func newDevice(devHandle C.rdma_device_t, cInfo *C.rdma_device_info_t) *Device {
+	return &Device{devHandle: devHandle, Info: convertDeviceInfo(cInfo)}
 }
 
 // Close closes the RDMA device and frees its resources (PD, device context).
@@ -318,7 +306,6 @@ func (ring *EventRing) Poll(maxEvents int) []CompletionEvent {
 		return nil
 	}
 
-	// Allocate C array on the stack for small counts, heap for large.
 	cEvents := make([]C.rdma_completion_event_t, maxEvents)
 	n := C.rdma_event_ring_poll(
 		ring.handle,
@@ -409,7 +396,6 @@ func (dev *Device) CreateQueue(queueType int, ring *EventRing) (*Queue, error) {
 
 	q := &Queue{
 		handle: qHandle,
-		ring:   ring,
 		Info: QueueInfo{
 			QPN:              uint32(cInfo.qpn),
 			UsesSWTimestamps: cInfo.uses_sw_timestamps != 0,
@@ -589,57 +575,6 @@ func (q *Queue) SendSecondAck(targetGID [16]byte, targetQPN uint32, flowLabel ui
 }
 
 // ---------------------------------------------------------------------------
-// Event Poller
-// ---------------------------------------------------------------------------
-
-// StartEventPoller starts a goroutine that continuously drains the event
-// ring buffer and dispatches completion events to the provided handler
-// function. The poller runs until the context is cancelled. When the ring is
-// empty it blocks on the ring's RingWaiter if the queue's CQ poller is in
-// event mode (Info.UsesCQEvents); in busy mode, or if the ring has no
-// notification fd, it sleeps briefly (100us) between polls instead.
-func (q *Queue) StartEventPoller(ctx context.Context, handler func(CompletionEvent)) {
-	go func() {
-		const (
-			maxBatch  = 32
-			idleSleep = 100 * time.Microsecond
-		)
-		var waiter *RingWaiter
-		if q.Info.UsesCQEvents {
-			if w, err := q.ring.NewWaiter(); err == nil {
-				waiter = w
-			}
-		}
-		if waiter != nil {
-			defer waiter.Close()
-			stop := context.AfterFunc(ctx, func() { _ = waiter.Close() })
-			defer stop()
-		}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			events := q.ring.Poll(maxBatch)
-			if len(events) == 0 {
-				if waiter == nil {
-					time.Sleep(idleSleep)
-				} else if waiter.Wait() != nil {
-					return
-				}
-				continue
-			}
-
-			for _, ev := range events {
-				handler(ev)
-			}
-		}
-	}()
-}
-
-// ---------------------------------------------------------------------------
 // Error Reporting
 // ---------------------------------------------------------------------------
 
@@ -686,30 +621,7 @@ func SerializeProbePacket(pkt *ProbePacket, buf []byte) {
 	binary.BigEndian.PutUint64(buf[12:20], pkt.T1)
 	binary.BigEndian.PutUint64(buf[20:28], pkt.T3)
 	binary.BigEndian.PutUint64(buf[28:36], pkt.T4)
-	// bytes 36-39: reserved padding (already zero from caller if slice was zeroed,
-	// but we zero explicitly to guarantee wire cleanliness)
-	buf[36] = 0
-	buf[37] = 0
-	buf[38] = 0
-	buf[39] = 0
-}
-
-// DeserializeProbePacket deserializes a ProbePacket from the provided byte
-// slice. Returns nil if the buffer is too small (< ProbePacketSize bytes).
-func DeserializeProbePacket(buf []byte) *ProbePacket {
-	if len(buf) < ProbePacketSize {
-		return nil
-	}
-	return &ProbePacket{
-		Version:     buf[0],
-		MsgType:     buf[1],
-		AckType:     buf[2],
-		Flags:       buf[3],
-		SequenceNum: binary.BigEndian.Uint64(buf[4:12]),
-		T1:          binary.BigEndian.Uint64(buf[12:20]),
-		T3:          binary.BigEndian.Uint64(buf[20:28]),
-		T4:          binary.BigEndian.Uint64(buf[28:36]),
-	}
+	clear(buf[36:40]) // reserved
 }
 
 // ---------------------------------------------------------------------------
@@ -762,7 +674,6 @@ func cCharArrayToString(arr []C.char) string {
 	if n == 0 {
 		return ""
 	}
-	// Convert []C.char to []byte without allocation by reinterpreting memory.
 	bytes := make([]byte, n)
 	for i := 0; i < n; i++ {
 		bytes[i] = byte(arr[i])

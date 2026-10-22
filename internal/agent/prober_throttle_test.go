@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
@@ -41,7 +40,7 @@ func TestSetRateMultiplier_ScalesBothTypes(t *testing.T) {
 		mult     = 0.5
 	)
 
-	p := &Prober{logger: zerolog.Nop()}
+	p := newTestProber()
 	p.UpdateTargets(mixedTargets(nTor, nInter))
 	p.SetPerTypeRateLimit(torPPS, interPPS)
 	p.SetRateMultiplier(mult)
@@ -66,7 +65,7 @@ func TestSetRateMultiplier_UnityAndClampAreNoops(t *testing.T) {
 	)
 
 	for _, mult := range []float64{1.0, 0.0, -0.5, 1.5} {
-		p := &Prober{logger: zerolog.Nop()}
+		p := newTestProber()
 		p.UpdateTargets(mixedTargets(nTor, nInter))
 		p.SetPerTypeRateLimit(torPPS, interPPS)
 		p.SetRateMultiplier(mult)
@@ -90,7 +89,7 @@ func TestSetRateMultiplier_SurvivesUpdateTargets(t *testing.T) {
 		mult     = 0.25
 	)
 
-	p := &Prober{logger: zerolog.Nop()}
+	p := newTestProber()
 	p.UpdateTargets(mixedTargets(2, 3))
 	p.SetPerTypeRateLimit(torPPS, interPPS)
 	p.SetRateMultiplier(mult)
@@ -112,7 +111,7 @@ func TestSetRateMultiplier_SurvivesUpdateTargets(t *testing.T) {
 // including the new SetRateMultiplier, must take targetsMu -> rateMu, while the
 // reader takes only rateMu.
 func TestSetRateMultiplier_LockOrderRace(t *testing.T) {
-	p := &Prober{logger: zerolog.Nop()}
+	p := newTestProber()
 	p.UpdateTargets(typedTargets(controller_agent.PinglistType_TOR_MESH, "tor", 4))
 	p.SetPerTypeRateLimit(10, 2)
 

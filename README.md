@@ -1080,7 +1080,7 @@ host.
 ### Tests
 
 ```sh
-make test           # Go tests in internal/probe/ (no RDMA hardware needed)
+make test           # Go tests of every pure-Go package (no Cgo, no RDMA hardware)
 make test-zig       # Zig unit tests (needs libibverbs headers, not hardware)
 make test-scripts   # Python tests of scripts/topology/ (standard library only)
 make vet            # go vet ./...

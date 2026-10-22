@@ -3,14 +3,13 @@ package agent
 import (
 	"testing"
 
-	"github.com/rs/zerolog"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
 // newRefreshTestProber builds a Prober with a hint channel whose current
 // pinglist contains targets.
 func newRefreshTestProber(targets ...*controller_agent.PingTarget) *Prober {
-	p := &Prober{logger: zerolog.Nop(), refreshHint: make(chan struct{}, 1)}
+	p := newTestProber()
 	p.UpdateTargets(targets)
 	return p
 }
@@ -103,7 +102,7 @@ func TestProber_TimeoutStreak_IgnoresTargetsNotInPinglist(t *testing.T) {
 // TestProber_RecordTargetOutcome_NilHint verifies that a Prober without a
 // hint channel (struct literal) tracks streaks without blocking or panicking.
 func TestProber_RecordTargetOutcome_NilHint(t *testing.T) {
-	p := &Prober{logger: zerolog.Nop()}
+	p := newTestProber()
 	target := &controller_agent.PingTarget{TargetGid: "g1", TargetQpn: 7}
 	for i := 0; i < 2*staleTargetTimeoutStreak; i++ {
 		p.recordTargetOutcome(target, true)

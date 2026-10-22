@@ -8,7 +8,6 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/spf13/pflag"
-	"github.com/spf13/viper"
 	"github.com/yuuki/rpingmesh/internal/logging"
 )
 
@@ -112,66 +111,44 @@ type ControllerConfig struct {
 	TLSServerName string `mapstructure:"tls_server_name"`
 }
 
+// controllerKeys is the single source of controller config keys, defaults
+// and flag help. Order matches the ControllerConfig field order; it does not
+// affect --help, which pflag sorts by name.
+var controllerKeys = []keySpec{
+	{key: "listen_addr", def: ":50051", help: "Address to listen on for gRPC connections"},
+	{key: "database_uri", def: "http://localhost:4001", help: "rqlite database connection URI"},
+	{key: "database_connect_timeout_sec", def: DefaultDatabaseConnectTimeoutSec, help: "Seconds to keep retrying the rqlite connection at startup (0 = single attempt)"},
+	{key: "log_level", def: "info", help: "Log level (debug, info, warn, error)"},
+	{key: "log_format", def: logging.DefaultFormat, help: "Log output format: console or json"},
+	{key: "active_threshold_sec", def: DefaultActiveThresholdSec, help: "Window (seconds) within which an RNIC is considered active"},
+	{key: "stale_threshold_sec", def: DefaultStaleThresholdSec, help: "Window (seconds) after which an inactive RNIC is removed"},
+	{key: "inter_tor_sample_size", def: DefaultInterTorSampleSize, help: "Number of distinct ToRs sampled for inter-ToR pinglists"},
+	{key: "unspecified_mesh_max_targets", def: DefaultUnspecifiedMeshMaxTargets, help: "Cap on ToR-mesh targets for agents with unset tor_id (0 = unlimited)"},
+	{key: "ecmp_paths_assumed", def: DefaultEcmpPathsAssumed, help: "Assumed ECMP fabric width (m) for Eq.(1) flow-label coverage sizing"},
+	{key: "ecmp_coverage_probability", def: DefaultEcmpCoverageProbability, help: "Target probability (p, in (0,1)) that generated flow labels cover all ECMP paths"},
+	{key: "ecmp_max_flow_labels", def: DefaultEcmpMaxFlowLabels, help: "Hard cap on the number of flow labels per target (bounds probe amplification)"},
+	{key: "analyzer_enabled", def: true, help: "Enable the Phase 1 analyzer (ingest agent summaries, detect SLA violations)"},
+	{key: "analyzer_sla_loss_ratio", def: DefaultAnalyzerSLALossRatio, help: "Per-path loss ratio (0..1) above which a window is an SLA violation"},
+	{key: "analyzer_sla_network_rtt_p99_ns", def: uint64(DefaultAnalyzerSLANetworkRTTP99Ns), help: "Per-path p99 network-RTT threshold (ns) above which a window is an SLA violation (0 disables)"},
+	{key: "analyzer_window_retention", def: DefaultAnalyzerWindowRetention, help: "Number of recent windows the analyzer retains in memory"},
+	{key: "otel_collector_addr", def: DefaultControllerOtelCollectorAddr, help: "OTLP gRPC collector endpoint for analyzer metrics"},
+	{key: "tls_mode", def: TLSModeDisabled, help: "gRPC transport security mode (disabled|tls|mtls)"},
+	{key: "tls_cert_file", def: "", help: "Server certificate file (required when tls-mode is tls or mtls)"},
+	{key: "tls_key_file", def: "", help: "Server private key file (required when tls-mode is tls or mtls)"},
+	{key: "tls_ca_file", def: "", help: "CA file used to verify client certificates (required when tls-mode=mtls)"},
+	{key: "tls_server_name", def: "", help: "Reserved for config-key symmetry with the agent; unused by the controller (server) role"},
+}
+
 // LoadControllerConfig loads controller configuration from a YAML file,
 // environment variables, CLI flags, and applies defaults. Precedence
 // (highest to lowest) is: CLI flag > environment variable > YAML file >
-// default. Environment variables use the prefix RPINGMESH_ and replace dots
-// with underscores (e.g., RPINGMESH_LISTEN_ADDR). If flags is non-nil, it is
-// bound to viper via BindPFlags so that explicitly-set flags take priority;
-// pass the same FlagSet given to BindControllerFlags.
+// default. Environment variables are RPINGMESH_ plus the upper-cased config
+// key (e.g., RPINGMESH_LISTEN_ADDR). If flags is non-nil, it is bound to
+// viper so that explicitly-set flags take priority; pass the same FlagSet
+// given to BindControllerFlags.
 func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerConfig, error) {
-	v := viper.New()
-
-	// Set defaults
-	v.SetDefault("listen_addr", ":50051")
-	v.SetDefault("database_uri", "http://localhost:4001")
-	v.SetDefault("database_connect_timeout_sec", DefaultDatabaseConnectTimeoutSec)
-	v.SetDefault("log_level", "info")
-	v.SetDefault("log_format", logging.DefaultFormat)
-	v.SetDefault("active_threshold_sec", DefaultActiveThresholdSec)
-	v.SetDefault("stale_threshold_sec", DefaultStaleThresholdSec)
-	v.SetDefault("inter_tor_sample_size", DefaultInterTorSampleSize)
-	v.SetDefault("unspecified_mesh_max_targets", DefaultUnspecifiedMeshMaxTargets)
-	v.SetDefault("ecmp_paths_assumed", DefaultEcmpPathsAssumed)
-	v.SetDefault("ecmp_coverage_probability", DefaultEcmpCoverageProbability)
-	v.SetDefault("ecmp_max_flow_labels", DefaultEcmpMaxFlowLabels)
-	v.SetDefault("analyzer_enabled", true)
-	v.SetDefault("analyzer_sla_loss_ratio", DefaultAnalyzerSLALossRatio)
-	v.SetDefault("analyzer_sla_network_rtt_p99_ns", DefaultAnalyzerSLANetworkRTTP99Ns)
-	v.SetDefault("analyzer_window_retention", DefaultAnalyzerWindowRetention)
-	v.SetDefault("otel_collector_addr", DefaultControllerOtelCollectorAddr)
-	v.SetDefault("tls_mode", TLSModeDisabled)
-	v.SetDefault("tls_cert_file", "")
-	v.SetDefault("tls_key_file", "")
-	v.SetDefault("tls_ca_file", "")
-	v.SetDefault("tls_server_name", "")
-
-	// Enable environment variable override with RPINGMESH_ prefix
-	v.SetEnvPrefix("RPINGMESH")
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	v.AutomaticEnv()
-
-	// Bind CLI flags so that explicitly-set flags take precedence over
-	// environment variables, config file values, and defaults.
-	if flags != nil {
-		if err := bindPFlags(v, flags); err != nil {
-			return nil, err
-		}
-	}
-
-	// Load config file if a path was provided
-	if configPath != "" {
-		v.SetConfigFile(configPath)
-	} else {
-		// Search default locations when no explicit path is given
-		v.SetConfigName("controller")
-		v.SetConfigType("yaml")
-		v.AddConfigPath(".")
-		v.AddConfigPath("$HOME/.rpingmesh")
-		v.AddConfigPath("/etc/rpingmesh")
-	}
-
-	if err := readConfigFile(v, configPath); err != nil {
+	v, err := newViper("controller", configPath, flags, controllerKeys)
+	if err != nil {
 		return nil, err
 	}
 
@@ -208,30 +185,43 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 	return config, nil
 }
 
-// bindPFlags binds each flag in flags to v under a key with hyphens
-// replaced by underscores (e.g. "listen-addr" -> "listen_addr"), so that CLI
-// flag names resolve to the same viper key used by the YAML config,
-// environment variables (via SetEnvKeyReplacer), and struct mapstructure
-// tags. viper.BindPFlags alone would bind flags under their literal
-// hyphenated names, which would never match a "_"-separated lookup key and
-// would silently make flags dead weight.
-func bindPFlags(v *viper.Viper, flags *pflag.FlagSet) error {
-	var bindErr error
-	flags.VisitAll(func(f *pflag.Flag) {
-		if bindErr != nil {
-			return
-		}
-		key := strings.ReplaceAll(f.Name, "-", "_")
-		if err := v.BindPFlag(key, f); err != nil {
-			bindErr = fmt.Errorf("failed to bind flag %q: %w", f.Name, err)
-		}
-	})
-	return bindErr
+// BindControllerFlags binds common controller CLI flags to a pflag.FlagSet.
+// These flags can later be bound to a viper instance for unified config resolution.
+func BindControllerFlags(flags *pflag.FlagSet) {
+	registerFlags(flags, controllerKeys)
 }
 
 // Validate checks that the controller configuration is well-formed. It
-// returns an error describing the first invalid field encountered.
+// returns an error describing the first invalid field encountered. The
+// helpers run in a fixed order so that the first error for a given input is
+// stable.
 func (c *ControllerConfig) Validate() error {
+	if err := c.validateEndpoints(); err != nil {
+		return err
+	}
+	if err := c.validateLogging(); err != nil {
+		return err
+	}
+	if err := c.validateRegistry(); err != nil {
+		return err
+	}
+	if err := c.validateECMP(); err != nil {
+		return err
+	}
+	if err := c.validateAnalyzer(); err != nil {
+		return err
+	}
+	if err := validateOTLPEndpoint(c.OtelCollectorAddr); err != nil {
+		return err
+	}
+	// The controller is the gRPC server of the controller-agent connection:
+	// fail fast if the certificate files required by tls_mode are missing,
+	// rather than at the first client handshake.
+	return validateTLSFiles(tlsRoleServer, c.TLSMode, c.TLSCertFile, c.TLSKeyFile, c.TLSCAFile)
+}
+
+// validateEndpoints checks listen_addr and the database settings.
+func (c *ControllerConfig) validateEndpoints() error {
 	if strings.TrimSpace(c.ListenAddr) == "" {
 		return fmt.Errorf("listen_addr must not be empty")
 	}
@@ -249,14 +239,19 @@ func (c *ControllerConfig) Validate() error {
 	if c.DatabaseConnectTimeoutSec < 0 {
 		return fmt.Errorf("database_connect_timeout_sec must be >= 0, got: %d", c.DatabaseConnectTimeoutSec)
 	}
+	return nil
+}
 
+// validateLogging checks log_level and log_format.
+func (c *ControllerConfig) validateLogging() error {
 	if _, err := zerolog.ParseLevel(c.LogLevel); err != nil {
 		return fmt.Errorf("log_level %q is not a known level: %w", c.LogLevel, err)
 	}
-	if err := logging.ValidateFormat(c.LogFormat); err != nil {
-		return err
-	}
+	return logging.ValidateFormat(c.LogFormat)
+}
 
+// validateRegistry checks the RNIC registry thresholds and pinglist sizing.
+func (c *ControllerConfig) validateRegistry() error {
 	if c.ActiveThresholdSec <= 0 {
 		return fmt.Errorf("active_threshold_sec must be > 0, got: %d", c.ActiveThresholdSec)
 	}
@@ -272,7 +267,11 @@ func (c *ControllerConfig) Validate() error {
 	if c.UnspecifiedMeshMaxTargets < 0 {
 		return fmt.Errorf("unspecified_mesh_max_targets must be >= 0, got: %d", c.UnspecifiedMeshMaxTargets)
 	}
+	return nil
+}
 
+// validateECMP checks the Eq.(1) flow-label sizing inputs.
+func (c *ControllerConfig) validateECMP() error {
 	if c.EcmpPathsAssumed < 1 {
 		return fmt.Errorf("ecmp_paths_assumed must be >= 1, got: %d", c.EcmpPathsAssumed)
 	}
@@ -289,58 +288,24 @@ func (c *ControllerConfig) Validate() error {
 	if c.EcmpMaxFlowLabels > MaxEcmpFlowLabels {
 		return fmt.Errorf("ecmp_max_flow_labels must be <= %d, got: %d", MaxEcmpFlowLabels, c.EcmpMaxFlowLabels)
 	}
-
-	// Analyzer settings are only enforced when the analyzer is enabled.
-	if c.AnalyzerEnabled {
-		// A loss ratio is a probability in [0, 1]; outside that range the
-		// threshold is meaningless (a negative ratio flags everything, > 1
-		// flags nothing).
-		if c.AnalyzerSLALossRatio < 0 || c.AnalyzerSLALossRatio > 1 {
-			return fmt.Errorf("analyzer_sla_loss_ratio must be in [0, 1], got: %v", c.AnalyzerSLALossRatio)
-		}
-		// The window ring must retain at least one window.
-		if c.AnalyzerWindowRetention < 1 {
-			return fmt.Errorf("analyzer_window_retention must be >= 1, got: %d", c.AnalyzerWindowRetention)
-		}
-	}
-
-	if err := validateOTLPEndpoint(c.OtelCollectorAddr); err != nil {
-		return err
-	}
-
-	// The controller is the gRPC server of the controller-agent connection:
-	// fail fast if the certificate files required by tls_mode are missing,
-	// rather than at the first client handshake.
-	if err := validateTLSFiles(tlsRoleServer, c.TLSMode, c.TLSCertFile, c.TLSKeyFile, c.TLSCAFile); err != nil {
-		return err
-	}
-
 	return nil
 }
 
-// BindControllerFlags binds common controller CLI flags to a pflag.FlagSet.
-// These flags can later be bound to a viper instance for unified config resolution.
-func BindControllerFlags(flags *pflag.FlagSet) {
-	flags.String("listen-addr", ":50051", "Address to listen on for gRPC connections")
-	flags.String("database-uri", "http://localhost:4001", "rqlite database connection URI")
-	flags.Int("database-connect-timeout-sec", DefaultDatabaseConnectTimeoutSec, "Seconds to keep retrying the rqlite connection at startup (0 = single attempt)")
-	flags.String("log-level", "info", "Log level (debug, info, warn, error)")
-	flags.String("log-format", logging.DefaultFormat, "Log output format: console or json")
-	flags.Int("active-threshold-sec", DefaultActiveThresholdSec, "Window (seconds) within which an RNIC is considered active")
-	flags.Int("stale-threshold-sec", DefaultStaleThresholdSec, "Window (seconds) after which an inactive RNIC is removed")
-	flags.Int("inter-tor-sample-size", DefaultInterTorSampleSize, "Number of distinct ToRs sampled for inter-ToR pinglists")
-	flags.Int("unspecified-mesh-max-targets", DefaultUnspecifiedMeshMaxTargets, "Cap on ToR-mesh targets for agents with unset tor_id (0 = unlimited)")
-	flags.Int("ecmp-paths-assumed", DefaultEcmpPathsAssumed, "Assumed ECMP fabric width (m) for Eq.(1) flow-label coverage sizing")
-	flags.Float64("ecmp-coverage-probability", DefaultEcmpCoverageProbability, "Target probability (p, in (0,1)) that generated flow labels cover all ECMP paths")
-	flags.Int("ecmp-max-flow-labels", DefaultEcmpMaxFlowLabels, "Hard cap on the number of flow labels per target (bounds probe amplification)")
-	flags.Bool("analyzer-enabled", true, "Enable the Phase 1 analyzer (ingest agent summaries, detect SLA violations)")
-	flags.Float64("analyzer-sla-loss-ratio", DefaultAnalyzerSLALossRatio, "Per-path loss ratio (0..1) above which a window is an SLA violation")
-	flags.Uint64("analyzer-sla-network-rtt-p99-ns", DefaultAnalyzerSLANetworkRTTP99Ns, "Per-path p99 network-RTT threshold (ns) above which a window is an SLA violation (0 disables)")
-	flags.Int("analyzer-window-retention", DefaultAnalyzerWindowRetention, "Number of recent windows the analyzer retains in memory")
-	flags.String("otel-collector-addr", DefaultControllerOtelCollectorAddr, "OTLP gRPC collector endpoint for analyzer metrics")
-	flags.String("tls-mode", TLSModeDisabled, "gRPC transport security mode (disabled|tls|mtls)")
-	flags.String("tls-cert-file", "", "Server certificate file (required when tls-mode is tls or mtls)")
-	flags.String("tls-key-file", "", "Server private key file (required when tls-mode is tls or mtls)")
-	flags.String("tls-ca-file", "", "CA file used to verify client certificates (required when tls-mode=mtls)")
-	flags.String("tls-server-name", "", "Reserved for config-key symmetry with the agent; unused by the controller (server) role")
+// validateAnalyzer checks the analyzer thresholds, which are only enforced
+// when the analyzer is enabled.
+func (c *ControllerConfig) validateAnalyzer() error {
+	if !c.AnalyzerEnabled {
+		return nil
+	}
+	// A loss ratio is a probability in [0, 1]; outside that range the
+	// threshold is meaningless (a negative ratio flags everything, > 1
+	// flags nothing).
+	if c.AnalyzerSLALossRatio < 0 || c.AnalyzerSLALossRatio > 1 {
+		return fmt.Errorf("analyzer_sla_loss_ratio must be in [0, 1], got: %v", c.AnalyzerSLALossRatio)
+	}
+	// The window ring must retain at least one window.
+	if c.AnalyzerWindowRetention < 1 {
+		return fmt.Errorf("analyzer_window_retention must be >= 1, got: %d", c.AnalyzerWindowRetention)
+	}
+	return nil
 }

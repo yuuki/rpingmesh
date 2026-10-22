@@ -47,6 +47,20 @@ const (
 	tlsRoleClient
 )
 
+// String names the role as it appears in error messages.
+func (r tlsRole) String() string {
+	if r == tlsRoleServer {
+		return "server"
+	}
+	return "client"
+}
+
+// errUnknownTLSMode is the error every entry point returns for a tls_mode
+// outside the accepted set.
+func errUnknownTLSMode(mode string) error {
+	return fmt.Errorf("tls_mode must be one of %q, %q, or %q, got %q", TLSModeDisabled, TLSModeTLS, TLSModeMTLS, mode)
+}
+
 // validateTLSFiles fails fast at config-load time if the certificate files
 // required by mode (for the given role) are missing or unreadable, rather
 // than deferring the failure to the first TLS handshake attempt.
@@ -76,7 +90,7 @@ func validateTLSFiles(role tlsRole, mode, certFile, keyFile, caFile string) erro
 		}
 		return requireTLSFile("tls_key_file", keyFile)
 	default:
-		return fmt.Errorf("tls_mode must be one of %q, %q, or %q, got %q", TLSModeDisabled, TLSModeTLS, TLSModeMTLS, mode)
+		return errUnknownTLSMode(mode)
 	}
 }
 
@@ -102,18 +116,18 @@ func ServerTLSConfig(mode, certFile, keyFile, caFile string) (*tls.Config, error
 	case TLSModeDisabled, "":
 		return nil, nil
 	case TLSModeTLS:
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		cert, err := loadKeyPair(tlsRoleServer, certFile, keyFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load server certificate/key: %w", err)
+			return nil, err
 		}
 		return &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		}, nil
 	case TLSModeMTLS:
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		cert, err := loadKeyPair(tlsRoleServer, certFile, keyFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load server certificate/key: %w", err)
+			return nil, err
 		}
 		caPool, err := loadCACertPool(caFile)
 		if err != nil {
@@ -126,7 +140,7 @@ func ServerTLSConfig(mode, certFile, keyFile, caFile string) (*tls.Config, error
 			MinVersion:   tls.VersionTLS12,
 		}, nil
 	default:
-		return nil, fmt.Errorf("tls_mode must be one of %q, %q, or %q, got %q", TLSModeDisabled, TLSModeTLS, TLSModeMTLS, mode)
+		return nil, errUnknownTLSMode(mode)
 	}
 }
 
@@ -154,9 +168,9 @@ func ClientTLSConfig(mode, certFile, keyFile, caFile, serverName string) (*tls.C
 			MinVersion: tls.VersionTLS12,
 		}, nil
 	case TLSModeMTLS:
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		cert, err := loadKeyPair(tlsRoleClient, certFile, keyFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load client certificate/key: %w", err)
+			return nil, err
 		}
 		caPool, err := loadCACertPool(caFile)
 		if err != nil {
@@ -169,8 +183,18 @@ func ClientTLSConfig(mode, certFile, keyFile, caFile, serverName string) (*tls.C
 			MinVersion:   tls.VersionTLS12,
 		}, nil
 	default:
-		return nil, fmt.Errorf("tls_mode must be one of %q, %q, or %q, got %q", TLSModeDisabled, TLSModeTLS, TLSModeMTLS, mode)
+		return nil, errUnknownTLSMode(mode)
 	}
+}
+
+// loadKeyPair loads the PEM certificate/key pair a role presents, naming the
+// role in the error so an operator can tell which binary's files are wrong.
+func loadKeyPair(role tlsRole, certFile, keyFile string) (tls.Certificate, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("failed to load %s certificate/key: %w", role, err)
+	}
+	return cert, nil
 }
 
 // loadCACertPool reads and parses a PEM-encoded CA bundle from caFile.

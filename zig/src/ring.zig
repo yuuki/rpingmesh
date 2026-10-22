@@ -98,6 +98,9 @@ comptime {
     if (@sizeOf(CompletionEvent) != 80) {
         @compileError("CompletionEvent size mismatch: expected 80 bytes for C ABI compatibility");
     }
+    if (@sizeOf(CompletionEvent) != @sizeOf(c.rdma_completion_event_t)) {
+        @compileError("CompletionEvent must match rdma_completion_event_t");
+    }
 }
 
 // ---------------------------------------------------------------------------

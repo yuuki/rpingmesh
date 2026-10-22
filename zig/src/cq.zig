@@ -154,7 +154,7 @@ fn recvByteLenOK(byte_len: u32) bool {
 /// dropped, ends here; a slot that cannot be reposted is lost until the
 /// queue is recreated.
 fn repostRecv(queue: *types.UdQueue, slot_index: u32) void {
-    memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {
+    memory.postRecvBuffer(queue.qp, queue.recv_bufs.mr, queue.recv_bufs.buf, slot_index) catch {
         log.warn("@{x} failed to repost recv slot={d}", .{ @intFromPtr(queue), slot_index });
     };
 }
@@ -236,7 +236,7 @@ fn cqPollerLoop(queue: *types.UdQueue) void {
 /// Returns when queue.running becomes false, or (after clearing
 /// queue.uses_cq_events) when the provider refuses to re-arm the CQ.
 fn eventPollerLoop(queue: *types.UdQueue) void {
-    const base_cq = c.ibv_cq_ex_to_cq(queue.recv_cq) orelse {
+    const base_cq = c.ibv_cq_ex_to_cq(queue.cq) orelse {
         queue.uses_cq_events = false;
         return;
     };
@@ -286,7 +286,7 @@ fn waitForCqEvent(queue: *types.UdQueue, channel: *c.ibv_comp_channel) void {
     }
 }
 
-/// Drain every available completion from the queue's CQ(s), then wake the
+/// Drain every available completion from the queue's CQ, then wake the
 /// Go consumer once if any event was pushed into the ring.
 ///
 /// The notification is sent in busy mode too: a queue that started in event
@@ -294,14 +294,7 @@ fn waitForCqEvent(queue: *types.UdQueue, channel: *c.ibv_comp_channel) void {
 /// eventfd, and the write costs one syscall per batch, not per poll.
 fn drainCq(queue: *types.UdQueue) void {
     const produced_before: u64 = if (queue.event_ring) |r| r.producedCount() else 0;
-    while (true) {
-        var n = pollCqCompletions(queue, queue.recv_cq);
-        // Also poll the send CQ if it is separate from the recv CQ.
-        if (queue.send_cq != queue.recv_cq) {
-            n += pollCqCompletions(queue, queue.send_cq);
-        }
-        if (n == 0) break;
-    }
+    while (pollCqCompletions(queue, queue.cq) != 0) {}
     if (queue.event_ring) |r| {
         if (r.producedCount() != produced_before) r.notify();
     }
@@ -385,7 +378,7 @@ pub fn stampStagedSecondAck(slot_ptr: [*]u8, t4_ns: u64) void {
 /// second ACK cannot be posted is counted as failed and its slot reclaimed.
 fn flushPendingSecondAcks(queue: *types.UdQueue, pending: *const PendingSecondAcks) void {
     for (pending.slots[0..pending.len], pending.t4_ns[0..pending.len]) |slot, t4_ns| {
-        const slot_ptr = memory.getSlotPtr(queue.send_buf, slot, types.NUM_SEND_SLOTS) catch {
+        const slot_ptr = memory.getSlotPtr(queue.send_bufs.buf, slot, types.NUM_SEND_SLOTS) catch {
             failAsyncAck(queue, slot);
             continue;
         };
@@ -397,7 +390,7 @@ fn flushPendingSecondAcks(queue: *types.UdQueue, pending: *const PendingSecondAc
         queue.setSendSlotMode(slot, .AsyncSecondAck);
         memory.postUdSend(
             queue.qp,
-            queue.send_mr,
+            queue.send_bufs.mr,
             slot_ptr + types.SECOND_ACK_SLOT_OFFSET,
             slot,
             ah,
@@ -573,7 +566,7 @@ const RecvCompletion = struct {
 /// slot would be stale bytes from an earlier recv) or with an unknown wire
 /// version is dropped; its slot is reposted all the same.
 fn deliverRecv(queue: *types.UdQueue, rc: RecvCompletion) void {
-    const slot_ptr = memory.getSlotPtr(queue.recv_buf, rc.slot_index, types.NUM_RECV_SLOTS) catch return;
+    const slot_ptr = memory.getSlotPtr(queue.recv_bufs.buf, rc.slot_index, types.NUM_RECV_SLOTS) catch return;
     defer repostRecv(queue, rc.slot_index);
 
     if (!rc.has_grh or !recvByteLenOK(rc.byte_len)) return;

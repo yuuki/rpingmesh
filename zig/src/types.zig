@@ -17,26 +17,30 @@ const std = @import("std");
 pub const c = @import("c");
 
 // ---------------------------------------------------------------------------
-// Constants (matching rdma_bridge.h)
+// Constants (from rdma_bridge.h, translated into the `c` module)
 // ---------------------------------------------------------------------------
 
 /// Size of each memory region buffer in bytes.
-pub const MR_SIZE: u32 = 4096;
+pub const MR_SIZE: u32 = c.RDMA_MR_SIZE;
 
 /// Size of the Global Routing Header prepended by the hardware on UD receives.
-pub const GRH_SIZE: u32 = 40;
+pub const GRH_SIZE: u32 = c.RDMA_GRH_SIZE;
 
 /// Number of entries in each Completion Queue.
-pub const CQ_SIZE: u32 = 256;
+pub const CQ_SIZE: u32 = c.RDMA_CQ_SIZE;
 
 /// Number of receive buffers posted at queue creation time.
-pub const INITIAL_RECV_BUFFERS: u32 = 32;
+pub const INITIAL_RECV_BUFFERS: u32 = c.RDMA_INITIAL_RECV_BUFFERS;
 
 /// Queue key used for all UD Queue Pairs in this system.
-pub const QKEY: u32 = 0x11111111;
+pub const QKEY: u32 = c.RDMA_QKEY;
 
 /// Size of a probe packet payload in bytes (the wire format in wire.zig).
-pub const PROBE_PACKET_SIZE: u32 = @intCast(wire.PACKET_SIZE);
+pub const PROBE_PACKET_SIZE: u32 = c.RDMA_PROBE_PACKET_SIZE;
+
+comptime {
+    if (PROBE_PACKET_SIZE != wire.PACKET_SIZE) @compileError("RDMA_PROBE_PACKET_SIZE must equal wire.PACKET_SIZE");
+}
 
 /// Byte offset, within a send slot, of the second ACK that an asynchronous
 /// ACK pair stages at post time (see packet.zig sendAckPair). The first ACK
@@ -115,13 +119,13 @@ pub const SlotState = enum(u8) {
     InUse = 2,
 };
 
-/// Identifies the role of a UD Queue Pair, matching the C defines
-/// RDMA_QUEUE_TYPE_SENDER (0) and RDMA_QUEUE_TYPE_RESPONDER (1).
-pub const QueueType = enum(u8) {
+/// Identifies the role of a UD Queue Pair (RDMA_QUEUE_TYPE_* in
+/// rdma_bridge.h).
+pub const QueueType = enum(i32) {
     /// Sends probes and receives ACKs.
-    Sender = 0,
+    Sender = c.RDMA_QUEUE_TYPE_SENDER,
     /// Receives probes and sends ACKs.
-    Responder = 1,
+    Responder = c.RDMA_QUEUE_TYPE_RESPONDER,
 };
 
 /// How a queue's CQ poller thread waits for completions (RDMA_CQ_POLL_* in
@@ -132,11 +136,11 @@ pub const CqPollMode = enum(i32) {
     /// completion, so the poller's wakeup latency becomes timestamp error;
     /// busy polling bounds it to one ~50 us sleep. Hardware timestamps are
     /// unaffected by when the poller runs.
-    Auto = 0,
+    Auto = c.RDMA_CQ_POLL_AUTO,
     /// Sleep on a completion channel until the CQ raises an event.
-    Event = 1,
+    Event = c.RDMA_CQ_POLL_EVENT,
     /// Poll continuously with a ~50 us sleep between polls.
-    Busy = 2,
+    Busy = c.RDMA_CQ_POLL_BUSY,
 
     /// Whether a queue in this mode should use CQ events.
     pub fn wantsEvents(self: CqPollMode, uses_sw_timestamps: bool) bool {
@@ -236,31 +240,58 @@ pub const DeviceInfo = extern struct {
     active_gid_index: u8,
 };
 
+/// Queue information returned by rdma_create_queue, matching
+/// rdma_queue_info_t in rdma_bridge.h (uint8_t instead of bool for ABI
+/// safety).
+pub const QueueInfo = extern struct {
+    /// Queue Pair Number assigned by the hardware.
+    qpn: u32,
+    /// 0 = hardware timestamps, 1 = software timestamps.
+    uses_sw_timestamps: u8,
+    /// 1 = the CQ poller sleeps on a completion channel, 0 = busy polling.
+    uses_cq_events: u8,
+};
+
+comptime {
+    if (@sizeOf(DeviceInfo) != @sizeOf(c.rdma_device_info_t)) @compileError("DeviceInfo must match rdma_device_info_t");
+    if (@sizeOf(QueueInfo) != @sizeOf(c.rdma_queue_info_t)) @compileError("QueueInfo must match rdma_queue_info_t");
+}
+
+/// Page size used for buffer alignment.
+pub const PAGE_SIZE = 4096;
+
+/// A set of page-aligned buffers registered as one RDMA Memory Region,
+/// divided into `num_slots` contiguous slots of SLOT_SIZE bytes that work
+/// requests use independently. Created by memory.allocateBuffers().
+pub const BufferSet = struct {
+    /// Pointer to the page-aligned buffer memory.
+    buf: [*]align(PAGE_SIZE) u8,
+
+    /// Memory Region handle from ibv_reg_mr().
+    mr: *c.ibv_mr,
+
+    /// Number of slots in this buffer set.
+    num_slots: u32,
+
+    /// Total size of the buffer in bytes (num_slots * SLOT_SIZE).
+    size: usize,
+};
+
 /// UD (Unreliable Datagram) Queue Pair with all associated resources:
-/// CQs, memory regions, buffers, and the CQ poller thread.
+/// CQ, memory regions, buffers, and the CQ poller thread.
 pub const UdQueue = struct {
     /// The Queue Pair handle.
     qp: *c.ibv_qp,
 
-    /// Extended Completion Queue for send completions (supports timestamps).
-    send_cq: *c.ibv_cq_ex,
+    /// Extended Completion Queue shared by sends and receives (supports
+    /// timestamps). One CQ keeps completions in one stream for the poller.
+    cq: *c.ibv_cq_ex,
 
-    /// Extended Completion Queue for receive completions.
-    recv_cq: *c.ibv_cq_ex,
+    /// Send slots: NUM_SEND_SLOTS slots of SLOT_SIZE bytes in one MR.
+    send_bufs: BufferSet,
 
-    /// Memory Region for the send buffer.
-    send_mr: *c.ibv_mr,
-
-    /// Memory Region for the receive buffer.
-    recv_mr: *c.ibv_mr,
-
-    /// Send buffer: page-aligned contiguous memory for send slots.
-    /// Total size = NUM_SEND_SLOTS * SLOT_SIZE bytes.
-    send_buf: [*]align(4096) u8,
-
-    /// Receive buffer: page-aligned contiguous memory for receive slots.
-    /// Total size = NUM_RECV_SLOTS * SLOT_SIZE bytes.
-    recv_buf: [*]align(4096) u8,
+    /// Receive slots: NUM_RECV_SLOTS slots of SLOT_SIZE bytes in one MR.
+    recv_bufs: BufferSet,
 
     /// Queue Pair Number assigned by the hardware.
     qpn: u32,
@@ -377,6 +408,50 @@ pub const UdQueue = struct {
     /// Send completion status. 0 = success, nonzero = RDMA error code.
     /// Written by the CQ poller before send_completion_wr_id.
     send_completion_status: std.atomic.Value(i32),
+
+    /// Resources a queue is built from; see queue.createQueue().
+    pub const InitArgs = struct {
+        qp: *c.ibv_qp,
+        cq: *c.ibv_cq_ex,
+        send_bufs: BufferSet,
+        recv_bufs: BufferSet,
+        uses_sw_timestamps: bool,
+        queue_type: QueueType,
+        event_ring: ?*ring.EventRing,
+        device: *RdmaDevice,
+        comp_channel: ?*c.ibv_comp_channel,
+        wake_fd: i32,
+    };
+
+    /// A queue with every send slot free, no poller running, CQ events off
+    /// and an empty mailbox.
+    pub fn init(a: InitArgs) UdQueue {
+        return UdQueue{
+            .qp = a.qp,
+            .cq = a.cq,
+            .send_bufs = a.send_bufs,
+            .recv_bufs = a.recv_bufs,
+            .qpn = a.qp.qp_num,
+            .uses_sw_timestamps = a.uses_sw_timestamps,
+            .queue_type = a.queue_type,
+            .event_ring = a.event_ring,
+            .cq_thread = null,
+            .device = a.device,
+            .send_slot_ah = @splat(std.atomic.Value(usize).init(0)),
+            .send_slot_states = @splat(std.atomic.Value(u8).init(@backingInt(SlotState.Free))),
+            .send_slot_modes = @splat(std.atomic.Value(u8).init(@backingInt(SendSlotMode.Sync))),
+            .send_slot_remote_qpn = @splat(0),
+            .async_ack_failures = std.atomic.Value(u64).init(0),
+            .recv_slot_states = @splat(SlotState.Free),
+            .running = std.atomic.Value(bool).init(false),
+            .comp_channel = a.comp_channel,
+            .uses_cq_events = false,
+            .wake_fd = a.wake_fd,
+            .send_completion_wr_id = std.atomic.Value(u64).init(SEND_WR_ID_NONE),
+            .send_completion_timestamp = std.atomic.Value(u64).init(0),
+            .send_completion_status = std.atomic.Value(i32).init(0),
+        };
+    }
 
     /// Atomically allocate a free send slot, transitioning it from Free to
     /// InUse. Returns the slot index, or null if every slot is currently in
@@ -666,20 +741,9 @@ test "SlotState enum values" {
     try std.testing.expectEqual(@as(u8, 2), @backingInt(SlotState.InUse));
 }
 
-test "QueueType enum values match C defines" {
-    // RDMA_QUEUE_TYPE_SENDER = 0, RDMA_QUEUE_TYPE_RESPONDER = 1
-    try std.testing.expectEqual(@as(u8, 0), @backingInt(QueueType.Sender));
-    try std.testing.expectEqual(@as(u8, 1), @backingInt(QueueType.Responder));
-}
-
-test "constants match C header" {
-    try std.testing.expectEqual(@as(u32, 4096), MR_SIZE);
-    try std.testing.expectEqual(@as(u32, 40), GRH_SIZE);
-    try std.testing.expectEqual(@as(u32, 256), CQ_SIZE);
-    try std.testing.expectEqual(@as(u32, 32), INITIAL_RECV_BUFFERS);
-    try std.testing.expectEqual(@as(u32, 0x11111111), QKEY);
-    try std.testing.expectEqual(@as(u32, 40), PROBE_PACKET_SIZE);
+test "SLOT_SIZE holds a GRH plus one MR-sized payload" {
     try std.testing.expectEqual(@as(u32, 4136), SLOT_SIZE);
+    try std.testing.expectEqual(GRH_SIZE + MR_SIZE, SLOT_SIZE);
 }
 
 test "DeviceInfo is extern struct with correct field sizes" {

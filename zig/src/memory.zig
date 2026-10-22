@@ -11,15 +11,8 @@ const std = @import("std");
 const types = @import("types.zig");
 const c = types.c;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Size of each buffer slot in bytes: GRH (40) + payload (4096) = 4136.
-pub const SLOT_SIZE = types.SLOT_SIZE;
-
-/// Page size used for buffer alignment. Most architectures use 4096.
-const PAGE_SIZE = 4096;
+const SLOT_SIZE = types.SLOT_SIZE;
+const PAGE_SIZE = types.PAGE_SIZE;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -43,28 +36,8 @@ pub const MemoryError = error{
     NullPointer,
 };
 
-// ---------------------------------------------------------------------------
-// BufferSet
-// ---------------------------------------------------------------------------
-
-/// A set of page-aligned buffers registered as an RDMA Memory Region.
-///
-/// The buffer is divided into num_slots contiguous slots of SLOT_SIZE bytes.
-/// Each slot can be independently used as a scatter/gather element in a
-/// work request.
-pub const BufferSet = struct {
-    /// Pointer to the page-aligned buffer memory.
-    buf: [*]align(PAGE_SIZE) u8,
-
-    /// Memory Region handle from ibv_reg_mr().
-    mr: *c.ibv_mr,
-
-    /// Number of slots in this buffer set.
-    num_slots: u32,
-
-    /// Total size of the buffer in bytes (num_slots * SLOT_SIZE).
-    size: usize,
-};
+/// See types.BufferSet; allocateBuffers() creates one.
+pub const BufferSet = types.BufferSet;
 
 // ---------------------------------------------------------------------------
 // Buffer allocation and registration
@@ -285,11 +258,6 @@ pub fn postInitialRecvBuffers(
 // Tests
 // ---------------------------------------------------------------------------
 
-test "SLOT_SIZE matches types constant" {
-    try std.testing.expectEqual(types.SLOT_SIZE, SLOT_SIZE);
-    try std.testing.expectEqual(@as(u32, 4136), SLOT_SIZE);
-}
-
 test "getSlotPtr returns correct offset" {
     // Create a small test buffer (not registered with RDMA, just for pointer math)
     var test_buf: [4136 * 4]u8 = undefined;
@@ -328,17 +296,4 @@ test "getSlotPtr rejects when num_slots is zero" {
 
     const result = getSlotPtr(base, 0, 0);
     try std.testing.expectError(MemoryError.SlotIndexOutOfBounds, result);
-}
-
-test "BufferSet struct has expected fields" {
-    // Verify the struct layout is correct at compile time
-    const info = @typeInfo(BufferSet);
-    try std.testing.expect(info == .@"struct");
-
-    const names = info.@"struct".field_names;
-    try std.testing.expectEqual(@as(usize, 4), names.len);
-    try std.testing.expectEqualStrings("buf", names[0]);
-    try std.testing.expectEqualStrings("mr", names[1]);
-    try std.testing.expectEqualStrings("num_slots", names[2]);
-    try std.testing.expectEqualStrings("size", names[3]);
 }

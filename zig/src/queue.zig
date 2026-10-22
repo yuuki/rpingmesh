@@ -8,9 +8,6 @@
 //   - Address Handle (AH) creation for sending to remote targets
 //   - Completion channel setup for the event-driven CQ poller
 //   - CQ poller thread startup and teardown
-//
-// The design follows the existing Go implementation in internal/rdma/queue.go
-// but uses Zig idioms and the SPSC ring buffer for event delivery.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -18,6 +15,8 @@ const ring = @import("ring.zig");
 const memory = @import("memory.zig");
 const cq = @import("cq.zig");
 const c = types.c;
+
+const log = std.log.scoped(.rdma_queue);
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -53,26 +52,17 @@ pub const QueueError = error{
 // Queue creation
 // ---------------------------------------------------------------------------
 
-/// Create a UD Queue Pair with all associated resources.
+/// Create a UD Queue Pair with all associated resources and start its CQ
+/// poller thread.
 ///
-/// This function performs the full queue initialization sequence:
-///   1. Allocate the UdQueue struct
-///   2. Create extended CQs (with HW timestamp fallback)
-///   3. Allocate send and receive buffers
-///   4. Create a UD QP with the CQs
-///   5. Transition the QP through INIT -> RTR -> RTS states
-///   6. Post initial receive buffers
-///   7. Start the CQ poller thread
-///
-/// Buffers are allocated (step 3) before the QP is created (step 4) even
-/// though the QP has no functional dependency on them yet. This ordering is
-/// deliberate: Zig's errdefer unwinds in LIFO order, so registering the
-/// QP-destroy errdefer *after* the buffer-free errdefers guarantees that if
-/// a later step fails (e.g. postInitialRecvBuffers in step 6), the QP is
-/// destroyed before the buffers it may have posted work requests against
-/// are freed. Freeing a buffer while the QP could still reference it via an
-/// outstanding work request would risk the hardware DMA'ing into freed
-/// memory.
+/// Buffers are allocated before the QP is created even though the QP has no
+/// functional dependency on them yet. This ordering is deliberate: Zig's
+/// errdefer unwinds in LIFO order, so registering the QP-destroy errdefer
+/// *after* the buffer-free errdefers guarantees that if a later step fails
+/// (e.g. posting the initial receive buffers), the QP is destroyed before
+/// the buffers it may have posted work requests against are freed. Freeing
+/// a buffer while the QP could still reference it via an outstanding work
+/// request would risk the hardware DMA'ing into freed memory.
 ///
 /// On failure, all partially allocated resources are cleaned up before
 /// returning the error.
@@ -82,135 +72,68 @@ pub fn createQueue(
     cq_mode: types.CqPollMode,
     event_ring: *ring.EventRing,
 ) QueueError!*types.UdQueue {
-    // Allocate the UdQueue struct
     const queue = std.heap.page_allocator.create(types.UdQueue) catch {
         types.setLastError("failed to allocate UdQueue struct");
         return QueueError.OutOfMemory;
     };
     errdefer std.heap.page_allocator.destroy(queue);
 
-    // Step 0: Create the completion channel and the poller's shutdown
-    // eventfd. Neither is fatal: without them the CQ poller busy-polls.
-    // The channel's errdefer is registered before the CQ's, so on unwind
-    // the CQ (which references the channel) is destroyed first. The
-    // channel must exist before the CQ is created; in Auto mode it is
-    // created up front and simply left unarmed if the CQ ends up with
-    // software timestamps.
-    const comp_channel: ?*c.ibv_comp_channel = if (cq_mode == .Busy) null else createCompChannel(dev);
-    errdefer if (comp_channel) |ch| {
-        _ = c.ibv_destroy_comp_channel(ch);
-    };
-    const wake_efd = c.eventfd(0, c.EFD_NONBLOCK | c.EFD_CLOEXEC);
-    const wake_fd: i32 = if (wake_efd >= 0) wake_efd else -1;
-    errdefer if (wake_fd >= 0) {
-        _ = c.close(wake_fd);
-    };
+    // The channel's errdefer is registered before the CQ's, so on unwind the
+    // CQ (which references the channel) is destroyed first.
+    const wait = createCompChannelAndWakeFd(dev, cq_mode);
+    errdefer wait.deinit();
 
-    // Step 1: Create extended CQs with conditional HW timestamp support.
-    // First try with wallclock timestamp; if the device does not support it
-    // (returns EOPNOTSUPP/ENOTSUP), retry without the timestamp flag.
-    const cq_result = createExtendedCqs(dev, comp_channel) orelse {
-        // Error message already set by createExtendedCqs
+    const cq_result = createExtendedCq(dev, wait.comp_channel) orelse {
+        // Error message already set by createExtendedCq
         return QueueError.CreateCqFailed;
     };
-    errdefer {
-        destroyCqEx(cq_result.recv_cq);
-        if (cq_result.send_cq != cq_result.recv_cq) {
-            destroyCqEx(cq_result.send_cq);
-        }
-    }
+    errdefer destroyCqEx(cq_result.cq);
 
-    // Step 2: Allocate send and receive buffers.
-    //
-    // Allocated before the QP (see the ordering note in the function doc
-    // comment above) so that error-path cleanup destroys the QP before
-    // freeing these buffers.
-    const send_bufset = memory.allocateBuffers(dev, types.NUM_SEND_SLOTS) catch {
+    // Allocated before the QP (see the ordering note in the doc comment).
+    var send_bufs = memory.allocateBuffers(dev, types.NUM_SEND_SLOTS) catch {
         types.setLastError("failed to allocate send buffers");
         return QueueError.BufferAllocFailed;
     };
-    errdefer {
-        var mutable_send = send_bufset;
-        memory.freeBuffers(&mutable_send);
-    }
+    errdefer memory.freeBuffers(&send_bufs);
 
-    const recv_bufset = memory.allocateBuffers(dev, types.NUM_RECV_SLOTS) catch {
+    var recv_bufs = memory.allocateBuffers(dev, types.NUM_RECV_SLOTS) catch {
         types.setLastError("failed to allocate recv buffers");
         return QueueError.BufferAllocFailed;
     };
-    errdefer {
-        var mutable_recv = recv_bufset;
-        memory.freeBuffers(&mutable_recv);
-    }
+    errdefer memory.freeBuffers(&recv_bufs);
 
-    // Step 3: Create the UD QP.
-    //
     // Registered after the buffer errdefers above, so on unwind this
-    // errdefer runs *first* -- the QP is destroyed before the buffers are
-    // freed.
-    const qp = createUdQp(dev, cq_result.send_cq, cq_result.recv_cq) orelse {
+    // errdefer runs *first*: the QP is destroyed before the buffers are freed.
+    const qp = createUdQp(dev, cq_result.cq) orelse {
         types.setLastError("ibv_create_qp() failed");
         return QueueError.CreateQpFailed;
     };
     errdefer _ = c.ibv_destroy_qp(qp);
 
-    // Step 4: Transition QP through INIT -> RTR -> RTS
     try transitionQpToInit(dev, qp);
     try transitionQpToRtr(qp);
     try transitionQpToRts(qp);
 
-    // Initialize the queue struct
-    queue.* = types.UdQueue{
+    queue.* = types.UdQueue.init(.{
         .qp = qp,
-        .send_cq = cq_result.send_cq,
-        .recv_cq = cq_result.recv_cq,
-        .send_mr = send_bufset.mr,
-        .recv_mr = recv_bufset.mr,
-        .send_buf = send_bufset.buf,
-        .recv_buf = recv_bufset.buf,
-        .qpn = qp.qp_num,
+        .cq = cq_result.cq,
+        .send_bufs = send_bufs,
+        .recv_bufs = recv_bufs,
         .uses_sw_timestamps = cq_result.uses_sw_timestamps,
         .queue_type = queue_type,
         .event_ring = event_ring,
-        .cq_thread = null,
         .device = dev,
-        .send_slot_ah = @splat(std.atomic.Value(usize).init(0)),
-        .send_slot_states = @splat(std.atomic.Value(u8).init(@backingInt(types.SlotState.Free))),
-        .send_slot_modes = @splat(std.atomic.Value(u8).init(@backingInt(types.SendSlotMode.Sync))),
-        .send_slot_remote_qpn = @splat(0),
-        .async_ack_failures = std.atomic.Value(u64).init(0),
-        .recv_slot_states = @splat(types.SlotState.Free),
-        .running = std.atomic.Value(bool).init(false),
-        .comp_channel = comp_channel,
-        .uses_cq_events = false,
-        .wake_fd = wake_fd,
-        .send_completion_wr_id = std.atomic.Value(u64).init(types.SEND_WR_ID_NONE),
-        .send_completion_timestamp = std.atomic.Value(u64).init(0),
-        .send_completion_status = std.atomic.Value(i32).init(0),
-    };
+        .comp_channel = wait.comp_channel,
+        .wake_fd = wait.wake_fd,
+    });
 
-    // Step 6: Post initial receive buffers
-    memory.postInitialRecvBuffers(qp, recv_bufset.mr, recv_bufset.buf, types.INITIAL_RECV_BUFFERS) catch {
+    memory.postInitialRecvBuffers(qp, recv_bufs.mr, recv_bufs.buf, types.INITIAL_RECV_BUFFERS) catch {
         types.setLastError("failed to post initial recv buffers");
         return QueueError.PostRecvFailed;
     };
 
-    // Step 7: Decide the CQ poller mode. Event mode must be wanted (see
-    // CqPollMode) and needs a channel, a shared send/recv CQ (the poller
-    // waits on a single CQ), and a provider that accepts
-    // ibv_req_notify_cq(). Arming here also proves the provider supports it
-    // before we report uses_cq_events to Go.
-    const wants_events = cq_mode.wantsEvents(cq_result.uses_sw_timestamps);
-    if (wants_events and comp_channel != null and cq_result.send_cq == cq_result.recv_cq) {
-        if (c.ibv_cq_ex_to_cq(cq_result.recv_cq)) |base_cq| {
-            queue.uses_cq_events = c.ibv_req_notify_cq(base_cq, 0) == 0;
-        }
-    }
-    if (wants_events and !queue.uses_cq_events) {
-        std.log.scoped(.rdma_queue).warn("CQ events unavailable; CQ poller falls back to busy polling", .{});
-    }
+    decideCqEventMode(queue, cq_mode);
 
-    // Step 8: Start the CQ poller thread
     cq.startCqPollerThread(queue) catch {
         types.setLastError("failed to start CQ poller thread");
         return QueueError.StartPollerFailed;
@@ -219,27 +142,65 @@ pub fn createQueue(
     return queue;
 }
 
+/// The two descriptors the event-driven CQ poller sleeps on: the CQ's
+/// completion channel and the eventfd that wakes it for shutdown. Neither is
+/// required; without them the poller busy-polls.
+const PollerWaitFds = struct {
+    comp_channel: ?*c.ibv_comp_channel,
+    /// -1 when eventfd creation failed.
+    wake_fd: i32,
+
+    fn deinit(self: PollerWaitFds) void {
+        if (self.comp_channel) |ch| {
+            _ = c.ibv_destroy_comp_channel(ch);
+        }
+        if (self.wake_fd >= 0) {
+            _ = c.close(self.wake_fd);
+        }
+    }
+};
+
+/// Create the completion channel and the poller's shutdown eventfd. The
+/// channel must exist before the CQ is created; in Auto mode it is created
+/// up front and simply left unarmed if the CQ ends up with software
+/// timestamps. Busy mode never creates one.
+fn createCompChannelAndWakeFd(dev: *types.RdmaDevice, cq_mode: types.CqPollMode) PollerWaitFds {
+    const comp_channel: ?*c.ibv_comp_channel = if (cq_mode == .Busy) null else createCompChannel(dev);
+    const wake_efd = c.eventfd(0, c.EFD_NONBLOCK | c.EFD_CLOEXEC);
+    return .{ .comp_channel = comp_channel, .wake_fd = if (wake_efd >= 0) wake_efd else -1 };
+}
+
+/// Decide whether the CQ poller sleeps on CQ events. Event mode must be
+/// wanted (see CqPollMode), needs a channel, and needs a provider that
+/// accepts ibv_req_notify_cq(). Arming here proves the provider supports it
+/// before uses_cq_events is reported to Go; the poller arms again before
+/// its first drain, which is harmless. Must run before the poller thread
+/// starts: uses_cq_events is a plain bool the poller thread also writes.
+fn decideCqEventMode(queue: *types.UdQueue, cq_mode: types.CqPollMode) void {
+    const wants_events = cq_mode.wantsEvents(queue.uses_sw_timestamps);
+    if (wants_events and queue.comp_channel != null) {
+        if (c.ibv_cq_ex_to_cq(queue.cq)) |base_cq| {
+            queue.uses_cq_events = c.ibv_req_notify_cq(base_cq, 0) == 0;
+        }
+    }
+    if (wants_events and !queue.uses_cq_events) {
+        log.warn("CQ events unavailable; CQ poller falls back to busy polling", .{});
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Queue destruction
 // ---------------------------------------------------------------------------
 
-/// Destroy a UD Queue Pair and free all associated resources.
-///
-/// This function performs cleanup in the correct order:
-///   1. Stop the CQ poller thread
-///   2. Destroy the QP
-///   3. Free send/recv buffers and deregister MRs
-///   4. Destroy CQs, then the completion channel and wake eventfd
-///   5. Free the queue struct
+/// Destroy a UD Queue Pair and free all associated resources: stop the CQ
+/// poller, destroy the QP, free the buffers, destroy the CQ, then the
+/// completion channel and wake eventfd, and finally the queue struct.
 pub fn destroyQueue(queue: *types.UdQueue) void {
-    const log = std.log.scoped(.rdma_queue);
-
-    // Stop the CQ poller thread (sets running=false and joins)
     cq.stopCqPollerThread(queue);
 
-    // Destroy the QP first (before CQs, as QP references them). Log a
-    // failure instead of discarding it -- a nonzero return here is useful
-    // operational signal during teardown even though we cannot recover.
+    // The QP goes before the CQ (it references it). Log a failure instead of
+    // discarding it -- a nonzero return here is useful operational signal
+    // during teardown even though we cannot recover.
     const qp_ret = c.ibv_destroy_qp(queue.qp);
     if (qp_ret != 0) {
         log.err("ibv_destroy_qp() failed with errno={d}; leaking leftover send-slot AHs to avoid destroying them while the QP may still reference them", .{qp_ret});
@@ -250,31 +211,12 @@ pub fn destroyQueue(queue: *types.UdQueue) void {
         queue.destroyAllSendSlotAhs();
     }
 
-    // Free send/recv buffers and deregister their MRs by delegating to
-    // memory.freeBuffers(), so the dereg-failure handling (intentional leak
-    // instead of a potential use-after-free; see memory.zig) is defined in
-    // exactly one place instead of being duplicated here.
-    var send_bufset = memory.BufferSet{
-        .buf = queue.send_buf,
-        .mr = queue.send_mr,
-        .num_slots = types.NUM_SEND_SLOTS,
-        .size = @as(usize, types.NUM_SEND_SLOTS) * @as(usize, types.SLOT_SIZE),
-    };
-    memory.freeBuffers(&send_bufset);
+    // memory.freeBuffers() owns the dereg-failure handling (intentional leak
+    // instead of a potential use-after-free; see memory.zig).
+    memory.freeBuffers(&queue.send_bufs);
+    memory.freeBuffers(&queue.recv_bufs);
 
-    var recv_bufset = memory.BufferSet{
-        .buf = queue.recv_buf,
-        .mr = queue.recv_mr,
-        .num_slots = types.NUM_RECV_SLOTS,
-        .size = @as(usize, types.NUM_RECV_SLOTS) * @as(usize, types.SLOT_SIZE),
-    };
-    memory.freeBuffers(&recv_bufset);
-
-    // Destroy CQs (convert from ibv_cq_ex back to ibv_cq for destruction)
-    destroyCqEx(queue.recv_cq);
-    if (queue.send_cq != queue.recv_cq) {
-        destroyCqEx(queue.send_cq);
-    }
+    destroyCqEx(queue.cq);
 
     // The channel can only be destroyed once no CQ references it. Every CQ
     // event was acknowledged by the poller as it was consumed, so
@@ -286,7 +228,6 @@ pub fn destroyQueue(queue: *types.UdQueue) void {
     }
     if (queue.wake_fd >= 0) _ = c.close(queue.wake_fd);
 
-    // Free the queue struct
     std.heap.page_allocator.destroy(queue);
 }
 
@@ -305,7 +246,7 @@ pub fn destroyQueue(queue: *types.UdQueue) void {
 ///     configuration (static per-agent values; see RdmaDevice.sl /
 ///     RdmaDevice.traffic_class)
 ///
-/// Uses ibv_create_ah() (not rdma_create_ah()) to match the Go implementation.
+/// Uses ibv_create_ah() (not rdma_create_ah()).
 pub fn createAddressHandle(
     dev: *types.RdmaDevice,
     target_gid: [16]u8,
@@ -349,24 +290,22 @@ pub fn destroyAddressHandle(ah: *c.ibv_ah) void {
 // Internal helpers - Extended CQ creation
 // ---------------------------------------------------------------------------
 
-/// Result of creating extended CQs with timestamp fallback.
+/// Result of creating the extended CQ with timestamp fallback.
 const ExtendedCqResult = struct {
-    send_cq: *c.ibv_cq_ex,
-    recv_cq: *c.ibv_cq_ex,
+    cq: *c.ibv_cq_ex,
     uses_sw_timestamps: bool,
 };
 
-/// Create extended CQs with hardware timestamp fallback.
+/// Create the extended CQ with hardware timestamp fallback.
 ///
 /// First attempts to create the CQ with IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK.
 /// If that fails with EOPNOTSUPP or ENOTSUP, retries without the timestamp flag
 /// and sets uses_sw_timestamps to true.
 ///
-/// The Go implementation uses a single CQ for both send and recv. We follow the
-/// same pattern here: both send_cq and recv_cq point to the same CQ.
-/// When `channel` is non-null the CQ is attached to it so the poller can
-/// sleep until a completion event (see cq.zig).
-fn createExtendedCqs(dev: *types.RdmaDevice, channel: ?*c.ibv_comp_channel) ?ExtendedCqResult {
+/// One CQ serves both the send and the receive side of the QP, so the poller
+/// waits on a single CQ. When `channel` is non-null the CQ is attached to it
+/// so the poller can sleep until a completion event (see cq.zig).
+fn createExtendedCq(dev: *types.RdmaDevice, channel: ?*c.ibv_comp_channel) ?ExtendedCqResult {
     var cq_attr = std.mem.zeroes(c.ibv_cq_init_attr_ex);
     cq_attr.cqe = types.CQ_SIZE;
     cq_attr.cq_context = null;
@@ -381,14 +320,8 @@ fn createExtendedCqs(dev: *types.RdmaDevice, channel: ?*c.ibv_comp_channel) ?Ext
     cq_attr.wc_flags = base_flags |
         @as(u64, c.IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK);
 
-    var cq_ex = c.ibv_create_cq_ex(dev.ctx, &cq_attr);
-    if (cq_ex != null) {
-        // Hardware timestamps supported
-        return ExtendedCqResult{
-            .send_cq = cq_ex.?,
-            .recv_cq = cq_ex.?,
-            .uses_sw_timestamps = false,
-        };
+    if (c.ibv_create_cq_ex(dev.ctx, &cq_attr)) |cq_ex| {
+        return ExtendedCqResult{ .cq = cq_ex, .uses_sw_timestamps = false };
     }
 
     // Hardware timestamp creation failed. Check if it is EOPNOTSUPP/ENOTSUP
@@ -398,19 +331,12 @@ fn createExtendedCqs(dev: *types.RdmaDevice, channel: ?*c.ibv_comp_channel) ?Ext
     const enotsup = @as(c_int, if (@hasDecl(std.c.E, "NOTSUP")) @backingInt(std.c.E.NOTSUP) else eopnotsupp);
 
     if (errno_val == eopnotsupp or errno_val == enotsup) {
-        // Retry without the timestamp flag
         cq_attr.wc_flags = base_flags;
-        cq_ex = c.ibv_create_cq_ex(dev.ctx, &cq_attr);
-        if (cq_ex != null) {
-            return ExtendedCqResult{
-                .send_cq = cq_ex.?,
-                .recv_cq = cq_ex.?,
-                .uses_sw_timestamps = true,
-            };
+        if (c.ibv_create_cq_ex(dev.ctx, &cq_attr)) |cq_ex| {
+            return ExtendedCqResult{ .cq = cq_ex, .uses_sw_timestamps = true };
         }
     }
 
-    // Both attempts failed
     types.setLastError("ibv_create_cq_ex() failed (both HW and SW timestamp attempts)");
     return null;
 }
@@ -430,16 +356,14 @@ fn createCompChannel(dev: *types.RdmaDevice) ?*c.ibv_comp_channel {
     return ch;
 }
 
-/// Safely destroy an extended CQ by converting it to a base CQ first.
-///
-/// ibv_destroy_cq() requires an ibv_cq pointer, but we store ibv_cq_ex.
-/// Use ibv_cq_ex_to_cq() for the conversion.
+/// Destroy an extended CQ. ibv_destroy_cq() takes an ibv_cq, so convert
+/// with ibv_cq_ex_to_cq() first.
 fn destroyCqEx(cq_ex: *c.ibv_cq_ex) void {
     const base_cq = c.ibv_cq_ex_to_cq(cq_ex);
     if (base_cq != null) {
         const ret = c.ibv_destroy_cq(base_cq);
         if (ret != 0) {
-            std.log.scoped(.rdma_queue).err("ibv_destroy_cq() failed with errno={d}", .{ret});
+            log.err("ibv_destroy_cq() failed with errno={d}", .{ret});
         }
     }
 }
@@ -448,28 +372,16 @@ fn destroyCqEx(cq_ex: *c.ibv_cq_ex) void {
 // Internal helpers - QP creation and state transitions
 // ---------------------------------------------------------------------------
 
-/// Create a UD Queue Pair with the specified send and receive CQs.
-///
-/// Configures the QP with:
-///   - qp_type = IBV_QPT_UD
-///   - max_send_wr = NUM_SEND_SLOTS
-///   - max_recv_wr = NUM_RECV_SLOTS
-///   - max_send_sge = 1
-///   - max_recv_sge = 1
-fn createUdQp(
-    dev: *types.RdmaDevice,
-    send_cq: *c.ibv_cq_ex,
-    recv_cq: *c.ibv_cq_ex,
-) ?*c.ibv_qp {
-    // Convert extended CQs to base CQs for QP creation
-    const base_send_cq = c.ibv_cq_ex_to_cq(send_cq) orelse return null;
-    const base_recv_cq = c.ibv_cq_ex_to_cq(recv_cq) orelse return null;
+/// Create a UD Queue Pair whose send and receive completions both go to
+/// `cq_ex`, with NUM_SEND_SLOTS / NUM_RECV_SLOTS work requests of one SGE.
+fn createUdQp(dev: *types.RdmaDevice, cq_ex: *c.ibv_cq_ex) ?*c.ibv_qp {
+    const base_cq = c.ibv_cq_ex_to_cq(cq_ex) orelse return null;
 
     var qp_init_attr = std.mem.zeroes(c.ibv_qp_init_attr);
     qp_init_attr.qp_type = c.IBV_QPT_UD;
     qp_init_attr.sq_sig_all = 0; // Signal completions per-WR via flags
-    qp_init_attr.send_cq = base_send_cq;
-    qp_init_attr.recv_cq = base_recv_cq;
+    qp_init_attr.send_cq = base_cq;
+    qp_init_attr.recv_cq = base_cq;
     qp_init_attr.cap.max_send_wr = types.NUM_SEND_SLOTS;
     qp_init_attr.cap.max_recv_wr = types.NUM_RECV_SLOTS;
     qp_init_attr.cap.max_send_sge = 1;
@@ -478,15 +390,7 @@ fn createUdQp(
     return c.ibv_create_qp(dev.pd, &qp_init_attr);
 }
 
-/// Transition the QP to INIT state.
-///
-/// Required attributes:
-///   IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_QKEY
-///
-/// Sets:
-///   - pkey_index = 0
-///   - port_num = dev.port_num
-///   - qkey = QKEY (0x11111111)
+/// Transition the QP to INIT state (pkey_index 0, the device's port, QKEY).
 fn transitionQpToInit(dev: *types.RdmaDevice, qp: *c.ibv_qp) QueueError!void {
     var attr = std.mem.zeroes(c.ibv_qp_attr);
     attr.qp_state = c.IBV_QPS_INIT;
@@ -501,9 +405,8 @@ fn transitionQpToInit(dev: *types.RdmaDevice, qp: *c.ibv_qp) QueueError!void {
     }
 }
 
-/// Transition the QP to RTR (Ready to Receive) state.
-///
-/// For UD QPs, no extra attributes are needed beyond IBV_QP_STATE.
+/// Transition the QP to RTR (Ready to Receive) state. For UD QPs, no extra
+/// attributes are needed beyond IBV_QP_STATE.
 fn transitionQpToRtr(qp: *c.ibv_qp) QueueError!void {
     var attr = std.mem.zeroes(c.ibv_qp_attr);
     attr.qp_state = c.IBV_QPS_RTR;
@@ -514,12 +417,7 @@ fn transitionQpToRtr(qp: *c.ibv_qp) QueueError!void {
     }
 }
 
-/// Transition the QP to RTS (Ready to Send) state.
-///
-/// Required attributes:
-///   IBV_QP_STATE | IBV_QP_SQ_PSN
-///
-/// Sets sq_psn = 0 (Packet Sequence Number for the send queue).
+/// Transition the QP to RTS (Ready to Send) state with sq_psn 0.
 fn transitionQpToRts(qp: *c.ibv_qp) QueueError!void {
     var attr = std.mem.zeroes(c.ibv_qp_attr);
     attr.qp_state = c.IBV_QPS_RTS;
@@ -536,27 +434,15 @@ fn transitionQpToRts(qp: *c.ibv_qp) QueueError!void {
 // C-ABI exported functions (called from Go via Cgo)
 // ---------------------------------------------------------------------------
 
-/// Create a UD Queue Pair.
-///
-/// Exported as `rdma_create_queue` for the C ABI.
-/// @param dev_ptr      Device handle from rdma_open_device()
-/// @param queue_type   RDMA_QUEUE_TYPE_SENDER (0) or RDMA_QUEUE_TYPE_RESPONDER (1)
-/// @param cq_poll_mode RDMA_CQ_POLL_AUTO (0), _EVENT (1) or _BUSY (2)
-/// @param ring_ptr     Event ring for completion event delivery
-/// @param out_queue    Receives the queue handle
-/// @param out_info     Receives queue information (QPN, timestamp mode)
-/// @return             0 on success, -1 on failure
+/// Create a UD Queue Pair (C-ABI export matching rdma_create_queue in
+/// rdma_bridge.h). Returns 0 on success, -1 on failure.
 export fn rdma_create_queue(
     dev_ptr: ?*types.RdmaDevice,
     queue_type_raw: i32,
     cq_poll_mode_raw: i32,
     ring_ptr: ?*ring.EventRing,
     out_queue: *?*types.UdQueue,
-    out_info: *extern struct {
-        qpn: u32,
-        uses_sw_timestamps: u8,
-        uses_cq_events: u8,
-    },
+    out_info: *types.QueueInfo,
 ) i32 {
     const dev = dev_ptr orelse {
         types.setLastError("null device pointer");
@@ -566,40 +452,28 @@ export fn rdma_create_queue(
         types.setLastError("null event ring pointer");
         return -1;
     };
-
-    // Convert raw queue type integer to enum
-    const qt: types.QueueType = switch (queue_type_raw) {
-        0 => .Sender,
-        1 => .Responder,
-        else => {
-            types.setLastError("invalid queue type");
-            return -1;
-        },
+    const qt = std.enums.fromInt(types.QueueType, queue_type_raw) orelse {
+        types.setLastError("invalid queue type");
+        return -1;
     };
-
-    const cq_mode: types.CqPollMode = switch (cq_poll_mode_raw) {
-        0 => .Auto,
-        1 => .Event,
-        2 => .Busy,
-        else => {
-            types.setLastError("invalid CQ poll mode");
-            return -1;
-        },
+    const cq_mode = std.enums.fromInt(types.CqPollMode, cq_poll_mode_raw) orelse {
+        types.setLastError("invalid CQ poll mode");
+        return -1;
     };
 
     const queue = createQueue(dev, qt, cq_mode, event_ring) catch return -1;
 
     out_queue.* = queue;
-    out_info.qpn = queue.qpn;
-    out_info.uses_sw_timestamps = if (queue.uses_sw_timestamps) 1 else 0;
-    out_info.uses_cq_events = if (queue.uses_cq_events) 1 else 0;
-
+    out_info.* = .{
+        .qpn = queue.qpn,
+        .uses_sw_timestamps = @intFromBool(queue.uses_sw_timestamps),
+        .uses_cq_events = @intFromBool(queue.uses_cq_events),
+    };
     return 0;
 }
 
-/// Destroy a UD Queue Pair and free all resources.
-///
-/// Exported as `rdma_destroy_queue` for the C ABI.
+/// Destroy a UD Queue Pair and free all resources (C-ABI export matching
+/// rdma_destroy_queue in rdma_bridge.h).
 export fn rdma_destroy_queue(queue_ptr: ?*types.UdQueue) void {
     const queue = queue_ptr orelse return;
     destroyQueue(queue);
@@ -633,11 +507,10 @@ test "CqPollMode.wantsEvents" {
     try std.testing.expect(!types.CqPollMode.Busy.wantsEvents(true));
 }
 
-test "ExtendedCqResult struct layout" {
-    const result = ExtendedCqResult{
-        .send_cq = undefined,
-        .recv_cq = undefined,
-        .uses_sw_timestamps = true,
-    };
-    try std.testing.expect(result.uses_sw_timestamps);
+test "queue type and poll mode raw values are range-checked" {
+    try std.testing.expectEqual(@as(?types.QueueType, null), std.enums.fromInt(types.QueueType, @as(i32, 2)));
+    try std.testing.expectEqual(@as(?types.QueueType, null), std.enums.fromInt(types.QueueType, @as(i32, -1)));
+    try std.testing.expectEqual(@as(?types.CqPollMode, null), std.enums.fromInt(types.CqPollMode, @as(i32, 3)));
+    try std.testing.expectEqual(@as(?types.QueueType, .Responder), std.enums.fromInt(types.QueueType, @as(i32, c.RDMA_QUEUE_TYPE_RESPONDER)));
+    try std.testing.expectEqual(@as(?types.CqPollMode, .Busy), std.enums.fromInt(types.CqPollMode, @as(i32, c.RDMA_CQ_POLL_BUSY)));
 }

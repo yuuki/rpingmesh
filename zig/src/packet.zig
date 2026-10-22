@@ -36,7 +36,11 @@ pub const SendResult = extern struct {
 /// Return code of sendAckPair / rdma_send_ack_pair when every send slot is
 /// held by an in-flight send. The caller may retry once a completion has
 /// returned a slot.
-pub const ACK_PAIR_NO_FREE_SLOT: i32 = -2;
+pub const ACK_PAIR_NO_FREE_SLOT: i32 = c.RDMA_ACK_PAIR_NO_FREE_SLOT;
+
+comptime {
+    if (@sizeOf(SendResult) != @sizeOf(c.rdma_send_result_t)) @compileError("SendResult must match rdma_send_result_t");
+}
 
 /// Errors that can occur during packet operations.
 pub const PacketError = error{
@@ -84,7 +88,7 @@ fn prepareSendSlot(queue: *types.UdQueue, target_gid: [16]u8, flow_label: u32) P
     };
     errdefer queue.freeSendSlot(slot_index);
 
-    const slot_ptr = memory.getSlotPtr(queue.send_buf, slot_index, types.NUM_SEND_SLOTS) catch {
+    const slot_ptr = memory.getSlotPtr(queue.send_bufs.buf, slot_index, types.NUM_SEND_SLOTS) catch {
         types.setLastError("send slot index out of bounds");
         return PacketError.SlotIndexOutOfBounds;
     };
@@ -101,7 +105,7 @@ fn prepareSendSlot(queue: *types.UdQueue, target_gid: [16]u8, flow_label: u32) P
 /// slot and its AH are released here; afterwards only the CQ poller may
 /// release them, even after a wait timeout.
 fn postPrepared(queue: *types.UdQueue, prep: PreparedSend, target_qpn: u32) PacketError!void {
-    memory.postUdSend(queue.qp, queue.send_mr, prep.slot_ptr, prep.slot_index, prep.ah, target_qpn) catch {
+    memory.postUdSend(queue.qp, queue.send_bufs.mr, prep.slot_ptr, prep.slot_index, prep.ah, target_qpn) catch {
         queue.releaseSendSlot(prep.slot_index);
         return PacketError.PostSendFailed;
     };
@@ -392,8 +396,4 @@ test "stageAckPair stages both ACKs and the CQ poller's T4 stamp completes the s
     try std.testing.expectEqual(@as(u64, 111), second.t1);
     try std.testing.expectEqual(@as(u64, 333), second.t3);
     try std.testing.expectEqual(@as(u64, 444), second.t4);
-}
-
-test "ACK_PAIR_NO_FREE_SLOT matches RDMA_ACK_PAIR_NO_FREE_SLOT" {
-    try std.testing.expectEqual(@as(i32, -2), ACK_PAIR_NO_FREE_SLOT);
 }

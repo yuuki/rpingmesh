@@ -123,7 +123,7 @@ uppercase, underscore-separated field names (for example,
 
 ## Requirements
 
-- Go 1.27.2+
+- Go 1.27.3+
 - Zig 0.17.0 (pinned in `mise.toml`, `.github/workflows/`, `Dockerfile.e2e`, `docker-compose.e2e.yml`)
 - protoc, protoc-gen-go, protoc-gen-go-grpc
 - libibverbs-dev, librdmacm-dev (Linux only; for agent build and RDMA testing)

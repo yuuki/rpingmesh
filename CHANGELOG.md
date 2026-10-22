@@ -19,6 +19,7 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Require Go 1.27.3 or later.
 - The agent rejects an unknown `log_level` at startup, as the controller
   already did, instead of falling back to `info` with a warning.
 - `PingTarget.source_port` and `priority` are marked deprecated in the proto.

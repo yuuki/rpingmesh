@@ -395,7 +395,7 @@ fn flushPendingSecondAcks(queue: *types.UdQueue, pending: *const PendingSecondAc
             queue.qp,
             queue.send_mr,
             slot_ptr + types.SECOND_ACK_SLOT_OFFSET,
-            @intCast(slot),
+            slot,
             ah,
             queue.send_slot_remote_qpn[slot],
         ) catch {
@@ -445,31 +445,35 @@ fn pollCqClassic(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *PendingSecon
 }
 
 /// Dispatch a classic ibv_wc completion to the appropriate handler.
+///
+/// Completions are classified by wr_id (types.isSendWrId), never by opcode:
+/// libibverbs leaves wc.opcode undefined unless status == IBV_WC_SUCCESS, so
+/// a flushed or errored CQE must still reach signalSendCompletion (which
+/// fails a synchronous sender fast and reclaims an asynchronous ACK pair's
+/// slot) or the recv repost path.
 fn dispatchClassicWc(queue: *types.UdQueue, wc: *const c.ibv_wc, pending: *PendingSecondAcks) void {
-    const status_int: i32 = @intCast(wc.status);
-    if (wc.opcode == c.IBV_WC_SEND) {
-        log.debug("@{x} SEND (classic) status={d}", .{ @intFromPtr(queue), status_int });
-        // Signal the waiting sender thread with a SW timestamp, matched by
-        // wr_id (see signalSendCompletion / the mailbox invariant in types.zig).
-        signalSendCompletion(queue, wc.wr_id, swTimestampNs(), status_int, pending);
-    } else if (wc.opcode == c.IBV_WC_RECV) {
-        log.debug("@{x} RECV (classic) status={d}", .{ @intFromPtr(queue), status_int });
-        if (wc.status == c.IBV_WC_SUCCESS) {
-            processRecvClassic(queue, wc);
-        } else {
-            // A failed recv completion (e.g. IBV_WC_WR_FLUSH_ERR on teardown,
-            // or a transient link error) still owns one of NUM_RECV_SLOTS.
-            // Without reposting it here, that slot is permanently lost --
-            // repeated errors would eventually starve the recv queue.
-            const slot_index: u32 = @intCast(wc.wr_id & 0xFFFFFFFF);
-            log.warn("@{x} RECV (classic) completion error status={d}, reposting slot={d}", .{ @intFromPtr(queue), status_int, slot_index });
-            memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {
-                log.warn("@{x} failed to repost recv slot={d} after completion error", .{ @intFromPtr(queue), slot_index });
-            };
-        }
+    const status: i32 = @intCast(wc.status);
+    if (types.isSendWrId(wc.wr_id)) {
+        log.debug("@{x} SEND (classic) status={d}", .{ @intFromPtr(queue), status });
+        signalSendCompletion(queue, wc.wr_id, swTimestampNs(), status, pending);
+    } else if (wc.status == c.IBV_WC_SUCCESS) {
+        log.debug("@{x} RECV (classic) status={d}", .{ @intFromPtr(queue), status });
+        processRecvClassic(queue, wc);
     } else {
-        log.debug("@{x} unknown opcode (classic) status={d}", .{ @intFromPtr(queue), status_int });
+        repostFailedRecv(queue, wc.wr_id, status);
     }
+}
+
+/// Repost the slot of a failed recv completion (e.g. IBV_WC_WR_FLUSH_ERR on
+/// teardown, or a transient link error). The completion still owns one of
+/// NUM_RECV_SLOTS; without the repost that slot is lost until the queue is
+/// recreated, and repeated errors would starve the recv queue.
+fn repostFailedRecv(queue: *types.UdQueue, wr_id: u64, status: i32) void {
+    const slot_index = types.wrIdSlot(wr_id);
+    log.warn("@{x} RECV completion error status={d}, reposting slot={d}", .{ @intFromPtr(queue), status, slot_index });
+    memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {
+        log.warn("@{x} failed to repost recv slot={d} after completion error", .{ @intFromPtr(queue), slot_index });
+    };
 }
 
 /// Process a receive completion from the classic ibv_wc path.
@@ -477,7 +481,7 @@ fn dispatchClassicWc(queue: *types.UdQueue, wc: *const c.ibv_wc, pending: *Pendi
 /// Mirrors processRecvCompletion() but reads fields directly from ibv_wc
 /// instead of the extended CQ handle.
 fn processRecvClassic(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
-    const slot_index: u32 = @intCast(wc.wr_id & 0xFFFFFFFF);
+    const slot_index = types.wrIdSlot(wc.wr_id);
     const ts = swTimestampNs();
     const src_qp: u32 = wc.src_qp;
 
@@ -568,38 +572,18 @@ fn swTimestampNs() u64 {
     return types.monotonicNs();
 }
 
-/// Dispatch a single work completion to the appropriate handler.
-///
-/// Routes by opcode (IBV_WC_SEND or IBV_WC_RECV). Every send completion,
-/// even an error, goes to signalSendCompletion(), so a synchronous sender
-/// never spin-waits indefinitely and an asynchronous ACK pair is always
-/// resolved. For recv completions, only pushes to the ring on success.
+/// Dispatch a single extended-CQ work completion to the appropriate handler.
+/// Classified by wr_id for the same reason as dispatchClassicWc.
 fn dispatchCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *PendingSecondAcks) void {
-    const opcode = c.ibv_wc_read_opcode(cq);
     const status: i32 = @intCast(cq.status);
-
-    if (opcode == c.IBV_WC_SEND) {
+    if (types.isSendWrId(cq.wr_id)) {
         log.debug("@{x} SEND completion status={d}", .{ @intFromPtr(queue), status });
-        // Always signal the sender, regardless of status, so waitSendCompletion
-        // can report the error rather than timing out.
         processSendCompletion(queue, cq, pending);
-    } else if (opcode == c.IBV_WC_RECV) {
+    } else if (status == c.IBV_WC_SUCCESS) {
         log.debug("@{x} RECV completion status={d}", .{ @intFromPtr(queue), status });
-        if (status == c.IBV_WC_SUCCESS) {
-            processRecvCompletion(queue, cq);
-        } else {
-            // A failed recv completion still owns one of NUM_RECV_SLOTS.
-            // Repost it (mirroring the classic-path handling above) so a
-            // transient completion error does not permanently leak a slot.
-            const wr_id: u64 = cq.wr_id;
-            const slot_index: u32 = @intCast(wr_id & 0xFFFFFFFF);
-            log.warn("@{x} RECV completion error status={d}, reposting slot={d}", .{ @intFromPtr(queue), status, slot_index });
-            memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {
-                log.warn("@{x} failed to repost recv slot={d} after completion error", .{ @intFromPtr(queue), slot_index });
-            };
-        }
+        processRecvCompletion(queue, cq);
     } else {
-        log.debug("@{x} unknown opcode, status={d}", .{ @intFromPtr(queue), status });
+        repostFailedRecv(queue, cq.wr_id, status);
     }
 }
 
@@ -614,9 +598,7 @@ fn dispatchCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *Pending
 /// builds a CompletionEvent, pushes it into the event ring, and reposts
 /// the receive buffer for reuse.
 pub fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
-    // Get the slot index from wr_id
-    const wr_id: u64 = cq.wr_id;
-    const slot_index: u32 = @intCast(wr_id & 0xFFFFFFFF);
+    const slot_index = types.wrIdSlot(cq.wr_id);
 
     // Get timestamp
     const timestamp_ns: u64 = getCompletionTimestamp(queue, cq);
@@ -735,7 +717,7 @@ pub fn processSendCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *
 /// timestamp/status once its own wr_id is published. See the mailbox invariant
 /// comment in types.zig.
 fn signalSendCompletion(queue: *types.UdQueue, wr_id: u64, timestamp_ns: u64, status: i32, pending: *PendingSecondAcks) void {
-    const slot_index: u32 = @intCast(wr_id & 0xFFFFFFFF);
+    const slot_index = types.wrIdSlot(wr_id);
     switch (queue.sendSlotMode(slot_index)) {
         .AsyncFirstAck => {
             if (status == 0 and pending.add(slot_index, timestamp_ns)) return;
@@ -885,4 +867,81 @@ test "stampStagedSecondAck writes T4 big-endian into the staged packet only" {
     // The first ACK and the rest of the staged packet are untouched.
     for (slot[0..at]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
     for (slot[at + 8 ..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+}
+
+/// A UdQueue for dispatch tests: every send slot free, no verbs objects.
+/// Only paths that never touch qp/MRs may run on it (send-side bookkeeping;
+/// destroySendSlotAh is a no-op while no AH is stored).
+fn testQueue() types.UdQueue {
+    var queue: types.UdQueue = undefined;
+    queue.send_slot_ah = @splat(std.atomic.Value(usize).init(0));
+    queue.send_slot_states = @splat(std.atomic.Value(u8).init(@backingInt(types.SlotState.Free)));
+    queue.send_slot_modes = @splat(std.atomic.Value(u8).init(@backingInt(types.SendSlotMode.Sync)));
+    queue.send_slot_remote_qpn = @splat(0);
+    queue.async_ack_failures = std.atomic.Value(u64).init(0);
+    queue.send_completion_wr_id = std.atomic.Value(u64).init(types.SEND_WR_ID_NONE);
+    queue.send_completion_timestamp = std.atomic.Value(u64).init(0);
+    queue.send_completion_status = std.atomic.Value(i32).init(0);
+    return queue;
+}
+
+fn slotState(queue: *types.UdQueue, slot: u32) types.SlotState {
+    return @fromBackingInt(queue.send_slot_states[slot].load(.acquire));
+}
+
+test "an errored send completion with an unset opcode still reaches the mailbox" {
+    var queue = testQueue();
+    const slot = queue.allocSendSlot() orelse return error.TestUnexpectedResult;
+    queue.setSendSlotMode(slot, .Sync);
+
+    var wc = std.mem.zeroes(c.ibv_wc);
+    wc.wr_id = types.sendWrId(slot);
+    wc.status = c.IBV_WC_WR_FLUSH_ERR;
+    // The provider leaves opcode undefined on error; make it the value that
+    // would misroute the completion if the dispatcher looked at it.
+    wc.opcode = c.IBV_WC_RECV;
+    var pending = PendingSecondAcks{};
+    dispatchClassicWc(&queue, &wc, &pending);
+
+    try std.testing.expectEqual(types.SlotState.Free, slotState(&queue, slot));
+    try std.testing.expectEqual(wc.wr_id, queue.send_completion_wr_id.load(.acquire));
+    try std.testing.expectEqual(@as(i32, @intCast(c.IBV_WC_WR_FLUSH_ERR)), queue.send_completion_status.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
+}
+
+test "an errored first-ACK completion fails the pair and reclaims its slot" {
+    var queue = testQueue();
+    const slot = queue.allocSendSlot() orelse return error.TestUnexpectedResult;
+    queue.setSendSlotMode(slot, .AsyncFirstAck);
+
+    var wc = std.mem.zeroes(c.ibv_wc);
+    wc.wr_id = types.sendWrId(slot);
+    wc.status = c.IBV_WC_WR_FLUSH_ERR;
+    wc.opcode = c.IBV_WC_RECV;
+    var pending = PendingSecondAcks{};
+    dispatchClassicWc(&queue, &wc, &pending);
+
+    try std.testing.expectEqual(types.SlotState.Free, slotState(&queue, slot));
+    try std.testing.expectEqual(types.SendSlotMode.Sync, queue.sendSlotMode(slot));
+    try std.testing.expectEqual(@as(u64, 1), queue.async_ack_failures.load(.monotonic));
+    // Asynchronous pairs never touch the mailbox.
+    try std.testing.expectEqual(types.SEND_WR_ID_NONE, queue.send_completion_wr_id.load(.acquire));
+}
+
+test "a successful first-ACK completion queues the second ACK and keeps the slot" {
+    var queue = testQueue();
+    const slot = queue.allocSendSlot() orelse return error.TestUnexpectedResult;
+    queue.setSendSlotMode(slot, .AsyncFirstAck);
+
+    var wc = std.mem.zeroes(c.ibv_wc);
+    wc.wr_id = types.sendWrId(slot);
+    wc.status = c.IBV_WC_SUCCESS;
+    wc.opcode = c.IBV_WC_SEND;
+    var pending = PendingSecondAcks{};
+    dispatchClassicWc(&queue, &wc, &pending);
+
+    try std.testing.expectEqual(types.SlotState.InUse, slotState(&queue, slot));
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(slot, pending.slots[0]);
+    try std.testing.expectEqual(@as(u64, 0), queue.async_ack_failures.load(.monotonic));
 }

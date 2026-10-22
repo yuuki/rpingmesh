@@ -182,9 +182,10 @@ pub fn getSlotPtr(buf: [*]u8, slot_index: u32, num_slots: u32) MemoryError![*]u8
 /// Post one signaled UD send of a PROBE_PACKET_SIZE-byte packet.
 ///
 /// `packet` must point into the send MR `mr` (a send slot, or the second ACK
-/// staged inside one). `wr_id` is the send slot index, which is how the CQ
-/// poller maps the completion back to the slot. Used by packet.zig for every
-/// send it posts and by cq.zig for the second ACK of an asynchronous pair.
+/// staged inside one). The WR's wr_id is types.sendWrId(slot_index), which is
+/// how the CQ poller maps the completion back to the slot and tells it from a
+/// recv completion. Used by packet.zig for every send it posts and by cq.zig
+/// for the second ACK of an asynchronous pair.
 /// ibv_post_send is thread-safe for a QP created without a thread domain (as
 /// queue.zig creates it), so the CQ poller may post while the application
 /// thread posts on the same QP. A provider single-thread mode (for example
@@ -193,7 +194,7 @@ pub fn postUdSend(
     qp: *c.ibv_qp,
     mr: *c.ibv_mr,
     packet: [*]u8,
-    wr_id: u64,
+    slot_index: u32,
     ah: *c.ibv_ah,
     remote_qpn: u32,
 ) MemoryError!void {
@@ -204,7 +205,7 @@ pub fn postUdSend(
     };
 
     var wr = std.mem.zeroes(c.ibv_send_wr);
-    wr.wr_id = wr_id;
+    wr.wr_id = types.sendWrId(slot_index);
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = c.IBV_WR_SEND;
@@ -223,8 +224,9 @@ pub fn postUdSend(
 /// Post a single receive buffer to a Queue Pair.
 ///
 /// Creates an ibv_recv_wr (receive work request) that tells the HCA where
-/// to write incoming data for this slot. The wr_id is set to the slot_index
-/// so that when a completion arrives, we can identify which buffer was used.
+/// to write incoming data for this slot. The wr_id is the bare slot_index
+/// (no SEND_WR_ID_FLAG), which identifies both the buffer and, to the CQ
+/// poller, the completion as a receive.
 ///
 /// The scatter/gather entry points to the slot's buffer with a length of
 /// SLOT_SIZE and the lkey from the registered Memory Region.

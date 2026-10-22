@@ -50,9 +50,32 @@ pub const NUM_SEND_SLOTS: u32 = 32;
 /// Number of receive slots in the receive memory region.
 pub const NUM_RECV_SLOTS: u32 = 32;
 
+/// Flag set in the wr_id of every send WR. Recv WRs use the bare slot index
+/// as wr_id, send WRs `SEND_WR_ID_FLAG | slot`, so the CQ poller can tell a
+/// send completion from a recv completion by wr_id alone. It cannot use the
+/// opcode: libibverbs defines wc.opcode / ibv_wc_read_opcode() only for
+/// IBV_WC_SUCCESS, and an unset opcode reads as 0 == IBV_WC_SEND, which
+/// would route a flushed recv completion to the send path.
+pub const SEND_WR_ID_FLAG: u64 = 1 << 32;
+
+/// wr_id of the send WR posted from send slot `slot`.
+pub fn sendWrId(slot: u32) u64 {
+    return SEND_WR_ID_FLAG | slot;
+}
+
+/// Whether a completion's wr_id belongs to a send WR (see SEND_WR_ID_FLAG).
+pub fn isSendWrId(wr_id: u64) bool {
+    return (wr_id & SEND_WR_ID_FLAG) != 0;
+}
+
+/// Slot index carried by a send or recv wr_id.
+pub fn wrIdSlot(wr_id: u64) u32 {
+    return @truncate(wr_id);
+}
+
 /// Sentinel for `UdQueue.send_completion_wr_id` meaning "no completion has
 /// been published for the current in-flight send yet". A genuine send wr_id
-/// is a slot index (0..NUM_SEND_SLOTS-1), so this all-ones value can never
+/// is SEND_WR_ID_FLAG plus a slot index, so this all-ones value can never
 /// collide with a real completion.
 pub const SEND_WR_ID_NONE: u64 = std.math.maxInt(u64);
 
@@ -322,8 +345,8 @@ pub const UdQueue = struct {
     // These fields form a single-slot mailbox, not a queue. They assume
     // "one UdQueue is driven by at most one sender thread at a time" -- a
     // caller posts a send WR, then waits on waitSendCompletion() before
-    // posting another. The mailbox is matched by wr_id (= the send slot
-    // index): the CQ poller publishes the completed send's wr_id LAST, with
+    // posting another. The mailbox is matched by wr_id (= sendWrId(slot)):
+    // the CQ poller publishes the completed send's wr_id LAST, with
     // release ordering, after writing timestamp/status; the waiting sender
     // spins until it observes ITS OWN wr_id (acquire) and only then trusts
     // timestamp/status.
@@ -609,6 +632,21 @@ test "SendSlotMode tags and staging offsets" {
     try std.testing.expectEqual(@as(u8, 2), @backingInt(SendSlotMode.AsyncSecondAck));
     // The staged second ACK must fit in the slot after the first ACK.
     try std.testing.expect(SECOND_ACK_SLOT_OFFSET + PROBE_PACKET_SIZE <= SLOT_SIZE);
+}
+
+test "send wr_ids are distinguishable from recv wr_ids" {
+    for (0..NUM_SEND_SLOTS) |i| {
+        const slot: u32 = @intCast(i);
+        const wr_id = sendWrId(slot);
+        try std.testing.expect(isSendWrId(wr_id));
+        try std.testing.expectEqual(slot, wrIdSlot(wr_id));
+        try std.testing.expect(wr_id != SEND_WR_ID_NONE);
+    }
+    for (0..NUM_RECV_SLOTS) |i| {
+        const slot: u32 = @intCast(i);
+        try std.testing.expect(!isSendWrId(slot));
+        try std.testing.expectEqual(slot, wrIdSlot(slot));
+    }
 }
 
 test "SlotState enum values" {

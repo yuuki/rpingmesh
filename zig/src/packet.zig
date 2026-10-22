@@ -180,9 +180,9 @@ fn sendPacketInternal(
         types.setLastError("no free send slot available");
         return PacketError.NoFreeSendSlot;
     };
-    // wr_id == slot index. With no slot reuse while a WR is outstanding, the
-    // slot index uniquely identifies the in-flight send for mailbox matching.
-    const wr_id: u64 = @intCast(slot_index);
+    // With no slot reuse while a WR is outstanding, the slot's wr_id uniquely
+    // identifies the in-flight send for mailbox matching.
+    const wr_id = types.sendWrId(slot_index);
 
     // Slot-freeing ownership below is deliberate: until ibv_post_send succeeds
     // there is no outstanding WR, so this function must free the slot on every
@@ -221,7 +221,7 @@ fn sendPacketInternal(
     // Step 5: Post the send work request. The slot is synchronous: its
     // completion is published to the mailbox (see types.SendSlotMode).
     queue.setSendSlotMode(slot_index, .Sync);
-    memory.postUdSend(queue.qp, queue.send_mr, slot_ptr, wr_id, ah, target_qpn) catch {
+    memory.postUdSend(queue.qp, queue.send_mr, slot_ptr, slot_index, ah, target_qpn) catch {
         // No WR was accepted by the QP, so no completion will ever arrive to
         // free this slot or its AH; destroy both here.
         queue.destroySendSlotAh(slot_index);
@@ -324,7 +324,6 @@ pub fn sendAckPair(
         types.setLastError("no free send slot available");
         return ACK_PAIR_NO_FREE_SLOT;
     };
-    const wr_id: u64 = @intCast(slot_index);
 
     // Until ibv_post_send accepts the WR, this function owns the slot and
     // frees it on every error path (as in sendPacketInternal).
@@ -348,7 +347,7 @@ pub fn sendAckPair(
     queue.setSendSlotAh(slot_index, ah);
     queue.setSendSlotMode(slot_index, .AsyncFirstAck);
 
-    memory.postUdSend(queue.qp, queue.send_mr, slot_ptr, wr_id, ah, target_qpn) catch {
+    memory.postUdSend(queue.qp, queue.send_mr, slot_ptr, slot_index, ah, target_qpn) catch {
         queue.setSendSlotMode(slot_index, .Sync);
         queue.destroySendSlotAh(slot_index);
         freeSendSlot(queue, slot_index);

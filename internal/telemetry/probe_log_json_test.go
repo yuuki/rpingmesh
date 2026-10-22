@@ -3,15 +3,12 @@ package telemetry
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
-
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/yuuki/rpingmesh/internal/logging"
 	"github.com/yuuki/rpingmesh/internal/probe"
@@ -39,12 +36,7 @@ func sortedKeys(m map[string]any) []string {
 // fields rtt_tor_check.py reads, and that the Python tool's fixture has
 // exactly the same shape, so the two cannot drift apart silently.
 func TestProbeResultLogJSONMatchesRTTTool(t *testing.T) {
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewManualReader()))
-	defer provider.Shutdown(context.Background())
-	mc, err := NewMetricsCollectorWithProvider(provider)
-	if err != nil {
-		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-	}
+	mc, _ := newTestCollector(t)
 	var buf bytes.Buffer
 	logger, err := logging.New(logging.FormatJSON, &buf)
 	if err != nil {

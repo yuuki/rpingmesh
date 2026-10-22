@@ -21,9 +21,8 @@ import (
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"github.com/yuuki/rpingmesh/internal/rdmabridge"
 	"github.com/yuuki/rpingmesh/internal/telemetry"
+	"github.com/yuuki/rpingmesh/internal/testutil/otelmetrics"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
-	"go.opentelemetry.io/otel/attribute"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
@@ -158,10 +157,7 @@ func TestProbeToOTelMetrics(t *testing.T) {
 	}
 
 	// --- OTel metrics with ManualReader ---
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	defer provider.Shutdown(context.Background())
-
+	provider, reader := otelmetrics.NewManualProvider(t)
 	mc, err := telemetry.NewMetricsCollectorWithProvider(provider)
 	if err != nil {
 		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
@@ -249,15 +245,11 @@ func TestProbeToOTelMetrics(t *testing.T) {
 
 	// --- Wait for metrics to be recorded ---
 	t.Log("Waiting for OTel metrics to be recorded...")
-	var rm metricdata.ResourceMetrics
 	deadline := time.Now().Add(metricsTimeout)
 	var found bool
 
 	for time.Now().Before(deadline) {
-		if err := reader.Collect(context.Background(), &rm); err != nil {
-			t.Fatalf("ManualReader.Collect: %v", err)
-		}
-		if getCounterValue(rm, "rpingmesh.probe_total") > 0 {
+		if otelmetrics.Total(t, otelmetrics.Collect(t, reader), "rpingmesh.probe_total") > 0 {
 			found = true
 			break
 		}
@@ -283,20 +275,19 @@ func TestProbeToOTelMetrics(t *testing.T) {
 	}
 
 	// Collect final metrics after shutdown.
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("ManualReader.Collect (final): %v", err)
-	}
+	rm := otelmetrics.Collect(t, reader)
 
 	if !found {
 		t.Fatal("timeout: no rpingmesh.probe_total metric recorded within deadline")
 	}
 
 	// --- Assertions ---
-	probeTotal := getCounterValue(rm, "rpingmesh.probe_total")
-	probeSuccess := getCounterValue(rm, "rpingmesh.probe_success_total")
-	probeFailed := getCounterValue(rm, "rpingmesh.probe_failed_total")
-	probeFailedTimeout := getCounterValueByAttr(rm, "rpingmesh.probe_failed_total", "reason", "timeout")
-	probeFailedInvalidRTT := getCounterValueByAttr(rm, "rpingmesh.probe_failed_total", "reason", "invalid_rtt")
+	probeTotal := otelmetrics.Total(t, rm, "rpingmesh.probe_total")
+	probeSuccess := otelmetrics.Total(t, rm, "rpingmesh.probe_success_total")
+	probeFailed := otelmetrics.Total(t, rm, "rpingmesh.probe_failed_total")
+	failedByReason := otelmetrics.TotalByAttr(t, rm, "rpingmesh.probe_failed_total", "reason")
+	probeFailedTimeout := failedByReason["timeout"]
+	probeFailedInvalidRTT := failedByReason["invalid_rtt"]
 
 	t.Logf("metrics: probe_total=%d probe_success=%d probe_failed=%d (timeout=%d invalid_rtt=%d)",
 		probeTotal, probeSuccess, probeFailed, probeFailedTimeout, probeFailedInvalidRTT)
@@ -369,14 +360,11 @@ func TestProbeToOTelMetrics(t *testing.T) {
 		assertHistogramHasData(t, rm, "rpingmesh.prober_delay_ns")
 		assertHistogramHasData(t, rm, "rpingmesh.responder_delay_ns")
 
-		// Log RTT values from histogram.
-		if h := getHistogramData(rm, "rpingmesh.network_rtt_ns"); h != nil {
-			t.Logf("network_rtt_ns: count=%d sum=%d min=%d max=%d",
-				h.Count, h.Sum, extremaVal(h.Min), extremaVal(h.Max))
-		}
-		if h := getHistogramData(rm, "rpingmesh.responder_delay_ns"); h != nil {
-			t.Logf("responder_delay_ns: count=%d sum=%d min=%d max=%d",
-				h.Count, h.Sum, extremaVal(h.Min), extremaVal(h.Max))
+		for _, name := range []string{"rpingmesh.network_rtt_ns", "rpingmesh.responder_delay_ns"} {
+			if dps := otelmetrics.HistogramPoints(t, rm, name); len(dps) > 0 {
+				t.Logf("%s: count=%d sum=%d min=%d max=%d",
+					name, dps[0].Count, dps[0].Sum, extremaVal(dps[0].Min), extremaVal(dps[0].Max))
+			}
 		}
 	}
 
@@ -404,117 +392,35 @@ func abs64(v int64) int64 {
 	return v
 }
 
-// getCounterValue returns the sum of all data points for the named counter metric.
-func getCounterValue(rm metricdata.ResourceMetrics, name string) int64 {
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			if m.Name != name {
-				continue
-			}
-			if sum, ok := m.Data.(metricdata.Sum[int64]); ok {
-				var total int64
-				for _, dp := range sum.DataPoints {
-					total += dp.Value
-				}
-				return total
-			}
-		}
-	}
-	return 0
-}
-
-// getCounterValueByAttr returns the sum of data points for the named counter
-// metric whose attribute set has key==value. Used to break down
-// rpingmesh.probe_failed_total by its "reason" attribute.
-func getCounterValueByAttr(rm metricdata.ResourceMetrics, name, key, value string) int64 {
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			if m.Name != name {
-				continue
-			}
-			sum, ok := m.Data.(metricdata.Sum[int64])
-			if !ok {
-				continue
-			}
-			var total int64
-			for _, dp := range sum.DataPoints {
-				if val, ok := dp.Attributes.Value(attribute.Key(key)); ok && val.AsString() == value {
-					total += dp.Value
-				}
-			}
-			return total
-		}
-	}
-	return 0
-}
-
-// getHistogramData returns the first data point of the named histogram metric.
-func getHistogramData(rm metricdata.ResourceMetrics, name string) *metricdata.HistogramDataPoint[int64] {
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			if m.Name != name {
-				continue
-			}
-			if h, ok := m.Data.(metricdata.Histogram[int64]); ok {
-				if len(h.DataPoints) > 0 {
-					return &h.DataPoints[0]
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// assertHistogramHasData fails the test if the named histogram has no data points
-// or zero count.
-func assertHistogramHasData(t *testing.T, rm metricdata.ResourceMetrics, name string) {
+// assertHistogramHasData fails the test if the named histogram has no data
+// points or a zero count.
+func assertHistogramHasData(t *testing.T, rm *metricdata.ResourceMetrics, name string) {
 	t.Helper()
-	dp := getHistogramData(rm, name)
-	if dp == nil {
+	dps := otelmetrics.HistogramPoints(t, rm, name)
+	if len(dps) == 0 {
 		t.Errorf("histogram %q: no data points found", name)
 		return
 	}
-	if dp.Count == 0 {
+	if dps[0].Count == 0 {
 		t.Errorf("histogram %q: count is 0", name)
 	}
 }
 
-// assertCounterHasAttributes verifies that the named counter metric has at least
-// one data point with all the expected attribute key-value pairs.
-func assertCounterHasAttributes(t *testing.T, rm metricdata.ResourceMetrics, name string, expected map[string]string) {
+// assertCounterHasAttributes verifies that the named counter has at least one
+// data point carrying all the expected attribute key-value pairs.
+func assertCounterHasAttributes(t *testing.T, rm *metricdata.ResourceMetrics, name string, expected map[string]string) {
 	t.Helper()
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			if m.Name != name {
-				continue
-			}
-			sum, ok := m.Data.(metricdata.Sum[int64])
-			if !ok {
-				t.Errorf("metric %q is not a Sum[int64]", name)
-				return
-			}
-			for _, dp := range sum.DataPoints {
-				if matchesAttributes(dp.Attributes, expected) {
-					return // found a matching data point
-				}
-			}
-			t.Errorf("metric %q: no data point with attributes %v", name, expected)
+	sets := otelmetrics.DataPointAttrs(t, rm, name)
+	if sets == nil {
+		t.Errorf("metric %q not found", name)
+		return
+	}
+	for _, set := range sets {
+		if otelmetrics.HasAttributes(set, expected) {
 			return
 		}
 	}
-	t.Errorf("metric %q not found", name)
-}
-
-// matchesAttributes checks whether an attribute set contains all expected
-// key-value pairs.
-func matchesAttributes(attrs attribute.Set, expected map[string]string) bool {
-	for k, v := range expected {
-		val, ok := attrs.Value(attribute.Key(k))
-		if !ok || val.AsString() != v {
-			return false
-		}
-	}
-	return true
+	t.Errorf("metric %q: no data point with attributes %v", name, expected)
 }
 
 // extremaVal extracts the value from an Extrema[int64], returning 0 if not set.

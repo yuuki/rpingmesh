@@ -10,6 +10,7 @@ import (
 	"github.com/yuuki/rpingmesh/internal/buildinfo"
 	"github.com/yuuki/rpingmesh/internal/config"
 	"github.com/yuuki/rpingmesh/internal/probe"
+	"github.com/yuuki/rpingmesh/internal/testutil/otelmetrics"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -126,33 +127,17 @@ func TestWithServiceName_Overrides(t *testing.T) {
 }
 
 // failedCounterReason returns the "reason" attribute value of the sole
-// probe_failed_total data point recorded by mc, failing the test if the
+// probe_failed_total data point recorded by reader, failing the test if the
 // metric or data point is missing.
-func failedCounterReason(t *testing.T, mc *MetricsCollector, reader *sdkmetric.ManualReader) string {
+func failedCounterReason(t *testing.T, reader *sdkmetric.ManualReader) string {
 	t.Helper()
-
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("ManualReader.Collect: %v", err)
+	got := otelmetrics.TotalByAttr(t, otelmetrics.Collect(t, reader), "rpingmesh.probe_failed_total", "reason")
+	if len(got) != 1 {
+		t.Fatalf("rpingmesh.probe_failed_total by reason = %v, want exactly one data point", got)
 	}
-
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			if m.Name != "rpingmesh.probe_failed_total" {
-				continue
-			}
-			sum, ok := m.Data.(metricdata.Sum[int64])
-			if !ok || len(sum.DataPoints) == 0 {
-				t.Fatalf("rpingmesh.probe_failed_total: no data points")
-			}
-			reason, ok := sum.DataPoints[0].Attributes.Value("reason")
-			if !ok {
-				t.Fatalf("rpingmesh.probe_failed_total: missing reason attribute")
-			}
-			return reason.AsString()
-		}
+	for reason := range got {
+		return reason
 	}
-	t.Fatalf("rpingmesh.probe_failed_total metric not found")
 	return ""
 }
 
@@ -192,39 +177,38 @@ func TestRecordProbeResult_FailureReason(t *testing.T) {
 			rtt:        nil,
 			wantReason: reasonUnknown,
 		},
+		// The typed classification wins over the error message wording.
+		{
+			name:       "typed timeout",
+			result:     &probe.ProbeResult{Success: false, FailureReason: probe.FailureTimeout, ErrorMessage: "no ACKs"},
+			rtt:        nil,
+			wantReason: reasonTimeout,
+		},
+		{
+			name:       "typed send_error",
+			result:     &probe.ProbeResult{Success: false, FailureReason: probe.FailureSendError, ErrorMessage: "ibv_post_send: EIO"},
+			rtt:        nil,
+			wantReason: reasonSendError,
+		},
+		{
+			name:       "typed unknown",
+			result:     &probe.ProbeResult{Success: false, FailureReason: "something_new", ErrorMessage: "timed out"},
+			rtt:        nil,
+			wantReason: reasonUnknown,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			reader := sdkmetric.NewManualReader()
-			provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-			defer provider.Shutdown(context.Background())
-
-			mc, err := NewMetricsCollectorWithProvider(provider)
-			if err != nil {
-				t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-			}
+			mc, reader := newTestCollector(t)
 
 			mc.RecordProbeResult(tc.result, tc.rtt, "tor-source")
 
-			if got := failedCounterReason(t, mc, reader); got != tc.wantReason {
+			if got := failedCounterReason(t, reader); got != tc.wantReason {
 				t.Errorf("reason = %q, want %q", got, tc.wantReason)
 			}
 		})
 	}
-}
-
-// findMetric returns the named metric from a collected ResourceMetrics, or
-// nil if not present.
-func findMetric(rm *metricdata.ResourceMetrics, name string) *metricdata.Metrics {
-	for _, sm := range rm.ScopeMetrics {
-		for i, m := range sm.Metrics {
-			if m.Name == name {
-				return &sm.Metrics[i]
-			}
-		}
-	}
-	return nil
 }
 
 // TestRecordProbeResult_Success verifies that a successful probe with a
@@ -232,14 +216,7 @@ func findMetric(rm *metricdata.ResourceMetrics, name string) *metricdata.Metrics
 // probe_failed_total) and records the three RTT histograms with the exact
 // nanosecond values supplied.
 func TestRecordProbeResult_Success(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	defer provider.Shutdown(context.Background())
-
-	mc, err := NewMetricsCollectorWithProvider(provider)
-	if err != nil {
-		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-	}
+	mc, reader := newTestCollector(t)
 
 	result := &probe.ProbeResult{
 		TargetTorID: "tor-target",
@@ -253,16 +230,13 @@ func TestRecordProbeResult_Success(t *testing.T) {
 	}
 	mc.RecordProbeResult(result, rtt, "tor-source")
 
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("ManualReader.Collect: %v", err)
-	}
+	rm := otelmetrics.Collect(t, reader)
 
-	if m := findMetric(&rm, "rpingmesh.probe_failed_total"); m != nil {
+	if m := otelmetrics.Find(rm, "rpingmesh.probe_failed_total"); m != nil {
 		t.Errorf("rpingmesh.probe_failed_total: expected no data points recorded on success, got %+v", m.Data)
 	}
 
-	sumMetric := findMetric(&rm, "rpingmesh.probe_success_total")
+	sumMetric := otelmetrics.Find(rm, "rpingmesh.probe_success_total")
 	if sumMetric == nil {
 		t.Fatal("rpingmesh.probe_success_total metric not found")
 	}
@@ -271,7 +245,7 @@ func TestRecordProbeResult_Success(t *testing.T) {
 		t.Fatalf("rpingmesh.probe_success_total = %+v, want a single data point with value 1", sumMetric.Data)
 	}
 
-	totalMetric := findMetric(&rm, "rpingmesh.probe_total")
+	totalMetric := otelmetrics.Find(rm, "rpingmesh.probe_total")
 	if totalMetric == nil {
 		t.Fatal("rpingmesh.probe_total metric not found")
 	}
@@ -289,7 +263,7 @@ func TestRecordProbeResult_Success(t *testing.T) {
 		{"rpingmesh.responder_delay_ns", rtt.ResponderDelay},
 	}
 	for _, hc := range histCases {
-		hm := findMetric(&rm, hc.name)
+		hm := otelmetrics.Find(rm, hc.name)
 		if hm == nil {
 			t.Fatalf("%s metric not found", hc.name)
 		}
@@ -304,22 +278,12 @@ func TestRecordProbeResult_Success(t *testing.T) {
 }
 
 func TestRecordProbeResult_EmptyTorMapped(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	defer provider.Shutdown(context.Background())
-
-	mc, err := NewMetricsCollectorWithProvider(provider)
-	if err != nil {
-		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-	}
+	mc, reader := newTestCollector(t)
 
 	mc.RecordProbeResult(&probe.ProbeResult{TargetTorID: "  ", Success: false, ErrorMessage: "timed out waiting for ACKs"}, nil, "")
 
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("ManualReader.Collect: %v", err)
-	}
-	totalMetric := findMetric(&rm, "rpingmesh.probe_total")
+	rm := otelmetrics.Collect(t, reader)
+	totalMetric := otelmetrics.Find(rm, "rpingmesh.probe_total")
 	if totalMetric == nil {
 		t.Fatal("rpingmesh.probe_total metric not found")
 	}
@@ -342,14 +306,7 @@ func TestRecordProbeResult_EmptyTorMapped(t *testing.T) {
 // that an empty name maps to the "unspecified" label, and that results from
 // two local RNICs on the same ToR pair stay in separate series.
 func TestRecordProbeResult_SourceRnicAttributes(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	defer provider.Shutdown(context.Background())
-
-	mc, err := NewMetricsCollectorWithProvider(provider)
-	if err != nil {
-		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-	}
+	mc, reader := newTestCollector(t)
 
 	ok := &probe.ProbeResult{
 		TargetTorID: "leaf-b", Success: true,
@@ -362,10 +319,7 @@ func TestRecordProbeResult_SourceRnicAttributes(t *testing.T) {
 		SourceRdmaDevice: "mlx5_1",
 	}, nil, "leaf-a")
 
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("ManualReader.Collect: %v", err)
-	}
+	rm := otelmetrics.Collect(t, reader)
 
 	type rnic struct{ device, netdev string }
 	attrsOf := func(set attribute.Set) rnic {
@@ -380,7 +334,7 @@ func TestRecordProbeResult_SourceRnicAttributes(t *testing.T) {
 	want1 := rnic{"mlx5_1", probe.UnspecifiedTorLabel}
 
 	// probe_total: one series per source RNIC.
-	total := findMetric(&rm, "rpingmesh.probe_total")
+	total := otelmetrics.Find(rm, "rpingmesh.probe_total")
 	if total == nil {
 		t.Fatal("rpingmesh.probe_total metric not found")
 	}
@@ -394,7 +348,7 @@ func TestRecordProbeResult_SourceRnicAttributes(t *testing.T) {
 	}
 
 	for _, name := range []string{"rpingmesh.probe_success_total", "rpingmesh.probe_failed_total"} {
-		m := findMetric(&rm, name)
+		m := otelmetrics.Find(rm, name)
 		if m == nil {
 			t.Fatalf("%s metric not found", name)
 		}
@@ -411,7 +365,7 @@ func TestRecordProbeResult_SourceRnicAttributes(t *testing.T) {
 		}
 	}
 	for _, name := range []string{"rpingmesh.network_rtt_ns", "rpingmesh.prober_delay_ns", "rpingmesh.responder_delay_ns"} {
-		m := findMetric(&rm, name)
+		m := otelmetrics.Find(rm, name)
 		if m == nil {
 			t.Fatalf("%s metric not found", name)
 		}
@@ -429,22 +383,12 @@ func TestRecordProbeResult_SourceRnicAttributes(t *testing.T) {
 // when passed a nil ProbeResult (defensive guard against a caller mistake),
 // so no metrics are recorded and no panic occurs.
 func TestRecordProbeResult_NilResult(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	defer provider.Shutdown(context.Background())
-
-	mc, err := NewMetricsCollectorWithProvider(provider)
-	if err != nil {
-		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-	}
+	mc, reader := newTestCollector(t)
 
 	mc.RecordProbeResult(nil, nil, "tor-source")
 
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("ManualReader.Collect: %v", err)
-	}
-	if m := findMetric(&rm, "rpingmesh.probe_total"); m != nil {
+	rm := otelmetrics.Collect(t, reader)
+	if m := otelmetrics.Find(rm, "rpingmesh.probe_total"); m != nil {
 		if sum, ok := m.Data.(metricdata.Sum[int64]); ok && len(sum.DataPoints) > 0 {
 			t.Errorf("rpingmesh.probe_total: expected no data points for nil result, got %+v", sum)
 		}
@@ -455,14 +399,7 @@ func TestRecordProbeResult_NilResult(t *testing.T) {
 // reports one data point per ring label supplied via the readers map, each
 // tagged with the corresponding "ring" attribute and current drop count.
 func TestRegisterEventRingDropCallback(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	defer provider.Shutdown(context.Background())
-
-	mc, err := NewMetricsCollectorWithProvider(provider)
-	if err != nil {
-		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-	}
+	mc, reader := newTestCollector(t)
 
 	dropCounts := map[string]uint64{"prober": 3, "responder": 7}
 	readers := map[string]func() uint64{
@@ -473,12 +410,9 @@ func TestRegisterEventRingDropCallback(t *testing.T) {
 		t.Fatalf("RegisterEventRingDropCallback: %v", err)
 	}
 
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("ManualReader.Collect: %v", err)
-	}
+	rm := otelmetrics.Collect(t, reader)
 
-	m := findMetric(&rm, "rpingmesh.event_ring_dropped_total")
+	m := otelmetrics.Find(rm, "rpingmesh.event_ring_dropped_total")
 	if m == nil {
 		t.Fatal("rpingmesh.event_ring_dropped_total metric not found")
 	}
@@ -507,26 +441,16 @@ func TestRegisterEventRingDropCallback(t *testing.T) {
 // the current rate multiplier returned by the registered reader, as a single
 // attribute-free data point.
 func TestRegisterSelfThrottleCallback(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	defer provider.Shutdown(context.Background())
-
-	mc, err := NewMetricsCollectorWithProvider(provider)
-	if err != nil {
-		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-	}
+	mc, reader := newTestCollector(t)
 
 	multiplier := 0.25
 	if err := mc.RegisterSelfThrottleCallback(func() float64 { return multiplier }); err != nil {
 		t.Fatalf("RegisterSelfThrottleCallback: %v", err)
 	}
 
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("ManualReader.Collect: %v", err)
-	}
+	rm := otelmetrics.Collect(t, reader)
 
-	m := findMetric(&rm, "rpingmesh.agent.self_throttle")
+	m := otelmetrics.Find(rm, "rpingmesh.agent.self_throttle")
 	if m == nil {
 		t.Fatal("rpingmesh.agent.self_throttle metric not found")
 	}
@@ -546,14 +470,7 @@ func TestRegisterSelfThrottleCallback(t *testing.T) {
 // ProbeResults from the channel, computes RTT via probe.CalculateRTT, and
 // records them, and that it exits cleanly when the channel is closed.
 func TestStartResultConsumer(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	defer provider.Shutdown(context.Background())
-
-	mc, err := NewMetricsCollectorWithProvider(provider)
-	if err != nil {
-		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-	}
+	mc, reader := newTestCollector(t)
 
 	resultChan := make(chan *probe.ProbeResult, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -574,11 +491,8 @@ func TestStartResultConsumer(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		var rm metricdata.ResourceMetrics
-		if err := reader.Collect(context.Background(), &rm); err != nil {
-			t.Fatalf("ManualReader.Collect: %v", err)
-		}
-		if m := findMetric(&rm, "rpingmesh.probe_total"); m != nil {
+		rm := otelmetrics.Collect(t, reader)
+		if m := otelmetrics.Find(rm, "rpingmesh.probe_total"); m != nil {
 			if sum, ok := m.Data.(metricdata.Sum[int64]); ok && len(sum.DataPoints) == 1 && sum.DataPoints[0].Value == 1 {
 				break
 			}
@@ -600,14 +514,7 @@ func TestStartResultConsumer(t *testing.T) {
 // SourceTorID (stamped by the prober from its device's ToR) is used as the
 // source_tor attribute instead of the consumer default.
 func TestStartResultConsumer_PerResultSourceTor(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	defer provider.Shutdown(context.Background())
-
-	mc, err := NewMetricsCollectorWithProvider(provider)
-	if err != nil {
-		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-	}
+	mc, reader := newTestCollector(t)
 
 	resultChan := make(chan *probe.ProbeResult, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -623,11 +530,8 @@ func TestStartResultConsumer_PerResultSourceTor(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		var rm metricdata.ResourceMetrics
-		if err := reader.Collect(context.Background(), &rm); err != nil {
-			t.Fatalf("ManualReader.Collect: %v", err)
-		}
-		if m := findMetric(&rm, "rpingmesh.probe_total"); m != nil {
+		rm := otelmetrics.Collect(t, reader)
+		if m := otelmetrics.Find(rm, "rpingmesh.probe_total"); m != nil {
 			if sum, ok := m.Data.(metricdata.Sum[int64]); ok && len(sum.DataPoints) == 1 {
 				src, _ := sum.DataPoints[0].Attributes.Value("source_tor")
 				if got := src.AsString(); got != "leaf-a" {
@@ -724,28 +628,18 @@ func TestNetworkRTTBucketBoundaries_ContainsDefaultSLA(t *testing.T) {
 // TestRecordProbeResult_HistogramBoundaries verifies that the RTT histogram
 // and the two delay histograms export their own bucket ladders.
 func TestRecordProbeResult_HistogramBoundaries(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	defer provider.Shutdown(context.Background())
-
-	mc, err := NewMetricsCollectorWithProvider(provider)
-	if err != nil {
-		t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-	}
+	mc, reader := newTestCollector(t)
 	mc.RecordProbeResult(&probe.ProbeResult{TargetTorID: "tor-b", Success: true},
 		&probe.RTTResult{NetworkRTT: 5_000, ProberDelay: 80_000, ResponderDelay: 60_000, Valid: true}, "tor-a")
 
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("ManualReader.Collect: %v", err)
-	}
+	rm := otelmetrics.Collect(t, reader)
 	cases := map[string][]float64{
 		"rpingmesh.network_rtt_ns":     networkRTTBucketBoundaries,
 		"rpingmesh.prober_delay_ns":    delayBucketBoundaries,
 		"rpingmesh.responder_delay_ns": delayBucketBoundaries,
 	}
 	for name, want := range cases {
-		m := findMetric(&rm, name)
+		m := otelmetrics.Find(rm, name)
 		if m == nil {
 			t.Fatalf("%s metric not found", name)
 		}
@@ -772,29 +666,19 @@ func TestRecordProbeResult_DelayTargetTor(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			reader := sdkmetric.NewManualReader()
-			provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-			defer provider.Shutdown(context.Background())
-
-			mc, err := NewMetricsCollectorWithProvider(provider, tc.opts...)
-			if err != nil {
-				t.Fatalf("NewMetricsCollectorWithProvider: %v", err)
-			}
+			mc, reader := newTestCollector(t, tc.opts...)
 			rtt := &probe.RTTResult{NetworkRTT: 5_000, ProberDelay: 80_000, ResponderDelay: 60_000, Valid: true}
 			for _, tor := range []string{"tor-b", "tor-c"} {
 				mc.RecordProbeResult(&probe.ProbeResult{TargetTorID: tor, Success: true,
 					SourceRdmaDevice: "mlx5_0", SourceNetdev: "eth0"}, rtt, "tor-a")
 			}
 
-			var rm metricdata.ResourceMetrics
-			if err := reader.Collect(context.Background(), &rm); err != nil {
-				t.Fatalf("ManualReader.Collect: %v", err)
-			}
+			rm := otelmetrics.Collect(t, reader)
 			for name, keep := range map[string]bool{
 				"rpingmesh.prober_delay_ns":    tc.proberKeep,
 				"rpingmesh.responder_delay_ns": tc.respKeep,
 			} {
-				dps := findMetric(&rm, name).Data.(metricdata.Histogram[int64]).DataPoints
+				dps := otelmetrics.Find(rm, name).Data.(metricdata.Histogram[int64]).DataPoints
 				wantPoints := 1
 				if keep {
 					wantPoints = 2
@@ -816,10 +700,10 @@ func TestRecordProbeResult_DelayTargetTor(t *testing.T) {
 					t.Errorf("%s count = %d, want 2 (both targets in one series)", name, dps[0].Count)
 				}
 			}
-			if dps := findMetric(&rm, "rpingmesh.network_rtt_ns").Data.(metricdata.Histogram[int64]).DataPoints; len(dps) != 2 {
+			if dps := otelmetrics.Find(rm, "rpingmesh.network_rtt_ns").Data.(metricdata.Histogram[int64]).DataPoints; len(dps) != 2 {
 				t.Errorf("rpingmesh.network_rtt_ns has %d data points, want 2 (one per target_tor)", len(dps))
 			}
-			if dps := findMetric(&rm, "rpingmesh.probe_total").Data.(metricdata.Sum[int64]).DataPoints; len(dps) != 2 {
+			if dps := otelmetrics.Find(rm, "rpingmesh.probe_total").Data.(metricdata.Sum[int64]).DataPoints; len(dps) != 2 {
 				t.Errorf("rpingmesh.probe_total has %d data points, want 2 (one per target_tor)", len(dps))
 			}
 		})

@@ -11,15 +11,8 @@ const std = @import("std");
 const types = @import("types.zig");
 const c = types.c;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Size of each buffer slot in bytes: GRH (40) + payload (4096) = 4136.
-pub const SLOT_SIZE = types.SLOT_SIZE;
-
-/// Page size used for buffer alignment. Most architectures use 4096.
-const PAGE_SIZE = 4096;
+const SLOT_SIZE = types.SLOT_SIZE;
+const PAGE_SIZE = types.PAGE_SIZE;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -31,40 +24,16 @@ pub const MemoryError = error{
     AllocFailed,
     /// ibv_reg_mr() returned null.
     RegMrFailed,
-    /// ibv_dereg_mr() returned a non-zero error code.
-    DeregMrFailed,
     /// The slot index is out of bounds for the buffer.
     SlotIndexOutOfBounds,
     /// ibv_post_recv() failed.
     PostRecvFailed,
     /// ibv_post_send() failed.
     PostSendFailed,
-    /// A required pointer argument was null.
-    NullPointer,
 };
 
-// ---------------------------------------------------------------------------
-// BufferSet
-// ---------------------------------------------------------------------------
-
-/// A set of page-aligned buffers registered as an RDMA Memory Region.
-///
-/// The buffer is divided into num_slots contiguous slots of SLOT_SIZE bytes.
-/// Each slot can be independently used as a scatter/gather element in a
-/// work request.
-pub const BufferSet = struct {
-    /// Pointer to the page-aligned buffer memory.
-    buf: [*]align(PAGE_SIZE) u8,
-
-    /// Memory Region handle from ibv_reg_mr().
-    mr: *c.ibv_mr,
-
-    /// Number of slots in this buffer set.
-    num_slots: u32,
-
-    /// Total size of the buffer in bytes (num_slots * SLOT_SIZE).
-    size: usize,
-};
+/// See types.BufferSet; allocateBuffers() creates one.
+pub const BufferSet = types.BufferSet;
 
 // ---------------------------------------------------------------------------
 // Buffer allocation and registration
@@ -86,20 +55,14 @@ pub fn allocateBuffers(dev: *types.RdmaDevice, num_slots: u32) MemoryError!Buffe
 
     const total_size: usize = @as(usize, num_slots) * @as(usize, SLOT_SIZE);
 
-    // Allocate page-aligned memory. The page_allocator produces page-aligned
-    // allocations by default, but we explicitly request the alignment.
     const buf = std.heap.page_allocator.alignedAlloc(u8, @as(std.mem.Alignment, @fromBackingInt(@intCast(@ctz(@as(usize, PAGE_SIZE))))), total_size) catch {
         types.setLastError("failed to allocate page-aligned buffer");
         return MemoryError.AllocFailed;
     };
     errdefer std.heap.page_allocator.free(buf);
-
-    // Zero-initialize the buffer
     @memset(buf, 0);
 
-    // Register the buffer as a Memory Region with the device's PD.
-    // IBV_ACCESS_LOCAL_WRITE allows the HCA to write into this buffer
-    // (required for receive operations).
+    // IBV_ACCESS_LOCAL_WRITE lets the HCA write received data into the buffer.
     const mr = c.ibv_reg_mr(
         dev.pd,
         @ptrCast(buf.ptr),
@@ -144,11 +107,10 @@ pub fn freeBuffers(buf_set: *BufferSet) void {
         return;
     }
 
-    // Free the page-aligned buffer
     const slice = buf_set.buf[0..buf_set.size];
     std.heap.page_allocator.free(slice);
 
-    // Zero out the struct to prevent dangling pointer use
+    // Leave nothing dangling behind.
     buf_set.buf = undefined;
     buf_set.mr = undefined;
     buf_set.num_slots = 0;
@@ -182,9 +144,10 @@ pub fn getSlotPtr(buf: [*]u8, slot_index: u32, num_slots: u32) MemoryError![*]u8
 /// Post one signaled UD send of a PROBE_PACKET_SIZE-byte packet.
 ///
 /// `packet` must point into the send MR `mr` (a send slot, or the second ACK
-/// staged inside one). `wr_id` is the send slot index, which is how the CQ
-/// poller maps the completion back to the slot. Used by packet.zig for every
-/// send it posts and by cq.zig for the second ACK of an asynchronous pair.
+/// staged inside one). The WR's wr_id is types.sendWrId(slot_index), which is
+/// how the CQ poller maps the completion back to the slot and tells it from a
+/// recv completion. Used by packet.zig for every send it posts and by cq.zig
+/// for the second ACK of an asynchronous pair.
 /// ibv_post_send is thread-safe for a QP created without a thread domain (as
 /// queue.zig creates it), so the CQ poller may post while the application
 /// thread posts on the same QP. A provider single-thread mode (for example
@@ -193,7 +156,7 @@ pub fn postUdSend(
     qp: *c.ibv_qp,
     mr: *c.ibv_mr,
     packet: [*]u8,
-    wr_id: u64,
+    slot_index: u32,
     ah: *c.ibv_ah,
     remote_qpn: u32,
 ) MemoryError!void {
@@ -204,7 +167,7 @@ pub fn postUdSend(
     };
 
     var wr = std.mem.zeroes(c.ibv_send_wr);
-    wr.wr_id = wr_id;
+    wr.wr_id = types.sendWrId(slot_index);
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = c.IBV_WR_SEND;
@@ -220,14 +183,9 @@ pub fn postUdSend(
     }
 }
 
-/// Post a single receive buffer to a Queue Pair.
-///
-/// Creates an ibv_recv_wr (receive work request) that tells the HCA where
-/// to write incoming data for this slot. The wr_id is set to the slot_index
-/// so that when a completion arrives, we can identify which buffer was used.
-///
-/// The scatter/gather entry points to the slot's buffer with a length of
-/// SLOT_SIZE and the lkey from the registered Memory Region.
+/// Post one receive buffer (a whole SLOT_SIZE slot) to a Queue Pair. The
+/// wr_id is the bare slot_index (no SEND_WR_ID_FLAG), which identifies both
+/// the buffer and, to the CQ poller, the completion as a receive.
 pub fn postRecvBuffer(
     qp: *c.ibv_qp,
     mr: *c.ibv_mr,
@@ -235,15 +193,11 @@ pub fn postRecvBuffer(
     slot_index: u32,
 ) MemoryError!void {
     const offset: usize = @as(usize, slot_index) * @as(usize, SLOT_SIZE);
-
-    // Scatter/gather list entry: describes the buffer for this receive
     var sge = c.ibv_sge{
         .addr = @intFromPtr(buf + offset),
         .length = SLOT_SIZE,
         .lkey = mr.lkey,
     };
-
-    // Receive work request
     var wr = c.ibv_recv_wr{
         .wr_id = @intCast(slot_index),
         .next = null,
@@ -259,14 +213,8 @@ pub fn postRecvBuffer(
     }
 }
 
-/// Post receive buffers for slots 0 through num_buffers-1.
-///
-/// This is called during queue initialization to pre-post a batch of
-/// receive buffers so the HCA has buffers ready to receive incoming
-/// packets immediately after the QP transitions to the RTS state.
-///
-/// If any individual post fails, the function returns immediately with
-/// an error. Buffers posted before the failure remain posted.
+/// Post receive buffers for slots 0 through num_buffers-1 at queue
+/// creation. On a failure the slots posted before it remain posted.
 pub fn postInitialRecvBuffers(
     qp: *c.ibv_qp,
     mr: *c.ibv_mr,
@@ -283,28 +231,14 @@ pub fn postInitialRecvBuffers(
 // Tests
 // ---------------------------------------------------------------------------
 
-test "SLOT_SIZE matches types constant" {
-    try std.testing.expectEqual(types.SLOT_SIZE, SLOT_SIZE);
-    try std.testing.expectEqual(@as(u32, 4136), SLOT_SIZE);
-}
-
 test "getSlotPtr returns correct offset" {
-    // Create a small test buffer (not registered with RDMA, just for pointer math)
+    // Pointer math only; the buffer is not registered with RDMA.
     var test_buf: [4136 * 4]u8 = undefined;
     const base: [*]u8 = &test_buf;
-
-    // Slot 0 should be at the base
-    const slot0 = try getSlotPtr(base, 0, 4);
-    try std.testing.expectEqual(base, slot0);
-
-    // Slot 1 should be at base + SLOT_SIZE
-    const slot1 = try getSlotPtr(base, 1, 4);
     const expected_offset: usize = SLOT_SIZE;
-    try std.testing.expectEqual(base + expected_offset, slot1);
-
-    // Slot 2 should be at base + 2 * SLOT_SIZE
-    const slot2 = try getSlotPtr(base, 2, 4);
-    try std.testing.expectEqual(base + 2 * expected_offset, slot2);
+    try std.testing.expectEqual(base, try getSlotPtr(base, 0, 4));
+    try std.testing.expectEqual(base + expected_offset, try getSlotPtr(base, 1, 4));
+    try std.testing.expectEqual(base + 2 * expected_offset, try getSlotPtr(base, 2, 4));
 }
 
 test "getSlotPtr rejects out of bounds index" {
@@ -326,17 +260,4 @@ test "getSlotPtr rejects when num_slots is zero" {
 
     const result = getSlotPtr(base, 0, 0);
     try std.testing.expectError(MemoryError.SlotIndexOutOfBounds, result);
-}
-
-test "BufferSet struct has expected fields" {
-    // Verify the struct layout is correct at compile time
-    const info = @typeInfo(BufferSet);
-    try std.testing.expect(info == .@"struct");
-
-    const names = info.@"struct".field_names;
-    try std.testing.expectEqual(@as(usize, 4), names.len);
-    try std.testing.expectEqualStrings("buf", names[0]);
-    try std.testing.expectEqualStrings("mr", names[1]);
-    try std.testing.expectEqualStrings("num_slots", names[2]);
-    try std.testing.expectEqualStrings("size", names[3]);
 }

@@ -119,8 +119,8 @@ test-scripts:
 
 # Run Zig unit tests (types.zig, ring.zig, cq.zig, etc.). Pure Zig, no Go/CGO
 # involved, but still needs libibverbs/librdmacm headers on the build host
-# (some modules @cImport them), so like build-zig this is Linux-only in
-# practice (see Dockerfile.e2e).
+# (the `c` module is translated from them), so like build-zig this is
+# Linux-only in practice (see Dockerfile.e2e).
 test-zig:
 	@echo "==> Running Zig unit tests..."
 	cd $(ZIG_DIR) && zig build test

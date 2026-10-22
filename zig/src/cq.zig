@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const wire = @import("wire.zig");
 const ring = @import("ring.zig");
 const memory = @import("memory.zig");
 const c = types.c;
@@ -39,17 +40,12 @@ const log = std.log.scoped(.cq_poller);
 // GRH parsing
 // ---------------------------------------------------------------------------
 
-/// Information extracted from a Global Routing Header (GRH).
-///
-/// The GRH is 40 bytes prepended by the hardware to every UD receive buffer.
-/// It follows the IPv6 header format and contains the source/destination GIDs
-/// and the flow label used for ECMP path selection.
+/// What the CQ poller needs from a Global Routing Header (GRH): the 40
+/// bytes the hardware prepends to every UD receive buffer, in IPv6 header
+/// format.
 pub const GRHInfo = struct {
     /// Source GID (16 bytes) identifying the sender.
     source_gid: [16]u8,
-
-    /// Destination GID (16 bytes) identifying the receiver.
-    dest_gid: [16]u8,
 
     /// Flow label from the IPv6 header (lower 20 bits of the first 4-byte word).
     /// Used for ECMP path pinning in the R-Pingmesh protocol.
@@ -58,7 +54,7 @@ pub const GRHInfo = struct {
 
 /// Parse the 40-byte GRH at the start of a UD receive buffer.
 ///
-/// Standard GRH layout (IPv6 header format, used for native InfiniBand):
+/// Standard GRH layout (IPv6 header format):
 ///   Bytes 0-3:   Version (4 bits) | Traffic Class (8 bits) | Flow Label (20 bits)
 ///   Bytes 4-5:   Payload Length
 ///   Byte  6:     Next Header
@@ -66,114 +62,33 @@ pub const GRHInfo = struct {
 ///   Bytes 8-23:  Source GID (128 bits)
 ///   Bytes 24-39: Destination GID (128 bits)
 ///
-/// rdma_rxe IPv4 GRH format (Linux soft-RoCE for RoCEv2 over IPv4):
-///   Bytes 0-19:  All zeros (the synthesized GRH header fields are zeroed)
-///   Bytes 20-39: IPv4 header (20 bytes)
-///     - Bytes 20-23: IP version/IHL/DSCP/ECN/total_length (first nibble = 0x4)
-///     - Bytes 32-35: Source IPv4 address
-///     - Bytes 36-39: Destination IPv4 address
-///
-/// This function detects the rdma_rxe IPv4 format by checking whether bytes 0-7
-/// are all zero AND byte 20 has an IPv4 version nibble (0x4x). In that case it
-/// constructs IPv4-mapped IPv6 GIDs (::ffff:a.b.c.d) from the embedded IP header.
+/// rdma_rxe (Linux soft-RoCE) delivers RoCEv2-over-IPv4 datagrams with a
+/// different "GRH": bytes 0-19 are zero and bytes 20-39 hold the IPv4
+/// header (source address at 32-35, destination at 36-39). That format is
+/// detected by bytes 0-7 being zero and byte 20 carrying an IPv4 version
+/// nibble, and the source GID is then built as the IPv4-mapped IPv6 address
+/// ::ffff:a.b.c.d; IPv4 has no flow label.
 pub fn parseGRH(buf: [*]const u8) GRHInfo {
-    // Detect rdma_rxe IPv4 "GRH": bytes 0-7 all zero AND byte 20 is IPv4 (0x4x).
-    const is_rxe_ipv4 = (buf[0] == 0 and buf[1] == 0 and buf[2] == 0 and buf[3] == 0 and
-        buf[4] == 0 and buf[5] == 0 and buf[6] == 0 and buf[7] == 0 and
-        (buf[20] & 0xF0) == 0x40);
-
+    const is_rxe_ipv4 = std.mem.allEqual(u8, buf[0..8], 0) and (buf[20] & 0xF0) == 0x40;
     if (is_rxe_ipv4) {
-        // IPv4 header is at buf[20..39].
-        // Source IP at buf[32..35] (IPv4 header offset 12).
-        // Dest   IP at buf[36..39] (IPv4 header offset 16).
-        // Construct IPv4-mapped IPv6 GIDs: ::ffff:a.b.c.d
         var source_gid: [16]u8 = @splat(0);
         source_gid[10] = 0xff;
         source_gid[11] = 0xff;
-        source_gid[12] = buf[32];
-        source_gid[13] = buf[33];
-        source_gid[14] = buf[34];
-        source_gid[15] = buf[35];
-
-        var dest_gid: [16]u8 = @splat(0);
-        dest_gid[10] = 0xff;
-        dest_gid[11] = 0xff;
-        dest_gid[12] = buf[36];
-        dest_gid[13] = buf[37];
-        dest_gid[14] = buf[38];
-        dest_gid[15] = buf[39];
-
-        return GRHInfo{
-            .source_gid = source_gid,
-            .dest_gid = dest_gid,
-            .flow_label = 0, // IPv4 has no flow label
-        };
+        @memcpy(source_gid[12..16], buf[32..36]);
+        return GRHInfo{ .source_gid = source_gid, .flow_label = 0 };
     }
 
-    // Standard IPv6-format GRH.
-    // Extract the flow label from the first 4 bytes (big-endian).
-    // Flow label occupies bits 12-31 (the lower 20 bits of the 32-bit word).
-    const word0: u32 = (@as(u32, buf[0]) << 24) |
-        (@as(u32, buf[1]) << 16) |
-        (@as(u32, buf[2]) << 8) |
-        @as(u32, buf[3]);
-    const flow_label = word0 & 0x000FFFFF;
-
-    // Source GID: bytes 8-23
-    var source_gid: [16]u8 = undefined;
-    for (0..16) |i| {
-        source_gid[i] = buf[8 + i];
-    }
-
-    // Destination GID: bytes 24-39
-    var dest_gid: [16]u8 = undefined;
-    for (0..16) |i| {
-        dest_gid[i] = buf[24 + i];
-    }
-
+    // The flow label is the low 20 bits of the first big-endian word.
+    const word0 = std.mem.readInt(u32, buf[0..4], .big);
     return GRHInfo{
-        .source_gid = source_gid,
-        .dest_gid = dest_gid,
-        .flow_label = flow_label,
+        .source_gid = buf[8..24].*,
+        .flow_label = word0 & 0x000FFFFF,
     };
 }
 
 // ---------------------------------------------------------------------------
-// Probe packet payload parsing
+// Receive sanity checks
 // ---------------------------------------------------------------------------
-
-/// Parse probe packet fields from the payload buffer (after GRH).
-///
-/// Wire format (40 bytes, matching packet.zig serializeProbePacket):
-///   Byte  0:     version (u8)
-///   Byte  1:     msg_type (u8) — 0=probe, 1=ack
-///   Byte  2:     ack_type (u8) — 0=N/A, 1=first, 2=second
-///   Byte  3:     flags (u8)
-///   Bytes 4-11:  sequence_num (u64, big-endian)
-///   Bytes 12-19: t1 (u64, big-endian)
-///   Bytes 20-27: t3 (u64, big-endian)
-///   Bytes 28-35: t4 (u64, big-endian)
-///   Bytes 36-39: reserved (zero)
-const ProbePayload = struct {
-    sequence_num: u64,
-    t1: u64,
-    t3: u64,
-    t4: u64,
-    is_ack: u8,
-    ack_type: u8,
-};
-
-/// Read a big-endian u64 from a byte pointer at the given offset.
-fn readBigEndianU64(buf: [*]const u8, offset: usize) u64 {
-    return (@as(u64, buf[offset]) << 56) |
-        (@as(u64, buf[offset + 1]) << 48) |
-        (@as(u64, buf[offset + 2]) << 40) |
-        (@as(u64, buf[offset + 3]) << 32) |
-        (@as(u64, buf[offset + 4]) << 24) |
-        (@as(u64, buf[offset + 5]) << 16) |
-        (@as(u64, buf[offset + 6]) << 8) |
-        @as(u64, buf[offset + 7]);
-}
 
 /// True when the UD completion is long enough to hold a GRH plus a full
 /// 40-byte probe payload. Short completions can still succeed with the
@@ -182,25 +97,13 @@ fn recvByteLenOK(byte_len: u32) bool {
     return byte_len >= types.GRH_SIZE + types.PROBE_PACKET_SIZE;
 }
 
-/// Parse a probe packet payload from raw bytes.
-/// Reads fields at the correct wire format offsets (see ProbePayload comment above).
-/// Returns null when the version byte is not PACKET_VERSION so the caller
-/// can drop the completion instead of treating leftover slot data as a probe.
-fn parseProbePayload(buf: [*]const u8) ?ProbePayload {
-    if (buf[0] != types.PACKET_VERSION) return null;
-    return ProbePayload{
-        .sequence_num = readBigEndianU64(buf, 4), // offset 4: after 4-byte header
-        .t1 = readBigEndianU64(buf, 12), // offset 12
-        .t3 = readBigEndianU64(buf, 20), // offset 20
-        .t4 = readBigEndianU64(buf, 28), // offset 28
-        .is_ack = buf[1], // msg_type: 0=probe, 1=ack
-        .ack_type = buf[2], // ack_type: 0=none, 1=first, 2=second
+/// Return a recv slot to the hardware. Every recv completion, delivered or
+/// dropped, ends here; a slot that cannot be reposted is lost until the
+/// queue is recreated.
+fn repostRecv(queue: *types.UdQueue, slot_index: u32) void {
+    memory.postRecvBuffer(queue.qp, queue.recv_bufs.mr, queue.recv_bufs.buf, slot_index) catch {
+        log.warn("@{x} failed to repost recv slot={d}", .{ @intFromPtr(queue), slot_index });
     };
-}
-
-/// Drop a receive completion without delivering it to Go and repost the slot.
-fn dropAndRepostRecv(queue: *types.UdQueue, slot_index: u32) void {
-    memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {};
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +183,7 @@ fn cqPollerLoop(queue: *types.UdQueue) void {
 /// Returns when queue.running becomes false, or (after clearing
 /// queue.uses_cq_events) when the provider refuses to re-arm the CQ.
 fn eventPollerLoop(queue: *types.UdQueue) void {
-    const base_cq = c.ibv_cq_ex_to_cq(queue.recv_cq) orelse {
+    const base_cq = c.ibv_cq_ex_to_cq(queue.cq) orelse {
         queue.uses_cq_events = false;
         return;
     };
@@ -330,7 +233,7 @@ fn waitForCqEvent(queue: *types.UdQueue, channel: *c.ibv_comp_channel) void {
     }
 }
 
-/// Drain every available completion from the queue's CQ(s), then wake the
+/// Drain every available completion from the queue's CQ, then wake the
 /// Go consumer once if any event was pushed into the ring.
 ///
 /// The notification is sent in busy mode too: a queue that started in event
@@ -338,14 +241,7 @@ fn waitForCqEvent(queue: *types.UdQueue, channel: *c.ibv_comp_channel) void {
 /// eventfd, and the write costs one syscall per batch, not per poll.
 fn drainCq(queue: *types.UdQueue) void {
     const produced_before: u64 = if (queue.event_ring) |r| r.producedCount() else 0;
-    while (true) {
-        var n = pollCqCompletions(queue, queue.recv_cq);
-        // Also poll the send CQ if it is separate from the recv CQ.
-        if (queue.send_cq != queue.recv_cq) {
-            n += pollCqCompletions(queue, queue.send_cq);
-        }
-        if (n == 0) break;
-    }
+    while (pollCqCompletions(queue, queue.cq) != 0) {}
     if (queue.event_ring) |r| {
         if (r.producedCount() != produced_before) r.notify();
     }
@@ -368,18 +264,11 @@ fn busyPollerLoop(queue: *types.UdQueue) void {
 
 /// Poll a single CQ for all available completions.
 ///
-/// Dispatches to one of two implementations based on whether the queue uses
-/// software timestamps (rdma_rxe / no HW wallclock) or hardware timestamps.
-///
-/// For software timestamp mode (uses_sw_timestamps == true), the classic
-/// ibv_poll_cq() API is used.  Some rdma_rxe versions do not properly
-/// consume completions through ibv_end_poll(), causing the extended poll API
-/// to re-deliver the same completion on every subsequent ibv_start_poll()
-/// call.  ibv_poll_cq() does not have this issue.
-///
-/// For hardware timestamp mode, the extended API (ibv_start_poll /
-/// ibv_next_poll / ibv_end_poll) is used so that wallclock timestamps can be
-/// read via ibv_wc_read_completion_wallclock_ns().
+/// With hardware timestamps the extended API (ibv_start_poll / ibv_next_poll
+/// / ibv_end_poll) is used so ibv_wc_read_completion_wallclock_ns() can read
+/// them. With software timestamps the classic ibv_poll_cq() is used instead:
+/// some rdma_rxe versions re-deliver a completion on every ibv_start_poll()
+/// because ibv_end_poll() does not consume it.
 ///
 /// Returns the number of work completions consumed (0 when the CQ is empty).
 fn pollCqCompletions(queue: *types.UdQueue, cq: *c.ibv_cq_ex) usize {
@@ -421,8 +310,7 @@ pub const PendingSecondAcks = struct {
 
 /// Write t4_ns into the T4 field of the second ACK staged in a send slot.
 pub fn stampStagedSecondAck(slot_ptr: [*]u8, t4_ns: u64) void {
-    const field = slot_ptr + types.SECOND_ACK_SLOT_OFFSET + types.WIRE_T4_OFFSET;
-    std.mem.writeInt(u64, field[0..8], t4_ns, .big);
+    wire.writeT4(@ptrCast(slot_ptr + types.SECOND_ACK_SLOT_OFFSET), t4_ns);
 }
 
 /// Post every queued second ACK: stamp T4, switch the slot to
@@ -430,7 +318,7 @@ pub fn stampStagedSecondAck(slot_ptr: [*]u8, t4_ns: u64) void {
 /// second ACK cannot be posted is counted as failed and its slot reclaimed.
 fn flushPendingSecondAcks(queue: *types.UdQueue, pending: *const PendingSecondAcks) void {
     for (pending.slots[0..pending.len], pending.t4_ns[0..pending.len]) |slot, t4_ns| {
-        const slot_ptr = memory.getSlotPtr(queue.send_buf, slot, types.NUM_SEND_SLOTS) catch {
+        const slot_ptr = memory.getSlotPtr(queue.send_bufs.buf, slot, types.NUM_SEND_SLOTS) catch {
             failAsyncAck(queue, slot);
             continue;
         };
@@ -442,9 +330,9 @@ fn flushPendingSecondAcks(queue: *types.UdQueue, pending: *const PendingSecondAc
         queue.setSendSlotMode(slot, .AsyncSecondAck);
         memory.postUdSend(
             queue.qp,
-            queue.send_mr,
+            queue.send_bufs.mr,
             slot_ptr + types.SECOND_ACK_SLOT_OFFSET,
-            @intCast(slot),
+            slot,
             ah,
             queue.send_slot_remote_qpn[slot],
         ) catch {
@@ -454,19 +342,10 @@ fn flushPendingSecondAcks(queue: *types.UdQueue, pending: *const PendingSecondAc
     }
 }
 
-/// Count a failed asynchronous ACK pair and reclaim its slot and AH.
+/// Count a failed asynchronous ACK pair and release its slot and AH.
 fn failAsyncAck(queue: *types.UdQueue, slot: u32) void {
     _ = queue.async_ack_failures.fetchAdd(1, .monotonic);
-    reclaimSendSlot(queue, slot);
-}
-
-/// Destroy a completed send's AH and return its slot to the free pool. The
-/// AH goes first: this is the slot's last completion, so the AH is no longer
-/// referenced by any WR.
-fn reclaimSendSlot(queue: *types.UdQueue, slot: u32) void {
-    queue.destroySendSlotAh(slot);
-    queue.setSendSlotMode(slot, .Sync);
-    queue.freeSendSlot(slot);
+    queue.releaseSendSlot(slot);
 }
 
 /// Maximum completions consumed by one poll session (classic ibv_poll_cq call
@@ -494,87 +373,44 @@ fn pollCqClassic(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *PendingSecon
 }
 
 /// Dispatch a classic ibv_wc completion to the appropriate handler.
+///
+/// Completions are classified by wr_id (types.isSendWrId), never by opcode:
+/// libibverbs leaves wc.opcode undefined unless status == IBV_WC_SUCCESS, so
+/// a flushed or errored CQE must still reach signalSendCompletion (which
+/// fails a synchronous sender fast and reclaims an asynchronous ACK pair's
+/// slot) or the recv repost path.
 fn dispatchClassicWc(queue: *types.UdQueue, wc: *const c.ibv_wc, pending: *PendingSecondAcks) void {
-    const status_int: i32 = @intCast(wc.status);
-    if (wc.opcode == c.IBV_WC_SEND) {
-        log.debug("@{x} SEND (classic) status={d}", .{ @intFromPtr(queue), status_int });
-        // Signal the waiting sender thread with a SW timestamp, matched by
-        // wr_id (see signalSendCompletion / the mailbox invariant in types.zig).
-        signalSendCompletion(queue, wc.wr_id, swTimestampNs(), status_int, pending);
-    } else if (wc.opcode == c.IBV_WC_RECV) {
-        log.debug("@{x} RECV (classic) status={d}", .{ @intFromPtr(queue), status_int });
-        if (wc.status == c.IBV_WC_SUCCESS) {
-            processRecvClassic(queue, wc);
-        } else {
-            // A failed recv completion (e.g. IBV_WC_WR_FLUSH_ERR on teardown,
-            // or a transient link error) still owns one of NUM_RECV_SLOTS.
-            // Without reposting it here, that slot is permanently lost --
-            // repeated errors would eventually starve the recv queue.
-            const slot_index: u32 = @intCast(wc.wr_id & 0xFFFFFFFF);
-            log.warn("@{x} RECV (classic) completion error status={d}, reposting slot={d}", .{ @intFromPtr(queue), status_int, slot_index });
-            memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {
-                log.warn("@{x} failed to repost recv slot={d} after completion error", .{ @intFromPtr(queue), slot_index });
-            };
-        }
+    const status: i32 = @intCast(wc.status);
+    if (types.isSendWrId(wc.wr_id)) {
+        log.debug("@{x} SEND (classic) status={d}", .{ @intFromPtr(queue), status });
+        signalSendCompletion(queue, wc.wr_id, types.monotonicNs(), status, pending);
+    } else if (wc.status == c.IBV_WC_SUCCESS) {
+        log.debug("@{x} RECV (classic) status={d}", .{ @intFromPtr(queue), status });
+        processRecvClassic(queue, wc);
     } else {
-        log.debug("@{x} unknown opcode (classic) status={d}", .{ @intFromPtr(queue), status_int });
+        repostFailedRecv(queue, wc.wr_id, status);
     }
 }
 
-/// Process a receive completion from the classic ibv_wc path.
-///
-/// Mirrors processRecvCompletion() but reads fields directly from ibv_wc
-/// instead of the extended CQ handle.
+/// Repost the slot of a failed recv completion (e.g. IBV_WC_WR_FLUSH_ERR on
+/// teardown, or a transient link error). The completion still owns one of
+/// NUM_RECV_SLOTS; without the repost that slot is lost until the queue is
+/// recreated, and repeated errors would starve the recv queue.
+fn repostFailedRecv(queue: *types.UdQueue, wr_id: u64, status: i32) void {
+    const slot_index = types.wrIdSlot(wr_id);
+    log.warn("@{x} RECV completion error status={d}, reposting slot={d}", .{ @intFromPtr(queue), status, slot_index });
+    repostRecv(queue, slot_index);
+}
+
+/// Process a successful receive completion from the classic ibv_wc path.
 fn processRecvClassic(queue: *types.UdQueue, wc: *const c.ibv_wc) void {
-    const slot_index: u32 = @intCast(wc.wr_id & 0xFFFFFFFF);
-    const ts = swTimestampNs();
-    const src_qp: u32 = wc.src_qp;
-
-    const slot_ptr = memory.getSlotPtr(queue.recv_buf, slot_index, types.NUM_RECV_SLOTS) catch return;
-
-    // IBV_WC_GRH (bit 0) indicates the driver wrote a GRH into the receive
-    // buffer.  For RoCEv2 UD this should always be set, but if it is not we
-    // cannot determine the sender's GID — repost the buffer and drop.
-    if ((wc.wc_flags & 1) == 0) {
-        dropAndRepostRecv(queue, slot_index);
-        return;
-    }
-
-    if (!recvByteLenOK(wc.byte_len)) {
-        dropAndRepostRecv(queue, slot_index);
-        return;
-    }
-
-    const grh_info = parseGRH(slot_ptr);
-    const payload_ptr = slot_ptr + types.GRH_SIZE;
-    const payload = parseProbePayload(payload_ptr) orelse {
-        dropAndRepostRecv(queue, slot_index);
-        return;
-    };
-
-    const event = ring.CompletionEvent{
-        .sequence_num = payload.sequence_num,
-        .t1 = payload.t1,
-        .t3 = payload.t3,
-        .t4 = payload.t4,
-        .is_ack = payload.is_ack,
-        .ack_type = payload.ack_type,
-        .flags = 0,
-        ._pad = 0,
-        .timestamp_ns = ts,
-        .source_gid = grh_info.source_gid,
-        .source_qpn = src_qp,
-        .flow_label = grh_info.flow_label,
-        .status = @intCast(wc.status),
-        .is_send = 0,
-        ._pad2 = [_]u8{ 0, 0, 0 },
-    };
-
-    if (queue.event_ring) |event_ring| {
-        _ = event_ring.push(&event);
-    }
-
-    memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {};
+    deliverRecv(queue, .{
+        .slot_index = types.wrIdSlot(wc.wr_id),
+        .timestamp_ns = types.monotonicNs(),
+        .src_qp = wc.src_qp,
+        .has_grh = (wc.wc_flags & c.IBV_WC_GRH) != 0,
+        .byte_len = wc.byte_len,
+    });
 }
 
 /// Extended CQ polling using ibv_start_poll / ibv_next_poll / ibv_end_poll.
@@ -607,48 +443,18 @@ fn pollCqExtended(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *PendingSeco
     return count;
 }
 
-/// Return the current monotonic clock time in nanoseconds (software fallback).
-///
-/// Delegates to the shared `types.monotonicNs()` helper, which uses true
-/// CLOCK_MONOTONIC (not `std.time.nanoTimestamp()`, which was CLOCK_REALTIME
-/// in Zig 0.15.x) so that SW-fallback T2/T3/T4/T5 stay in the same clock
-/// domain as T1 (`packet.zig`) and the Go side's T6.
-fn swTimestampNs() u64 {
-    return types.monotonicNs();
-}
-
-/// Dispatch a single work completion to the appropriate handler.
-///
-/// Routes by opcode (IBV_WC_SEND or IBV_WC_RECV). Every send completion,
-/// even an error, goes to signalSendCompletion(), so a synchronous sender
-/// never spin-waits indefinitely and an asynchronous ACK pair is always
-/// resolved. For recv completions, only pushes to the ring on success.
+/// Dispatch a single extended-CQ work completion to the appropriate handler.
+/// Classified by wr_id for the same reason as dispatchClassicWc.
 fn dispatchCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *PendingSecondAcks) void {
-    const opcode = c.ibv_wc_read_opcode(cq);
     const status: i32 = @intCast(cq.status);
-
-    if (opcode == c.IBV_WC_SEND) {
+    if (types.isSendWrId(cq.wr_id)) {
         log.debug("@{x} SEND completion status={d}", .{ @intFromPtr(queue), status });
-        // Always signal the sender, regardless of status, so waitSendCompletion
-        // can report the error rather than timing out.
         processSendCompletion(queue, cq, pending);
-    } else if (opcode == c.IBV_WC_RECV) {
+    } else if (status == c.IBV_WC_SUCCESS) {
         log.debug("@{x} RECV completion status={d}", .{ @intFromPtr(queue), status });
-        if (status == c.IBV_WC_SUCCESS) {
-            processRecvCompletion(queue, cq);
-        } else {
-            // A failed recv completion still owns one of NUM_RECV_SLOTS.
-            // Repost it (mirroring the classic-path handling above) so a
-            // transient completion error does not permanently leak a slot.
-            const wr_id: u64 = cq.wr_id;
-            const slot_index: u32 = @intCast(wr_id & 0xFFFFFFFF);
-            log.warn("@{x} RECV completion error status={d}, reposting slot={d}", .{ @intFromPtr(queue), status, slot_index });
-            memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {
-                log.warn("@{x} failed to repost recv slot={d} after completion error", .{ @intFromPtr(queue), slot_index });
-            };
-        }
+        processRecvCompletion(queue, cq);
     } else {
-        log.debug("@{x} unknown opcode, status={d}", .{ @intFromPtr(queue), status });
+        repostFailedRecv(queue, cq.wr_id, status);
     }
 }
 
@@ -656,99 +462,71 @@ fn dispatchCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *Pending
 // Receive completion processing
 // ---------------------------------------------------------------------------
 
-/// Process a single receive completion.
+/// Process a successful receive completion from the extended CQ path.
 ///
-/// Extracts the slot index from wr_id, reads the timestamp (HW or SW),
-/// parses the GRH for source GID and flow label, parses the probe payload,
-/// builds a CompletionEvent, pushes it into the event ring, and reposts
-/// the receive buffer for reuse.
-pub fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
-    // Get the slot index from wr_id
-    const wr_id: u64 = cq.wr_id;
-    const slot_index: u32 = @intCast(wr_id & 0xFFFFFFFF);
+/// src_qp and byte_len are CQE fields requested at CQ creation
+/// (IBV_WC_EX_WITH_SRC_QP / _BYTE_LEN); wc_flags is a core field that
+/// ibv_wc_read_wc_flags() reads unconditionally.
+fn processRecvCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex) void {
+    deliverRecv(queue, .{
+        .slot_index = types.wrIdSlot(cq.wr_id),
+        .timestamp_ns = getCompletionTimestamp(queue, cq),
+        .src_qp = c.ibv_wc_read_src_qp(cq),
+        .has_grh = (c.ibv_wc_read_wc_flags(cq) & c.IBV_WC_GRH) != 0,
+        .byte_len = c.ibv_wc_read_byte_len(cq),
+    });
+}
 
-    // Get timestamp
-    const timestamp_ns: u64 = getCompletionTimestamp(queue, cq);
+/// The inputs of a successful recv completion that the classic and extended
+/// CQ APIs expose differently. Everything after reading them is shared.
+const RecvCompletion = struct {
+    slot_index: u32,
+    /// HW wallclock or SW CLOCK_MONOTONIC timestamp of the completion.
+    timestamp_ns: u64,
+    src_qp: u32,
+    /// IBV_WC_GRH: the driver wrote a GRH into the slot. Without it the
+    /// sender's GID is unknown.
+    has_grh: bool,
+    byte_len: u32,
+};
 
-    // Get source QPN from the extended completion
-    const src_qp: u32 = c.ibv_wc_read_src_qp(cq);
+/// Deliver a successful recv completion to Go: parse the GRH and the probe
+/// payload, push a CompletionEvent into the event ring, and repost the slot.
+/// A completion without a GRH, shorter than GRH + packet (the rest of the
+/// slot would be stale bytes from an earlier recv) or with an unknown wire
+/// version is dropped; its slot is reposted all the same.
+fn deliverRecv(queue: *types.UdQueue, rc: RecvCompletion) void {
+    const slot_ptr = memory.getSlotPtr(queue.recv_bufs.buf, rc.slot_index, types.NUM_RECV_SLOTS) catch return;
+    defer repostRecv(queue, rc.slot_index);
 
-    // Get the receive buffer slot pointer
-    const slot_ptr = memory.getSlotPtr(queue.recv_buf, slot_index, types.NUM_RECV_SLOTS) catch {
-        // Slot index out of bounds - cannot process
-        return;
-    };
-
-    // IBV_WC_GRH (bit 0) indicates the driver wrote a GRH into the receive
-    // buffer. This mirrors the defensive check already present in
-    // processRecvClassic() below, which soft-RoCE (rdma_rxe) exercises but
-    // this extended-CQ path did not previously check at all -- meaning a
-    // production Mellanox NIC completion that ever arrives without a GRH
-    // would have had the first 40 bytes of application payload silently
-    // misparsed as a GRH (corrupting the reported source GID/flow label)
-    // instead of being safely dropped.
-    //
-    // ibv_wc_read_wc_flags() is available unconditionally here: unlike
-    // src_qp or the timestamp fields (which are optional CQE metadata
-    // gated by IBV_WC_EX_WITH_* flags requested at CQ creation time),
-    // wc_flags has no corresponding IBV_WC_EX_WITH_* flag in libibverbs
-    // -- it is a core field, always populated the same way opcode/status
-    // are. byte_len is requested via IBV_WC_EX_WITH_BYTE_LEN and is read
-    // below.
-    const wc_flags = c.ibv_wc_read_wc_flags(cq);
-    if ((wc_flags & c.IBV_WC_GRH) == 0) {
-        dropAndRepostRecv(queue, slot_index);
-        return;
-    }
-
-    // IBV_WC_EX_WITH_BYTE_LEN is requested at CQ creation, so this read is
-    // valid. Reject completions shorter than GRH + probe payload: a UD send
-    // with the right QKEY can still complete with a short datagram, and the
-    // remainder of the slot would be stale bytes from a previous recv.
-    const byte_len = c.ibv_wc_read_byte_len(cq);
-    if (!recvByteLenOK(byte_len)) {
-        dropAndRepostRecv(queue, slot_index);
-        return;
-    }
-
-    // Parse GRH from the first 40 bytes of the receive buffer
+    if (!rc.has_grh or !recvByteLenOK(rc.byte_len)) return;
     const grh_info = parseGRH(slot_ptr);
+    const pkt = wire.deserializeProbePacket(@ptrCast(slot_ptr + types.GRH_SIZE)) orelse return;
 
-    // Parse probe payload from bytes after the GRH
-    const payload_ptr = slot_ptr + types.GRH_SIZE;
-    const payload = parseProbePayload(payload_ptr) orelse {
-        dropAndRepostRecv(queue, slot_index);
-        return;
-    };
-
-    // Build the completion event
-    const event = ring.CompletionEvent{
-        .sequence_num = payload.sequence_num,
-        .t1 = payload.t1,
-        .t3 = payload.t3,
-        .t4 = payload.t4,
-        .is_ack = payload.is_ack,
-        .ack_type = payload.ack_type,
-        .flags = 0,
-        ._pad = 0,
-        .timestamp_ns = timestamp_ns,
-        .source_gid = grh_info.source_gid,
-        .source_qpn = src_qp,
-        .flow_label = grh_info.flow_label,
-        .status = @intCast(cq.status),
-        .is_send = 0,
-        ._pad2 = [_]u8{ 0, 0, 0 },
-    };
-
-    // Push the event into the ring buffer
+    const event = recvEvent(&pkt, &grh_info, &rc);
     if (queue.event_ring) |event_ring| {
         _ = event_ring.push(&event);
     }
+}
 
-    // Repost the receive buffer slot so the hardware can use it again
-    memory.postRecvBuffer(queue.qp, queue.recv_mr, queue.recv_buf, slot_index) catch {
-        // Failed to repost - the slot will be lost until queue recreation.
-        // This is logged via setLastError in the postRecvBuffer function.
+/// Build the event Go receives for a probe or ACK.
+fn recvEvent(pkt: *const wire.ProbePacket, grh_info: *const GRHInfo, rc: *const RecvCompletion) ring.CompletionEvent {
+    return ring.CompletionEvent{
+        .sequence_num = pkt.sequence_num,
+        .t1 = pkt.t1,
+        .t3 = pkt.t3,
+        .t4 = pkt.t4,
+        .is_ack = pkt.msg_type,
+        .ack_type = pkt.ack_type,
+        .flags = 0,
+        ._pad = 0,
+        .timestamp_ns = rc.timestamp_ns,
+        .source_gid = grh_info.source_gid,
+        .source_qpn = rc.src_qp,
+        .flow_label = grh_info.flow_label,
+        .status = c.IBV_WC_SUCCESS,
+        .is_send = 0,
+        ._pad2 = [_]u8{ 0, 0, 0 },
     };
 }
 
@@ -784,7 +562,7 @@ pub fn processSendCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *
 /// timestamp/status once its own wr_id is published. See the mailbox invariant
 /// comment in types.zig.
 fn signalSendCompletion(queue: *types.UdQueue, wr_id: u64, timestamp_ns: u64, status: i32, pending: *PendingSecondAcks) void {
-    const slot_index: u32 = @intCast(wr_id & 0xFFFFFFFF);
+    const slot_index = types.wrIdSlot(wr_id);
     switch (queue.sendSlotMode(slot_index)) {
         .AsyncFirstAck => {
             if (status == 0 and pending.add(slot_index, timestamp_ns)) return;
@@ -797,15 +575,14 @@ fn signalSendCompletion(queue: *types.UdQueue, wr_id: u64, timestamp_ns: u64, st
                 log.debug("@{x} second ACK completion status={d} on slot={d}", .{ @intFromPtr(queue), status, slot_index });
                 _ = queue.async_ack_failures.fetchAdd(1, .monotonic);
             }
-            reclaimSendSlot(queue, slot_index);
+            queue.releaseSendSlot(slot_index);
             return;
         },
         .Sync => {},
     }
-    // Destroy the AH before freeing the slot: this is the matching
-    // completion for the posted WR, so the AH is no longer referenced.
-    queue.destroySendSlotAh(slot_index);
-    queue.freeSendSlot(slot_index);
+    // This is the matching completion for the posted WR, so the AH is no
+    // longer referenced and the slot can be released.
+    queue.releaseSendSlot(slot_index);
 
     queue.send_completion_timestamp.store(timestamp_ns, .monotonic);
     queue.send_completion_status.store(status, .monotonic);
@@ -818,20 +595,12 @@ fn signalSendCompletion(queue: *types.UdQueue, wr_id: u64, timestamp_ns: u64, st
 // Timestamp helpers
 // ---------------------------------------------------------------------------
 
-/// Get the completion timestamp, using HW or SW source depending on queue config.
-///
-/// If the queue uses hardware timestamps, reads the wallclock nanosecond
-/// timestamp from the extended CQ. Otherwise falls back to the shared
-/// CLOCK_MONOTONIC helper (see `swTimestampNs`).
+/// The completion's timestamp: the NIC wallclock from the extended CQ, or
+/// CLOCK_MONOTONIC at poll time (same domain as T1 and the Go side's T6)
+/// when the queue fell back to software timestamps.
 fn getCompletionTimestamp(queue: *types.UdQueue, cq: *c.ibv_cq_ex) u64 {
-    if (queue.uses_sw_timestamps) {
-        // Software timestamp: use CLOCK_MONOTONIC, same domain as T1 and
-        // the Go side's T6.
-        return swTimestampNs();
-    } else {
-        // Hardware timestamp: read from extended CQ
-        return c.ibv_wc_read_completion_wallclock_ns(cq);
-    }
+    if (queue.uses_sw_timestamps) return types.monotonicNs();
+    return c.ibv_wc_read_completion_wallclock_ns(cq);
 }
 
 // ---------------------------------------------------------------------------
@@ -868,11 +637,25 @@ test "parseGRH extracts source and dest GID" {
     try std.testing.expectEqual(@as(u8, 0xfe), info.source_gid[0]);
     try std.testing.expectEqual(@as(u8, 0x80), info.source_gid[1]);
     try std.testing.expectEqual(@as(u8, 0x01), info.source_gid[15]);
+    try std.testing.expectEqual(@as(u8, 0x00), info.source_gid[14]);
+}
 
-    // Check dest GID
-    try std.testing.expectEqual(@as(u8, 0xfe), info.dest_gid[0]);
-    try std.testing.expectEqual(@as(u8, 0x80), info.dest_gid[1]);
-    try std.testing.expectEqual(@as(u8, 0x02), info.dest_gid[15]);
+test "parseGRH decodes the rdma_rxe IPv4 header as an IPv4-mapped GID" {
+    var grh: [40]u8 = @splat(0);
+    grh[20] = 0x45; // IPv4, IHL 5
+    grh[32] = 10; // source 10.200.0.2
+    grh[33] = 200;
+    grh[34] = 0;
+    grh[35] = 2;
+    grh[36] = 10; // destination 10.200.0.1
+    grh[37] = 200;
+    grh[38] = 0;
+    grh[39] = 1;
+
+    const info = parseGRH(&grh);
+    const want = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 200, 0, 2 };
+    try std.testing.expectEqualSlices(u8, &want, &info.source_gid);
+    try std.testing.expectEqual(@as(u32, 0), info.flow_label);
 }
 
 test "parseGRH flow label zero" {
@@ -896,88 +679,11 @@ test "parseGRH flow label max (20 bits)" {
     try std.testing.expectEqual(@as(u32, 0xFFFFF), info.flow_label);
 }
 
-test "readBigEndianU64 correctness" {
-    const buf = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A };
-    try std.testing.expectEqual(@as(u64, 42), readBigEndianU64(&buf, 0));
-
-    const buf2 = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    try std.testing.expectEqual(@as(u64, 1 << 56), readBigEndianU64(&buf2, 0));
-
-    const buf3 = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-    try std.testing.expectEqual(@as(u64, 0xFFFFFFFFFFFFFFFF), readBigEndianU64(&buf3, 0));
-}
-
-test "parseProbePayload extracts fields" {
-    // Wire format under test (see the ProbePayload doc comment above, and
-    // packet.zig's serializeProbePacket/deserializeProbePacket, which this
-    // must stay in sync with):
-    //   byte  0:     version
-    //   byte  1:     msg_type (is_ack)
-    //   byte  2:     ack_type
-    //   byte  3:     flags
-    //   bytes 4-11:  sequence_num (u64 BigEndian)
-    //   bytes 12-19: t1 (u64 BigEndian)
-    //   bytes 20-27: t3 (u64 BigEndian)
-    //   bytes 28-35: t4 (u64 BigEndian)
-    //   bytes 36-39: reserved
-    var payload: [40]u8 = @splat(0);
-
-    payload[0] = types.PACKET_VERSION;
-
-    // msg_type (is_ack) = 1 (byte 1)
-    payload[1] = 1;
-
-    // ack_type = 2 (byte 2)
-    payload[2] = 2;
-
-    // sequence_num = 1 (bytes 4-11, BigEndian; LSB is the last byte, index 11)
-    payload[11] = 0x01;
-
-    // t1 = 1000 = 0x03E8 (bytes 12-19, BigEndian; LSB is index 19)
-    payload[18] = 0x03;
-    payload[19] = 0xE8;
-
-    // t3 = 2000 = 0x07D0 (bytes 20-27, BigEndian; LSB is index 27)
-    payload[26] = 0x07;
-    payload[27] = 0xD0;
-
-    // t4 = 3000 = 0x0BB8 (bytes 28-35, BigEndian; LSB is index 35)
-    payload[34] = 0x0B;
-    payload[35] = 0xB8;
-
-    const parsed = parseProbePayload(&payload) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u64, 1), parsed.sequence_num);
-    try std.testing.expectEqual(@as(u64, 1000), parsed.t1);
-    try std.testing.expectEqual(@as(u64, 2000), parsed.t3);
-    try std.testing.expectEqual(@as(u64, 3000), parsed.t4);
-    try std.testing.expectEqual(@as(u8, 1), parsed.is_ack);
-    try std.testing.expectEqual(@as(u8, 2), parsed.ack_type);
-}
-
-test "parseProbePayload rejects unexpected version" {
-    var payload: [40]u8 = @splat(0);
-    payload[1] = 1;
-    try std.testing.expect(parseProbePayload(&payload) == null);
-    payload[0] = types.PACKET_VERSION + 1;
-    try std.testing.expect(parseProbePayload(&payload) == null);
-}
-
 test "recvByteLenOK requires GRH plus probe payload" {
     const need: u32 = types.GRH_SIZE + types.PROBE_PACKET_SIZE;
     try std.testing.expect(!recvByteLenOK(need - 1));
     try std.testing.expect(recvByteLenOK(need));
     try std.testing.expect(recvByteLenOK(need + 16));
-}
-
-test "GRHInfo struct has expected fields" {
-    const info = GRHInfo{
-        .source_gid = @splat(0),
-        .dest_gid = @splat(0),
-        .flow_label = 0,
-    };
-    try std.testing.expectEqual(@as(u32, 0), info.flow_label);
-    try std.testing.expectEqual(@as(usize, 16), info.source_gid.len);
-    try std.testing.expectEqual(@as(usize, 16), info.dest_gid.len);
 }
 
 test "PendingSecondAcks holds one entry per send slot" {
@@ -995,9 +701,116 @@ test "PendingSecondAcks holds one entry per send slot" {
 test "stampStagedSecondAck writes T4 big-endian into the staged packet only" {
     var slot: [types.SLOT_SIZE]u8 = @splat(0xAA);
     stampStagedSecondAck(&slot, 0x0102030405060708);
-    const at = types.SECOND_ACK_SLOT_OFFSET + types.WIRE_T4_OFFSET;
-    try std.testing.expectEqual(@as(u64, 0x0102030405060708), readBigEndianU64(&slot, at));
+    const at = types.SECOND_ACK_SLOT_OFFSET + wire.OFFSET_T4;
+    try std.testing.expectEqual(@as(u64, 0x0102030405060708), std.mem.readInt(u64, slot[at..][0..8], .big));
     // The first ACK and the rest of the staged packet are untouched.
     for (slot[0..at]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
     for (slot[at + 8 ..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+}
+
+/// A UdQueue for dispatch tests: every send slot free, no verbs objects.
+/// Only paths that never touch qp/MRs may run on it (send-side bookkeeping;
+/// destroySendSlotAh is a no-op while no AH is stored).
+fn testQueue() types.UdQueue {
+    var queue: types.UdQueue = undefined;
+    queue.send_slot_ah = @splat(std.atomic.Value(usize).init(0));
+    queue.send_slot_states = @splat(std.atomic.Value(u8).init(@backingInt(types.SlotState.Free)));
+    queue.send_slot_modes = @splat(std.atomic.Value(u8).init(@backingInt(types.SendSlotMode.Sync)));
+    queue.send_slot_remote_qpn = @splat(0);
+    queue.async_ack_failures = std.atomic.Value(u64).init(0);
+    queue.send_completion_wr_id = std.atomic.Value(u64).init(types.SEND_WR_ID_NONE);
+    queue.send_completion_timestamp = std.atomic.Value(u64).init(0);
+    queue.send_completion_status = std.atomic.Value(i32).init(0);
+    return queue;
+}
+
+fn slotState(queue: *types.UdQueue, slot: u32) types.SlotState {
+    return @fromBackingInt(queue.send_slot_states[slot].load(.acquire));
+}
+
+test "an errored send completion with an unset opcode still reaches the mailbox" {
+    var queue = testQueue();
+    const slot = queue.allocSendSlot() orelse return error.TestUnexpectedResult;
+    queue.setSendSlotMode(slot, .Sync);
+
+    var wc = std.mem.zeroes(c.ibv_wc);
+    wc.wr_id = types.sendWrId(slot);
+    wc.status = c.IBV_WC_WR_FLUSH_ERR;
+    // The provider leaves opcode undefined on error; make it the value that
+    // would misroute the completion if the dispatcher looked at it.
+    wc.opcode = c.IBV_WC_RECV;
+    var pending = PendingSecondAcks{};
+    dispatchClassicWc(&queue, &wc, &pending);
+
+    try std.testing.expectEqual(types.SlotState.Free, slotState(&queue, slot));
+    try std.testing.expectEqual(wc.wr_id, queue.send_completion_wr_id.load(.acquire));
+    try std.testing.expectEqual(@as(i32, @intCast(c.IBV_WC_WR_FLUSH_ERR)), queue.send_completion_status.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
+}
+
+test "an errored first-ACK completion fails the pair and reclaims its slot" {
+    var queue = testQueue();
+    const slot = queue.allocSendSlot() orelse return error.TestUnexpectedResult;
+    queue.setSendSlotMode(slot, .AsyncFirstAck);
+
+    var wc = std.mem.zeroes(c.ibv_wc);
+    wc.wr_id = types.sendWrId(slot);
+    wc.status = c.IBV_WC_WR_FLUSH_ERR;
+    wc.opcode = c.IBV_WC_RECV;
+    var pending = PendingSecondAcks{};
+    dispatchClassicWc(&queue, &wc, &pending);
+
+    try std.testing.expectEqual(types.SlotState.Free, slotState(&queue, slot));
+    try std.testing.expectEqual(types.SendSlotMode.Sync, queue.sendSlotMode(slot));
+    try std.testing.expectEqual(@as(u64, 1), queue.async_ack_failures.load(.monotonic));
+    // Asynchronous pairs never touch the mailbox.
+    try std.testing.expectEqual(types.SEND_WR_ID_NONE, queue.send_completion_wr_id.load(.acquire));
+}
+
+test "a successful first-ACK completion queues the second ACK and keeps the slot" {
+    var queue = testQueue();
+    const slot = queue.allocSendSlot() orelse return error.TestUnexpectedResult;
+    queue.setSendSlotMode(slot, .AsyncFirstAck);
+
+    var wc = std.mem.zeroes(c.ibv_wc);
+    wc.wr_id = types.sendWrId(slot);
+    wc.status = c.IBV_WC_SUCCESS;
+    wc.opcode = c.IBV_WC_SEND;
+    var pending = PendingSecondAcks{};
+    dispatchClassicWc(&queue, &wc, &pending);
+
+    try std.testing.expectEqual(types.SlotState.InUse, slotState(&queue, slot));
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(slot, pending.slots[0]);
+    try std.testing.expectEqual(@as(u64, 0), queue.async_ack_failures.load(.monotonic));
+}
+
+test "recvEvent maps the packet, GRH and completion onto the Go-facing event" {
+    const pkt = wire.ProbePacket{
+        .version = wire.PACKET_VERSION,
+        .msg_type = wire.MSG_TYPE_ACK,
+        .ack_type = wire.ACK_TYPE_SECOND,
+        .flags = 0x55,
+        .sequence_num = 0x1122334455667788,
+        .t1 = 1,
+        .t3 = 3,
+        .t4 = 4,
+    };
+    var grh_info = GRHInfo{ .source_gid = @splat(0), .flow_label = 0xABCDE };
+    grh_info.source_gid[15] = 9;
+    const rc = RecvCompletion{ .slot_index = 7, .timestamp_ns = 555, .src_qp = 0x2A, .has_grh = true, .byte_len = 80 };
+
+    const ev = recvEvent(&pkt, &grh_info, &rc);
+    try std.testing.expectEqual(pkt.sequence_num, ev.sequence_num);
+    try std.testing.expectEqual(@as(u64, 1), ev.t1);
+    try std.testing.expectEqual(@as(u64, 3), ev.t3);
+    try std.testing.expectEqual(@as(u64, 4), ev.t4);
+    try std.testing.expectEqual(wire.MSG_TYPE_ACK, ev.is_ack);
+    try std.testing.expectEqual(wire.ACK_TYPE_SECOND, ev.ack_type);
+    try std.testing.expectEqual(@as(u64, 555), ev.timestamp_ns);
+    try std.testing.expectEqual(@as(u32, 0x2A), ev.source_qpn);
+    try std.testing.expectEqual(@as(u32, 0xABCDE), ev.flow_label);
+    try std.testing.expectEqual(@as(u8, 9), ev.source_gid[15]);
+    try std.testing.expectEqual(@as(i32, 0), ev.status);
+    try std.testing.expectEqual(@as(u8, 0), ev.is_send);
 }

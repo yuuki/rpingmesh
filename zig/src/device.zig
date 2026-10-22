@@ -22,24 +22,16 @@ const c = types.c;
 pub const DeviceError = error{
     /// ibv_get_device_list() returned null.
     GetDeviceListFailed,
-    /// No RDMA devices were found on the system.
-    NoDevicesFound,
     /// The requested device index is out of range.
     InvalidDeviceIndex,
     /// ibv_open_device() returned null.
     OpenDeviceFailed,
     /// ibv_alloc_pd() returned null.
     AllocPdFailed,
-    /// No active port found on the device.
+    /// No active port with a usable GID found on the device.
     NoActivePort,
-    /// ibv_query_port() failed.
-    QueryPortFailed,
-    /// ibv_query_gid() failed or returned a zero GID.
-    QueryGidFailed,
     /// Device name not found in the device list.
     DeviceNotFound,
-    /// ibv_query_device_ex() failed.
-    QueryDeviceExFailed,
     /// Memory allocation failed.
     OutOfMemory,
 };
@@ -70,7 +62,6 @@ pub fn initContext() DeviceError!*types.RdmaContext {
     ctx.* = types.RdmaContext{
         .device_list = device_list,
         .device_count = @intCast(num_devices),
-        .initialized = true,
     };
 
     return ctx;
@@ -85,7 +76,6 @@ pub fn destroyContext(ctx: *types.RdmaContext) void {
     if (ctx.device_list) |list| {
         c.ibv_free_device_list(list);
     }
-    ctx.initialized = false;
     std.heap.page_allocator.destroy(ctx);
 }
 
@@ -100,29 +90,34 @@ pub fn getDeviceCount(ctx: *types.RdmaContext) i32 {
 /// Returns the name length (excluding the NUL); a name longer than
 /// `out.len - 1` is truncated.
 pub fn getDeviceName(ctx: *types.RdmaContext, index: i32, out: []u8) DeviceError!usize {
-    if (index < 0 or index >= ctx.device_count) {
-        types.setLastError("device index out of range");
-        return DeviceError.InvalidDeviceIndex;
-    }
     if (out.len == 0) {
         types.setLastError("device name buffer is empty");
         return DeviceError.OutOfMemory;
     }
-    const device_list = ctx.device_list orelse {
-        types.setLastError("device list is null");
-        return DeviceError.GetDeviceListFailed;
-    };
-    const dev_ptr_array: [*]?*c.ibv_device = @ptrCast(device_list);
-    const device = dev_ptr_array[@intCast(index)] orelse {
-        types.setLastError("device pointer at index is null");
-        return DeviceError.InvalidDeviceIndex;
-    };
+    const device = try deviceAt(ctx, index);
     const dev_name_ptr = c.ibv_get_device_name(device);
     if (dev_name_ptr == null) {
         types.setLastError("ibv_get_device_name() returned null");
         return DeviceError.DeviceNotFound;
     }
     return copyNameZ(std.mem.sliceTo(dev_name_ptr, 0), out);
+}
+
+/// The device at `index` in the context's device list.
+fn deviceAt(ctx: *types.RdmaContext, index: i32) DeviceError!*c.ibv_device {
+    if (index < 0 or index >= ctx.device_count) {
+        types.setLastError("device index out of range");
+        return DeviceError.InvalidDeviceIndex;
+    }
+    const device_list = ctx.device_list orelse {
+        types.setLastError("device list is null");
+        return DeviceError.GetDeviceListFailed;
+    };
+    const dev_ptr_array: [*]?*c.ibv_device = @ptrCast(device_list);
+    return dev_ptr_array[@intCast(index)] orelse {
+        types.setLastError("device pointer at index is null");
+        return DeviceError.InvalidDeviceIndex;
+    };
 }
 
 /// Copy `name` into `out` with a NUL terminator, truncating to fit.
@@ -155,63 +150,35 @@ fn copyNameZ(name: []const u8, out: []u8) usize {
 /// On failure, all partially allocated resources are cleaned up before
 /// returning the error.
 pub fn openDevice(ctx: *types.RdmaContext, index: i32, gid_index: i32, sl: u8, traffic_class: u8) DeviceError!*types.RdmaDevice {
-    // Validate index bounds
-    if (index < 0 or index >= ctx.device_count) {
-        types.setLastError("device index out of range");
-        return DeviceError.InvalidDeviceIndex;
-    }
+    const device = try deviceAt(ctx, index);
 
-    // Access the device pointer from the device list array.
-    // The device list is a C array of ibv_device pointers.
-    const device_list = ctx.device_list orelse {
-        types.setLastError("device list is null");
-        return DeviceError.GetDeviceListFailed;
-    };
-
-    const dev_ptr_array: [*]?*c.ibv_device = @ptrCast(device_list);
-    const device = dev_ptr_array[@intCast(index)] orelse {
-        types.setLastError("device pointer at index is null");
-        return DeviceError.InvalidDeviceIndex;
-    };
-
-    // Open the device context
     const ibv_ctx = c.ibv_open_device(device) orelse {
         types.setLastError("ibv_open_device() failed");
         return DeviceError.OpenDeviceFailed;
     };
     errdefer _ = c.ibv_close_device(ibv_ctx);
 
-    // Allocate a Protection Domain
     const pd = c.ibv_alloc_pd(ibv_ctx) orelse {
         types.setLastError("ibv_alloc_pd() failed");
         return DeviceError.AllocPdFailed;
     };
     errdefer _ = c.ibv_dealloc_pd(pd);
 
-    // Get device name. This is needed both for the DeviceInfo struct below
-    // and for the sysfs GID-type validation performed inside
-    // findActivePortAndGid(), so it is extracted before that call.
+    // The name goes into DeviceInfo and names the sysfs path for the GID
+    // type check inside findActivePortAndGid().
     const dev_name_ptr = c.ibv_get_device_name(device);
     var device_name: [64]u8 = @splat(0);
-    var device_name_len: usize = 0;
-    if (dev_name_ptr != null) {
-        const name_slice = std.mem.sliceTo(dev_name_ptr, 0);
-        device_name_len = @min(name_slice.len, device_name.len - 1);
-        @memcpy(device_name[0..device_name_len], name_slice[0..device_name_len]);
-    }
+    const device_name_len: usize = if (dev_name_ptr != null) copyNameZ(std.mem.sliceTo(dev_name_ptr, 0), &device_name) else 0;
 
-    // Find the first active port and query GID
     const port_result = findActivePortAndGid(ibv_ctx, gid_index, device_name[0..device_name_len]) orelse {
         // Error message already set by findActivePortAndGid
         return DeviceError.NoActivePort;
     };
 
-    // Format GID and extract IP
     const gid_bytes = types.gidToBytes(port_result.gid);
     const gid_str = types.gidToString(gid_bytes);
     const ip_str = extractIPFromGID(gid_bytes);
 
-    // Allocate and populate the device struct
     const dev = std.heap.page_allocator.create(types.RdmaDevice) catch {
         types.setLastError("failed to allocate RdmaDevice");
         return DeviceError.OutOfMemory;
@@ -301,52 +268,21 @@ pub fn closeDevice(dev: *types.RdmaDevice) void {
 ///
 /// If the GID is an IPv4-mapped IPv6 address (bytes 0-9 are zero, bytes
 /// 10-11 are 0xFF), the last 4 bytes are formatted as dotted-decimal IPv4.
-/// Otherwise the full GID is formatted as colon-separated IPv6 hex groups.
+/// Otherwise the full GID is formatted as colon-separated IPv6 hex groups
+/// (types.gidToString).
 pub fn extractIPFromGID(gid: [16]u8) [64]u8 {
+    const is_ipv4_mapped = std.mem.allEqual(u8, gid[0..10], 0) and gid[10] == 0xff and gid[11] == 0xff;
+    if (!is_ipv4_mapped) return types.gidToString(gid);
+
     var result: [64]u8 = @splat(0);
-
-    // Check for IPv4-mapped IPv6: first 10 bytes zero, bytes 10-11 are 0xFF
-    const is_ipv4_mapped = blk: {
-        for (gid[0..10]) |b| {
-            if (b != 0) break :blk false;
-        }
-        break :blk (gid[10] == 0xff and gid[11] == 0xff);
-    };
-
-    if (is_ipv4_mapped) {
-        // Format as dotted-decimal IPv4: A.B.C.D
-        var pos: usize = 0;
-        for (0..4) |i| {
-            if (i > 0) {
-                result[pos] = '.';
-                pos += 1;
-            }
-            pos += formatU8Decimal(result[pos..], gid[12 + i]);
-        }
-    } else {
-        // Format as colon-separated hex groups (full IPv6 representation).
-        // Each group is 2 bytes (4 hex digits), separated by colons.
-        // Example: fe80:0000:0000:0000:0000:0000:0000:0001
-        const hex_chars = "0123456789abcdef";
-        var pos: usize = 0;
-        for (0..8) |group| {
-            if (group > 0) {
-                result[pos] = ':';
-                pos += 1;
-            }
-            const hi = gid[group * 2];
-            const lo = gid[group * 2 + 1];
-            result[pos] = hex_chars[hi >> 4];
-            pos += 1;
-            result[pos] = hex_chars[hi & 0x0f];
-            pos += 1;
-            result[pos] = hex_chars[lo >> 4];
-            pos += 1;
-            result[pos] = hex_chars[lo & 0x0f];
+    var pos: usize = 0;
+    for (0..4) |i| {
+        if (i > 0) {
+            result[pos] = '.';
             pos += 1;
         }
+        pos += formatU8Decimal(result[pos..], gid[12 + i]);
     }
-
     return result;
 }
 
@@ -392,11 +328,8 @@ fn formatInvalidGidIndexError(buf: []u8, dev_name: []const u8, port_num: u8, gid
     ) catch buf[0..0];
 }
 
-/// Iterate over all physical ports to find the first active port with a
-/// non-zero GID at the specified GID index.
-///
-/// Mirrors the Go OpenDevice() logic that iterates ports 1..phys_port_cnt,
-/// queries each port's state, and checks the GID at the given index.
+/// Iterate over all physical ports (1..phys_port_cnt) to find the first
+/// active port with a non-zero GID at the specified GID index.
 ///
 /// Once a usable GID is found, this also validates its RoCE GID type via
 /// sysfs (see logGidTypeInfo()) and logs a warning if it is not RoCE v2 --
@@ -455,16 +388,8 @@ fn findActivePortAndGid(ibv_ctx: *c.ibv_context, gid_index: i32, dev_name: []con
             continue;
         }
 
-        // Validate the GID is not all zeros
-        const gid_bytes = types.gidToBytes(gid);
-        var is_zero = true;
-        for (gid_bytes) |b| {
-            if (b != 0) {
-                is_zero = false;
-                break;
-            }
-        }
-        if (is_zero) {
+        // An all-zero entry means the index is unpopulated on this port.
+        if (std.mem.allEqual(u8, &types.gidToBytes(gid), 0)) {
             continue;
         }
 

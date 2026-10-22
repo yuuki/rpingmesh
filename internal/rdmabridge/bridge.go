@@ -456,8 +456,8 @@ var ErrNoFreeSendSlot = errors.New("no free send slot")
 // any send completion. It posts the first ACK (echoing T1, carrying T3 =
 // recvTimestampNS) and returns; when that ACK's send completion arrives, the
 // queue's CQ poller writes the completion timestamp as T4 into the second
-// ACK, which was staged in the same send slot, and posts it. T4 therefore
-// means the same as the value SendFirstAck returns.
+// ACK, which was staged in the same send slot, and posts it. T4 is that
+// first ACK's send completion timestamp.
 //
 // Because nothing blocks on a completion, the caller can keep draining its
 // event ring while completions are slow, and no thread spins while waiting.
@@ -504,76 +504,6 @@ func (q *Queue) AsyncAckFailures() uint64 {
 	return uint64(C.rdma_queue_async_ack_failures(q.handle))
 }
 
-// SendFirstAck sends the first ACK in response to a received probe (step 2
-// of the R-Pingmesh protocol). It echoes T1 from the probe, records T3
-// (receive time), and outputs T4 (the send completion timestamp of this ACK).
-func (q *Queue) SendFirstAck(targetGID [16]byte, targetQPN uint32, flowLabel uint32, recvPacket []byte, recvTimestampNS uint64, timeoutMS uint32) (uint64, error) {
-	// The Zig side unconditionally reads ProbePacketSize bytes from recvPacket,
-	// so a shorter (or nil) slice would cause an out-of-bounds read. Reject it
-	// here rather than passing a too-short buffer across the Cgo boundary.
-	if len(recvPacket) < ProbePacketSize {
-		return 0, fmt.Errorf("recvPacket too short: got %d bytes, need at least %d", len(recvPacket), ProbePacketSize)
-	}
-
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	cGID := goGIDToC(targetGID)
-	var outT4 C.uint64_t
-
-	pktPtr := (*C.uint8_t)(unsafe.Pointer(&recvPacket[0]))
-
-	rc := C.rdma_send_first_ack(
-		q.handle,
-		&cGID,
-		C.uint32_t(targetQPN),
-		C.uint32_t(flowLabel),
-		pktPtr,
-		C.uint64_t(recvTimestampNS),
-		&outT4,
-		C.uint32_t(timeoutMS),
-	)
-	if rc != 0 {
-		return 0, fmt.Errorf("rdma_send_first_ack failed (rc=%d): %s",
-			int(rc), GetLastError())
-	}
-	return uint64(outT4), nil
-}
-
-// SendSecondAck sends the second ACK containing T3 and T4 so the prober can
-// compute responder processing delay (step 3 of the R-Pingmesh protocol).
-func (q *Queue) SendSecondAck(targetGID [16]byte, targetQPN uint32, flowLabel uint32, recvPacket []byte, t3NS uint64, t4NS uint64, timeoutMS uint32) error {
-	// The Zig side unconditionally reads ProbePacketSize bytes from recvPacket,
-	// so a shorter (or nil) slice would cause an out-of-bounds read. Reject it
-	// here rather than passing a too-short buffer across the Cgo boundary.
-	if len(recvPacket) < ProbePacketSize {
-		return fmt.Errorf("recvPacket too short: got %d bytes, need at least %d", len(recvPacket), ProbePacketSize)
-	}
-
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	cGID := goGIDToC(targetGID)
-
-	pktPtr := (*C.uint8_t)(unsafe.Pointer(&recvPacket[0]))
-
-	rc := C.rdma_send_second_ack(
-		q.handle,
-		&cGID,
-		C.uint32_t(targetQPN),
-		C.uint32_t(flowLabel),
-		pktPtr,
-		C.uint64_t(t3NS),
-		C.uint64_t(t4NS),
-		C.uint32_t(timeoutMS),
-	)
-	if rc != 0 {
-		return fmt.Errorf("rdma_send_second_ack failed (rc=%d): %s",
-			int(rc), GetLastError())
-	}
-	return nil
-}
-
 // ---------------------------------------------------------------------------
 // Error Reporting
 // ---------------------------------------------------------------------------
@@ -599,7 +529,7 @@ func GetLastError() string {
 // using big-endian byte order. The buffer must be at least ProbePacketSize
 // (40) bytes long.
 //
-// Wire layout (40 bytes) — must match zig/src/packet.zig serializeProbePacket:
+// Wire layout (40 bytes) — must match zig/src/wire.zig serializeProbePacket:
 //
 //	[0]      Version
 //	[1]      MsgType

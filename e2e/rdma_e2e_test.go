@@ -170,7 +170,7 @@ func TestRDMAE2ETwoDevices(t *testing.T) {
 		}
 	})
 
-	// --- Responder event poller: receive probe, send first and second ACK ---
+	// --- Responder event poller: receive probe, answer with an ACK pair ---
 	startEventPoller(testCtx, responderQueue, responderRing, func(ev rdmabridge.CompletionEvent) {
 		t.Logf("responder event: IsSend=%v IsAck=%v AckType=%d Status=%d TimestampNS=%d SourceQPN=%d",
 			ev.IsSend, ev.IsAck, ev.AckType, ev.Status, ev.TimestampNS, ev.SourceQPN)
@@ -204,37 +204,20 @@ func TestRDMAE2ETwoDevices(t *testing.T) {
 		buf := make([]byte, rdmabridge.ProbePacketSize)
 		rdmabridge.SerializeProbePacket(pkt, buf)
 
-		// Send ACKs using ev.SourceGID (parsed by cq.zig's parseGRH),
-		// matching the production responder's code path.
-		t4, ackErr := responderQueue.SendFirstAck(
+		// Answer with an ACK pair using ev.SourceGID (parsed by cq.zig's
+		// parseGRH), matching the production responder's code path: the
+		// first ACK is posted here, and the CQ poller stamps its send
+		// completion timestamp (T4) into the staged second ACK and posts
+		// it, so the prober can compute ResponderDelay = T4-T3.
+		if err := responderQueue.SendAckPair(
 			ev.SourceGID,
 			ev.SourceQPN,
 			ev.FlowLabel,
 			buf,
 			t3,
-			probeTimeoutMS,
-		)
-		if ackErr != nil {
-			select {
-			case errCh <- fmt.Errorf("SendFirstAck: %w", ackErr):
-			default:
-			}
-			return
-		}
-
-		// Send second ACK carrying T3 and T4 so the prober can compute
-		// ResponderDelay = T4-T3.
-		if err := responderQueue.SendSecondAck(
-			ev.SourceGID,
-			ev.SourceQPN,
-			ev.FlowLabel,
-			buf,
-			t3,
-			t4,
-			probeTimeoutMS,
 		); err != nil {
 			select {
-			case errCh <- fmt.Errorf("SendSecondAck: %w", err):
+			case errCh <- fmt.Errorf("SendAckPair: %w", err):
 			default:
 			}
 		}

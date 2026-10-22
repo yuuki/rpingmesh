@@ -4,6 +4,42 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-22
+
+### Fixed
+
+- The CQ poller routes send and receive completions by `wr_id`, not by the
+  opcode. libibverbs defines the opcode only for successful completions, so
+  an error completion with an unset opcode read as a send: a flushed receive
+  could free a send slot that still had a work request in flight, and a send
+  error completion could leave a synchronous sender waiting out its timeout
+  or leak an asynchronous ACK pair's slot without counting it in
+  `async_ack_failures`. Send work requests now carry a flag bit in their
+  `wr_id`.
+
+### Changed
+
+- The agent rejects an unknown `log_level` at startup, as the controller
+  already did, instead of falling back to `info` with a warning.
+- `PingTarget.source_port` and `priority` are marked deprecated in the proto.
+  The controller still fills them, and no agent reads them.
+- The README documents the list syntax per configuration source and that
+  JSON log keys are snake_case on the agent and camelCase on the controller.
+- Internal refactoring with no change to metric names, units, attributes, or
+  the wire format: the Zig library (a leaf `wire.zig` for the probe codec,
+  shared send-slot preparation, unified receive-completion handling,
+  dead-code removal, ABI constants read from `rdma_bridge.h`), the agent (one
+  struct per RNIC, shared component lifecycle), the controller, the
+  configuration loader (one key table per binary), and the telemetry
+  instruments.
+
+### Removed
+
+- The synchronous ACK exports `rdma_send_first_ack` and
+  `rdma_send_second_ack`, and the Go wrappers `Queue.SendFirstAck` and
+  `Queue.SendSecondAck`. Only tests used them; the responder answers probes
+  with `rdma_send_ack_pair`.
+
 ## [0.7.0] - 2026-10-21
 
 ### Added

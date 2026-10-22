@@ -409,19 +409,10 @@ fn flushPendingSecondAcks(queue: *types.UdQueue, pending: *const PendingSecondAc
     }
 }
 
-/// Count a failed asynchronous ACK pair and reclaim its slot and AH.
+/// Count a failed asynchronous ACK pair and release its slot and AH.
 fn failAsyncAck(queue: *types.UdQueue, slot: u32) void {
     _ = queue.async_ack_failures.fetchAdd(1, .monotonic);
-    reclaimSendSlot(queue, slot);
-}
-
-/// Destroy a completed send's AH and return its slot to the free pool. The
-/// AH goes first: this is the slot's last completion, so the AH is no longer
-/// referenced by any WR.
-fn reclaimSendSlot(queue: *types.UdQueue, slot: u32) void {
-    queue.destroySendSlotAh(slot);
-    queue.setSendSlotMode(slot, .Sync);
-    queue.freeSendSlot(slot);
+    queue.releaseSendSlot(slot);
 }
 
 /// Maximum completions consumed by one poll session (classic ibv_poll_cq call
@@ -661,15 +652,14 @@ fn signalSendCompletion(queue: *types.UdQueue, wr_id: u64, timestamp_ns: u64, st
                 log.debug("@{x} second ACK completion status={d} on slot={d}", .{ @intFromPtr(queue), status, slot_index });
                 _ = queue.async_ack_failures.fetchAdd(1, .monotonic);
             }
-            reclaimSendSlot(queue, slot_index);
+            queue.releaseSendSlot(slot_index);
             return;
         },
         .Sync => {},
     }
-    // Destroy the AH before freeing the slot: this is the matching
-    // completion for the posted WR, so the AH is no longer referenced.
-    queue.destroySendSlotAh(slot_index);
-    queue.freeSendSlot(slot_index);
+    // This is the matching completion for the posted WR, so the AH is no
+    // longer referenced and the slot can be released.
+    queue.releaseSendSlot(slot_index);
 
     queue.send_completion_timestamp.store(timestamp_ns, .monotonic);
     queue.send_completion_status.store(status, .monotonic);

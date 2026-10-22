@@ -456,6 +456,18 @@ pub const UdQueue = struct {
         return @fromBackingInt(self.send_slot_modes[slot_index].load(.acquire));
     }
 
+    /// Return a send slot to the free pool once no WR references it:
+    /// destroy its AH, reset its mode to Sync, then mark it Free. The mode
+    /// is reset before the slot becomes allocatable so the next sender
+    /// never inherits an asynchronous mode. Called by the CQ poller on the
+    /// slot's last completion and by the sender when ibv_post_send rejects
+    /// the WR (the slot's only two release points).
+    pub fn releaseSendSlot(self: *UdQueue, slot_index: u32) void {
+        self.destroySendSlotAh(slot_index);
+        self.setSendSlotMode(slot_index, .Sync);
+        self.freeSendSlot(slot_index);
+    }
+
     /// Destroy every remaining per-slot AH. Safe only after the CQ poller
     /// has stopped and ibv_destroy_qp has succeeded (no outstanding UD WRs).
     pub fn destroyAllSendSlotAhs(self: *UdQueue) void {

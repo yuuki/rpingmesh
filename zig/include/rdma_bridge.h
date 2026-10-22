@@ -319,11 +319,9 @@ void rdma_destroy_queue(rdma_queue_t queue);
  *
  * These functions implement the R-Pingmesh probing protocol:
  *   1. Prober sends probe       -> rdma_send_probe()
- *   2. Responder sends 1st ACK  -> rdma_send_ack_pair() (asynchronous), or
- *                                  rdma_send_first_ack() (synchronous)
+ *   2. Responder sends 1st ACK  -> rdma_send_ack_pair()
  *   3. Responder sends 2nd ACK  -> posted by the CQ poller after the 1st
- *                                  ACK's completion (rdma_send_ack_pair), or
- *                                  rdma_send_second_ack() (synchronous)
+ *                                  ACK's send completion (same call)
  *
  * Completions are delivered asynchronously via the event ring.
  * ========================================================================= */
@@ -350,32 +348,6 @@ rdma_send_result_t rdma_send_probe(rdma_queue_t queue,
                                    uint32_t flow_label,
                                    uint32_t timeout_ms);
 
-/*
- * rdma_send_first_ack - Send the first ACK in response to a probe
- *
- * Corresponds to step 2 in the R-Pingmesh protocol (Figure 4 in the paper).
- * Echoes T1 from the probe, records T3 (receive time), and sends the ACK.
- * Outputs T4 (the send completion timestamp of this first ACK).
- *
- * @param queue              Responder queue handle
- * @param target_gid         Prober's GID (16-byte binary, from GRH)
- * @param target_qpn         Prober's QPN
- * @param flow_label         Flow label to maintain same ECMP path
- * @param recv_packet        Raw received packet buffer (for payload extraction)
- * @param recv_timestamp_ns  T3: receive completion timestamp (ns)
- * @param out_t4_ns          Receives T4: first ACK send completion time (ns)
- * @param timeout_ms         Send completion timeout in milliseconds
- * @return                   0 on success, negative error code on failure
- */
-int32_t rdma_send_first_ack(rdma_queue_t queue,
-                            const rdma_gid_t* target_gid,
-                            uint32_t target_qpn,
-                            uint32_t flow_label,
-                            const uint8_t* recv_packet,
-                            uint64_t recv_timestamp_ns,
-                            uint64_t* out_t4_ns,
-                            uint32_t timeout_ms);
-
 /* Return code of rdma_send_ack_pair() when every send slot is in flight. */
 #define RDMA_ACK_PAIR_NO_FREE_SLOT (-2)
 
@@ -387,8 +359,8 @@ int32_t rdma_send_first_ack(rdma_queue_t queue,
  * timestamp (T4) into the staged second ACK and posts it on the same slot
  * and address handle. The caller never waits for a send completion, so a
  * slow completion delays only this probe and no thread spins meanwhile.
- * T4 has the same meaning as with rdma_send_first_ack(). Failures after
- * this call returns are counted by rdma_queue_async_ack_failures().
+ * T4 is the first ACK's send completion timestamp. Failures after this
+ * call returns are counted by rdma_queue_async_ack_failures().
  *
  * @param queue              Responder queue handle
  * @param target_gid         Prober's GID (16-byte binary, from GRH)
@@ -419,32 +391,6 @@ int32_t rdma_send_ack_pair(rdma_queue_t queue,
  * @return       Failure count (0 for a NULL queue)
  */
 uint64_t rdma_queue_async_ack_failures(rdma_queue_t queue);
-
-/*
- * rdma_send_second_ack - Send the second ACK with processing delay info
- *
- * Corresponds to step 3 in the R-Pingmesh protocol (Figure 4 in the paper).
- * Contains T3 and T4 so the prober can compute the responder processing
- * delay and subtract it from the round-trip time.
- *
- * @param queue         Responder queue handle
- * @param target_gid    Prober's GID (16-byte binary)
- * @param target_qpn    Prober's QPN
- * @param flow_label    Flow label to maintain same ECMP path
- * @param recv_packet   Raw received packet buffer (for sequence number extraction)
- * @param t3_ns         T3: probe receive completion timestamp (ns)
- * @param t4_ns         T4: first ACK send completion timestamp (ns)
- * @param timeout_ms    Send completion timeout in milliseconds
- * @return              0 on success, negative error code on failure
- */
-int32_t rdma_send_second_ack(rdma_queue_t queue,
-                             const rdma_gid_t* target_gid,
-                             uint32_t target_qpn,
-                             uint32_t flow_label,
-                             const uint8_t* recv_packet,
-                             uint64_t t3_ns,
-                             uint64_t t4_ns,
-                             uint32_t timeout_ms);
 
 /* =========================================================================
  * Event Ring Buffer

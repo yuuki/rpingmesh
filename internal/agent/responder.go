@@ -203,7 +203,7 @@ func (r *Responder) Destroy() {
 
 // buildRecvPacketPayload rebuilds the 40-byte wire-format probe the event
 // describes, which the Zig ACK path needs to build the ACKs. The layout lives
-// in rdmabridge.SerializeProbePacket (and zig/src/packet.zig).
+// in rdmabridge.SerializeProbePacket (and zig/src/wire.zig).
 func buildRecvPacketPayload(event *rdmabridge.CompletionEvent) []byte {
 	buf := make([]byte, rdmabridge.ProbePacketSize)
 	rdmabridge.SerializeProbePacket(&rdmabridge.ProbePacket{

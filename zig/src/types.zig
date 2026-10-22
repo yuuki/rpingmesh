@@ -91,9 +91,8 @@ pub const SLOT_SIZE: u32 = MR_SIZE + GRH_SIZE;
 /// What the CQ poller does when an in-flight send slot completes. Stored per
 /// slot (UdQueue.send_slot_modes) by the thread that posts the send.
 pub const SendSlotMode = enum(u8) {
-    /// Synchronous send (probe, or rdma_send_first_ack/second_ack): the
-    /// completion frees the slot and is published to the mailbox for
-    /// waitSendCompletion().
+    /// Synchronous send (a probe): the completion frees the slot and is
+    /// published to the mailbox for waitSendCompletion().
     Sync = 0,
     /// First ACK of an asynchronous ACK pair (rdma_send_ack_pair). On a
     /// successful completion the CQ poller writes the completion timestamp

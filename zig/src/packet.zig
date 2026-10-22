@@ -1,8 +1,10 @@
 // packet.zig - Send side of the R-Pingmesh probing protocol.
 //
-// Sends probes, first ACKs and second ACKs over a UD queue. The wire format
-// itself lives in wire.zig; this module owns the send slots, the address
-// handles and the synchronous completion mailbox (waitSendCompletion).
+// Sends probes (synchronously, waiting for the send completion that yields
+// T2) and ACK pairs (asynchronously; the CQ poller posts the second ACK)
+// over a UD queue. The wire format itself lives in wire.zig; this module
+// owns the send slots, the address handles and the synchronous completion
+// mailbox (waitSendCompletion).
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -29,15 +31,6 @@ pub const SendResult = extern struct {
 
     /// 0 on success, negative error code on failure.
     err: i32,
-};
-
-/// Result of a first ACK send operation.
-pub const FirstAckResult = struct {
-    /// T4: send completion timestamp of the first ACK (nanoseconds).
-    t4_ns: u64,
-
-    /// 0 on success, negative error code on failure.
-    error_code: i32,
 };
 
 // ---------------------------------------------------------------------------
@@ -301,9 +294,8 @@ pub const ACK_PAIR_NO_FREE_SLOT: i32 = -2;
 /// completion, so a slow completion delays only its own probe instead of
 /// every probe queued behind it, and no thread spins while it waits.
 ///
-/// T4 has the same meaning as with sendFirstAck: the first ACK's send
-/// completion timestamp (NIC hardware, or CLOCK_MONOTONIC read by the CQ
-/// poller in software-timestamp mode).
+/// T4 is the first ACK's send completion timestamp (NIC hardware, or
+/// CLOCK_MONOTONIC read by the CQ poller in software-timestamp mode).
 ///
 /// Failures of the asynchronous part (completion errors, a second ACK that
 /// cannot be posted) are counted in queue.async_ack_failures.
@@ -378,91 +370,6 @@ pub fn stageAckPair(slot_ptr: [*]u8, original: *const ProbePacket, t3_ns: u64) v
     wire.serializeProbePacket(&second_ack, @ptrCast(slot_ptr + types.SECOND_ACK_SLOT_OFFSET));
 }
 
-/// Send the first ACK in response to a received probe.
-///
-/// Deserializes the received probe packet, constructs a first ACK with T3
-/// (the responder's receive timestamp), posts the send, and returns T4
-/// (the send completion timestamp of the ACK).
-///
-/// Returns a FirstAckResult containing T4 and an error indicator.
-pub fn sendFirstAck(
-    queue: *types.UdQueue,
-    target_gid: [16]u8,
-    target_qpn: u32,
-    flow_label: u32,
-    recv_packet: [*]const u8,
-    recv_timestamp_ns: u64,
-    timeout_ms: u32,
-) FirstAckResult {
-    const original = decodeReceivedProbe(recv_packet) orelse {
-        return FirstAckResult{ .t4_ns = 0, .error_code = -1 };
-    };
-
-    // Construct the first ACK packet
-    const ack_pkt = ProbePacket{
-        .version = wire.PACKET_VERSION,
-        .msg_type = wire.MSG_TYPE_ACK,
-        .ack_type = wire.ACK_TYPE_FIRST,
-        .flags = 0,
-        .sequence_num = original.sequence_num,
-        .t1 = original.t1,
-        .t3 = recv_timestamp_ns,
-        .t4 = 0, // T4 will be captured from send completion
-    };
-
-    // Perform the send and capture T4
-    const t4_ns = sendPacketInternal(queue, target_gid, flow_label, target_qpn, &ack_pkt, timeout_ms) catch {
-        return FirstAckResult{
-            .t4_ns = 0,
-            .error_code = -1,
-        };
-    };
-
-    return FirstAckResult{
-        .t4_ns = t4_ns,
-        .error_code = 0,
-    };
-}
-
-/// Send the second ACK with processing delay information.
-///
-/// Deserializes the received probe packet for the sequence number, then
-/// constructs a second ACK containing both T3 and T4 so the prober can
-/// compute the responder processing delay and subtract it from the RTT.
-///
-/// Returns 0 on success, negative error code on failure.
-pub fn sendSecondAck(
-    queue: *types.UdQueue,
-    target_gid: [16]u8,
-    target_qpn: u32,
-    flow_label: u32,
-    recv_packet: [*]const u8,
-    t3_ns: u64,
-    t4_ns: u64,
-    timeout_ms: u32,
-) i32 {
-    const original = decodeReceivedProbe(recv_packet) orelse return -1;
-
-    // Construct the second ACK packet with processing delay information
-    const ack_pkt = ProbePacket{
-        .version = wire.PACKET_VERSION,
-        .msg_type = wire.MSG_TYPE_ACK,
-        .ack_type = wire.ACK_TYPE_SECOND,
-        .flags = 0,
-        .sequence_num = original.sequence_num,
-        .t1 = original.t1,
-        .t3 = t3_ns,
-        .t4 = t4_ns,
-    };
-
-    // Perform the send
-    _ = sendPacketInternal(queue, target_gid, flow_label, target_qpn, &ack_pkt, timeout_ms) catch {
-        return -1;
-    };
-
-    return 0;
-}
-
 // ---------------------------------------------------------------------------
 // C-ABI exported functions
 // ---------------------------------------------------------------------------
@@ -494,53 +401,6 @@ export fn rdma_send_probe(
     };
 
     return sendProbe(queue, gid.*, target_qpn, sequence_num, flow_label, timeout_ms);
-}
-
-/// Send the first ACK (C-ABI export matching rdma_send_first_ack in rdma_bridge.h).
-///
-/// @param queue_ptr          Responder queue handle
-/// @param target_gid         Pointer to 16-byte prober GID
-/// @param target_qpn         Prober's QPN
-/// @param flow_label         Flow label for ECMP path consistency
-/// @param recv_packet        Raw received packet buffer (payload after GRH)
-/// @param recv_timestamp_ns  T3: receive completion timestamp (ns)
-/// @param out_t4_ns          Output pointer for T4 timestamp
-/// @param timeout_ms         Send completion timeout in milliseconds
-/// @return                   0 on success, negative error code on failure
-export fn rdma_send_first_ack(
-    queue_ptr: ?*types.UdQueue,
-    target_gid: ?*const [16]u8,
-    target_qpn: u32,
-    flow_label: u32,
-    recv_packet: ?[*]const u8,
-    recv_timestamp_ns: u64,
-    out_t4_ns: ?*u64,
-    timeout_ms: u32,
-) i32 {
-    const queue = queue_ptr orelse {
-        types.setLastError("null queue pointer");
-        return -1;
-    };
-    const gid = target_gid orelse {
-        types.setLastError("null target_gid pointer");
-        return -1;
-    };
-    const pkt = recv_packet orelse {
-        types.setLastError("null recv_packet pointer");
-        return -1;
-    };
-    const t4_out = out_t4_ns orelse {
-        types.setLastError("null out_t4_ns pointer");
-        return -1;
-    };
-
-    const result = sendFirstAck(queue, gid.*, target_qpn, flow_label, pkt, recv_timestamp_ns, timeout_ms);
-    if (result.error_code != 0) {
-        return result.error_code;
-    }
-
-    t4_out.* = result.t4_ns;
-    return 0;
 }
 
 /// Post an asynchronous ACK pair (C-ABI export matching rdma_send_ack_pair in
@@ -584,43 +444,6 @@ export fn rdma_send_ack_pair(
 export fn rdma_queue_async_ack_failures(queue_ptr: ?*types.UdQueue) u64 {
     const queue = queue_ptr orelse return 0;
     return queue.async_ack_failures.load(.monotonic);
-}
-
-/// Send the second ACK (C-ABI export matching rdma_send_second_ack in rdma_bridge.h).
-///
-/// @param queue_ptr     Responder queue handle
-/// @param target_gid    Pointer to 16-byte prober GID
-/// @param target_qpn    Prober's QPN
-/// @param flow_label    Flow label for ECMP path consistency
-/// @param recv_packet   Raw received packet buffer (payload after GRH)
-/// @param t3_ns         T3: probe receive completion timestamp (ns)
-/// @param t4_ns         T4: first ACK send completion timestamp (ns)
-/// @param timeout_ms    Send completion timeout in milliseconds
-/// @return              0 on success, negative error code on failure
-export fn rdma_send_second_ack(
-    queue_ptr: ?*types.UdQueue,
-    target_gid: ?*const [16]u8,
-    target_qpn: u32,
-    flow_label: u32,
-    recv_packet: ?[*]const u8,
-    t3_ns: u64,
-    t4_ns: u64,
-    timeout_ms: u32,
-) i32 {
-    const queue = queue_ptr orelse {
-        types.setLastError("null queue pointer");
-        return -1;
-    };
-    const gid = target_gid orelse {
-        types.setLastError("null target_gid pointer");
-        return -1;
-    };
-    const pkt = recv_packet orelse {
-        types.setLastError("null recv_packet pointer");
-        return -1;
-    };
-
-    return sendSecondAck(queue, gid.*, target_qpn, flow_label, pkt, t3_ns, t4_ns, timeout_ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -677,15 +500,6 @@ test "findFreeSendSlot returns null when all slots busy" {
 test "PacketError enum is defined" {
     const err: PacketError = PacketError.NoFreeSendSlot;
     try std.testing.expect(err == PacketError.NoFreeSendSlot);
-}
-
-test "FirstAckResult struct layout" {
-    const result = FirstAckResult{
-        .t4_ns = 1000,
-        .error_code = 0,
-    };
-    try std.testing.expectEqual(@as(u64, 1000), result.t4_ns);
-    try std.testing.expectEqual(@as(i32, 0), result.error_code);
 }
 
 test "getMonotonicNs returns non-zero value" {

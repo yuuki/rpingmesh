@@ -58,8 +58,8 @@ comptime {
     //                 rdma_get_device_name, rdma_open_device,
     //                 rdma_open_device_by_name, rdma_close_device
     //   queue.zig  -> rdma_create_queue, rdma_destroy_queue
-    //   packet.zig -> rdma_send_probe, rdma_send_first_ack, rdma_send_second_ack,
-    //                 rdma_send_ack_pair, rdma_queue_async_ack_failures
+    //   packet.zig -> rdma_send_probe, rdma_send_ack_pair,
+    //                 rdma_queue_async_ack_failures
     _ = ring;
     _ = device;
     _ = queue;

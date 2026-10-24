@@ -195,6 +195,48 @@ func (s *ControllerService) GetPinglist(
 	}, nil
 }
 
+// MaxTargetRnicInfoGIDs caps the GIDs one GetTargetRnicInfo request may
+// carry: each GID costs a registry query, and an agent resolves the flows of
+// one RNIC per request, so a larger batch is almost certainly a bug.
+const MaxTargetRnicInfoGIDs = 4096
+
+// GetTargetRnicInfo resolves the destination GIDs of traced service flows
+// into SERVICE_TRACING probe targets (see
+// pinglist.PinglistGenerator.GenerateServiceTargets). GIDs that are not
+// registered or that the requester must not probe are omitted from the
+// response rather than reported as errors, because an RNIC without an agent
+// is a normal sight in a service network.
+func (s *ControllerService) GetTargetRnicInfo(
+	ctx context.Context,
+	req *controller_agent.TargetRnicInfoRequest,
+) (*controller_agent.TargetRnicInfoResponse, error) {
+	if req.GetAgentId() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "agent_id is required")
+	}
+	if req.GetRequesterGid() == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "requester_gid is required")
+	}
+	if n := len(req.GetTargetGids()); n > MaxTargetRnicInfoGIDs {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"too many target_gids: %d (max %d)", n, MaxTargetRnicInfoGIDs)
+	}
+
+	log.Debug().
+		Str("agentID", req.GetAgentId()).
+		Str("requesterGID", req.GetRequesterGid()).
+		Int("targetGIDs", len(req.GetTargetGids())).
+		Msg("Target RNIC info request")
+
+	targets, err := s.pinglist.GenerateServiceTargets(ctx, req.GetRequesterGid(), req.GetTargetGids())
+	if err != nil {
+		log.Error().Err(err).
+			Str("agentID", req.GetAgentId()).
+			Msg("Failed to resolve service tracing targets")
+		return nil, status.Errorf(codes.Internal, "failed to resolve target RNICs: %v", err)
+	}
+	return &controller_agent.TargetRnicInfoResponse{Targets: targets}, nil
+}
+
 // ReportProbeAnalysis ingests a batch of per-path window summaries reported by
 // an agent and returns an ack carrying the number of SLA-violating summaries
 // the analyzer detected. When no analyzer is configured, it accepts-and-drops

@@ -52,6 +52,25 @@ type fakeControllerServer struct {
 	reportFunc  func(req *controller_agent.ProbeAnalysisReport) (*controller_agent.ProbeAnalysisAck, error)
 	reportCalls int
 	lastReport  *controller_agent.ProbeAnalysisReport
+
+	// targetInfoFunc, if set, handles GetTargetRnicInfo; otherwise an empty
+	// response is returned. lastTargetInfoReq captures the most recent
+	// request (guarded by mu).
+	targetInfoFunc    func(req *controller_agent.TargetRnicInfoRequest) (*controller_agent.TargetRnicInfoResponse, error)
+	lastTargetInfoReq *controller_agent.TargetRnicInfoRequest
+}
+
+func (s *fakeControllerServer) GetTargetRnicInfo(
+	_ context.Context, req *controller_agent.TargetRnicInfoRequest,
+) (*controller_agent.TargetRnicInfoResponse, error) {
+	s.mu.Lock()
+	s.lastTargetInfoReq = req
+	s.mu.Unlock()
+
+	if s.targetInfoFunc != nil {
+		return s.targetInfoFunc(req)
+	}
+	return &controller_agent.TargetRnicInfoResponse{}, nil
 }
 
 func (s *fakeControllerServer) RegisterAgent(

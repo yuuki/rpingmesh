@@ -65,6 +65,24 @@ pinglist_update_interval_sec: 300 # Pinglist refresh interval
 # controller (see controller.yaml ecmp_* settings).
 flow_label_rotation_period_sec: 3600
 
+# Service tracing (paper section 4.2.2)
+# When enabled, the agent traces the application RDMA connections on this
+# host with eBPF (kprobes on the uverbs entry points) and probes every traced
+# flow with the flow's own flow label, so the probes follow the service
+# traffic's ECMP paths. Results go to the rpingmesh.service.* metrics. Linux
+# only: the agent needs CAP_BPF and CAP_PERFMON (see
+# packaging/systemd/rpingmesh-agent.service.d/10-service-tracing.conf) and a
+# kernel with BTF; when the tracer cannot start, the agent logs why and keeps
+# probing without service tracing.
+service_tracing_enabled: false
+# Aggregate service-tracing probe rate per RNIC, shared by all of its traced
+# flows (visited in random order each pass). The paper probes service flows
+# every 10 ms; with many flows the shared cap paces each flow more slowly.
+service_tracing_probe_rate_per_second: 100
+# Minimum interval between two passes over an RNIC's traced flows, i.e. the
+# per-flow probe interval when the rate cap does not bind.
+service_tracing_probe_interval_ms: 10
+
 # Analyzer reporting (Phase 1)
 # When enabled, the agent aggregates probe results per path over fixed windows
 # and reports PathSummary batches to the controller's analyzer via

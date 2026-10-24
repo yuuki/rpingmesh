@@ -21,3 +21,8 @@ coverage.out
 
 # Python bytecode
 __pycache__/
+
+# Compiled eBPF objects of the service tracer are committed (see
+# internal/agent/servicetrace/generate.go), so a global *.o ignore must not
+# hide them.
+!/internal/agent/servicetrace/*.o

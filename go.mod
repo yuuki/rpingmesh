@@ -3,6 +3,7 @@ module github.com/yuuki/rpingmesh
 go 1.27.3
 
 require (
+	github.com/cilium/ebpf v0.22.0
 	github.com/google/uuid v1.6.0
 	github.com/rqlite/gorqlite v0.0.0-20260504155303-50d445fd0ab9
 	github.com/rs/zerolog v1.35.1
@@ -45,3 +46,5 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20261005182115-fad411399dd8 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20261005182115-fad411399dd8 // indirect
 )
+
+tool github.com/cilium/ebpf/cmd/bpf2go

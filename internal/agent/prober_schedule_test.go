@@ -26,8 +26,9 @@ func simSchedule(t *testing.T, p *Prober, dur time.Duration, before func(now tim
 	passes := [...]sendPass{
 		{ptype: controller_agent.PinglistType_TOR_MESH},
 		{ptype: controller_agent.PinglistType_INTER_TOR},
+		{ptype: controller_agent.PinglistType_SERVICE_TRACING},
 	}
-	var seenGen uint64
+	var seen seenGens
 	sends := make(map[string][]time.Time)
 
 	start := time.Unix(1_000_000, 0)
@@ -36,7 +37,7 @@ func simSchedule(t *testing.T, p *Prober, dur time.Duration, before func(now tim
 		if before != nil {
 			before(now)
 		}
-		pass, wait := p.nextSend(passes[:], &seenGen, now)
+		pass, wait := p.nextSend(passes[:], &seen, now)
 		if pass == nil || wait > 0 {
 			if wait <= 0 {
 				t.Fatalf("scheduler asked to sleep for %v at %v (busy loop)", wait, now.Sub(start))

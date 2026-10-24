@@ -81,9 +81,20 @@ type Prober struct {
 	sourceRdmaDevice string
 	sourceNetdev     string
 
-	targets    []*controller_agent.PingTarget
-	targetsGen uint64 // bumped by UpdateTargets; guarded by targetsMu
-	targetsMu  sync.RWMutex
+	// targets are the controller's pinglist targets (ToR-mesh and
+	// inter-ToR); serviceTargets are the SERVICE_TRACING targets built from
+	// the traced service flows (see UpdateServiceTargets). They are kept
+	// apart so a pinglist refresh never drops the service targets and vice
+	// versa, and each list has its own generation (targetsGen, serviceGen)
+	// so an update of one list restarts only that list's passes: service
+	// connections can churn every second, and restarting the pinglist
+	// passes on every churn would starve the targets at their end. Both
+	// generations are guarded by targetsMu.
+	targets        []*controller_agent.PingTarget
+	serviceTargets []*controller_agent.PingTarget
+	targetsGen     uint64
+	serviceGen     uint64
+	targetsMu      sync.RWMutex
 
 	pending   map[uint64]*pendingProbe // sequence_num -> pending probe
 	pendingMu sync.Mutex
@@ -114,6 +125,19 @@ type Prober struct {
 	torMeshRate    perTypeRate
 	interTorRate   perTypeRate
 	rateMultiplier float64
+
+	// serviceRate paces the service-tracing pass. Unlike the two pinglist
+	// rates, its pps is an AGGREGATE cap per prober (RNIC), not a per-target
+	// one: the number of traced flows is set by the applications, not by the
+	// controller, so a per-target rate could not bound the probe load. The
+	// flows share the budget, and each pass visits them in a fresh random
+	// order (the paper's "shuffle the pinglist in each round"). Guarded by
+	// rateMu like the other rates.
+	serviceRate perTypeRate
+	// serviceInterval is the minimum spacing between two passes over the
+	// service targets (the paper's 10 ms service-tracing interval); 0 means
+	// probeInterval. Read only by the probe-loop goroutine; set before Start.
+	serviceInterval time.Duration
 
 	// flowLabelRotationPeriodSec is the period over which the rotating subset
 	// of each target's flow-label set is refreshed. Read only by the
@@ -295,11 +319,89 @@ func (p *Prober) SetRateMultiplier(mult float64) {
 		Msg("Probe send rate multiplier updated")
 }
 
-// applyRatesLocked recomputes both limiters from the stored per-target rates,
-// the given target counts and the throttle multiplier. Caller holds rateMu.
+// applyRatesLocked recomputes the limiters from the stored rates, the given
+// pinglist target counts and the throttle multiplier. Caller holds rateMu.
 func (p *Prober) applyRatesLocked(nTorMesh, nInterTor int) {
 	p.torMeshRate.limiter.SetRate(scaledRate(p.torMeshRate.pps, nTorMesh, p.rateMultiplier, p.probeInterval))
 	p.interTorRate.limiter.SetRate(scaledRate(p.interTorRate.pps, nInterTor, p.rateMultiplier, p.probeInterval))
+	p.serviceRate.limiter.SetRate(serviceAggregateRate(p.serviceRate.pps, p.rateMultiplier))
+}
+
+// serviceAggregateRate is the service-tracing limiter rate: the configured
+// aggregate pps scaled by the throttle multiplier. A non-positive pps
+// disables the cap (0 is read by RateLimiter.SetRate as disabled); the
+// service pass interval then paces the sends alone, so config validation
+// requires a positive rate whenever service tracing is enabled.
+func serviceAggregateRate(pps, mult float64) float64 {
+	if pps <= 0 {
+		return 0
+	}
+	return pps * clampRateMultiplier(mult)
+}
+
+// SetServiceTracingRate caps the aggregate service-tracing send rate of this
+// prober at pps probes per second and spaces passes over the service targets
+// by at least intervalMS milliseconds (0 keeps probeInterval). Call it before
+// Start; the rate is applied on the next rate recomputation.
+func (p *Prober) SetServiceTracingRate(pps float64, intervalMS uint32) {
+	p.rateMu.Lock()
+	p.serviceRate.pps = pps
+	p.serviceRate.limiter.SetRate(serviceAggregateRate(pps, p.rateMultiplier))
+	p.rateMu.Unlock()
+	p.serviceInterval = time.Duration(intervalMS) * time.Millisecond
+	p.logger.Info().
+		Float64("service_pps", pps).
+		Uint32("service_interval_ms", intervalMS).
+		Msg("Service tracing probe rate updated")
+}
+
+// UpdateServiceTargets replaces the SERVICE_TRACING targets, one per traced
+// service flow, each carrying that flow's own flow label. The pinglist
+// targets and their passes are untouched; only the service pass restarts.
+func (p *Prober) UpdateServiceTargets(targets []*controller_agent.PingTarget) {
+	p.targetsMu.Lock()
+	defer p.targetsMu.Unlock()
+	p.serviceTargets = targets
+	p.serviceGen++
+	p.logger.Info().
+		Int("count", len(targets)).
+		Msg("Service tracing targets updated")
+}
+
+// passInterval is the minimum spacing between two passes of a pinglist
+// type: the service interval for service tracing, probeInterval otherwise.
+func (p *Prober) passInterval(ptype controller_agent.PinglistType) time.Duration {
+	if ptype == controller_agent.PinglistType_SERVICE_TRACING && p.serviceInterval > 0 {
+		return p.serviceInterval
+	}
+	return p.probeInterval
+}
+
+// passTargetsLocked returns the targets of one pass of ptype: the pinglist
+// targets of that type, or a freshly shuffled copy of the service targets.
+// Caller holds targetsMu (read).
+func (p *Prober) passTargetsLocked(ptype controller_agent.PinglistType) []*controller_agent.PingTarget {
+	if ptype != controller_agent.PinglistType_SERVICE_TRACING {
+		return targetsOfType(p.targets, ptype)
+	}
+	if len(p.serviceTargets) == 0 {
+		return nil
+	}
+	out := make([]*controller_agent.PingTarget, 0, len(p.serviceTargets))
+	for _, t := range p.serviceTargets {
+		if t != nil {
+			out = append(out, t)
+		}
+	}
+	rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+	return out
+}
+
+// seenGens records the generations of the two target lists that the probe
+// loop's passes reflect (see nextSend). Owned by the probe-loop goroutine.
+type seenGens struct {
+	targets uint64
+	service uint64
 }
 
 // clampRateMultiplier maps any value outside (0, 1] to 1.0 (unthrottled).
@@ -359,8 +461,11 @@ func countTargetsByType(targets []*controller_agent.PingTarget) (nTorMesh, nInte
 
 // rateForType returns the limiter governing ptype. Caller holds rateMu.
 func (p *Prober) rateForType(ptype controller_agent.PinglistType) *perTypeRate {
-	if ptype == controller_agent.PinglistType_INTER_TOR {
+	switch ptype {
+	case controller_agent.PinglistType_INTER_TOR:
 		return &p.interTorRate
+	case controller_agent.PinglistType_SERVICE_TRACING:
+		return &p.serviceRate
 	}
 	return &p.torMeshRate
 }
@@ -508,12 +613,12 @@ func (ps *sendPass) active() bool { return ps.next < len(ps.targets) }
 // pinglist type, and periodically expires pending probes whose ACKs never
 // came.
 //
-// The two types are scheduled independently from this single goroutine: each
+// The types are scheduled independently from this single goroutine: each
 // iteration sends the probe whose type limiter is ready soonest, so a type
 // whose cap binds delays only its own sends. The sends must stay on one
 // goroutine: the Zig send path waits for its completion through a single
 // per-queue slot, so concurrent SendProbe calls would steal each other's
-// completions. A pass starts at most once per probeInterval, which keeps the
+// completions. A pass starts at most once per passInterval, which keeps the
 // one-probe-per-target-per-interval ceiling even when a limiter is disabled.
 func (p *Prober) probeLoop(ctx context.Context) {
 	defer p.wg.Done()
@@ -521,8 +626,9 @@ func (p *Prober) probeLoop(ctx context.Context) {
 	passes := [...]sendPass{
 		{ptype: controller_agent.PinglistType_TOR_MESH},
 		{ptype: controller_agent.PinglistType_INTER_TOR},
+		{ptype: controller_agent.PinglistType_SERVICE_TRACING},
 	}
-	var seenGen uint64
+	var seen seenGens
 
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
@@ -546,7 +652,7 @@ func (p *Prober) probeLoop(ctx context.Context) {
 			lastCleanup = now
 		}
 
-		pass, wait := p.nextSend(passes[:], &seenGen, now)
+		pass, wait := p.nextSend(passes[:], &seen, now)
 		if pass == nil || wait > 0 {
 			// Sleep until the next send is due, waking for shutdown. The
 			// sleep is bounded so the stale-pending sweep keeps its cadence
@@ -579,42 +685,56 @@ func (p *Prober) probeLoop(ctx context.Context) {
 // start, with wait set to when one can.
 //
 // A finished pass whose notBefore has passed is restarted with a fresh
-// snapshot of its type's targets. After UpdateTargets every current pass is
-// abandoned, so probes are not sent to targets that were just removed and
-// new targets are reached without waiting for a stale pass to finish. Called
-// only from the probe-loop goroutine, which owns passes and seenGen.
-func (p *Prober) nextSend(passes []sendPass, seenGen *uint64, now time.Time) (*sendPass, time.Duration) {
+// snapshot of its type's targets. After UpdateTargets the pinglist passes
+// are abandoned, and after UpdateServiceTargets the service pass is, so
+// probes are not sent to targets that were just removed and new targets are
+// reached without waiting for a stale pass to finish; an update of one list
+// never restarts the other's passes. Called only from the probe-loop
+// goroutine, which owns passes and seen.
+func (p *Prober) nextSend(passes []sendPass, seen *seenGens, now time.Time) (*sendPass, time.Duration) {
 	p.targetsMu.RLock()
-	gen := p.targetsGen
-	var targets []*controller_agent.PingTarget
-	if gen != *seenGen {
-		targets = p.targets
+	targetsChanged := p.targetsGen != seen.targets
+	serviceChanged := p.serviceGen != seen.service
+	var pinglist []*controller_agent.PingTarget
+	if targetsChanged {
+		pinglist = p.targets
 	}
 	for i := range passes {
 		ps := &passes[i]
-		if gen != *seenGen {
+		isService := ps.ptype == controller_agent.PinglistType_SERVICE_TRACING
+		if (isService && serviceChanged) || (!isService && targetsChanged) {
 			ps.targets, ps.next = nil, 0
 		}
 		if !ps.active() && !now.Before(ps.notBefore) {
-			ps.targets = targetsOfType(p.targets, ps.ptype)
+			ps.targets = p.passTargetsLocked(ps.ptype)
 			ps.next = 0
-			ps.notBefore = now.Add(p.probeInterval)
+			ps.notBefore = now.Add(p.passInterval(ps.ptype))
 		}
 	}
+	seen.targets, seen.service = p.targetsGen, p.serviceGen
 	p.targetsMu.RUnlock()
 
-	if gen != *seenGen {
-		p.pruneLabelRotation(targets)
-		*seenGen = gen
+	if targetsChanged {
+		// Service targets never own rotation state (see nextFlowLabel), so
+		// the pinglist alone decides what to keep.
+		p.pruneLabelRotation(pinglist)
 	}
 
 	var best *sendPass
 	bestWait := time.Duration(-1)
+	// soonestStart is the next restart of a finished pass that has targets;
+	// soonestAny also counts passes without targets (an empty pinglist
+	// type), which only need a wake-up when nothing else is scheduled.
 	soonestStart := time.Duration(-1)
+	soonestAny := time.Duration(-1)
 	for i := range passes {
 		ps := &passes[i]
 		if !ps.active() {
-			if w := ps.notBefore.Sub(now); soonestStart < 0 || w < soonestStart {
+			w := ps.notBefore.Sub(now)
+			if soonestAny < 0 || w < soonestAny {
+				soonestAny = w
+			}
+			if len(ps.targets) > 0 && (soonestStart < 0 || w < soonestStart) {
 				soonestStart = w
 			}
 			continue
@@ -625,7 +745,10 @@ func (p *Prober) nextSend(passes []sendPass, seenGen *uint64, now time.Time) (*s
 		}
 	}
 	if best == nil {
-		return nil, soonestStart
+		if soonestStart >= 0 {
+			return nil, soonestStart
+		}
+		return nil, soonestAny
 	}
 	if soonestStart >= 0 && soonestStart < bestWait {
 		// A finished pass restarts before the active pass's next slot; wake
@@ -728,9 +851,17 @@ func (p *Prober) sendProbe(target *controller_agent.PingTarget, rotationEpoch ui
 }
 
 // nextFlowLabel returns the flow label for the next probe to target and
-// advances the target's round-robin index. Probe-loop goroutine only.
+// advances the target's round-robin index. A target with a single label (a
+// service flow, or a legacy single-label pinglist target) returns it without
+// touching the round-robin state: that state is keyed by GID and shared with
+// the pinglist target of the same remote RNIC, whose ECMP coverage would
+// otherwise skip labels every time a service probe went to the same GID.
+// Probe-loop goroutine only.
 func (p *Prober) nextFlowLabel(target *controller_agent.PingTarget, rotationEpoch uint64) uint32 {
 	labels := p.cachedLabelsForTarget(target, rotationEpoch)
+	if len(labels) == 1 {
+		return labels[0]
+	}
 	gid := target.GetTargetGid()
 	idx := p.labelRotation[gid]
 	p.labelRotation[gid] = idx + 1
@@ -898,6 +1029,7 @@ func fillTargetMetadata(result *probe.ProbeResult, seqNum uint64, flowLabel uint
 	// An older controller never sets Sampled, but every inter-ToR target is
 	// sampled.
 	result.TargetSampled = target.GetSampled() || isInterTor(target)
+	result.ServiceTracing = target.GetPinglistType() == controller_agent.PinglistType_SERVICE_TRACING
 	if parsedGID, err := probe.ParseGID(target.GetTargetGid()); err == nil {
 		result.TargetGID = parsedGID
 	}

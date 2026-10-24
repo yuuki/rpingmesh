@@ -35,11 +35,11 @@ jobs:
         with:
           version: 0.17.0
 
-      - name: Install system dependencies (protoc, libibverbs, librdmacm)
+      - name: Install system dependencies (protoc, libibverbs, librdmacm, clang)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler libibverbs-dev librdmacm-dev
+            protobuf-compiler libibverbs-dev librdmacm-dev clang llvm
 
       - name: Install protoc Go plugins
         run: |
@@ -49,6 +49,12 @@ jobs:
 
       - name: Generate protobuf bindings
         run: make generate-proto
+
+      # The service-tracing eBPF program must still compile and its committed
+      # Go bindings must be current; the committed objects themselves are not
+      # compared (they differ between clang versions).
+      - name: Check the eBPF program and bindings
+        run: make check-bpf
 
       - name: go vet
         run: make vet
@@ -64,6 +70,14 @@ jobs:
 
       - name: Run Go unit tests (excludes ./e2e/...)
         run: go test -race $(go list ./... | grep -v '/e2e')
+
+      # Load the service-tracing eBPF objects into the runner's kernel and
+      # attach them to the uverbs entry points, which needs root. The test
+      # skips itself when ib_uverbs cannot be loaded on the runner kernel.
+      - name: Load the eBPF tracer into the kernel (root)
+        run: |
+          sudo modprobe ib_uverbs || echo "::warning::ib_uverbs not available; the tracer load test will skip"
+          sudo -E env "PATH=$PATH" go test -count=1 -v -run TestTracerOpenClose ./internal/agent/servicetrace/
 
   # Release-style portable agent build: links the agent in an Enterprise
   # Linux 9 container and fails if the binary needs a glibc newer than the

@@ -1,333 +1,182 @@
 # eBPF Service Tracing
 
-Status: design only, not implemented (tracking ID P3-J). This document
-specifies how the agent uses eBPF to trace the lifecycle of application RDMA
-QPs, so probe results can be attributed to the services using each RNIC: the
-"service-aware monitoring" of the SIGCOMM 2024 R-Pingmesh paper.
+Status: implemented (`internal/agent/servicetrace`,
+`internal/agent/service_monitor.go`, the `GetTargetRnicInfo` RPC). This
+document records the design and the reasons behind its departures from the
+first draft, which planned to trace `ib_core` functions with CO-RE.
 
-## Goals
+## Goal
 
-- **Correlate probe results with services.** Knowing which processes create
-  and use QPs on each local RNIC lets the agent answer "which application's
-  traffic shares the path a degraded probe just measured", turning a ToR-pair
-  anomaly into a service-impact statement.
-- **Prepare for service-aware probing.** The same signal shows which RNICs
-  actively carry traffic, so probing can later favor the RNIC pairs that
-  matter. The first round does not act on it, but the data model must support
-  it.
-- **Leave the data path alone.** The eBPF subsystem must be separable from the
-  Zig/Cgo RDMA bridge and must not affect the build or runtime on non-Linux or
-  eBPF-incapable hosts.
-
-## Non-Goals
-
-- No packet or payload inspection. Only QP lifecycle metadata (create, modify,
-  destroy, and the owning process and cgroup) is traced.
-- No change to the probe protocol, the Zig library, or analyzer
-  localization. Service attribution is an enrichment layer.
-- No dependency on eBPF for probing. Without eBPF the agent runs exactly as
-  today.
-- The first round does not implement service-aware prioritization or
-  controller-side aggregation of service data.
-
-## Current State (verified against code)
-
-- **No eBPF exists.** There is no eBPF code, no `cilium/ebpf` dependency, and
-  no `generate-bpf` Makefile target. eBPF service tracing is listed as out of
-  scope in `README.md`.
-- **Agent build.** The agent builds with `CGO_ENABLED=1` and links
-  `zig/zig-out/lib/librdmabridge.a` through the Cgo directives in
-  `internal/rdmabridge/bridge.go`. The controller is pure Go
-  (`CGO_ENABLED=0`). eBPF goes in the agent only and must not add a second C
-  link step alongside the Zig one.
-- **Controller RPCs.** `ControllerService` has `RegisterAgent`, `GetPinglist`,
-  and `ReportProbeAnalysis(ProbeAnalysisReport) returns (ProbeAnalysisAck)`
-  (`proto/controller_agent/controller_agent.proto`). `AnalysisReporter`
-  (`internal/agent/analysis_reporter.go`) aggregates locally, batches, and
-  reports best-effort without blocking probing. A service reporter would
-  follow the same pattern.
-- **Registry QPNs are rpingmesh's own.** The `rnics` table stores, per RNIC,
-  the agent's **responder** QPN (`responder.GetQueueInfo()` in
-  `buildRegistrationRequest`), not application QPs. Service tracing observes a
-  different QP population and adds to registry data rather than changing it.
-- **The agent's systemd unit is hardened.**
-  `packaging/systemd/rpingmesh-agent.service` runs as user `rpingmesh` with
-  `CapabilityBoundingSet=CAP_IPC_LOCK`, `AmbientCapabilities=CAP_IPC_LOCK`,
-  `NoNewPrivileges=yes`, `SystemCallFilter=@system-service`,
-  `SystemCallErrorNumber=EPERM`, `ProtectKernelTunables=yes`,
-  `ProtectKernelModules=yes`, `ProtectControlGroups=yes`,
-  `MemoryDenyWriteExecute=yes`, `RestrictNamespaces=yes`,
-  `LockPersonality=yes`, and
-  `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK`. Several of
-  these affect eBPF loading (see
-  [Security and systemd impact](#security-and-systemd-impact)).
-- **Packaging.** `packaging/nfpm/nfpm-agent.yaml` ships the binary, the unit,
-  and an example config. It ships no kernel or BTF assets.
+The SIGCOMM 2024 paper (section 4.2.2) traces the kernel's `modify_qp` and
+`destroy_qp` with eBPF to learn the 5-tuples of the RDMA connections a
+service opens, then probes the paths those 5-tuples take so the service
+network's RTT and loss are measured on the paths the service uses. This
+implementation does the same: an eBPF tracer reports queue pair lifecycle
+events, the agent folds them into live connections, resolves the remote
+RNICs through the controller, and probes each flow with the flow's own flow
+label through its existing UD queue.
 
 ## Design
 
-### What "service" means
+### What the tracer reads
 
-A process creates a QP through libibverbs, which issues `ib_uverbs` ioctls
-handled by the kernel `ib_uverbs`/`ib_core` layer. Hooking QP create, modify,
-and destroy captures, per QP:
+The tracer attaches kprobes and kretprobes to the entry points of the uverbs
+character device, `ib_uverbs_ioctl` and `ib_uverbs_write`, plus a kprobe on
+`ib_uverbs_close`, and parses the command buffers libibverbs passes to the
+kernel:
 
-- **Owner**: `pid`, `tgid`, `comm`, and `cgroup_id`. The cgroup ID is the
-  stable service key under systemd or Kubernetes; `comm` and `pid` are not.
-- **Local QP**: the QPN and the local device and port.
-- **Remote endpoint**: destination QPN and GID, taken from the transition to
-  RTR on connected (RC/UC) QPs. This ties a local service to a remote RNIC and
-  therefore to a ToR pair that probes also traverse.
-- **Lifecycle**: create and destroy timestamps.
+| Command | Path | What is read |
+|---------|------|--------------|
+| `CREATE_QP`, `EX_CREATE_QP`, `OPEN_QP` | `write(2)`, or ioctl `INVOKE_WRITE` | the QP type from the request; the handle and QPN from the response, after the kernel wrote it |
+| ioctl `QP_CREATE` method | ioctl | the type from the `CREATE_QP_TYPE` attribute; the handle the kernel writes back into the `CREATE_QP_HANDLE` attribute and the QPN behind `RESP_QP_NUM` |
+| `MODIFY_QP`, `EX_MODIFY_QP` | `write(2)` or `INVOKE_WRITE` | `attr_mask`, `qp_state`, `dest_qp_num`, and the address vector: `dgid`, `flow_label`, `sgid_index`, `port_num`, `hop_limit`, `traffic_class`, `sl` |
+| `DESTROY_QP`, ioctl `QP_DESTROY` | either | the handle |
+| file release | `ib_uverbs_close` | the context identity: every QP of the context is gone |
 
-The agent keeps an in-memory **QP→service table** keyed by
-**`(device, QPN)`**. A QPN is unique only within one device. On a multi-RNIC
-host (the agent already runs one Prober and Responder per device) two RNICs
-can assign the same QPN to different applications, and keying on the QPN
-alone would attribute a service to the wrong RNIC and ToR pair. The eBPF
-program therefore reports a device discriminator (the `ib_device` identity and
-port) with each QPN, and userspace resolves it to the local RNIC's GID.
+Commands are staged in a per-task map at entry and emitted from the return
+probe only when the kernel returned success, so a failed RTR never becomes a
+connection. Every entry probe first discards the task's previous staging:
+return probes can be missed (kretprobe `maxactive` exhaustion), and a stale
+entry must not be completed by the next, unrelated command's success. Each event carries the context identity (the `struct file`
+pointer, unique per `ibv_open_device`), the device number of the uverbs node
+the context was opened on (`struct file -> f_inode -> i_rdev`, the only
+kernel-internal reads, relocated with CO-RE against the vmlinux BTF), the
+calling process (pid, comm, cgroup id) and the command's fields. Events go to
+user space through a 1 MiB BPF ring buffer; drops and parse failures are
+counted in a stats map.
 
-The table joins back to probe results: a probe path
-`(source_gid, target_gid)` shares fabric with an application QP whose
-`(local device GID, remote GID)` maps to the same ToR pair. rpingmesh's own
-probe QPs are UD and never bind a single remote, so they fall out naturally.
+The Go side (`servicetrace.Table`) joins creates, modifies and destroys by
+(context, handle) into connections: a create records the QPN and type; an
+RTR transition with an address vector on an RC, UC or XRC QP makes a
+connection; a reset, a destroy or the context's release ends it. UD, raw
+packet and driver-specific QPs (the agent's own probing queues among them)
+never form connections.
 
-### Loader: cilium/ebpf
+### Why the uverbs ABI and not `ib_core`
 
-Use **`github.com/cilium/ebpf`**, a pure-Go loader, with `bpf2go` to generate
-CO-RE objects.
+The first draft planned `fentry`/`kprobe` programs on `ib_modify_qp_with_udata`
+and `ib_destroy_qp_user`, reading `struct ib_qp` and `struct ib_qp_attr` with
+CO-RE. That needs BTF for the module that defines those structures. On the
+GPU clusters this project targets, the RDMA modules come from an out-of-tree
+stack (`mlnx-ofa_kernel`) and ship without BTF, and their structure layouts
+differ from the in-tree kernel's, so CO-RE has nothing to relocate against.
+The uverbs user-space ABI (`include/uapi/rdma/ib_user_verbs.h`,
+`ib_user_ioctl_cmds.h`) is stable by definition, every libibverbs relies on
+it, and it carries everything the paper's tracing needs. The entry points
+are local symbols of `ib_uverbs` but are present in kallsyms on both
+in-tree and out-of-tree stacks, and kprobes attach to them by name without
+BTF.
 
-- **No second C runtime.** `libbpfgo` links libbpf through Cgo. The agent
-  already uses Cgo for Zig, but libbpf would add an unrelated C link and a
-  library to ship. `cilium/ebpf` parses ELF and calls `bpf()` directly, so the
-  loader has no link-time coupling with the Zig bridge.
-- **No clang at runtime.** `bpf2go` compiles the eBPF C at build time into a
-  CO-RE object embedded with `go:embed`. The host needs only kernel BTF
-  (`/sys/kernel/btf/vmlinux`).
-- **Maturity.** `cilium/ebpf` is the de facto pure-Go loader (Cilium,
-  Tetragon) and supports ring buffers and CO-RE well.
+The cost is scope: kernel ULPs (NVMe-oF, NFS over RDMA, Lustre) do not go
+through uverbs and are not traced, and the trace sees commands, not QPs that
+already existed. The paper's service (user-space DML over NCCL) is covered.
 
-### Attach points and kernel requirements
+### Flow labels and the UDP source port
 
-In order of preference:
+A RoCEv2 driver sets a connected QP's UDP source port from
+`rdma_get_udp_sport(flow_label, lqpn, rqpn)`: the application's flow label if
+non-zero, else the symmetric `rdma_calc_flow_label(lqpn, rqpn)`, folded into
+a 14-bit port by `rdma_flow_label_to_udp_sport`. `servicetrace.EffectiveFlowLabel`
+reproduces the selection, so a probe sent with that label through the
+agent's UD address handle gets the same UDP source port and, on an
+IPv4-encapsulated fabric, the same 5-tuple except for what the responder's
+UD queue dictates (destination QPN inside the payload, not in the headers).
+Soft-RoCE derives the port from a hash of the local QPN instead, so the e2e
+suite can validate the tracing and the probe path but not the port
+equivalence; that needs hardware NICs.
 
-1. **`fentry`/`fexit` on `ib_core` functions**, for example
-   `ib_create_qp_user`, `ib_destroy_qp_user`, and `_ib_modify_qp` (the RTR
-   transition carries the remote). `fentry` is cheaper than a kprobe and gives
-   typed BTF access, but needs BPF trampolines (5.5+) and an attachable
-   symbol.
-2. **`kprobe`/`kretprobe`** on the same functions where `fentry` cannot
-   attach. These function names are not a stable ABI, so the loader must
-   tolerate missing symbols.
-3. **Tracepoints** would be the most stable, but the RDMA tracepoints do not
-   cover create/modify/destroy with the remote endpoint, so they are not the
-   primary mechanism.
-
-At startup the loader probes which symbols are attachable and whether BTF has
-the required struct fields, and disables tracing if not.
-
-**Minimum kernel: Linux 5.8.** The BPF ring buffer and the
-`CAP_BPF`/`CAP_PERFMON` split both landed in 5.8, and CO-RE needs kernel BTF
-(`CONFIG_DEBUG_INFO_BTF=y`). On older kernels tracing is disabled and the
-agent is otherwise unaffected.
+If the application's source GID index differs from the agent's `gid_index`
+(same device, different port address), the probe shares the flow's
+destination and UDP source port but not its source address. The monitor
+reads the flow's GID from sysfs and warns once per device and index.
 
 ### Agent integration
 
-- **New package** `internal/agent/servicetrace/` (Linux only): the embedded
-  CO-RE object generated by `bpf2go`, the loader, a ring-buffer reader
-  goroutine, and the QP→service table.
-- **Build-tag isolation.** eBPF files carry `//go:build linux`; a
-  `//go:build !linux` stub provides a no-op `Tracer`, so macOS development
-  builds are unchanged. The clang→BPF compile never shares a translation unit
-  or link step with the Cgo/Zig build.
-- **Graceful degradation.** When `service_tracing_enabled` is true, the
-  tracer checks kernel version, BTF, capabilities, and attach points. Any
-  failure logs a warning and the agent continues without tracing, the way
-  `createMetricsCollector` continues without metrics.
-- **Lifecycle.** Create the tracer in `Agent.Initialize` behind the config
-  gate. Start its ring-buffer reader goroutine in `Start`. In `Stop`, detach
-  the programs, close the maps, and join the goroutine. The RDMA teardown is
-  untouched.
+- `Agent.createServiceTracing` (gated by `service_tracing_enabled`) opens the
+  tracer; a failure (not Linux, no BTF, no ring buffers, `EPERM`, `ib_uverbs`
+  not loaded) is logged at warn level and the agent continues with
+  `rpingmesh.agent.service_trace_active = 0`.
+- `ServiceMonitor` applies events to the table on the tracer's reader
+  goroutine, rebuilds targets about one second after the connection set
+  changed (coalescing a job start that opens thousands of QPs) and every
+  `pinglist_update_interval_sec`. A rebuild groups each monitored device's
+  connections into flows keyed by (remote GID, effective flow label), asks
+  the controller for the remotes it has not resolved yet (or all of them on
+  the periodic refresh; unregistered remotes are retried after a minute by
+  a timer of their own, so the retry does not wait for the next connection
+  event), and pushes one `SERVICE_TRACING` `PingTarget` per flow, with
+  `flow_label` set to the flow's label and `flow_label_count` 1, to the
+  device's prober. Connections on devices the agent does not probe from are
+  ignored. Before each rebuild the monitor reconciles the table against
+  `/proc`: the ring buffer can drop events under load, and a lost context
+  close would otherwise keep an exited process's connections forever, so
+  contexts whose owning process is gone are dropped (a lost create or
+  destroy is bounded by the process's lifetime the same way); drops are
+  logged.
+- The prober keeps the service targets apart from the pinglist targets and
+  schedules a third pass for them, paced by an aggregate per-RNIC rate
+  (`service_tracing_probe_rate_per_second`) and a pass interval
+  (`service_tracing_probe_interval_ms`), visiting the flows in a new random
+  order each pass. The two lists have separate generations, so service
+  churn restarts only the service pass and never starves the pinglist
+  targets at the end of a slow pass, and single-label targets do not
+  advance the per-GID flow-label rotation the pinglist target of the same
+  remote relies on for ECMP coverage. Results carry
+  `ProbeResult.ServiceTracing`.
+- Telemetry records such results on the `rpingmesh.service.*` instruments
+  with the usual ToR-level attributes, and exposes the tracer through
+  `rpingmesh.agent.service_trace_active`, `service_connections`,
+  `service_flows`, `service_trace_events_total` and
+  `service_trace_dropped_total`. The results fan-in skips them for the
+  analysis reporter.
+- The controller's `GetTargetRnicInfo` looks each GID up in the registry and
+  applies the pinglist generator's self and same-host exclusion. The request
+  is capped at 4096 GIDs; the agent batches at 1024.
 
-### Data model
+### Build and packaging
 
-```go
-// Linux only. One record per observed application QP.
+The program is compiled by `bpf2go` (a `go.mod` tool) for `amd64` and
+`arm64` into committed `uverbs_*_bpfel.{go,o}` files, so `make build-agent`
+needs no clang; `make generate-bpf` regenerates them and `make check-bpf`
+(run in CI) verifies the program still compiles and the Go bindings are
+current. The libbpf headers it includes are vendored under
+`bpf/include/` with their BSD-2-Clause license. The BPF program itself is
+dual-licensed GPL-2.0 or BSD-2-Clause, as the kernel requires a
+GPL-compatible license for the helpers it uses.
 
-// QPKey is (device, QPN), never the QPN alone: QPNs are unique only within
-// one device, so two RNICs on a host can reuse the same value.
-type QPKey struct {
-    DeviceGID [16]byte // local RNIC, resolved from the device discriminator
-    LocalQPN  uint32
-}
+Loading needs `CAP_BPF` and `CAP_PERFMON` (Linux 5.8+). The hardened
+systemd unit grants only `CAP_IPC_LOCK`; the drop-in
+`packaging/systemd/rpingmesh-agent.service.d/10-service-tracing.conf` adds
+the two capabilities and the `bpf`/`perf_event_open` system calls, and the
+agent package ships it as an example rather than installing it.
 
-type QPRecord struct {
-    Key         QPKey
-    RemoteQPN   uint32   // 0 until the RTR transition is observed
-    RemoteGID   [16]byte // zero until RTR is observed (stays zero for UD)
-    PID         uint32
-    CgroupID    uint64   // service key
-    Comm        string
-    CreatedNs   uint64
-    DestroyedNs uint64   // 0 while live
-}
-```
+## Tests
 
-GIDs are 16-byte binary values, as in `probe.PathKey`; they become strings
-only for logs.
+- Pure Go (any OS): event decoding against the C layout, the table
+  (create/RTR/reset/destroy/close, handle reuse, context scoping, QP types),
+  the kernel flow-label arithmetic, the sysfs lookups, the service monitor
+  with a fake tracer and controller, the prober's service pass scheduling,
+  the telemetry instruments, config validation, and the controller RPC.
+- `TestTracerOpenClose` (Linux, root): loads and attaches the committed
+  objects into the running kernel; CI runs it under `sudo`.
+- `TestServiceTracingTracesRCApplication` (soft-RoCE e2e): traces
+  `ibv_rc_pingpong` between the two rxe devices and checks that each side's
+  RTR carries the other's GID and QPN, that the table sees two connections
+  with one effective flow label, and that nothing was dropped.
+  `TestServiceTracingProbePath` sends a `SERVICE_TRACING` probe with an
+  explicit label through the prober and checks the result.
 
-The kernel program writes fixed-layout create, modify-to-RTR, and destroy
-events to the ring buffer. Each event carries the device discriminator and
-port with the QPN. The Go reader resolves the discriminator to `DeviceGID` and
-folds events into a `map[QPKey]*QPRecord`. Reporting aggregates QPs to
-**service (cgroup) × remote ToR**, so no GID or PID reaches a metric.
+## Follow-ups
 
-### Reporting to the controller
-
-**First round: no controller reporting.** The table stays local and is
-exposed only through low-cardinality OTLP metrics. This proves the tracer with
-the least surface area and no proto change.
-
-**Second round: a new RPC**, `ReportServiceTracing(ServiceTracingReport)
-returns (ServiceTracingAck)`, following the `AnalysisReporter` best-effort
-pattern. Extending `ReportProbeAnalysis` is rejected: service data has a
-different shape, a lower and event-driven cadence, and a different consumer
-(service-impact correlation, not SLA detection or localization).
-
-### OTLP metrics (first round)
-
-Registered on the agent's `rpingmesh.agent` meter, next to
-`rpingmesh.agent.self_throttle`:
-
-| Metric | Type | Attributes | Meaning |
-|--------|------|------------|---------|
-| `rpingmesh.agent.service_trace_enabled` | Gauge (0/1) | none | tracer active or degraded |
-| `rpingmesh.agent.active_qps` | Gauge | none | live application QPs observed |
-| `rpingmesh.agent.qp_events_total` | Counter | `kind` (`create`/`modify`/`destroy`) | traced lifecycle events |
-
-Per-service and per-remote-ToR attributes wait for the second round, when a
-bounded service key (a cgroup→service-name mapping) exists. PID and GID
-attributes are unbounded and never allowed. The local RNIC
-(`source_rdma_device`) is bounded and may be added if per-device counts are
-needed.
-
-## Security and systemd Impact
-
-On 5.8+, loading programs and maps needs **`CAP_BPF`**, and attaching
-kprobe/fentry programs needs **`CAP_PERFMON`**. Older kernels need
-`CAP_SYS_ADMIN`, which this design does not support. The agent also needs
-read access to `/sys/kernel/btf/vmlinux`.
-
-The base unit changes only when tracing is enabled:
-
-- **Capabilities.** Add `CAP_BPF CAP_PERFMON` to `CapabilityBoundingSet` and
-  `AmbientCapabilities`, keeping `CAP_IPC_LOCK`. Do not add `CAP_SYS_ADMIN`.
-- **Syscall filter.** `@system-service` may not include `bpf()` and
-  `perf_event_open()` on every systemd version. Add them explicitly, for
-  example with a second `SystemCallFilter=bpf perf_event_open` line.
-  Otherwise loading fails with `EPERM`.
-- **`MemoryDenyWriteExecute=yes`** restricts userspace W+X mappings, not the
-  in-kernel BPF JIT, so it should not block loading. Verify on the target
-  kernel.
-- **`RestrictNamespaces=yes`, `LockPersonality=yes`**: expected to be
-  compatible; verify.
-- **`ProtectKernelTunables=yes`** makes parts of `/sys` read-only but still
-  readable, so reading BTF should work; verify the path is visible.
-- **`ProtectControlGroups=yes`** makes the cgroup tree read-only. Reading it
-  to map cgroup IDs to names should still work; verify.
-- **Kernel lockdown.** In lockdown "confidentiality" mode the kernel blocks
-  BPF regardless of capabilities. The agent can only detect this and degrade.
-
-**Packaging.** Keep the base unit at `CAP_IPC_LOCK` and ship an opt-in
-systemd drop-in (`rpingmesh-agent.service.d/10-ebpf.conf`) that operators
-enable together with tracing. The nfpm package can include it as an example
-file. Least privilege stays the default, and enabling tracing is an explicit,
-auditable capability grant.
-
-## Alternatives Considered
-
-- **libbpfgo.** Rejected: a libbpf C dependency and a second C link next to
-  Zig. Its only advantage is closer parity with upstream libbpf helpers.
-- **Runtime compilation (BCC style).** Rejected: needs clang and kernel
-  headers on every host. CO-RE needs only BTF.
-- **Extend `ReportProbeAnalysis`.** Rejected; see
-  [Reporting to the controller](#reporting-to-the-controller).
-- **RDMA netlink instead of eBPF.** `rdma resource show qp` lists QPs with
-  their owning PID, needs no eBPF or `CAP_BPF`, and uses `AF_NETLINK`, which
-  the unit already allows. It is a valid way to ship a live-QP count first.
-  But it is a polled snapshot: it misses short-lived QPs and does not give
-  lifecycle events or a reliable RTR-time remote binding. If the first round
-  needs only a liveness count, netlink polling is simpler; eBPF is warranted
-  once event-accurate lifecycle and remote binding are required. See
-  [Open Questions](#open-questions).
-- **Trace in the mlx5 driver.** Rejected as vendor-specific; `ib_core` is
-  vendor-neutral.
-- **Loosen the base unit for everyone.** Rejected; the drop-in keeps
-  capabilities opt-in.
-
-## Test Plan
-
-eBPF needs a real Linux kernel with BTF, so most logic is designed to be
-testable without loading a program.
-
-- **Pure Go (no kernel).** Table folding (create → RTR → destroy, device→GID
-  resolution, cgroup keying) driven by synthetic events, and the degradation
-  decision (old kernel, no BTF, missing capability) with injected
-  feature-probe results. The `!linux` stub builds and does nothing.
-- **Composite-key regression.** Two create events with the same QPN on two
-  devices must produce two `QPKey` entries mapped to their own services.
-- **Loader/verifier (Linux CI).** The embedded CO-RE object loads and passes
-  the verifier against the CI kernel's BTF. `cilium/ebpf` can load without
-  attaching, so no QP traffic is needed.
-- **Integration (Linux + rxe).** Create an application RC QP on soft-RoCE
-  (for example with an `ibv_rc_pingpong`-style helper) and assert the tracer
-  sees create, modify, and destroy. Run it as a privileged Linux-only test,
-  like `make test-e2e`.
-- **systemd.** `systemd-analyze verify` on the base unit and the drop-in.
-  With the drop-in, loading succeeds; without it, the agent logs `EPERM` and
-  continues.
-- **Cardinality.** First-round metrics carry no PID or GID attributes.
-
-## Implementation Plan (PR breakdown)
-
-1. **P3-J.1: skeleton and degradation (nothing attached).** Add
-   `cilium/ebpf` and `bpf2go` to the agent build, the `servicetrace` package
-   with the Linux/`!linux` split, feature detection, the
-   `service_tracing_enabled` config key, and the `service_trace_enabled`
-   gauge. Proves the loader coexists with the Zig/Cgo build at no risk to
-   probing.
-2. **P3-J.2: QP-lifecycle program and local table.** CO-RE program for create
-   and destroy (plus modify-to-RTR), ring-buffer reader, QP→service table,
-   `active_qps` and `qp_events_total`. Loader/verifier CI test and rxe
-   integration test. **This is the minimal useful deliverable.** If loader
-   work slips, ship the netlink poll here first.
-3. **P3-J.3: systemd drop-in and packaging.** `10-ebpf.conf`
-   (`CAP_BPF`/`CAP_PERFMON`, syscall filter), nfpm inclusion as an opt-in
-   example, and a note in the README "Deployment" section.
-4. **P3-J.4 (second round): controller reporting and service-impact join.**
-   `ReportServiceTracing` RPC, a best-effort reporter modeled on
-   `AnalysisReporter`, a controller-side join of service × remote ToR against
-   localization findings (see `analyzer-phase2-localization.md`), and a
-   bounded service label.
-5. **P3-J.5 (later): service-aware probe prioritization.** Use QP liveness to
-   bias pinglists or probe rates toward pairs that carry traffic. Depends on
-   J.4.
-
-## Open Questions
-
-- **eBPF or netlink for the first slice?** If the immediate goal is only "how
-  many application QPs are live per host", `rdma resource show qp` is much
-  simpler. Are event-accurate lifecycle and RTR-time remote binding required
-  from day one? This decides whether J.2 uses eBPF or netlink. *(User input
-  needed.)*
-- **Service identity.** Can cgroup IDs be resolved to service names in the
-  target environment (systemd slice, Kubernetes pod), and who owns that
-  mapping (agent config, a sidecar, the controller)? This gates the bounded
-  service label. *(User input needed.)*
-- **Fleet kernel versions.** Tracing is off below 5.8. Is that acceptable for
-  the fleet? The answer also sets how many attach-point candidates the loader
-  must carry. *(User input helpful.)*
-- **Capability posture.** Is granting `CAP_BPF` and `CAP_PERFMON` acceptable
-  to the security owners? The drop-in keeps it opt-in, but the policy decision
-  is theirs. *(User input needed.)*
+- **Controller-side service SLAs.** Service results are not reported to the
+  analyzer. A `pinglist_type` on `PathSummary` and a separate evaluation of
+  service paths would let the controller flag service-network violations
+  (the paper's Analyzer evaluates the two networks separately).
+- **Existing connections.** A snapshot from RDMA netlink
+  (`rdma resource show qp`) at startup would seed the table with QPs that
+  predate the agent, which the trace alone cannot see.
+- **Service identity.** Events carry the cgroup id and comm; mapping them to
+  a bounded service label (a systemd slice or a Kubernetes pod) would allow
+  per-service attribution without unbounded metric attributes.
+- **DC transport.** mlx5's dynamically connected transport binds the remote
+  per work request, not at RTR, and is invisible to this tracer.

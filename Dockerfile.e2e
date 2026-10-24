@@ -2,7 +2,9 @@
 #
 # Builds the Zig RDMA bridge library and compiles the e2e test binary.
 # At runtime, the container loads rdma_rxe, creates two soft-RoCE devices
-# (rxe0 on eth0, rxe1 on dummy0), and runs TestRDMAE2E.
+# (rxe0 on eth0, rxe1 on dummy0), and runs TestRDMAE2E. ibverbs-utils
+# provides ibv_rc_pingpong, the RC application the service-tracing e2e test
+# traces with eBPF (the privileged container may load eBPF programs).
 #
 # Usage:
 #   docker compose -f docker-compose.e2e.yml run --rm rdma-e2e
@@ -19,7 +21,7 @@ ARG ZIG_VERSION=0.17.0
 # Install runtime and build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl xz-utils make gcc libc6-dev \
-        libibverbs-dev librdmacm-dev rdma-core \
+        libibverbs-dev librdmacm-dev rdma-core ibverbs-utils \
         iproute2 kmod iputils-ping iptables tcpdump \
         protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*

@@ -81,6 +81,16 @@ contents:
     file_info:
       mode: 0644
 
+  # Opt-in capability grant for service tracing (service_tracing_enabled).
+  # Shipped as an example, not installed under /etc/systemd, so the base
+  # unit keeps its least-privilege CAP_IPC_LOCK-only posture unless an
+  # operator enables the feature (see README.md "Deployment").
+  - src: packaging/systemd/rpingmesh-agent.service.d/10-service-tracing.conf
+    dst: /usr/share/doc/rpingmesh-agent/examples/rpingmesh-agent.service.d/10-service-tracing.conf
+    type: doc
+    file_info:
+      mode: 0644
+
 scripts:
   postinstall: packaging/nfpm/scripts/postinstall-agent.sh
   preremove: packaging/nfpm/scripts/preremove-agent.sh

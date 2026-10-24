@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Service tracing (the paper's section 4.2.2), opt-in with
+  `service_tracing_enabled`. The agent loads an eBPF program (cilium/ebpf,
+  compiled ahead of time with bpf2go and committed) that attaches kprobes to
+  the uverbs entry points and parses the QP create, modify and destroy
+  commands of the uverbs user-space ABI, so it works with any RDMA stack,
+  including out-of-tree ones without module BTF. Traced RC/UC/XRC
+  connections become `SERVICE_TRACING` probe targets, each probed with the
+  flow's effective flow label (the kernel's `rdma_get_udp_sport` convention)
+  so the probe takes the service flow's ECMP path, at an aggregate rate per
+  RNIC (`service_tracing_probe_rate_per_second`, default 100) with passes
+  spaced by `service_tracing_probe_interval_ms` (default 10). Results are
+  recorded on the new `rpingmesh.service.*` instruments; the tracer's state
+  is on `rpingmesh.agent.service_trace_active`, `service_connections`,
+  `service_flows`, `service_trace_events_total` and
+  `service_trace_dropped_total`. A tracer that cannot start (no Linux, no
+  kernel BTF, missing `CAP_BPF`/`CAP_PERFMON`, `ib_uverbs` not loaded) is
+  logged and the agent continues without it.
+- `GetTargetRnicInfo` controller RPC, resolving the destination GIDs of
+  traced flows into probe targets, and `PinglistType.SERVICE_TRACING`.
+- `make generate-bpf` / `make check-bpf`, a systemd drop-in granting
+  `CAP_BPF` and `CAP_PERFMON`
+  (`packaging/systemd/rpingmesh-agent.service.d/10-service-tracing.conf`,
+  shipped as an example by the agent package), and a soft-RoCE e2e test that
+  traces `ibv_rc_pingpong`.
+
 ## [0.8.0] - 2026-10-22
 
 ### Fixed

@@ -803,12 +803,8 @@ func (a *Agent) createServiceTracing() {
 	if err != nil {
 		a.logger.Warn().Err(err).
 			Msg("Service tracing is enabled but the eBPF tracer could not start; continuing without it")
-		if a.metrics != nil {
-			inactive := telemetry.ServiceTracingSample{}
-			if err := a.metrics.RegisterServiceTracingCallback(func() telemetry.ServiceTracingSample { return inactive }); err != nil {
-				a.logger.Warn().Err(err).Msg("Failed to register service tracing metric callback")
-			}
-		}
+		// Still export service_trace_active = 0, so the degradation is visible.
+		a.registerServiceTracingMetrics(func() telemetry.ServiceTracingSample { return telemetry.ServiceTracingSample{} })
 		return
 	}
 
@@ -825,16 +821,23 @@ func (a *Agent) createServiceTracing() {
 		})
 	}
 	a.serviceMonitor = NewServiceMonitor(a.grpcClient, tracer, a.cfg.AgentID, devices, a.cfg.PinglistUpdateIntervalSec)
-	if a.metrics != nil {
-		if err := a.metrics.RegisterServiceTracingCallback(a.serviceMonitor.Stats); err != nil {
-			a.logger.Warn().Err(err).Msg("Failed to register service tracing metric callback")
-		}
-	}
+	a.registerServiceTracingMetrics(a.serviceMonitor.Stats)
 	a.logger.Info().
 		Int("devices", len(devices)).
 		Int("probe_rate_per_second", a.cfg.ServiceTracingProbeRatePerSecond).
 		Uint32("probe_interval_ms", a.cfg.ServiceTracingProbeIntervalMS).
 		Msg("Service tracing started: eBPF tracer attached to the uverbs entry points")
+}
+
+// registerServiceTracingMetrics wires the service tracing gauges to read,
+// when metrics are enabled.
+func (a *Agent) registerServiceTracingMetrics(read func() telemetry.ServiceTracingSample) {
+	if a.metrics == nil {
+		return
+	}
+	if err := a.metrics.RegisterServiceTracingCallback(read); err != nil {
+		a.logger.Warn().Err(err).Msg("Failed to register service tracing metric callback")
+	}
 }
 
 // createClusterMonitors creates one ClusterMonitor per device, each

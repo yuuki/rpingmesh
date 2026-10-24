@@ -319,67 +319,42 @@ func (m *ServiceMonitor) loadDeviceNumbers() {
 	m.devNumbers = devs
 }
 
-// deviceName resolves a uverbs device number, re-reading sysfs once per
-// rebuild for numbers it has not seen. rescanned is the per-rebuild guard.
-func (m *ServiceMonitor) deviceName(dev uint32, rescanned *bool) (string, bool) {
-	if name, ok := m.devNumbers[dev]; ok {
-		return name, true
-	}
-	if !*rescanned {
-		*rescanned = true
-		m.loadDeviceNumbers()
-		if name, ok := m.devNumbers[dev]; ok {
-			return name, true
-		}
-	}
-	return "", false
-}
-
-// rebuild groups the live connections into flows per device, resolves their
-// remote GIDs (all of them when resolveAll, else only the unknown ones) and
-// pushes the resulting targets to each device's prober. It reports whether
-// any flow is left unresolved, so the caller can schedule a retry.
-func (m *ServiceMonitor) rebuild(ctx context.Context, resolveAll bool) (unresolvedLeft bool) {
-	m.reconcile()
-	conns := m.table.Connections()
+// connectionsByDevice groups the live connections by monitored RDMA device
+// and counts those on other devices (not opened by the agent, or unknown).
+// A device number it has not seen makes it re-read sysfs once, for a device
+// that appeared after startup.
+func (m *ServiceMonitor) connectionsByDevice() (map[string][]servicetrace.Connection, uint64) {
 	perDevice := make(map[string][]servicetrace.Connection)
-	rescanned := false
 	var other uint64
-	for _, c := range conns {
-		name, ok := m.deviceName(c.Dev, &rescanned)
+	rescanned := false
+	for _, c := range m.table.Connections() {
+		name, ok := m.devNumbers[c.Dev]
+		if !ok && !rescanned {
+			rescanned = true
+			m.loadDeviceNumbers()
+			name, ok = m.devNumbers[c.Dev]
+		}
 		if !ok || m.devices[name] == nil {
 			other++
 			continue
 		}
 		perDevice[name] = append(perDevice[name], c)
 	}
+	return perDevice, other
+}
 
+// rebuild reconciles the table, groups the live connections into flows per
+// device, resolves their remote GIDs (all of them when resolveAll, else only
+// the unknown ones) and pushes the resulting targets to each device's
+// prober. It reports whether any flow is left unresolved, so the caller can
+// schedule a retry.
+func (m *ServiceMonitor) rebuild(ctx context.Context, resolveAll bool) (unresolvedLeft bool) {
+	m.reconcile()
+	perDevice, other := m.connectionsByDevice()
 	for name, d := range m.devices {
-		flows := make(map[serviceFlowKey]int)
-		for _, c := range perDevice[name] {
-			m.checkSourceGID(d, c)
-			flows[serviceFlowKey{remoteGID: c.RemoteGID, flowLabel: c.EffectiveFlowLabel()}]++
-		}
-		targets, unresolved := m.resolveFlows(ctx, d, flows, resolveAll)
-		d.Prober.UpdateServiceTargets(targets)
-		if unresolved > 0 {
+		if m.rebuildDevice(ctx, d, perDevice[name], resolveAll) > 0 {
 			unresolvedLeft = true
 		}
-
-		m.statsMu.Lock()
-		d.connections = len(perDevice[name])
-		d.flowsProbed = len(targets)
-		d.flowsUnresolved = unresolved
-		m.statsMu.Unlock()
-
-		m.logger.Info().
-			Str("device", name).
-			Int("connections", len(perDevice[name])).
-			Int("flows", len(flows)).
-			Int("probed", len(targets)).
-			Int("unresolved", unresolved).
-			Bool("resolve_all", resolveAll).
-			Msg("Rebuilt service tracing targets")
 	}
 
 	m.statsMu.Lock()
@@ -391,6 +366,34 @@ func (m *ServiceMonitor) rebuild(ctx context.Context, resolveAll bool) (unresolv
 			Msg("Traced connections on RDMA devices the agent does not probe from; ignored")
 	}
 	return unresolvedLeft
+}
+
+// rebuildDevice turns one device's connections into flows and targets and
+// returns the number of flows left unresolved.
+func (m *ServiceMonitor) rebuildDevice(ctx context.Context, d *serviceDeviceState, conns []servicetrace.Connection, resolveAll bool) int {
+	flows := make(map[serviceFlowKey]int)
+	for _, c := range conns {
+		m.checkSourceGID(d, c)
+		flows[serviceFlowKey{remoteGID: c.RemoteGID, flowLabel: c.EffectiveFlowLabel()}]++
+	}
+	targets, unresolved := m.resolveFlows(ctx, d, flows, resolveAll)
+	d.Prober.UpdateServiceTargets(targets)
+
+	m.statsMu.Lock()
+	d.connections = len(conns)
+	d.flowsProbed = len(targets)
+	d.flowsUnresolved = unresolved
+	m.statsMu.Unlock()
+
+	m.logger.Info().
+		Str("device", d.Name).
+		Int("connections", len(conns)).
+		Int("flows", len(flows)).
+		Int("probed", len(targets)).
+		Int("unresolved", unresolved).
+		Bool("resolve_all", resolveAll).
+		Msg("Rebuilt service tracing targets")
+	return unresolved
 }
 
 // resolveFlows returns one SERVICE_TRACING target per flow whose remote GID

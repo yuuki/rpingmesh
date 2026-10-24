@@ -96,7 +96,9 @@ generate-bpf:
 
 # Verify the eBPF program still compiles and that the committed Go bindings
 # are up to date, without touching the committed objects (the .o files differ
-# between clang versions, so only the .go files are compared).
+# between clang versions, so only the .go files are compared). The bpf2go
+# command line mirrors the go:generate directive in
+# internal/agent/servicetrace/generate.go; keep the two in sync.
 check-bpf:
 	@echo "==> Checking eBPF program and bindings..."
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \

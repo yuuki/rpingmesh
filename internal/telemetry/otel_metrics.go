@@ -1083,6 +1083,13 @@ type ServiceTracingSample struct {
 	DecodeErrors      uint64
 }
 
+// labelledCount pairs a counter with its attribute value for the
+// observable counters below.
+type labelledCount struct {
+	label string
+	n     uint64
+}
+
 // RegisterServiceTracingCallback registers an OTel callback reporting the
 // service tracer's state: rpingmesh.agent.service_trace_active,
 // service_connections and service_flows (by source_rdma_device and, for the
@@ -1110,16 +1117,16 @@ func (mc *MetricsCollector) RegisterServiceTracingCallback(read func() ServiceTr
 				o.ObserveInt64(mc.serviceFlows, int64(d.FlowsUnresolved),
 					metric.WithAttributes(dev, attribute.String("state", "unresolved")))
 			}
-			for kind, n := range map[string]uint64{
-				"create": s.Creates, "connect": s.Connects, "reset": s.Resets,
-				"destroy": s.Destroys, "context_close": s.ContextCloses, "unknown_qp": s.UnknownQPs,
+			for _, e := range []labelledCount{
+				{"create", s.Creates}, {"connect", s.Connects}, {"reset", s.Resets},
+				{"destroy", s.Destroys}, {"context_close", s.ContextCloses}, {"unknown_qp", s.UnknownQPs},
 			} {
-				o.ObserveInt64(mc.serviceTraceEvents, int64(n), metric.WithAttributes(attribute.String("kind", kind)))
+				o.ObserveInt64(mc.serviceTraceEvents, int64(e.n), metric.WithAttributes(attribute.String("kind", e.label)))
 			}
-			for reason, n := range map[string]uint64{
-				"ring_buffer": s.RingBufferDropped, "parse": s.ParseErrors, "decode": s.DecodeErrors,
+			for _, e := range []labelledCount{
+				{"ring_buffer", s.RingBufferDropped}, {"parse", s.ParseErrors}, {"decode", s.DecodeErrors},
 			} {
-				o.ObserveInt64(mc.serviceTraceDropped, int64(n), metric.WithAttributes(attribute.String("reason", reason)))
+				o.ObserveInt64(mc.serviceTraceDropped, int64(e.n), metric.WithAttributes(attribute.String("reason", e.label)))
 			}
 			return nil
 		},

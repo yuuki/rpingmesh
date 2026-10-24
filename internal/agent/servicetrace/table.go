@@ -101,111 +101,134 @@ func (t *Table) Apply(ev Event) bool {
 
 	switch ev.Kind {
 	case KindQPCreate:
-		t.counters.Creates++
-		c := t.ctxs[ev.Context]
-		if c == nil {
-			c = &uverbsContext{dev: ev.Dev, pid: ev.PID, qps: make(map[uint32]*qpEntry)}
-			t.ctxs[ev.Context] = c
-		}
-		// The kernel reuses handles once freed, so a create over an existing
-		// handle means its destroy was missed: the old entry is gone.
-		prev := c.qps[ev.QPHandle]
-		c.qps[ev.QPHandle] = &qpEntry{
-			qpn:      ev.QPNum,
-			qpType:   ev.QPType,
-			pid:      ev.PID,
-			comm:     ev.Comm,
-			cgroupID: ev.CgroupID,
-		}
-		return prev != nil && prev.conn != nil
-
+		return t.applyCreate(ev)
 	case KindQPModify:
-		c := t.ctxs[ev.Context]
-		var q *qpEntry
-		if c != nil {
-			q = c.qps[ev.QPHandle]
-		}
-		if q == nil {
-			t.counters.UnknownQPs++
-			return false
-		}
-		switch {
-		case ev.IsConnect():
-			if !IsConnectedType(q.qpType) {
-				t.counters.Ignored++
-				return false
-			}
-			t.counters.Connects++
-			// The port the address vector names (the one sgid_index refers
-			// to); the command's own port_num travels with the INIT
-			// transition and is zero here.
-			port := ev.DestPortNum
-			if port == 0 {
-				port = ev.PortNum
-			}
-			q.conn = &Connection{
-				Dev:           c.dev,
-				Context:       ev.Context,
-				Handle:        ev.QPHandle,
-				LocalQPN:      q.qpn,
-				QPType:        q.qpType,
-				PID:           q.pid,
-				Comm:          q.comm,
-				CgroupID:      q.cgroupID,
-				RemoteGID:     ev.DGID,
-				RemoteQPN:     ev.DestQPNum,
-				FlowLabel:     ev.FlowLabel & FlowLabelMask,
-				SGIDIndex:     ev.SGIDIndex,
-				Port:          port,
-				TrafficClass:  ev.TrafficClass,
-				SL:            ev.SL,
-				HopLimit:      ev.HopLimit,
-				ConnectedAtNS: ev.TimestampNS,
-			}
+		return t.applyModify(ev)
+	case KindQPDestroy:
+		return t.applyDestroy(ev)
+	case KindContextClose:
+		return t.applyContextClose(ev)
+	}
+	return false
+}
+
+// lookup returns the context and QP an event refers to; either is nil when
+// unknown. Caller holds mu.
+func (t *Table) lookup(ev Event) (*uverbsContext, *qpEntry) {
+	c := t.ctxs[ev.Context]
+	if c == nil {
+		return nil, nil
+	}
+	return c, c.qps[ev.QPHandle]
+}
+
+// hasConnection reports whether any QP of the context is connected.
+func (c *uverbsContext) hasConnection() bool {
+	for _, q := range c.qps {
+		if q.conn != nil {
 			return true
-		case ev.IsReset():
-			t.counters.Resets++
-			had := q.conn != nil
-			q.conn = nil
-			return had
-		default:
+		}
+	}
+	return false
+}
+
+func (t *Table) applyCreate(ev Event) bool {
+	t.counters.Creates++
+	c := t.ctxs[ev.Context]
+	if c == nil {
+		c = &uverbsContext{dev: ev.Dev, pid: ev.PID, qps: make(map[uint32]*qpEntry)}
+		t.ctxs[ev.Context] = c
+	}
+	// The kernel reuses handles once freed, so a create over an existing
+	// handle means its destroy was missed: the old entry is gone.
+	prev := c.qps[ev.QPHandle]
+	c.qps[ev.QPHandle] = &qpEntry{
+		qpn:      ev.QPNum,
+		qpType:   ev.QPType,
+		pid:      ev.PID,
+		comm:     ev.Comm,
+		cgroupID: ev.CgroupID,
+	}
+	return prev != nil && prev.conn != nil
+}
+
+func (t *Table) applyModify(ev Event) bool {
+	c, q := t.lookup(ev)
+	if q == nil {
+		t.counters.UnknownQPs++
+		return false
+	}
+	switch {
+	case ev.IsConnect():
+		if !IsConnectedType(q.qpType) {
 			t.counters.Ignored++
 			return false
 		}
+		t.counters.Connects++
+		q.conn = newConnection(c, q, ev)
+		return true
+	case ev.IsReset():
+		t.counters.Resets++
+		had := q.conn != nil
+		q.conn = nil
+		return had
+	}
+	t.counters.Ignored++
+	return false
+}
 
-	case KindQPDestroy:
-		t.counters.Destroys++
-		c := t.ctxs[ev.Context]
-		if c == nil {
-			t.counters.UnknownQPs++
-			return false
-		}
-		q := c.qps[ev.QPHandle]
-		if q == nil {
-			t.counters.UnknownQPs++
-			return false
-		}
-		delete(c.qps, ev.QPHandle)
-		if len(c.qps) == 0 {
-			delete(t.ctxs, ev.Context)
-		}
-		return q.conn != nil
-
-	case KindContextClose:
-		t.counters.ContextCloses++
-		c := t.ctxs[ev.Context]
-		if c == nil {
-			return false
-		}
-		delete(t.ctxs, ev.Context)
-		for _, q := range c.qps {
-			if q.conn != nil {
-				return true
-			}
-		}
+func (t *Table) applyDestroy(ev Event) bool {
+	t.counters.Destroys++
+	c, q := t.lookup(ev)
+	if q == nil {
+		t.counters.UnknownQPs++
 		return false
 	}
-	return false
+	delete(c.qps, ev.QPHandle)
+	if len(c.qps) == 0 {
+		delete(t.ctxs, ev.Context)
+	}
+	return q.conn != nil
+}
+
+func (t *Table) applyContextClose(ev Event) bool {
+	t.counters.ContextCloses++
+	c := t.ctxs[ev.Context]
+	if c == nil {
+		return false
+	}
+	delete(t.ctxs, ev.Context)
+	return c.hasConnection()
+}
+
+// newConnection builds the connection an RTR transition establishes.
+func newConnection(c *uverbsContext, q *qpEntry, ev Event) *Connection {
+	// The port the address vector names (the one sgid_index refers to);
+	// the command's own port_num travels with the INIT transition and is
+	// zero here.
+	port := ev.DestPortNum
+	if port == 0 {
+		port = ev.PortNum
+	}
+	return &Connection{
+		Dev:           c.dev,
+		Context:       ev.Context,
+		Handle:        ev.QPHandle,
+		LocalQPN:      q.qpn,
+		QPType:        q.qpType,
+		PID:           q.pid,
+		Comm:          q.comm,
+		CgroupID:      q.cgroupID,
+		RemoteGID:     ev.DGID,
+		RemoteQPN:     ev.DestQPNum,
+		FlowLabel:     ev.FlowLabel & FlowLabelMask,
+		SGIDIndex:     ev.SGIDIndex,
+		Port:          port,
+		TrafficClass:  ev.TrafficClass,
+		SL:            ev.SL,
+		HopLimit:      ev.HopLimit,
+		ConnectedAtNS: ev.TimestampNS,
+	}
 }
 
 // ReapContexts drops every context whose owning process alive reports as
@@ -225,11 +248,7 @@ func (t *Table) ReapContexts(alive func(pid uint32) bool) (removed int, changed 
 		delete(t.ctxs, key)
 		removed++
 		t.counters.ContextCloses++
-		for _, q := range c.qps {
-			if q.conn != nil {
-				changed = true
-			}
-		}
+		changed = changed || c.hasConnection()
 	}
 	return removed, changed
 }

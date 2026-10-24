@@ -135,9 +135,13 @@ static __always_inline void stat_inc(__u32 idx)
 		__sync_fetch_and_add(v, 1);
 }
 
-static __always_inline __u32 file_dev(struct file *filp)
+/* Fills the fields every event of a command shares. */
+static __always_inline void init_event(struct qp_event *ev, struct file *filp, __u32 kind, __u32 src)
 {
-	return BPF_CORE_READ(filp, f_inode, i_rdev);
+	ev->kind = kind;
+	ev->src = src;
+	ev->ctx = (__u64)filp;
+	ev->dev = BPF_CORE_READ(filp, f_inode, i_rdev);
 }
 
 /* Fills the identity fields and emits ev. */
@@ -177,6 +181,28 @@ static __always_inline void unstage(void)
 	bpf_map_delete_elem(&pending_cmds, &key);
 }
 
+/* Reads attribute i of an ioctl attribute array in user memory. */
+static __always_inline int read_attr(struct ib_uverbs_attr *a, __u64 attrs, __u32 i)
+{
+	return bpf_probe_read_user(a, sizeof(*a),
+				   (const void *)(attrs + (__u64)i * sizeof(*a)));
+}
+
+/* Finds the attribute attr_id among the first n of an array in user memory;
+ * returns true and fills *a when found. */
+static __always_inline bool find_attr(struct ib_uverbs_attr *a, __u64 attrs, __u32 n, __u16 attr_id)
+{
+	for (__u32 i = 0; i < MAX_ATTRS; i++) {
+		if (i >= n)
+			break;
+		if (read_attr(a, attrs, i))
+			break;
+		if (a->attr_id == attr_id)
+			return true;
+	}
+	return false;
+}
+
 /* Parses a MODIFY_QP body (the EX variant has the same prefix). */
 static __always_inline int parse_modify(struct qp_event *ev, const void *body)
 {
@@ -203,7 +229,7 @@ static __always_inline int parse_modify(struct qp_event *ev, const void *body)
  * Stages a write-path command. body points to the command body in user
  * memory (after the command headers); resp is the user pointer to the
  * response buffer, or 0 when the caller does not know it yet (the legacy
- * create/open/destroy bodies carry it in their first word).
+ * create/open bodies carry it in their first word).
  */
 static __always_inline void stage_write_cmd(struct file *filp, __u32 command,
 					    const void *body, __u64 resp, __u32 src)
@@ -211,139 +237,132 @@ static __always_inline void stage_write_cmd(struct file *filp, __u32 command,
 	struct pending p = {};
 	__u32 cmd = command & ~IB_USER_VERBS_CMD_FLAG_EXTENDED;
 	bool ext = command & IB_USER_VERBS_CMD_FLAG_EXTENDED;
-
-	p.ev.ctx = (__u64)filp;
-	p.ev.dev = file_dev(filp);
-	p.ev.src = src;
+	__u8 qp_type = 0;
+	__u32 word = 0;
 
 	switch (cmd) {
 	case IB_USER_VERBS_CMD_MODIFY_QP:
-		if (parse_modify(&p.ev, body)) {
-			stat_inc(STAT_PARSE_ERRORS);
-			return;
-		}
-		p.ev.kind = EV_QP_MODIFY;
+		init_event(&p.ev, filp, EV_QP_MODIFY, src);
+		if (parse_modify(&p.ev, body))
+			goto parse_error;
 		break;
 
-	case IB_USER_VERBS_CMD_CREATE_QP: {
-		__u8 qp_type = 0;
-		__u32 off = ext ? EX_CREATE_QP_QP_TYPE_OFF : CREATE_QP_QP_TYPE_OFF;
-		if (bpf_probe_read_user(&qp_type, sizeof(qp_type), body + off)) {
-			stat_inc(STAT_PARSE_ERRORS);
-			return;
-		}
+	case IB_USER_VERBS_CMD_CREATE_QP:
+		init_event(&p.ev, filp, EV_QP_CREATE, src);
+		if (bpf_probe_read_user(&qp_type, sizeof(qp_type),
+					body + (ext ? EX_CREATE_QP_QP_TYPE_OFF : CREATE_QP_QP_TYPE_OFF)))
+			goto parse_error;
+		/* The extended body has no response word; its pointer came with
+		 * the extended header (write) or the CORE_OUT attribute (ioctl). */
 		if (!resp && !ext &&
-		    bpf_probe_read_user(&resp, sizeof(resp), body + CREATE_QP_RESPONSE_OFF)) {
-			stat_inc(STAT_PARSE_ERRORS);
-			return;
-		}
+		    bpf_probe_read_user(&resp, sizeof(resp), body + CREATE_QP_RESPONSE_OFF))
+			goto parse_error;
 		if (!resp)
 			return;
-		p.ev.kind = EV_QP_CREATE;
 		p.ev.qp_type = qp_type;
 		p.resp = resp;
 		break;
-	}
 
-	case IB_USER_VERBS_CMD_OPEN_QP: {
-		__u8 qp_type = 0;
-		__u32 qpn = 0;
+	case IB_USER_VERBS_CMD_OPEN_QP:
+		init_event(&p.ev, filp, EV_QP_CREATE, src);
 		if (bpf_probe_read_user(&qp_type, sizeof(qp_type), body + OPEN_QP_QP_TYPE_OFF) ||
-		    bpf_probe_read_user(&qpn, sizeof(qpn), body + OPEN_QP_QPN_OFF)) {
-			stat_inc(STAT_PARSE_ERRORS);
-			return;
-		}
+		    bpf_probe_read_user(&word, sizeof(word), body + OPEN_QP_QPN_OFF))
+			goto parse_error;
 		if (!resp &&
-		    bpf_probe_read_user(&resp, sizeof(resp), body + OPEN_QP_RESPONSE_OFF)) {
-			stat_inc(STAT_PARSE_ERRORS);
-			return;
-		}
+		    bpf_probe_read_user(&resp, sizeof(resp), body + OPEN_QP_RESPONSE_OFF))
+			goto parse_error;
 		if (!resp)
 			return;
-		p.ev.kind = EV_QP_CREATE;
 		p.ev.qp_type = qp_type;
-		p.ev.qp_num = qpn;
+		p.ev.qp_num = word;
 		p.resp = resp;
 		p.from_open_qp = 1;
 		break;
-	}
 
-	case IB_USER_VERBS_CMD_DESTROY_QP: {
-		__u32 handle = 0;
-		if (bpf_probe_read_user(&handle, sizeof(handle), body + DESTROY_QP_HANDLE_OFF)) {
-			stat_inc(STAT_PARSE_ERRORS);
-			return;
-		}
-		p.ev.kind = EV_QP_DESTROY;
-		p.ev.qp_handle = handle;
+	case IB_USER_VERBS_CMD_DESTROY_QP:
+		init_event(&p.ev, filp, EV_QP_DESTROY, src);
+		if (bpf_probe_read_user(&word, sizeof(word), body + DESTROY_QP_HANDLE_OFF))
+			goto parse_error;
+		p.ev.qp_handle = word;
 		break;
-	}
 
 	default:
 		return;
 	}
 	stage(&p);
+	return;
+
+parse_error:
+	stat_inc(STAT_PARSE_ERRORS);
 }
 
-/* Reads attribute i of an ioctl attribute array in user memory. */
-static __always_inline int read_attr(struct ib_uverbs_attr *a, __u64 attrs, __u32 i)
+/*
+ * Stages an ioctl-native QP_CREATE or QP_DESTROY. The type and the handle
+ * are inline attribute values; for a create, the handle and QPN are only
+ * known at return, so the attribute array is kept for finalize.
+ */
+static __always_inline void stage_native(struct file *filp, __u32 kind, __u64 attrs, __u32 n)
 {
-	return bpf_probe_read_user(a, sizeof(*a),
-				   (const void *)(attrs + (__u64)i * sizeof(*a)));
-}
+	struct pending p = {};
+	struct ib_uverbs_attr a;
 
-/* Completes a staged command after the kernel reported success. */
-static __always_inline void finalize(struct pending *p)
-{
-	struct qp_event ev = p->ev;
-
-	if (ev.kind == EV_QP_CREATE) {
-		if (p->attrs) {
-			/* ioctl QP_CREATE: the kernel wrote the new handle into
-			 * the HANDLE attribute and the QPN behind RESP_QP_NUM. */
-			bool have_handle = false, have_qpn = false;
-			__u32 n = p->num_attrs;
-			for (__u32 i = 0; i < MAX_ATTRS; i++) {
-				struct ib_uverbs_attr a;
-				if (i >= n)
-					break;
-				if (read_attr(&a, p->attrs, i))
-					break;
-				if (a.attr_id == UVERBS_ATTR_CREATE_QP_HANDLE) {
-					ev.qp_handle = (__u32)a.data;
-					have_handle = true;
-				} else if (a.attr_id == UVERBS_ATTR_CREATE_QP_RESP_QP_NUM) {
-					if (!bpf_probe_read_user(&ev.qp_num, sizeof(ev.qp_num),
-								 (const void *)a.data))
-						have_qpn = true;
-				}
-			}
-			if (!have_handle || !have_qpn) {
-				stat_inc(STAT_PARSE_ERRORS);
-				return;
-			}
-		} else {
-			struct ib_uverbs_create_qp_resp_head r;
-			if (bpf_probe_read_user(&r, sizeof(r), (const void *)p->resp)) {
-				stat_inc(STAT_PARSE_ERRORS);
-				return;
-			}
-			ev.qp_handle = r.qp_handle;
-			if (!p->from_open_qp)
-				ev.qp_num = r.qpn;
-		}
+	init_event(&p.ev, filp, kind, SRC_IOCTL_NATIVE);
+	if (kind == EV_QP_CREATE) {
+		if (!find_attr(&a, attrs, n, UVERBS_ATTR_CREATE_QP_TYPE))
+			return;
+		p.ev.qp_type = (__u32)a.data;
+		p.attrs = attrs;
+		p.num_attrs = n;
+	} else {
+		if (!find_attr(&a, attrs, n, UVERBS_ATTR_DESTROY_QP_HANDLE))
+			return;
+		p.ev.qp_handle = (__u32)a.data;
 	}
-	emit(&ev);
+	stage(&p);
 }
 
+/* Reads the handle and QPN of a created QP once the kernel wrote them. */
+static __always_inline int read_created_qp(struct qp_event *ev, const struct pending *p)
+{
+	struct ib_uverbs_attr a;
+	struct ib_uverbs_create_qp_resp_head r;
+
+	if (p->attrs) {
+		/* ioctl QP_CREATE: the kernel wrote the new handle into the
+		 * HANDLE attribute and the QPN behind RESP_QP_NUM. */
+		if (!find_attr(&a, p->attrs, p->num_attrs, UVERBS_ATTR_CREATE_QP_HANDLE))
+			return -1;
+		ev->qp_handle = (__u32)a.data;
+		if (!find_attr(&a, p->attrs, p->num_attrs, UVERBS_ATTR_CREATE_QP_RESP_QP_NUM))
+			return -1;
+		return bpf_probe_read_user(&ev->qp_num, sizeof(ev->qp_num), (const void *)a.data);
+	}
+	if (bpf_probe_read_user(&r, sizeof(r), (const void *)p->resp))
+		return -1;
+	ev->qp_handle = r.qp_handle;
+	if (!p->from_open_qp)
+		ev->qp_num = r.qpn;
+	return 0;
+}
+
+/* Completes the task's staged command when the kernel reported success. */
 static __always_inline void complete(bool ok)
 {
 	__u64 key = bpf_get_current_pid_tgid();
 	struct pending *p = bpf_map_lookup_elem(&pending_cmds, &key);
+	struct qp_event ev;
+
 	if (!p)
 		return;
-	if (ok)
-		finalize(p);
+	if (!ok)
+		goto done;
+	ev = p->ev;
+	if (ev.kind == EV_QP_CREATE && read_created_qp(&ev, p)) {
+		stat_inc(STAT_PARSE_ERRORS);
+		goto done;
+	}
+	emit(&ev);
+done:
 	bpf_map_delete_elem(&pending_cmds, &key);
 }
 
@@ -364,6 +383,9 @@ int BPF_KPROBE(uverbs_ioctl_enter, struct file *filp, unsigned int cmd, unsigned
 		n = MAX_ATTRS;
 
 	if (hdr.object_id == UVERBS_OBJECT_DEVICE && hdr.method_id == UVERBS_METHOD_INVOKE_WRITE) {
+		/* A write command carried by ioctl: the body (without the write
+		 * headers) is behind CORE_IN, the response behind CORE_OUT, and
+		 * the command number is the inline WRITE_CMD constant. */
 		__u64 write_cmd = 0, core_in = 0, core_out = 0;
 		bool have_cmd = false;
 		for (__u32 i = 0; i < MAX_ATTRS; i++) {
@@ -374,75 +396,28 @@ int BPF_KPROBE(uverbs_ioctl_enter, struct file *filp, unsigned int cmd, unsigned
 				return 0;
 			switch (a.attr_id) {
 			case UVERBS_ATTR_WRITE_CMD:
-				write_cmd = a.data; /* inline constant */
+				write_cmd = a.data;
 				have_cmd = true;
 				break;
 			case UVERBS_ATTR_CORE_IN:
-				core_in = a.data; /* user pointer: the body is never inline */
+				core_in = a.data;
 				break;
 			case UVERBS_ATTR_CORE_OUT:
 				core_out = a.data;
 				break;
 			}
 		}
-		if (!have_cmd || !core_in)
-			return 0;
-		stage_write_cmd(filp, (__u32)write_cmd, (const void *)core_in, core_out,
-				SRC_IOCTL_WRITE);
+		if (have_cmd && core_in)
+			stage_write_cmd(filp, (__u32)write_cmd, (const void *)core_in, core_out,
+					SRC_IOCTL_WRITE);
 		return 0;
 	}
 
-	if (hdr.object_id != UVERBS_OBJECT_QP)
-		return 0;
-
-	if (hdr.method_id == UVERBS_METHOD_QP_CREATE) {
-		struct pending p = {};
-		bool have_type = false;
-		for (__u32 i = 0; i < MAX_ATTRS; i++) {
-			struct ib_uverbs_attr a;
-			if (i >= n)
-				break;
-			if (read_attr(&a, attrs, i))
-				return 0;
-			if (a.attr_id == UVERBS_ATTR_CREATE_QP_TYPE) {
-				p.ev.qp_type = (__u32)a.data; /* inline constant */
-				have_type = true;
-			}
-		}
-		if (!have_type)
-			return 0;
-		p.ev.kind = EV_QP_CREATE;
-		p.ev.src = SRC_IOCTL_NATIVE;
-		p.ev.ctx = (__u64)filp;
-		p.ev.dev = file_dev(filp);
-		p.attrs = attrs;
-		p.num_attrs = n;
-		stage(&p);
-		return 0;
-	}
-
-	if (hdr.method_id == UVERBS_METHOD_QP_DESTROY) {
-		struct pending p = {};
-		bool have_handle = false;
-		for (__u32 i = 0; i < MAX_ATTRS; i++) {
-			struct ib_uverbs_attr a;
-			if (i >= n)
-				break;
-			if (read_attr(&a, attrs, i))
-				return 0;
-			if (a.attr_id == UVERBS_ATTR_DESTROY_QP_HANDLE) {
-				p.ev.qp_handle = (__u32)a.data; /* inline object id */
-				have_handle = true;
-			}
-		}
-		if (!have_handle)
-			return 0;
-		p.ev.kind = EV_QP_DESTROY;
-		p.ev.src = SRC_IOCTL_NATIVE;
-		p.ev.ctx = (__u64)filp;
-		p.ev.dev = file_dev(filp);
-		stage(&p);
-		return 0;
+	if (hdr.object_id == UVERBS_OBJECT_QP) {
+		if (hdr.method_id == UVERBS_METHOD_QP_CREATE)
+			stage_native(filp, EV_QP_CREATE, attrs, n);
+		else if (hdr.method_id == UVERBS_METHOD_QP_DESTROY)
+			stage_native(filp, EV_QP_DESTROY, attrs, n);
 	}
 	return 0;
 }

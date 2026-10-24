@@ -7,5 +7,8 @@ package servicetrace
 //
 // Only little-endian 64-bit targets are generated: the agent links
 // libibverbs through Cgo and is packaged for linux/amd64 and linux/arm64.
+//
+// The Makefile's check-bpf target repeats this command line with another
+// output directory; keep the two in sync.
 
 //go:generate go tool bpf2go -tags linux -target amd64,arm64 -type qp_event -no-global-types uverbs bpf/uverbs_trace.bpf.c -- -I bpf -I bpf/include -O2 -g -Wall -Werror

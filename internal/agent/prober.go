@@ -336,10 +336,7 @@ func serviceAggregateRate(pps, mult float64) float64 {
 	if pps <= 0 {
 		return 0
 	}
-	if mult <= 0 || mult > 1 {
-		mult = 1.0
-	}
-	return pps * mult
+	return pps * clampRateMultiplier(mult)
 }
 
 // SetServiceTracingRate caps the aggregate service-tracing send rate of this

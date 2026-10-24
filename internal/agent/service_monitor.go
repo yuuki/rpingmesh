@@ -2,7 +2,10 @@ package agent
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -119,9 +122,18 @@ type ServiceMonitor struct {
 
 	refreshInterval time.Duration
 	debounce        time.Duration
+	// unresolvedRetry is how long a negative or failed resolution is kept
+	// before the remote is asked for again; a rebuild that left flows
+	// unresolved arms a timer for it, so the retry does not depend on
+	// further connection events.
+	unresolvedRetry time.Duration
 	// changed is signalled (non-blockingly) by the event handler when the
 	// connection set changed; capacity 1 coalesces bursts.
 	changed chan struct{}
+
+	// procRoot is where process directories are looked up to reap the
+	// contexts of exited processes (see servicetrace.Table.ReapContexts).
+	procRoot string
 
 	nowFn func() time.Time
 
@@ -129,6 +141,9 @@ type ServiceMonitor struct {
 	active              bool
 	otherDeviceConns    uint64
 	unimplementedWarned bool
+	// lastDropped is the tracer's drop count at the previous rebuild, to
+	// warn once per increase.
+	lastDropped uint64
 
 	logger zerolog.Logger
 }
@@ -155,8 +170,10 @@ func NewServiceMonitor(
 		devices:         make(map[string]*serviceDeviceState, len(devices)),
 		devNumbers:      make(map[uint32]string),
 		sysfsRoot:       servicetrace.DefaultSysfsRoot,
+		procRoot:        "/proc",
 		refreshInterval: interval,
 		debounce:        serviceRebuildDebounce,
+		unresolvedRetry: serviceUnresolvedRetry,
 		changed:         make(chan struct{}, 1),
 		nowFn:           time.Now,
 		logger:          log.With().Str("component", "service_monitor").Logger(),
@@ -220,8 +237,8 @@ func (m *ServiceMonitor) handleEvent(ev servicetrace.Event) {
 	}
 }
 
-// run rebuilds the targets after a debounced change signal and on every
-// refresh interval.
+// run rebuilds the targets after a debounced change signal, on every refresh
+// interval, and, while some flows are unresolved, after every retry period.
 func (m *ServiceMonitor) run(ctx context.Context) {
 	defer m.wg.Done()
 
@@ -231,6 +248,15 @@ func (m *ServiceMonitor) run(ctx context.Context) {
 	debounce := time.NewTimer(time.Hour)
 	debounce.Stop()
 	pending := false
+
+	retry := time.NewTimer(time.Hour)
+	retry.Stop()
+	armRetry := func(unresolved bool) {
+		retry.Stop()
+		if unresolved {
+			retry.Reset(m.unresolvedRetry)
+		}
+	}
 
 	for {
 		select {
@@ -245,10 +271,41 @@ func (m *ServiceMonitor) run(ctx context.Context) {
 			}
 		case <-debounce.C:
 			pending = false
-			m.rebuild(ctx, false)
+			armRetry(m.rebuild(ctx, false))
+		case <-retry.C:
+			armRetry(m.rebuild(ctx, false))
 		case <-ticker.C:
-			m.rebuild(ctx, true)
+			armRetry(m.rebuild(ctx, true))
 		}
+	}
+}
+
+// processAlive reports whether pid still exists, by its /proc entry. The
+// tracer reports pids of the initial pid namespace, the one the agent runs
+// in as a host service.
+func (m *ServiceMonitor) processAlive(pid uint32) bool {
+	_, err := os.Stat(filepath.Join(m.procRoot, strconv.FormatUint(uint64(pid), 10)))
+	return err == nil
+}
+
+// reconcile repairs what lost events may have left behind before a rebuild:
+// it warns when the tracer dropped events since the last rebuild, and drops
+// the contexts of processes that no longer exist, whose close event is the
+// one a drop can lose for good (a lost create or destroy is bounded by the
+// process's lifetime for the same reason).
+func (m *ServiceMonitor) reconcile() {
+	if dropped := m.source.Stats().RingBufferDropped; dropped > m.lastDropped {
+		m.logger.Warn().
+			Uint64("dropped_total", dropped).
+			Uint64("dropped_since_last_rebuild", dropped-m.lastDropped).
+			Msg("The service tracer dropped events (ring buffer full); connections of exited processes are reaped, " +
+				"but a lost create or destroy stays uncorrected until its process exits")
+		m.lastDropped = dropped
+	}
+	if removed, _ := m.table.ReapContexts(m.processAlive); removed > 0 {
+		m.logger.Info().
+			Int("contexts", removed).
+			Msg("Dropped traced contexts whose process no longer exists (their close event was lost)")
 	}
 }
 
@@ -280,8 +337,10 @@ func (m *ServiceMonitor) deviceName(dev uint32, rescanned *bool) (string, bool) 
 
 // rebuild groups the live connections into flows per device, resolves their
 // remote GIDs (all of them when resolveAll, else only the unknown ones) and
-// pushes the resulting targets to each device's prober.
-func (m *ServiceMonitor) rebuild(ctx context.Context, resolveAll bool) {
+// pushes the resulting targets to each device's prober. It reports whether
+// any flow is left unresolved, so the caller can schedule a retry.
+func (m *ServiceMonitor) rebuild(ctx context.Context, resolveAll bool) (unresolvedLeft bool) {
+	m.reconcile()
 	conns := m.table.Connections()
 	perDevice := make(map[string][]servicetrace.Connection)
 	rescanned := false
@@ -303,6 +362,9 @@ func (m *ServiceMonitor) rebuild(ctx context.Context, resolveAll bool) {
 		}
 		targets, unresolved := m.resolveFlows(ctx, d, flows, resolveAll)
 		d.Prober.UpdateServiceTargets(targets)
+		if unresolved > 0 {
+			unresolvedLeft = true
+		}
 
 		m.statsMu.Lock()
 		d.connections = len(perDevice[name])
@@ -328,6 +390,7 @@ func (m *ServiceMonitor) rebuild(ctx context.Context, resolveAll bool) {
 			Uint64("connections", other).
 			Msg("Traced connections on RDMA devices the agent does not probe from; ignored")
 	}
+	return unresolvedLeft
 }
 
 // resolveFlows returns one SERVICE_TRACING target per flow whose remote GID
@@ -349,7 +412,7 @@ func (m *ServiceMonitor) resolveFlows(ctx context.Context, d *serviceDeviceState
 		switch {
 		case resolveAll, entry == nil:
 			ask = append(ask, gid)
-		case entry.target == nil && now.Sub(entry.resolvedAt) >= serviceUnresolvedRetry:
+		case entry.target == nil && now.Sub(entry.resolvedAt) >= m.unresolvedRetry:
 			ask = append(ask, gid)
 		}
 	}

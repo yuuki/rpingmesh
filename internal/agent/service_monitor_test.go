@@ -142,6 +142,11 @@ func newTestServiceMonitor(t *testing.T, resolver *fakeResolver, source *fakeEve
 		Name: "mlx5_0", GID: localGIDStr, IPAddr: "10.0.0.1", Port: 1, GIDIndex: 3, Prober: prober,
 	}}, 300)
 	m.sysfsRoot = root
+	// A fake /proc in which the traced process (pid 7) exists.
+	m.procRoot = filepath.Join(root, "proc")
+	if err := os.MkdirAll(filepath.Join(m.procRoot, "7"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	m.debounce = 10 * time.Millisecond
 	m.logger = zerolog.Nop()
 	return m
@@ -299,6 +304,79 @@ func TestServiceMonitor_UnresolvedRetriedOnRefresh(t *testing.T) {
 	m.rebuild(ctx, false)
 	if resolver.callCount() != before+1 {
 		t.Errorf("stale negative answer was not retried")
+	}
+}
+
+// TestServiceMonitor_UnresolvedRetryTimer verifies that an unresolved remote
+// is asked for again after the retry period without any new connection
+// event, once the peer's agent has registered.
+func TestServiceMonitor_UnresolvedRetryTimer(t *testing.T) {
+	resolver := &fakeResolver{targets: map[string]*controller_agent.PingTarget{}}
+	source := &fakeEventSource{}
+	prober := &fakeServiceProber{}
+	m := newTestServiceMonitor(t, resolver, source, prober)
+	m.unresolvedRetry = 30 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer m.Stop()
+
+	source.Emit(createRC(0x1000, testUverbsDev, 1, 0x100))
+	source.Emit(connectTo(0x1000, 1, 0x200, 0, remoteGID, 3))
+	targets := waitForUpdate(t, prober, 0)
+	if len(targets) != 0 {
+		t.Fatalf("unresolved remote produced targets: %v", targets)
+	}
+	_, n := prober.last()
+
+	// The peer registers; nothing else happens on this host.
+	resolver.mu.Lock()
+	resolver.targets[remoteGIDStr] = &controller_agent.PingTarget{TargetGid: remoteGIDStr, TargetQpn: 5}
+	resolver.mu.Unlock()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if targets, m := prober.last(); m > n && len(targets) == 1 && targets[0].GetTargetQpn() == 5 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("the retry timer did not resolve the remote; resolver calls: %v", resolver.calls)
+}
+
+// TestServiceMonitor_ReapsExitedProcesses verifies that the connections of a
+// process whose close event was lost are dropped once the process is gone.
+func TestServiceMonitor_ReapsExitedProcesses(t *testing.T) {
+	resolver := &fakeResolver{targets: map[string]*controller_agent.PingTarget{
+		remoteGIDStr: {TargetGid: remoteGIDStr, TargetQpn: 77},
+	}}
+	source := &fakeEventSource{}
+	prober := &fakeServiceProber{}
+	m := newTestServiceMonitor(t, resolver, source, prober)
+	m.loadDeviceNumbers()
+	ctx := context.Background()
+
+	m.handleEvent(createRC(0x1000, testUverbsDev, 1, 0x100))
+	m.handleEvent(connectTo(0x1000, 1, 0x200, 0, remoteGID, 3))
+	m.rebuild(ctx, false)
+	if targets, _ := prober.last(); len(targets) != 1 {
+		t.Fatalf("initial: %v", targets)
+	}
+
+	// The process exits but its context-close event is lost.
+	if err := os.Remove(filepath.Join(m.procRoot, "7")); err != nil {
+		t.Fatal(err)
+	}
+	source.stats.RingBufferDropped = 1
+	m.rebuild(ctx, false)
+	if targets, _ := prober.last(); len(targets) != 0 {
+		t.Fatalf("after the process exited: %v", targets)
+	}
+	if st := m.Stats(); st.ContextCloses != 1 || st.Devices[0].Connections != 0 {
+		t.Errorf("stats = %+v", st)
 	}
 }
 

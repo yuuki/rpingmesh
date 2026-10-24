@@ -27,7 +27,9 @@
  * Commands that may fail are staged in a per-task map at entry and emitted
  * from the return probe only when the kernel returned success; the create
  * response (handle and QPN) is read from user memory at that point, after
- * the kernel wrote it.
+ * the kernel wrote it. Every entry first discards what the task staged
+ * before, so a missed return probe can never be completed by a later,
+ * unrelated command of the same task.
  *
  * The user-space handles are unique per context, so events carry the
  * context identity (the struct file pointer) and user space joins create,
@@ -160,6 +162,19 @@ static __always_inline void stage(struct pending *p)
 {
 	__u64 key = bpf_get_current_pid_tgid();
 	bpf_map_update_elem(&pending_cmds, &key, p, BPF_ANY);
+}
+
+/*
+ * Drops whatever the task staged before. Entry and return probes are
+ * independent, and a return probe can be missed (kretprobe maxactive
+ * exhaustion), which would leave a staged command behind; the next command's
+ * successful return must not emit it. Every entry probe calls this before
+ * deciding whether to stage anything.
+ */
+static __always_inline void unstage(void)
+{
+	__u64 key = bpf_get_current_pid_tgid();
+	bpf_map_delete_elem(&pending_cmds, &key);
 }
 
 /* Parses a MODIFY_QP body (the EX variant has the same prefix). */
@@ -339,6 +354,7 @@ int BPF_KPROBE(uverbs_ioctl_enter, struct file *filp, unsigned int cmd, unsigned
 	__u64 attrs = arg + sizeof(hdr);
 	__u32 n;
 
+	unstage();
 	if (cmd != RDMA_VERBS_IOCTL)
 		return 0;
 	if (bpf_probe_read_user(&hdr, sizeof(hdr), (const void *)arg))
@@ -445,6 +461,7 @@ int BPF_KPROBE(uverbs_write_enter, struct file *filp, const char *buf, unsigned 
 	const void *body = buf + sizeof(hdr);
 	__u64 resp = 0;
 
+	unstage();
 	if (count < sizeof(hdr))
 		return 0;
 	if (bpf_probe_read_user(&hdr, sizeof(hdr), buf))

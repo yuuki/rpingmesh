@@ -171,6 +171,42 @@ func TestTableUnknownQPs(t *testing.T) {
 	}
 }
 
+func TestTableReapContexts(t *testing.T) {
+	tb := NewTable()
+	evA := createEvent(ctxA, devA, 1, 0x100, QPTypeRC)
+	evA.PID = 100
+	tb.Apply(evA)
+	tb.Apply(connectEvent(ctxA, 1, 0x200, 0, 1))
+	evB := createEvent(ctxB, devB, 1, 0x300, QPTypeRC) // never connected
+	evB.PID = 200
+	tb.Apply(evB)
+	evC := createEvent(0x3000, devA, 1, 0x400, QPTypeRC) // unknown owner
+	evC.PID = 0
+	tb.Apply(evC)
+
+	alive := func(pid uint32) bool { return pid == 100 }
+	removed, changed := tb.ReapContexts(alive)
+	if removed != 1 || changed {
+		t.Fatalf("first reap: removed=%d changed=%v, want 1/false (ctxB had no connection)", removed, changed)
+	}
+	if tb.QPCount() != 2 {
+		t.Fatalf("QPCount = %d, want 2 (ctxA and the unknown-owner context)", tb.QPCount())
+	}
+	removed, changed = tb.ReapContexts(func(uint32) bool { return false })
+	if removed != 1 || !changed {
+		t.Fatalf("second reap: removed=%d changed=%v, want 1/true", removed, changed)
+	}
+	if n := len(tb.Connections()); n != 0 {
+		t.Fatalf("%d connections remain after reaping their owner", n)
+	}
+	if tb.QPCount() != 1 {
+		t.Fatalf("QPCount = %d, want 1 (the unknown-owner context is kept)", tb.QPCount())
+	}
+	if tb.Counters().ContextCloses != 2 {
+		t.Errorf("ContextCloses = %d, want 2", tb.Counters().ContextCloses)
+	}
+}
+
 func TestTableRecreateOverStaleHandle(t *testing.T) {
 	tb := NewTable()
 	tb.Apply(createEvent(ctxA, devA, 1, 0x100, QPTypeRC))

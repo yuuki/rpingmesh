@@ -85,10 +85,15 @@ type Prober struct {
 	// inter-ToR); serviceTargets are the SERVICE_TRACING targets built from
 	// the traced service flows (see UpdateServiceTargets). They are kept
 	// apart so a pinglist refresh never drops the service targets and vice
-	// versa. targetsGen is bumped by every update of either list.
+	// versa, and each list has its own generation (targetsGen, serviceGen)
+	// so an update of one list restarts only that list's passes: service
+	// connections can churn every second, and restarting the pinglist
+	// passes on every churn would starve the targets at their end. Both
+	// generations are guarded by targetsMu.
 	targets        []*controller_agent.PingTarget
 	serviceTargets []*controller_agent.PingTarget
-	targetsGen     uint64 // guarded by targetsMu
+	targetsGen     uint64
+	serviceGen     uint64
 	targetsMu      sync.RWMutex
 
 	pending   map[uint64]*pendingProbe // sequence_num -> pending probe
@@ -355,12 +360,12 @@ func (p *Prober) SetServiceTracingRate(pps float64, intervalMS uint32) {
 
 // UpdateServiceTargets replaces the SERVICE_TRACING targets, one per traced
 // service flow, each carrying that flow's own flow label. The pinglist
-// targets are untouched; both lists restart their passes.
+// targets and their passes are untouched; only the service pass restarts.
 func (p *Prober) UpdateServiceTargets(targets []*controller_agent.PingTarget) {
 	p.targetsMu.Lock()
 	defer p.targetsMu.Unlock()
 	p.serviceTargets = targets
-	p.targetsGen++
+	p.serviceGen++
 	p.logger.Info().
 		Int("count", len(targets)).
 		Msg("Service tracing targets updated")
@@ -395,15 +400,11 @@ func (p *Prober) passTargetsLocked(ptype controller_agent.PinglistType) []*contr
 	return out
 }
 
-// allTargetsLocked returns the pinglist and service targets together, for
-// pruning per-target state. Caller holds targetsMu (read).
-func (p *Prober) allTargetsLocked() []*controller_agent.PingTarget {
-	if len(p.serviceTargets) == 0 {
-		return p.targets
-	}
-	all := make([]*controller_agent.PingTarget, 0, len(p.targets)+len(p.serviceTargets))
-	all = append(all, p.targets...)
-	return append(all, p.serviceTargets...)
+// seenGens records the generations of the two target lists that the probe
+// loop's passes reflect (see nextSend). Owned by the probe-loop goroutine.
+type seenGens struct {
+	targets uint64
+	service uint64
 }
 
 // clampRateMultiplier maps any value outside (0, 1] to 1.0 (unthrottled).
@@ -630,7 +631,7 @@ func (p *Prober) probeLoop(ctx context.Context) {
 		{ptype: controller_agent.PinglistType_INTER_TOR},
 		{ptype: controller_agent.PinglistType_SERVICE_TRACING},
 	}
-	var seenGen uint64
+	var seen seenGens
 
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
@@ -654,7 +655,7 @@ func (p *Prober) probeLoop(ctx context.Context) {
 			lastCleanup = now
 		}
 
-		pass, wait := p.nextSend(passes[:], &seenGen, now)
+		pass, wait := p.nextSend(passes[:], &seen, now)
 		if pass == nil || wait > 0 {
 			// Sleep until the next send is due, waking for shutdown. The
 			// sleep is bounded so the stale-pending sweep keeps its cadence
@@ -687,20 +688,24 @@ func (p *Prober) probeLoop(ctx context.Context) {
 // start, with wait set to when one can.
 //
 // A finished pass whose notBefore has passed is restarted with a fresh
-// snapshot of its type's targets. After UpdateTargets every current pass is
-// abandoned, so probes are not sent to targets that were just removed and
-// new targets are reached without waiting for a stale pass to finish. Called
-// only from the probe-loop goroutine, which owns passes and seenGen.
-func (p *Prober) nextSend(passes []sendPass, seenGen *uint64, now time.Time) (*sendPass, time.Duration) {
+// snapshot of its type's targets. After UpdateTargets the pinglist passes
+// are abandoned, and after UpdateServiceTargets the service pass is, so
+// probes are not sent to targets that were just removed and new targets are
+// reached without waiting for a stale pass to finish; an update of one list
+// never restarts the other's passes. Called only from the probe-loop
+// goroutine, which owns passes and seen.
+func (p *Prober) nextSend(passes []sendPass, seen *seenGens, now time.Time) (*sendPass, time.Duration) {
 	p.targetsMu.RLock()
-	gen := p.targetsGen
-	var targets []*controller_agent.PingTarget
-	if gen != *seenGen {
-		targets = p.allTargetsLocked()
+	targetsChanged := p.targetsGen != seen.targets
+	serviceChanged := p.serviceGen != seen.service
+	var pinglist []*controller_agent.PingTarget
+	if targetsChanged {
+		pinglist = p.targets
 	}
 	for i := range passes {
 		ps := &passes[i]
-		if gen != *seenGen {
+		isService := ps.ptype == controller_agent.PinglistType_SERVICE_TRACING
+		if (isService && serviceChanged) || (!isService && targetsChanged) {
 			ps.targets, ps.next = nil, 0
 		}
 		if !ps.active() && !now.Before(ps.notBefore) {
@@ -709,11 +714,13 @@ func (p *Prober) nextSend(passes []sendPass, seenGen *uint64, now time.Time) (*s
 			ps.notBefore = now.Add(p.passInterval(ps.ptype))
 		}
 	}
+	seen.targets, seen.service = p.targetsGen, p.serviceGen
 	p.targetsMu.RUnlock()
 
-	if gen != *seenGen {
-		p.pruneLabelRotation(targets)
-		*seenGen = gen
+	if targetsChanged {
+		// Service targets never own rotation state (see nextFlowLabel), so
+		// the pinglist alone decides what to keep.
+		p.pruneLabelRotation(pinglist)
 	}
 
 	var best *sendPass
@@ -847,9 +854,17 @@ func (p *Prober) sendProbe(target *controller_agent.PingTarget, rotationEpoch ui
 }
 
 // nextFlowLabel returns the flow label for the next probe to target and
-// advances the target's round-robin index. Probe-loop goroutine only.
+// advances the target's round-robin index. A target with a single label (a
+// service flow, or a legacy single-label pinglist target) returns it without
+// touching the round-robin state: that state is keyed by GID and shared with
+// the pinglist target of the same remote RNIC, whose ECMP coverage would
+// otherwise skip labels every time a service probe went to the same GID.
+// Probe-loop goroutine only.
 func (p *Prober) nextFlowLabel(target *controller_agent.PingTarget, rotationEpoch uint64) uint32 {
 	labels := p.cachedLabelsForTarget(target, rotationEpoch)
+	if len(labels) == 1 {
+		return labels[0]
+	}
 	gid := target.GetTargetGid()
 	idx := p.labelRotation[gid]
 	p.labelRotation[gid] = idx + 1

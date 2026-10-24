@@ -35,7 +35,9 @@ kernel:
 
 Commands are staged in a per-task map at entry and emitted from the return
 probe only when the kernel returned success, so a failed RTR never becomes a
-connection. Each event carries the context identity (the `struct file`
+connection. Every entry probe first discards the task's previous staging:
+return probes can be missed (kretprobe `maxactive` exhaustion), and a stale
+entry must not be completed by the next, unrelated command's success. Each event carries the context identity (the `struct file`
 pointer, unique per `ibv_open_device`), the device number of the uverbs node
 the context was opened on (`struct file -> f_inode -> i_rdev`, the only
 kernel-internal reads, relocated with CO-RE against the vmlinux BTF), the
@@ -100,16 +102,27 @@ reads the flow's GID from sysfs and warns once per device and index.
   `pinglist_update_interval_sec`. A rebuild groups each monitored device's
   connections into flows keyed by (remote GID, effective flow label), asks
   the controller for the remotes it has not resolved yet (or all of them on
-  the periodic refresh; unregistered remotes are retried after a minute),
-  and pushes one `SERVICE_TRACING` `PingTarget` per flow, with
+  the periodic refresh; unregistered remotes are retried after a minute by
+  a timer of their own, so the retry does not wait for the next connection
+  event), and pushes one `SERVICE_TRACING` `PingTarget` per flow, with
   `flow_label` set to the flow's label and `flow_label_count` 1, to the
   device's prober. Connections on devices the agent does not probe from are
-  ignored.
+  ignored. Before each rebuild the monitor reconciles the table against
+  `/proc`: the ring buffer can drop events under load, and a lost context
+  close would otherwise keep an exited process's connections forever, so
+  contexts whose owning process is gone are dropped (a lost create or
+  destroy is bounded by the process's lifetime the same way); drops are
+  logged.
 - The prober keeps the service targets apart from the pinglist targets and
   schedules a third pass for them, paced by an aggregate per-RNIC rate
   (`service_tracing_probe_rate_per_second`) and a pass interval
   (`service_tracing_probe_interval_ms`), visiting the flows in a new random
-  order each pass. Results carry `ProbeResult.ServiceTracing`.
+  order each pass. The two lists have separate generations, so service
+  churn restarts only the service pass and never starves the pinglist
+  targets at the end of a slow pass, and single-label targets do not
+  advance the per-GID flow-label rotation the pinglist target of the same
+  remote relies on for ECMP coverage. Results carry
+  `ProbeResult.ServiceTracing`.
 - Telemetry records such results on the `rpingmesh.service.*` instruments
   with the usual ToR-level attributes, and exposes the tracer through
   `rpingmesh.agent.service_trace_active`, `service_connections`,

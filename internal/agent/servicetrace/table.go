@@ -72,6 +72,9 @@ type qpEntry struct {
 
 type uverbsContext struct {
 	dev uint32
+	// pid is the thread group that created the context's first QP, used to
+	// reap the context if its close event was lost (see ReapContexts).
+	pid uint32
 	qps map[uint32]*qpEntry
 }
 
@@ -101,7 +104,7 @@ func (t *Table) Apply(ev Event) bool {
 		t.counters.Creates++
 		c := t.ctxs[ev.Context]
 		if c == nil {
-			c = &uverbsContext{dev: ev.Dev, qps: make(map[uint32]*qpEntry)}
+			c = &uverbsContext{dev: ev.Dev, pid: ev.PID, qps: make(map[uint32]*qpEntry)}
 			t.ctxs[ev.Context] = c
 		}
 		// The kernel reuses handles once freed, so a create over an existing
@@ -203,6 +206,32 @@ func (t *Table) Apply(ev Event) bool {
 		return false
 	}
 	return false
+}
+
+// ReapContexts drops every context whose owning process alive reports as
+// gone, and returns how many it dropped and whether a connection went with
+// them. The tracer reports a context's release as an event, but the ring
+// buffer can drop events under load, and a lost close would otherwise leave
+// the process's connections in the table forever; the owner's existence is
+// the one fact user space can check without the kernel's help. Contexts
+// whose owner pid is unknown (0) are kept.
+func (t *Table) ReapContexts(alive func(pid uint32) bool) (removed int, changed bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for key, c := range t.ctxs {
+		if c.pid == 0 || alive(c.pid) {
+			continue
+		}
+		delete(t.ctxs, key)
+		removed++
+		t.counters.ContextCloses++
+		for _, q := range c.qps {
+			if q.conn != nil {
+				changed = true
+			}
+		}
+	}
+	return removed, changed
 }
 
 // Connections returns a snapshot of the live connections, ordered by device,

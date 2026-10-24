@@ -120,20 +120,20 @@ func TestServiceTracing_IndependentLists(t *testing.T) {
 
 	p.UpdateTargets(typedTargets(controller_agent.PinglistType_TOR_MESH, "tor", 3))
 	p.targetsMu.RLock()
-	nAll := len(p.allTargetsLocked())
+	nTor := len(p.targets)
 	nSvc := len(p.serviceTargets)
 	p.targetsMu.RUnlock()
-	if nSvc != 3 || nAll != 6 {
-		t.Fatalf("after pinglist refresh: %d service targets, %d in total; want 3 and 6", nSvc, nAll)
+	if nSvc != 3 || nTor != 3 {
+		t.Fatalf("after pinglist refresh: %d service targets, %d pinglist targets; want 3 and 3", nSvc, nTor)
 	}
 
 	p.UpdateServiceTargets(nil)
 	p.targetsMu.RLock()
-	nAll = len(p.allTargetsLocked())
+	nTor = len(p.targets)
 	nSvc = len(p.serviceTargets)
 	p.targetsMu.RUnlock()
-	if nSvc != 0 || nAll != 3 {
-		t.Fatalf("after clearing service targets: %d service targets, %d in total; want 0 and 3", nSvc, nAll)
+	if nSvc != 0 || nTor != 3 {
+		t.Fatalf("after clearing service targets: %d service targets, %d pinglist targets; want 0 and 3", nSvc, nTor)
 	}
 
 	sends := simSchedule(t, p, 2*time.Second, nil)
@@ -180,9 +180,9 @@ func TestServiceTracing_EmptyPassDoesNotWake(t *testing.T) {
 		{ptype: controller_agent.PinglistType_INTER_TOR},
 		{ptype: controller_agent.PinglistType_SERVICE_TRACING},
 	}
-	var seenGen uint64
+	var seen seenGens
 	now := time.Unix(1_000_000, 0)
-	pass, wait := p.nextSend(passes[:], &seenGen, now)
+	pass, wait := p.nextSend(passes[:], &seen, now)
 	if pass == nil || wait != 0 {
 		t.Fatalf("first call: pass=%v wait=%v, want the tor-mesh target now", pass, wait)
 	}
@@ -190,9 +190,58 @@ func TestServiceTracing_EmptyPassDoesNotWake(t *testing.T) {
 	p.reserveSend(pass.ptype, now)
 	// The tor-mesh pass is done; the next event must be its restart after
 	// probeInterval, not the empty service pass's 10 ms restart.
-	pass, wait = p.nextSend(passes[:], &seenGen, now.Add(time.Millisecond))
+	pass, wait = p.nextSend(passes[:], &seen, now.Add(time.Millisecond))
 	if pass != nil || wait < 90*time.Millisecond {
 		t.Fatalf("second call: pass=%v wait=%v, want a sleep until the tor-mesh restart", pass, wait)
+	}
+}
+
+// TestServiceTracing_UpdatesDoNotRestartPinglistPasses verifies that service
+// target churn (connections appearing every second) leaves the pinglist
+// passes alone: with a pass that takes longer than the churn period, every
+// pinglist target still gets its share instead of only the first ones.
+func TestServiceTracing_UpdatesDoNotRestartPinglistPasses(t *testing.T) {
+	tor := typedTargets(controller_agent.PinglistType_TOR_MESH, "tor", 4)
+	p := newSimProber(100*time.Millisecond, tor, nil)
+	// 0.5 probes/s per target: a pass over 4 targets takes 2 s.
+	p.SetPerTypeRateLimit(0.5, 0.5)
+	p.SetServiceTracingRate(100, 10)
+
+	const dur = 40 * time.Second
+	var lastUpdate time.Time
+	n := 0
+	sends := simSchedule(t, p, dur, func(now time.Time) {
+		if now.Sub(lastUpdate) >= time.Second {
+			lastUpdate = now
+			n++
+			p.UpdateServiceTargets(serviceTargets(1 + n%3))
+		}
+	})
+	assertRate(t, sends, tor, dur, 0.5, "tor-mesh")
+}
+
+// TestServiceTracing_DoesNotAdvancePinglistRotation verifies that a service
+// probe to a remote RNIC does not advance the flow-label rotation of the
+// pinglist target for the same GID, so the pinglist's ECMP coverage stays
+// complete when the two interleave.
+func TestServiceTracing_DoesNotAdvancePinglistRotation(t *testing.T) {
+	p := newTestProber()
+	const gid = "fe80::77"
+	cluster := &controller_agent.PingTarget{TargetGid: gid, FlowLabelSeed: 0x1234, FlowLabelCount: 4}
+	service := &controller_agent.PingTarget{TargetGid: gid, FlowLabel: 0x55, FlowLabelCount: 1,
+		PinglistType: controller_agent.PinglistType_SERVICE_TRACING}
+	want := probe.GenerateFlowLabels(0x1234, 4, 1)
+
+	for i := 0; i < 8; i++ {
+		if got := p.nextFlowLabel(cluster, 1); got != want[i%4] {
+			t.Fatalf("pinglist probe %d got label %#x, want %#x", i, got, want[i%4])
+		}
+		if got := p.nextFlowLabel(service, 1); got != 0x55 {
+			t.Fatalf("service probe %d got label %#x, want 0x55", i, got)
+		}
+	}
+	if _, ok := p.labelRotation[gid]; !ok {
+		t.Fatal("the pinglist target must own rotation state for its GID")
 	}
 }
 

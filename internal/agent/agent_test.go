@@ -15,6 +15,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -832,5 +833,98 @@ func TestAgent_RegistrationPlaneSupport(t *testing.T) {
 				t.Errorf("plane support warnings = %d, want %d; logs:\n%s", got, tc.warnings, logs.String())
 			}
 		})
+	}
+}
+
+// TestAgent_CreateResultsFanIn_ServiceResultsGatedOnController verifies that
+// service-tracing results reach the analysis branch only once the controller
+// reported that it evaluates service path summaries apart from the cluster
+// ones (an older controller would judge them as cluster paths), while the
+// metrics branch always gets every result.
+func TestAgent_CreateResultsFanIn_ServiceResultsGatedOnController(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		supported bool
+		wantSeqs  []uint64
+	}{
+		{"new controller", true, []uint64{1, 2}},
+		{"old controller", false, []uint64{2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probers := []*Prober{fakeProber(4)}
+			a := newTestAgent(nil, probers)
+			a.cfg.AnalysisReportEnabled = true
+			a.metricsResultsActive = true
+			a.createResultsFanIn()
+			a.applyRegistrationServiceAnalysisSupport(&controller_agent.AgentRegistrationResponse{
+				Success: true, ServicePathSummaries: tc.supported,
+			})
+
+			probers[0].emitResult(&probe.ProbeResult{SequenceNum: 1, PinglistType: probe.PinglistServiceTracing})
+			probers[0].emitResult(&probe.ProbeResult{SequenceNum: 2})
+
+			for i := 0; i < 2; i++ {
+				select {
+				case <-a.results:
+				case <-time.After(2 * time.Second):
+					t.Fatalf("timed out waiting for metrics result %d", i)
+				}
+			}
+			probers[0].Destroy()
+			a.stopResultsFanIn()
+
+			var got []uint64
+			for r := range a.analysisResults {
+				got = append(got, r.SequenceNum)
+			}
+			if !slices.Equal(got, tc.wantSeqs) {
+				t.Errorf("analysis branch got %v, want %v", got, tc.wantSeqs)
+			}
+		})
+	}
+}
+
+// TestAgent_ApplyRegistrationServiceAnalysisSupport verifies the support
+// flag follows the registration response and that an old controller is
+// warned about once, and only when the warning is actionable (service
+// tracing and analysis reporting both on).
+func TestAgent_ApplyRegistrationServiceAnalysisSupport(t *testing.T) {
+	const warning = "does not evaluate service-tracing path summaries"
+	for _, tc := range []struct {
+		name           string
+		supported      bool
+		serviceTracing bool
+		warnings       int
+	}{
+		{"new controller", true, true, 0},
+		{"old controller", false, true, 1},
+		{"old controller without service tracing", false, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newTestAgent(nil, nil)
+			a.cfg.AnalysisReportEnabled = true
+			a.cfg.ServiceTracingEnabled = tc.serviceTracing
+			var logs bytes.Buffer
+			a.logger = zerolog.New(&logs)
+			resp := &controller_agent.AgentRegistrationResponse{Success: true, ServicePathSummaries: tc.supported}
+			for i := 0; i < 3; i++ { // initial registration + heartbeats
+				a.applyRegistrationServiceAnalysisSupport(resp)
+			}
+			if got := a.servicePathSummaries.Load(); got != tc.supported {
+				t.Errorf("servicePathSummaries = %v, want %v", got, tc.supported)
+			}
+			if got := strings.Count(logs.String(), warning); got != tc.warnings {
+				t.Errorf("warnings = %d, want %d; logs:\n%s", got, tc.warnings, logs.String())
+			}
+		})
+	}
+
+	// A controller upgrade seen at a heartbeat re-registration turns the
+	// tee on without a restart.
+	a := newTestAgent(nil, nil)
+	a.applyRegistrationServiceAnalysisSupport(&controller_agent.AgentRegistrationResponse{Success: true})
+	a.applyRegistrationServiceAnalysisSupport(&controller_agent.AgentRegistrationResponse{Success: true, ServicePathSummaries: true})
+	if !a.servicePathSummaries.Load() {
+		t.Error("servicePathSummaries = false after a supporting re-registration, want true")
 	}
 }

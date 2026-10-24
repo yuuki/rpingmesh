@@ -72,7 +72,7 @@ Phase 1 analyzer merged in PR #36.
   table, or path→link mapping.
 - **OTLP.** `analyzer/metrics.go` registers
   `rpingmesh.analyzer.path_summaries_total` and
-  `rpingmesh.analyzer.sla_violations_total{source_tor,target_tor,kind}`.
+  `rpingmesh.analyzer.sla_violations_total{network,source_tor,target_tor,kind}`.
   `setupAnalyzer` in `cmd/controller/main.go` creates the meter
   `rpingmesh.analyzer` on a provider tagged `service.name=rpingmesh-analyzer`
   and wires the analyzer with `svc.SetAnalyzer`. Phase 2 metrics register on

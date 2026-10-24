@@ -202,7 +202,8 @@ func (r *AnalysisReporter) report(ctx context.Context, summaries []probe.PathSum
 
 // toProto maps an aggregator PathSummary to its proto form, stamping the
 // path's source ToR (falling back to the reporter's default when the results
-// carried none) and rendering GIDs as canonical strings.
+// carried none), rendering GIDs as canonical strings and converting the
+// pinglist type by value (probe.PinglistType mirrors the proto enum).
 func (r *AnalysisReporter) toProto(s *probe.PathSummary) *controller_agent.PathSummary {
 	sourceTor := r.sourceTorID
 	if s.SourceTorID != "" {
@@ -214,6 +215,7 @@ func (r *AnalysisReporter) toProto(s *probe.PathSummary) *controller_agent.PathS
 		TargetGid:         probe.FormatGID(s.TargetGID),
 		TargetTorId:       probe.TorMetricLabel(s.TargetTorID),
 		TargetQpn:         s.TargetQPN,
+		PinglistType:      controller_agent.PinglistType(s.PinglistType),
 		WindowStartUnixNs: s.WindowStartUnixNs,
 		WindowDurationMs:  s.WindowDurationMs,
 		ProbeTotal:        s.ProbeTotal,

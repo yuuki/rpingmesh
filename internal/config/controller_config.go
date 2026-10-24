@@ -93,7 +93,14 @@ type ControllerConfig struct {
 	AnalyzerEnabled            bool    `mapstructure:"analyzer_enabled"`
 	AnalyzerSLALossRatio       float64 `mapstructure:"analyzer_sla_loss_ratio"`
 	AnalyzerSLANetworkRTTP99Ns uint64  `mapstructure:"analyzer_sla_network_rtt_p99_ns"`
-	AnalyzerWindowRetention    int     `mapstructure:"analyzer_window_retention"`
+	// AnalyzerServiceSLOLossRatio and AnalyzerServiceSLONetworkRTTP99Ns are
+	// the SLO thresholds for the service network: path summaries of probes
+	// sent along traced application flows (pinglist_type SERVICE_TRACING),
+	// which the analyzer evaluates apart from the cluster paths. They default
+	// to the cluster thresholds' defaults but are independent settings.
+	AnalyzerServiceSLOLossRatio       float64 `mapstructure:"analyzer_service_slo_loss_ratio"`
+	AnalyzerServiceSLONetworkRTTP99Ns uint64  `mapstructure:"analyzer_service_slo_network_rtt_p99_ns"`
+	AnalyzerWindowRetention           int     `mapstructure:"analyzer_window_retention"`
 	// OtelCollectorAddr is the OTLP gRPC endpoint the analyzer exports its
 	// metrics to (service.name=rpingmesh-analyzer). Only used when the analyzer
 	// is enabled; export is best-effort.
@@ -129,6 +136,8 @@ var controllerKeys = []keySpec{
 	{key: "analyzer_enabled", def: true, help: "Enable the Phase 1 analyzer (ingest agent summaries, detect SLA violations)"},
 	{key: "analyzer_sla_loss_ratio", def: DefaultAnalyzerSLALossRatio, help: "Per-path loss ratio (0..1) above which a window is an SLA violation"},
 	{key: "analyzer_sla_network_rtt_p99_ns", def: uint64(DefaultAnalyzerSLANetworkRTTP99Ns), help: "Per-path p99 network-RTT threshold (ns) above which a window is an SLA violation (0 disables)"},
+	{key: "analyzer_service_slo_loss_ratio", def: DefaultAnalyzerSLALossRatio, help: "Service-network (service tracing) per-path loss ratio (0..1) above which a window is an SLO violation"},
+	{key: "analyzer_service_slo_network_rtt_p99_ns", def: uint64(DefaultAnalyzerSLANetworkRTTP99Ns), help: "Service-network (service tracing) per-path p99 network-RTT threshold (ns) above which a window is an SLO violation (0 disables)"},
 	{key: "analyzer_window_retention", def: DefaultAnalyzerWindowRetention, help: "Number of recent windows the analyzer retains in memory"},
 	{key: "otel_collector_addr", def: DefaultControllerOtelCollectorAddr, help: "OTLP gRPC collector endpoint for analyzer metrics"},
 	{key: "tls_mode", def: TLSModeDisabled, help: "gRPC transport security mode (disabled|tls|mtls)"},
@@ -165,16 +174,18 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		EcmpCoverageProbability:   v.GetFloat64("ecmp_coverage_probability"),
 		EcmpMaxFlowLabels:         v.GetInt("ecmp_max_flow_labels"),
 
-		AnalyzerEnabled:            v.GetBool("analyzer_enabled"),
-		AnalyzerSLALossRatio:       v.GetFloat64("analyzer_sla_loss_ratio"),
-		AnalyzerSLANetworkRTTP99Ns: v.GetUint64("analyzer_sla_network_rtt_p99_ns"),
-		AnalyzerWindowRetention:    v.GetInt("analyzer_window_retention"),
-		OtelCollectorAddr:          v.GetString("otel_collector_addr"),
-		TLSMode:                    v.GetString("tls_mode"),
-		TLSCertFile:                v.GetString("tls_cert_file"),
-		TLSKeyFile:                 v.GetString("tls_key_file"),
-		TLSCAFile:                  v.GetString("tls_ca_file"),
-		TLSServerName:              v.GetString("tls_server_name"),
+		AnalyzerEnabled:                   v.GetBool("analyzer_enabled"),
+		AnalyzerSLALossRatio:              v.GetFloat64("analyzer_sla_loss_ratio"),
+		AnalyzerSLANetworkRTTP99Ns:        v.GetUint64("analyzer_sla_network_rtt_p99_ns"),
+		AnalyzerServiceSLOLossRatio:       v.GetFloat64("analyzer_service_slo_loss_ratio"),
+		AnalyzerServiceSLONetworkRTTP99Ns: v.GetUint64("analyzer_service_slo_network_rtt_p99_ns"),
+		AnalyzerWindowRetention:           v.GetInt("analyzer_window_retention"),
+		OtelCollectorAddr:                 v.GetString("otel_collector_addr"),
+		TLSMode:                           v.GetString("tls_mode"),
+		TLSCertFile:                       v.GetString("tls_cert_file"),
+		TLSKeyFile:                        v.GetString("tls_key_file"),
+		TLSCAFile:                         v.GetString("tls_ca_file"),
+		TLSServerName:                     v.GetString("tls_server_name"),
 	}
 
 	if err := config.Validate(); err != nil {
@@ -301,6 +312,9 @@ func (c *ControllerConfig) validateAnalyzer() error {
 	// flags nothing).
 	if c.AnalyzerSLALossRatio < 0 || c.AnalyzerSLALossRatio > 1 {
 		return fmt.Errorf("analyzer_sla_loss_ratio must be in [0, 1], got: %v", c.AnalyzerSLALossRatio)
+	}
+	if c.AnalyzerServiceSLOLossRatio < 0 || c.AnalyzerServiceSLOLossRatio > 1 {
+		return fmt.Errorf("analyzer_service_slo_loss_ratio must be in [0, 1], got: %v", c.AnalyzerServiceSLOLossRatio)
 	}
 	// The window ring must retain at least one window.
 	if c.AnalyzerWindowRetention < 1 {

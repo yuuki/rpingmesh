@@ -104,7 +104,7 @@ gen() {
           }
           # analyzer SLA violations (job=rpingmesh-analyzer; the analyzer is
           # a separate, single process in this demo, so no instance split).
-          albl = "source_tor=\"" T[i] "\",target_tor=\"" T[j] "\",job=\"rpingmesh-analyzer\""
+          albl = "network=\"cluster\",source_tor=\"" T[i] "\",target_tor=\"" T[j] "\",job=\"rpingmesh-analyzer\""
           if (slaloss[key] > 0)
             printf "rpingmesh_analyzer_sla_violations_total{%s,kind=\"loss\"} %d %d\n", albl, slaloss[key], ts
           if (slartt[key] > 0)

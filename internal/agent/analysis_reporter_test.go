@@ -334,3 +334,60 @@ func TestAnalysisReporter_PerResultSourceTorWins(t *testing.T) {
 		t.Errorf("SourceTorId = %q, want leaf-a", got)
 	}
 }
+
+// TestAnalysisReporter_PinglistTypeMappedToProto verifies that the pinglist
+// type of each summary reaches the controller, converted by value to the
+// proto enum, so the analyzer can evaluate service paths apart from cluster
+// ones.
+func TestAnalysisReporter_PinglistTypeMappedToProto(t *testing.T) {
+	fake := &fakeSender{}
+	input := make(chan *probe.ProbeResult, 4)
+	r := NewAnalysisReporter(fake, "agent-1", "tor-a", 3600, input)
+	r.Start(context.Background())
+
+	input <- validProbeResult(srcGID(1), srcGID(2), "tor-b", 42)
+	service := validProbeResult(srcGID(1), srcGID(2), "tor-b", 42)
+	service.PinglistType = probe.PinglistServiceTracing
+	input <- service
+	inter := validProbeResult(srcGID(1), srcGID(3), "tor-c", 43)
+	inter.PinglistType = probe.PinglistInterTor
+	input <- inter
+	close(input)
+	r.Wait()
+
+	got := map[controller_agent.PinglistType]int{}
+	for _, s := range fake.allSummaries() {
+		got[s.GetPinglistType()]++
+	}
+	want := map[controller_agent.PinglistType]int{
+		controller_agent.PinglistType_TOR_MESH:        1,
+		controller_agent.PinglistType_SERVICE_TRACING: 1,
+		controller_agent.PinglistType_INTER_TOR:       1,
+	}
+	for typ, n := range want {
+		if got[typ] != n {
+			t.Errorf("summaries of type %s = %d, want %d (all: %v)", typ, got[typ], n, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("summary types = %v, want exactly %v", got, want)
+	}
+}
+
+// TestPinglistTypeMirrorsProto pins the by-value conversion between
+// probe.PinglistType and the proto enum that fillTargetMetadata and the
+// reporter's toProto rely on.
+func TestPinglistTypeMirrorsProto(t *testing.T) {
+	for _, tc := range []struct {
+		p     probe.PinglistType
+		proto controller_agent.PinglistType
+	}{
+		{probe.PinglistTorMesh, controller_agent.PinglistType_TOR_MESH},
+		{probe.PinglistInterTor, controller_agent.PinglistType_INTER_TOR},
+		{probe.PinglistServiceTracing, controller_agent.PinglistType_SERVICE_TRACING},
+	} {
+		if int32(tc.p) != int32(tc.proto) {
+			t.Errorf("probe.%s = %d, proto %s = %d; values must match", tc.p, tc.p, tc.proto, tc.proto)
+		}
+	}
+}

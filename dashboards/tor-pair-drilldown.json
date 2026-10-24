@@ -163,8 +163,8 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "sum by (kind) (rate({__name__=~\"rpingmesh[._]analyzer[._]sla_violations_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
-          "legendFormat": "{{kind}}", "range": true } ],
+          "expr": "sum by (network, kind) (rate({__name__=~\"rpingmesh[._]analyzer[._]sla_violations_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
+          "legendFormat": "{{network}} {{kind}}", "range": true } ],
       "fieldConfig": { "defaults": { "unit": "cps",
         "custom": { "drawStyle": "line", "fillOpacity": 15 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }

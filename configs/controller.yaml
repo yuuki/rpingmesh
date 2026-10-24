@@ -25,13 +25,18 @@ ecmp_max_flow_labels: 64          # Hard cap on labels per target (bounds amplif
 unspecified_mesh_max_targets: 32
 
 # Analyzer (Phase 1)
-# Ingests agent-reported per-path window summaries and flags SLA violations
+# Ingests agent-reported per-path window summaries and flags SLO violations
 # (per-path loss ratio and p99 network-RTT threshold breaches). Findings go to
 # logs (with GID detail) and OTLP metrics (rpingmesh.analyzer.*, ToR-level
-# attributes only).
+# attributes only). The cluster network (the controller's pinglists) and the
+# service network (paths of traced application flows, see
+# service_tracing_enabled in agent.yaml) are evaluated apart, each against
+# its own thresholds; findings carry network="cluster" or "service".
 analyzer_enabled: true
-analyzer_sla_loss_ratio: 0.02            # per-path loss ratio (0..1) that is a violation
-analyzer_sla_network_rtt_p99_ns: 500000  # per-path p99 network-RTT (ns) that is a violation (0 disables)
+analyzer_sla_loss_ratio: 0.02            # cluster per-path loss ratio (0..1) that is a violation
+analyzer_sla_network_rtt_p99_ns: 500000  # cluster per-path p99 network-RTT (ns) that is a violation (0 disables)
+analyzer_service_slo_loss_ratio: 0.02            # service-network per-path loss ratio (0..1) that is a violation
+analyzer_service_slo_network_rtt_p99_ns: 500000  # service-network per-path p99 network-RTT (ns) that is a violation (0 disables)
 analyzer_window_retention: 20            # recent windows retained in memory
 otel_collector_addr: "localhost:4317"    # OTLP endpoint for analyzer metrics
 

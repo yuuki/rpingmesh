@@ -25,6 +25,19 @@ All notable changes to this project are documented in this file.
   logged and the agent continues without it.
 - `GetTargetRnicInfo` controller RPC, resolving the destination GIDs of
   traced flows into probe targets, and `PinglistType.SERVICE_TRACING`.
+- The controller's analyzer evaluates the service network apart from the
+  cluster network, as the paper's Analyzer does. The agent's path aggregator
+  keys its windows by (source RNIC, target RNIC, pinglist type) and reports
+  the type in the new `PathSummary.pinglist_type`; `SERVICE_TRACING`
+  summaries are judged against the new `analyzer_service_slo_loss_ratio` and
+  `analyzer_service_slo_network_rtt_p99_ns` thresholds (defaults equal to the
+  cluster ones) and their findings carry `network="service"`.
+  `rpingmesh.analyzer.sla_violations_total` gains a `network` attribute
+  (`cluster` or `service`); the committed dashboards and the
+  `RpingmeshSLAViolation` rule group by it. Agents report service summaries
+  only to a controller that answers registration with
+  `service_path_summaries`, so an older controller never judges them as
+  cluster paths; upgrade the controller first.
 - `make generate-bpf` / `make check-bpf`, a systemd drop-in granting
   `CAP_BPF` and `CAP_PERFMON`
   (`packaging/systemd/rpingmesh-agent.service.d/10-service-tracing.conf`,

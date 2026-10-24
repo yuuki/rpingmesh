@@ -53,7 +53,7 @@ temporality, which is what a Prometheus-style backend expects.
 | `rpingmesh.agent.self_throttle` | Float64 ObservableGauge | none | Self-protection rate multiplier: 1.0 = unthrottled, floor 0.1 |
 | `rpingmesh.event_ring_dropped_total` | Int64 ObservableCounter | `ring` ∈ {`prober`, `responder`} | Completion events dropped on a full ring |
 | `rpingmesh.analyzer.path_summaries_total` | Int64 Counter | none | Per-path window summaries ingested by the analyzer |
-| `rpingmesh.analyzer.sla_violations_total` | Int64 Counter | `source_tor`, `target_tor`, `kind` ∈ {`loss`, `rtt`} | SLA violations detected by the analyzer |
+| `rpingmesh.analyzer.sla_violations_total` | Int64 Counter | `network` ∈ {`cluster`, `service`}, `source_tor`, `target_tor`, `kind` ∈ {`loss`, `rtt`} | SLO violations detected by the analyzer; `network` keeps the service-tracing paths apart from the cluster ones |
 
 The network RTT histogram and the two delay histograms use separate explicit
 bucket ladders in nanoseconds, sized from production RoCEv2 leaf-spine

@@ -402,6 +402,9 @@ func TestRegisterAgent_StoresPerRnicPlane(t *testing.T) {
 	if !resp.GetPerRnicPlaneId() {
 		t.Error("resp.PerRnicPlaneId = false, want true (agents use it to detect plane support)")
 	}
+	if !resp.GetServicePathSummaries() {
+		t.Error("resp.ServicePathSummaries = false, want true (agents report service summaries only when set)")
+	}
 	for i, want := range []string{"rail0", "rail1", ""} {
 		if got := fake.lastRnics[i].GetPlaneId(); got != want {
 			t.Errorf("rnic %d plane = %q, want %q (trimmed, no request-wide fallback)", i, got, want)

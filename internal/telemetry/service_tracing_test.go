@@ -19,7 +19,7 @@ var serviceProbeMetrics = []string{
 
 func serviceResult() *probe.ProbeResult {
 	r := successfulResult("host-b", "mlx5_1", "ens2f0", false)
-	r.ServiceTracing = true
+	r.PinglistType = probe.PinglistServiceTracing
 	return r
 }
 

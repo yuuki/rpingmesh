@@ -64,16 +64,17 @@ groups:
           summary: "No successful probes from {{ $labels.source_tor }} to {{ $labels.target_tor }}"
           description: "Probes between these ToRs are being sent but none succeeded for 5 minutes."
 
-      # The analyzer applies the per-path loss and p99 network-RTT SLAs
-      # configured on the controller (analyzer_sla_*).
+      # The analyzer applies the per-path loss and p99 network-RTT SLO
+      # thresholds configured on the controller (analyzer_sla_* for the
+      # cluster network, analyzer_service_slo_* for the service network).
       - alert: RpingmeshSLAViolation
         expr: |
-          sum by (source_tor, target_tor, kind) (increase({__name__=~"rpingmesh[._]analyzer[._]sla_violations_total"}[10m])) > 0
+          sum by (network, source_tor, target_tor, kind) (increase({__name__=~"rpingmesh[._]analyzer[._]sla_violations_total"}[10m])) > 0
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "{{ $labels.kind }} SLA violated on {{ $labels.source_tor }} -> {{ $labels.target_tor }}"
+          summary: "{{ $labels.network }} network {{ $labels.kind }} SLO violated on {{ $labels.source_tor }} -> {{ $labels.target_tor }}"
           description: "The controller's analyzer flagged {{ $value | printf \"%.0f\" }} path windows in the last 10 minutes. Per-path GID detail is in the controller logs."
 
   - name: rpingmesh-agents

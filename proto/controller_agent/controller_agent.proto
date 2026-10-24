@@ -69,6 +69,13 @@ message AgentRegistrationResponse {
     // Older controllers leave it false and ignore plane_id, so their
     // pinglists may pair RNICs of different planes.
     bool per_rnic_plane_id = 4;
+    // service_path_summaries is true when the controller's analyzer evaluates
+    // PathSummary records of pinglist_type SERVICE_TRACING against the
+    // service-network SLO thresholds, apart from the cluster ones. Older
+    // controllers leave it false: they ignore PathSummary.pinglist_type and
+    // would mix service paths into the cluster evaluation, so an agent must
+    // keep service results out of its analysis reports.
+    bool service_path_summaries = 5;
 }
 
 // PinglistType determines what kind of pinglist to generate, and which
@@ -202,6 +209,12 @@ message PathSummary {
     // whose RTT failed validation (e.g. clock-skew/SW-timestamp noise). Not
     // counted as loss.
     uint32 invalid_rtt_count    = 15;
+    // pinglist_type is the pinglist the path's target came from. SERVICE_TRACING
+    // summaries aggregate the probes sent along traced application flows (at
+    // the service-tracing rate, with the flows' own flow labels); the analyzer
+    // evaluates them against the service-network SLO thresholds, apart from
+    // the cluster paths (TOR_MESH, INTER_TOR) of the same target RNIC.
+    PinglistType pinglist_type  = 16;
 }
 
 // ProbeAnalysisReport is a batch of window summaries reported by one agent.

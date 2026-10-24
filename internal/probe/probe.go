@@ -83,12 +83,52 @@ type ProbeResult struct {
 	TargetRdmaDevice string
 	TargetNetdev     string
 	TargetSampled    bool
-	// ServiceTracing marks a probe sent along a traced service flow (a
+	// PinglistType is the pinglist the probe's target came from. A
+	// PinglistServiceTracing result was sent along a traced service flow (a
 	// SERVICE_TRACING target, see internal/agent/servicetrace) rather than
-	// a controller pinglist target. Such results measure the service
-	// network and are recorded on the rpingmesh.service.* instruments,
-	// never on the cluster-monitoring ones.
-	ServiceTracing bool
+	// to a controller pinglist target: it measures the service network, is
+	// recorded on the rpingmesh.service.* instruments (never on the
+	// cluster-monitoring ones) and is summarized apart from the cluster
+	// paths of the same target by the PathAggregator.
+	PinglistType PinglistType
+}
+
+// PinglistType identifies the pinglist a probe target belongs to. The values
+// equal those of the controller_agent.PinglistType proto enum, which this
+// RDMA- and proto-independent package cannot import; the agent converts
+// between the two by value (and tests pin the equality).
+type PinglistType int32
+
+const (
+	// PinglistTorMesh: a target in the same ToR, from the controller's
+	// ToR-mesh pinglist.
+	PinglistTorMesh PinglistType = 0
+	// PinglistInterTor: a sampled target in another ToR, from the
+	// controller's inter-ToR pinglist.
+	PinglistInterTor PinglistType = 1
+	// PinglistServiceTracing: the remote RNIC of a traced application flow,
+	// probed with the flow's own flow label.
+	PinglistServiceTracing PinglistType = 2
+)
+
+// String returns the lower-case name used in logs and findings.
+func (t PinglistType) String() string {
+	switch t {
+	case PinglistTorMesh:
+		return "tor_mesh"
+	case PinglistInterTor:
+		return "inter_tor"
+	case PinglistServiceTracing:
+		return "service_tracing"
+	default:
+		return "unknown"
+	}
+}
+
+// IsServiceTracing reports whether the probe was sent along a traced service
+// flow rather than to a controller pinglist target.
+func (r *ProbeResult) IsServiceTracing() bool {
+	return r.PinglistType == PinglistServiceTracing
 }
 
 // InvalidKind classifies why CalculateRTT rejected a measurement. The values

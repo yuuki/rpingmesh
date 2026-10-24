@@ -180,6 +180,46 @@ func (c *GRPCControllerClient) GetPinglist(
 	return resp.GetTargets(), nil
 }
 
+// GetTargetRnicInfo resolves the destination GIDs of the service flows traced
+// on the RNIC requesterGID into SERVICE_TRACING probe targets. GIDs the
+// controller does not know are simply absent from the result. A controller
+// that predates service tracing answers with codes.Unimplemented, which the
+// caller treats as "no targets" and logs once.
+func (c *GRPCControllerClient) GetTargetRnicInfo(
+	ctx context.Context,
+	agentID, requesterGID string,
+	targetGIDs []string,
+) ([]*controller_agent.PingTarget, error) {
+	req := &controller_agent.TargetRnicInfoRequest{
+		AgentId:      agentID,
+		RequesterGid: requesterGID,
+		TargetGids:   targetGIDs,
+	}
+
+	c.logger.Debug().
+		Str("agent_id", agentID).
+		Str("requester_gid", requesterGID).
+		Int("target_gids", len(targetGIDs)).
+		Msg("Resolving service tracing targets through the controller")
+
+	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
+	resp, err := c.client.GetTargetRnicInfo(rpcCtx, req)
+	if err != nil {
+		return nil, fmt.Errorf("GetTargetRnicInfo RPC failed: %w", err)
+	}
+
+	c.logger.Debug().
+		Str("agent_id", agentID).
+		Str("requester_gid", requesterGID).
+		Int("target_gids", len(targetGIDs)).
+		Int("resolved", len(resp.GetTargets())).
+		Msg("Resolved service tracing targets")
+
+	return resp.GetTargets(), nil
+}
+
 // ReportProbeAnalysis sends a batch of window-aggregated per-path summaries to
 // the controller's analyzer. It is best-effort: the caller (the agent's
 // analysis reporter) drops the batch on any error rather than retrying, so a

@@ -3,7 +3,8 @@
 # clang, libibverbs-dev, librdmacm-dev
 
 .PHONY: all build build-zig build-go build-controller build-agent \
-        generate generate-proto clean test test-go test-zig test-scripts test-all vet \
+        generate generate-proto generate-bpf check-bpf \
+        clean test test-go test-zig test-scripts test-all vet \
         test-e2e setup-colima test-e2e-controller clean-e2e-controller \
         check-nfpm package package-agent package-controller \
         package-build-agent package-build-agent-el9 package-build-controller \
@@ -79,6 +80,33 @@ generate-proto:
 	@echo "==> Generating protobuf code..."
 	cd $(PROTO_DIR) && go generate
 	@echo "==> Proto generation complete"
+
+# Compile the service-tracing eBPF program with bpf2go (go.mod tool). The
+# generated objects under internal/agent/servicetrace/ are committed, so
+# build-agent never needs clang; run this after editing anything under
+# internal/agent/servicetrace/bpf/. Needs a clang with the BPF backend
+# (clang >= 14); point BPF2GO_CC/BPF2GO_STRIP at it when it is not the
+# default clang (e.g. Homebrew LLVM on macOS, since Apple clang lacks the
+# BPF target).
+BPF_DIR := internal/agent/servicetrace
+generate-bpf:
+	@echo "==> Generating eBPF objects (bpf2go)..."
+	go generate ./$(BPF_DIR)/
+	@echo "==> eBPF generation complete"
+
+# Verify the eBPF program still compiles and that the committed Go bindings
+# are up to date, without touching the committed objects (the .o files differ
+# between clang versions, so only the .go files are compared).
+check-bpf:
+	@echo "==> Checking eBPF program and bindings..."
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+		cd $(BPF_DIR) && GOPACKAGE=servicetrace go tool bpf2go -output-dir "$$tmp" \
+			-tags linux -target amd64,arm64 -type qp_event -no-global-types \
+			uverbs bpf/uverbs_trace.bpf.c -- -I bpf -I bpf/include -O2 -g -Wall -Werror && \
+		for f in uverbs_x86_bpfel.go uverbs_arm64_bpfel.go; do \
+			diff -u "$$f" "$$tmp/$$f" || { echo "ERROR: $$f is stale; run 'make generate-bpf'"; exit 1; }; \
+		done
+	@echo "==> eBPF check complete"
 
 # Build Go binaries
 build-go: build-controller build-agent
@@ -329,6 +357,8 @@ help:
 	@echo "  build-agent          Build agent binary only"
 	@echo "  generate             Generate all code (proto)"
 	@echo "  generate-proto       Generate protobuf Go code"
+	@echo "  generate-bpf         Compile the service-tracing eBPF program (needs clang with the BPF backend)"
+	@echo "  check-bpf            Verify the eBPF program compiles and its committed Go bindings are current"
 	@echo "  test                 Run tests"
 	@echo "  test-go              Run Go tests (internal/probe only, pure Go)"
 	@echo "  test-zig             Run Zig unit tests (zig build test)"
@@ -353,5 +383,6 @@ help:
 	@echo ""
 	@echo "Requirements:"
 	@echo "  Go 1.27.3+, Zig 0.17.0, protoc, libibverbs-dev, librdmacm-dev"
+	@echo "  For generate-bpf/check-bpf: clang >= 14 with the BPF backend"
 	@echo "  For test-e2e: colima running, run 'make setup-colima' first"
 	@echo "  For package: nfpm (https://nfpm.goreleaser.com/install/)"

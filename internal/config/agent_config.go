@@ -60,6 +60,18 @@ const (
 	DefaultThrottleCPUPercent = 90
 )
 
+// Defaults for service tracing (R-Pingmesh paper section 4.2.2). The feature
+// is opt-in: it loads eBPF programs, which needs CAP_BPF and CAP_PERFMON (see
+// packaging/systemd/rpingmesh-agent.service.d/10-service-tracing.conf). The
+// probe rate is an aggregate cap per RNIC shared by every traced flow, and
+// the interval is the minimum spacing between two passes over the flows; the
+// paper probes service flows every 10 ms.
+const (
+	DefaultServiceTracingEnabled            = false
+	DefaultServiceTracingProbeRatePerSecond = 100
+	DefaultServiceTracingProbeIntervalMS    = 10
+)
+
 // MaxGIDIndex is a coarse sanity upper bound for gid_index. Real ibv GID
 // tables are small (rdma_rxe typically exposes a handful of entries; mlx5
 // rarely exceeds a few dozen), so a huge value can never be valid on any
@@ -254,6 +266,23 @@ type AgentConfig struct {
 	// rotation). See DefaultFlowLabelRotationPeriodSec.
 	FlowLabelRotationPeriodSec uint32 `mapstructure:"flow_label_rotation_period_sec"`
 
+	// ServiceTracingEnabled traces the application RDMA connections on this
+	// host with eBPF and probes each traced flow with the flow's own flow
+	// label, so the probes follow the service traffic's ECMP paths (paper
+	// section 4.2.2). Linux only; the agent needs CAP_BPF and CAP_PERFMON
+	// and a kernel with BTF, and continues without service tracing when
+	// the tracer cannot start.
+	ServiceTracingEnabled bool `mapstructure:"service_tracing_enabled"`
+	// ServiceTracingProbeRatePerSecond caps the aggregate service-tracing
+	// probe rate of each RNIC (probes per second shared by all of its traced
+	// flows, visited in random order). It bounds the probe load whatever
+	// the number of flows the applications open.
+	ServiceTracingProbeRatePerSecond int `mapstructure:"service_tracing_probe_rate_per_second"`
+	// ServiceTracingProbeIntervalMS is the minimum interval between two
+	// passes over an RNIC's traced flows, i.e. the per-flow probe interval
+	// when the rate cap does not bind.
+	ServiceTracingProbeIntervalMS uint32 `mapstructure:"service_tracing_probe_interval_ms"`
+
 	// AnalysisReportEnabled turns on per-path window aggregation and reporting
 	// of PathSummary batches to the controller's analyzer via
 	// ReportProbeAnalysis. Reporting is best-effort and never blocks probing.
@@ -338,6 +367,9 @@ var agentKeys = []keySpec{
 	{key: "tor_mesh_probe_rate_per_second", def: DefaultTorMeshProbeRatePerSecond, help: "Probe rate per second per ToR-mesh target (0 = inherit target-probe-rate-per-second)"},
 	{key: "inter_tor_probe_rate_per_second", def: DefaultInterTorProbeRatePerSecond, help: "Probe rate per second per inter-ToR target (0 = inherit target-probe-rate-per-second)"},
 	{key: "flow_label_rotation_period_sec", def: uint32(DefaultFlowLabelRotationPeriodSec), help: "Period (seconds) over which the rotating ~20% of each target's ECMP flow-label set is refreshed"},
+	{key: "service_tracing_enabled", def: DefaultServiceTracingEnabled, help: "Trace application RDMA connections with eBPF and probe their flows (Linux; needs CAP_BPF and CAP_PERFMON)"},
+	{key: "service_tracing_probe_rate_per_second", def: DefaultServiceTracingProbeRatePerSecond, help: "Aggregate service-tracing probe rate per RNIC, shared by all of its traced flows"},
+	{key: "service_tracing_probe_interval_ms", def: uint32(DefaultServiceTracingProbeIntervalMS), help: "Minimum interval in milliseconds between two passes over an RNIC's traced flows"},
 	{key: "analysis_report_enabled", def: true, help: "Enable per-path window aggregation and SLA reporting to the controller"},
 	{key: "analysis_window_sec", def: uint32(DefaultAnalysisWindowSec), help: "Per-path aggregation window length in seconds"},
 	{key: "tls_mode", def: TLSModeDisabled, help: "gRPC transport security mode for the controller connection (disabled|tls|mtls)"},
@@ -381,54 +413,57 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 	}
 
 	config := &AgentConfig{
-		AgentID:                        agentID,
-		HostName:                       hostname,
-		TorID:                          v.GetString("tor_id"),
-		DeviceTorIDs:                   canonicalDeviceMap(v.GetStringMapString("device_tor_ids"), probe.CanonicalTorID),
-		PlaneID:                        probe.CanonicalPlaneID(v.GetString("plane_id")),
-		DevicePlaneIDs:                 canonicalDeviceMap(v.GetStringMapString("device_plane_ids"), probe.CanonicalPlaneID),
-		LLDPTorDiscovery:               v.GetBool("lldp_tor_discovery"),
-		LLDPTorIDField:                 v.GetString("lldp_tor_id_field"),
-		LLDPCLIPath:                    v.GetString("lldpcli_path"),
-		LLDPDiscoveryTimeoutSec:        v.GetUint32("lldp_discovery_timeout_sec"),
-		ControllerAddr:                 v.GetString("controller_addr"),
-		LogLevel:                       v.GetString("log_level"),
-		LogFormat:                      v.GetString("log_format"),
-		ProbeIntervalMS:                v.GetUint32("probe_interval_ms"),
-		OtelCollectorAddr:              v.GetString("otel_collector_addr"),
-		MetricsEnabled:                 v.GetBool("metrics_enabled"),
-		MetricsTargetRnicLabels:        v.GetString("metrics_target_rnic_labels"),
-		MetricsTargetRnicLabelsScope:   v.GetString("metrics_target_rnic_labels_scope"),
-		MetricsCardinalityLimit:        v.GetInt("metrics_cardinality_limit"),
-		MetricsProberDelayTargetTor:    v.GetBool("metrics_prober_delay_target_tor"),
-		MetricsResponderDelayTargetTor: v.GetBool("metrics_responder_delay_target_tor"),
-		AllowedDeviceNames:             v.GetStringSlice("allowed_device_names"),
-		ExcludedDeviceNames:            v.GetStringSlice("excluded_device_names"),
-		ExcludedGIDCIDRs:               v.GetStringSlice("excluded_gid_cidrs"),
-		MappedDevicesOnly:              v.GetBool("mapped_devices_only"),
-		GIDIndex:                       v.GetInt("gid_index"),
-		ServiceLevel:                   v.GetInt("service_level"),
-		TrafficClass:                   v.GetInt("traffic_class"),
-		CQPollMode:                     v.GetString("cq_poll_mode"),
-		EventRingCapacity:              v.GetUint32("event_ring_capacity"),
-		PinglistUpdateIntervalSec:      v.GetUint32("pinglist_update_interval_sec"),
-		TargetProbeRatePerSecond:       v.GetInt("target_probe_rate_per_second"),
-		TorMeshProbeRatePerSecond:      v.GetInt("tor_mesh_probe_rate_per_second"),
-		InterTorProbeRatePerSecond:     v.GetInt("inter_tor_probe_rate_per_second"),
-		FlowLabelRotationPeriodSec:     v.GetUint32("flow_label_rotation_period_sec"),
-		AnalysisReportEnabled:          v.GetBool("analysis_report_enabled"),
-		AnalysisWindowSec:              v.GetUint32("analysis_window_sec"),
-		TLSMode:                        v.GetString("tls_mode"),
-		TLSCertFile:                    v.GetString("tls_cert_file"),
-		TLSKeyFile:                     v.GetString("tls_key_file"),
-		TLSCAFile:                      v.GetString("tls_ca_file"),
-		TLSServerName:                  v.GetString("tls_server_name"),
-		SelfProtectionEnabled:          v.GetBool("self_protection_enabled"),
-		WatchdogIntervalSec:            v.GetUint32("watchdog_interval_sec"),
-		MaxMemoryMB:                    v.GetInt("max_memory_mb"),
-		MaxProcs:                       v.GetInt("max_procs"),
-		ThrottleMemoryRatio:            v.GetFloat64("throttle_memory_ratio"),
-		ThrottleCPUPercent:             v.GetFloat64("throttle_cpu_percent"),
+		AgentID:                          agentID,
+		HostName:                         hostname,
+		TorID:                            v.GetString("tor_id"),
+		DeviceTorIDs:                     canonicalDeviceMap(v.GetStringMapString("device_tor_ids"), probe.CanonicalTorID),
+		PlaneID:                          probe.CanonicalPlaneID(v.GetString("plane_id")),
+		DevicePlaneIDs:                   canonicalDeviceMap(v.GetStringMapString("device_plane_ids"), probe.CanonicalPlaneID),
+		LLDPTorDiscovery:                 v.GetBool("lldp_tor_discovery"),
+		LLDPTorIDField:                   v.GetString("lldp_tor_id_field"),
+		LLDPCLIPath:                      v.GetString("lldpcli_path"),
+		LLDPDiscoveryTimeoutSec:          v.GetUint32("lldp_discovery_timeout_sec"),
+		ControllerAddr:                   v.GetString("controller_addr"),
+		LogLevel:                         v.GetString("log_level"),
+		LogFormat:                        v.GetString("log_format"),
+		ProbeIntervalMS:                  v.GetUint32("probe_interval_ms"),
+		OtelCollectorAddr:                v.GetString("otel_collector_addr"),
+		MetricsEnabled:                   v.GetBool("metrics_enabled"),
+		MetricsTargetRnicLabels:          v.GetString("metrics_target_rnic_labels"),
+		MetricsTargetRnicLabelsScope:     v.GetString("metrics_target_rnic_labels_scope"),
+		MetricsCardinalityLimit:          v.GetInt("metrics_cardinality_limit"),
+		MetricsProberDelayTargetTor:      v.GetBool("metrics_prober_delay_target_tor"),
+		MetricsResponderDelayTargetTor:   v.GetBool("metrics_responder_delay_target_tor"),
+		AllowedDeviceNames:               v.GetStringSlice("allowed_device_names"),
+		ExcludedDeviceNames:              v.GetStringSlice("excluded_device_names"),
+		ExcludedGIDCIDRs:                 v.GetStringSlice("excluded_gid_cidrs"),
+		MappedDevicesOnly:                v.GetBool("mapped_devices_only"),
+		GIDIndex:                         v.GetInt("gid_index"),
+		ServiceLevel:                     v.GetInt("service_level"),
+		TrafficClass:                     v.GetInt("traffic_class"),
+		CQPollMode:                       v.GetString("cq_poll_mode"),
+		EventRingCapacity:                v.GetUint32("event_ring_capacity"),
+		PinglistUpdateIntervalSec:        v.GetUint32("pinglist_update_interval_sec"),
+		TargetProbeRatePerSecond:         v.GetInt("target_probe_rate_per_second"),
+		TorMeshProbeRatePerSecond:        v.GetInt("tor_mesh_probe_rate_per_second"),
+		InterTorProbeRatePerSecond:       v.GetInt("inter_tor_probe_rate_per_second"),
+		FlowLabelRotationPeriodSec:       v.GetUint32("flow_label_rotation_period_sec"),
+		ServiceTracingEnabled:            v.GetBool("service_tracing_enabled"),
+		ServiceTracingProbeRatePerSecond: v.GetInt("service_tracing_probe_rate_per_second"),
+		ServiceTracingProbeIntervalMS:    v.GetUint32("service_tracing_probe_interval_ms"),
+		AnalysisReportEnabled:            v.GetBool("analysis_report_enabled"),
+		AnalysisWindowSec:                v.GetUint32("analysis_window_sec"),
+		TLSMode:                          v.GetString("tls_mode"),
+		TLSCertFile:                      v.GetString("tls_cert_file"),
+		TLSKeyFile:                       v.GetString("tls_key_file"),
+		TLSCAFile:                        v.GetString("tls_ca_file"),
+		TLSServerName:                    v.GetString("tls_server_name"),
+		SelfProtectionEnabled:            v.GetBool("self_protection_enabled"),
+		WatchdogIntervalSec:              v.GetUint32("watchdog_interval_sec"),
+		MaxMemoryMB:                      v.GetInt("max_memory_mb"),
+		MaxProcs:                         v.GetInt("max_procs"),
+		ThrottleMemoryRatio:              v.GetFloat64("throttle_memory_ratio"),
+		ThrottleCPUPercent:               v.GetFloat64("throttle_cpu_percent"),
 	}
 
 	if err := config.Validate(); err != nil {
@@ -472,6 +507,9 @@ func (c *AgentConfig) Validate() error {
 		return err
 	}
 	if err := c.validateProbing(); err != nil {
+		return err
+	}
+	if err := c.validateServiceTracing(); err != nil {
 		return err
 	}
 	if err := c.validateSelfProtection(); err != nil {
@@ -655,6 +693,29 @@ func (c *AgentConfig) validateProbing() error {
 	// aggregator's window alignment, both of which require a positive length.
 	if c.AnalysisReportEnabled && c.AnalysisWindowSec == 0 {
 		return fmt.Errorf("analysis_window_sec must be > 0 when analysis_report_enabled, got: %d", c.AnalysisWindowSec)
+	}
+	return nil
+}
+
+// validateServiceTracing checks the service-tracing rate and interval. A
+// negative rate is always rejected; the positive-value requirements apply
+// only when the feature is enabled, so a disabled feature never blocks
+// startup over a knob it does not use.
+func (c *AgentConfig) validateServiceTracing() error {
+	if c.ServiceTracingProbeRatePerSecond < 0 {
+		return fmt.Errorf("service_tracing_probe_rate_per_second must be >= 0, got: %d", c.ServiceTracingProbeRatePerSecond)
+	}
+	if !c.ServiceTracingEnabled {
+		return nil
+	}
+	// Without a cap the prober would send every traced flow back-to-back
+	// each pass, and applications, not the controller, set the flow count.
+	if c.ServiceTracingProbeRatePerSecond == 0 {
+		return fmt.Errorf("service_tracing_probe_rate_per_second must be > 0 when service_tracing_enabled")
+	}
+	// A zero interval would make the service pass restart without pause.
+	if c.ServiceTracingProbeIntervalMS == 0 {
+		return fmt.Errorf("service_tracing_probe_interval_ms must be > 0 when service_tracing_enabled")
 	}
 	return nil
 }

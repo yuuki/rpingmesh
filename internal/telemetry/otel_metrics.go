@@ -215,6 +215,25 @@ type collectorOptions struct {
 	// WithResponderDelayTargetTor).
 	proberDelayTargetTor    bool
 	responderDelayTargetTor bool
+	// serviceTracing registers the rpingmesh.service.* instruments and the
+	// tracer gauges (see WithServiceTracing).
+	serviceTracing bool
+}
+
+// serviceMetricPrefix prefixes the instruments that record the probes sent
+// along traced service flows (probe.ProbeResult.ServiceTracing). They are
+// separate from the default instruments so the cluster-monitoring series,
+// which measure controller-chosen paths at a fixed rate, are never mixed
+// with service-network samples taken at the service-tracing rate.
+const serviceMetricPrefix = "rpingmesh.service."
+
+// WithServiceTracing registers the rpingmesh.service.* probe instruments and
+// the rpingmesh.agent.service_* tracer gauges. Without it, service-tracing
+// results are logged but not recorded.
+func WithServiceTracing(enabled bool) Option {
+	return func(o *collectorOptions) {
+		o.serviceTracing = enabled
+	}
 }
 
 // defaultCollectorOptions returns the options applied before any Option.
@@ -299,6 +318,14 @@ type MetricsCollector struct {
 	// WithTargetRnicLabels enabled them.
 	target           *probeInstruments
 	targetRnicLabels TargetRnicLabels
+	// service holds the rpingmesh.service.* instruments and the tracer
+	// gauges; nil unless WithServiceTracing enabled them.
+	service             *probeInstruments
+	serviceTraceActive  metric.Int64ObservableGauge
+	serviceConnections  metric.Int64ObservableGauge
+	serviceFlows        metric.Int64ObservableGauge
+	serviceTraceEvents  metric.Int64ObservableCounter
+	serviceTraceDropped metric.Int64ObservableCounter
 	// proberDelayTargetTor and responderDelayTargetTor keep target_tor on
 	// the delay histograms (see WithProberDelayTargetTor,
 	// WithResponderDelayTargetTor).
@@ -617,6 +644,20 @@ func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOpt
 		mc.target = &probeInstruments{}
 		mc.target.register(r, targetRnicMetricPrefix, true, options.targetRnicLabels.Histograms)
 	}
+	if options.serviceTracing {
+		mc.service = &probeInstruments{}
+		mc.service.register(r, serviceMetricPrefix, false, true)
+		mc.serviceTraceActive = r.gauge("rpingmesh.agent.service_trace_active",
+			"Whether the eBPF service tracer is attached (1) or service tracing is degraded (0)", "1")
+		mc.serviceConnections = r.gauge("rpingmesh.agent.service_connections",
+			"Connected application queue pairs traced on a local RNIC", "{connection}")
+		mc.serviceFlows = r.gauge("rpingmesh.agent.service_flows",
+			"Distinct traced service flows of a local RNIC, by whether their remote RNIC resolved to a probe target", "{flow}")
+		mc.serviceTraceEvents = r.observableCounter("rpingmesh.agent.service_trace_events_total",
+			"Queue pair lifecycle events the service tracer processed, by kind", "{event}")
+		mc.serviceTraceDropped = r.observableCounter("rpingmesh.agent.service_trace_dropped_total",
+			"Service tracer events lost before they reached the connection table, by reason", "{event}")
+	}
 	if r.err != nil {
 		return nil, r.err
 	}
@@ -740,6 +781,21 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 	if mc.responderDelayTargetTor {
 		responderDelayAttrs = attrs
 	}
+
+	// A probe along a traced service flow measures the service network: it
+	// goes to the rpingmesh.service.* instruments only, with the same
+	// ToR-level attributes, and never to the destination-RNIC instruments.
+	if result.ServiceTracing {
+		if mc.service != nil {
+			mc.service.record(ctx, outcome, attrSet, proberDelayAttrs, responderDelayAttrs)
+		}
+		if outcome.invalid() {
+			mc.logInvalidRTT(result, rtt, labels)
+		}
+		mc.logProbeResult(result, labels, outcome)
+		return
+	}
+
 	mc.probeInstruments.record(ctx, outcome, attrSet, proberDelayAttrs, responderDelayAttrs)
 	if outcome.invalid() {
 		mc.logInvalidRTT(result, rtt, labels)
@@ -989,6 +1045,88 @@ func (mc *MetricsCollector) RegisterSelfThrottleCallback(read func() float64) er
 	)
 	if err != nil {
 		return fmt.Errorf("register self throttle callback: %w", err)
+	}
+	return nil
+}
+
+// ServiceTracingDevice is the service-tracing state of one local RNIC for
+// RegisterServiceTracingCallback.
+type ServiceTracingDevice struct {
+	RdmaDevice string
+	// Connections is the number of connected application QPs traced on the
+	// device.
+	Connections int
+	// FlowsProbed and FlowsUnresolved count the distinct service flows
+	// (remote GID and flow label) whose remote RNIC the controller did or
+	// did not resolve to a probe target.
+	FlowsProbed     int
+	FlowsUnresolved int
+}
+
+// ServiceTracingSample is one reading of the service tracer's state for
+// RegisterServiceTracingCallback. The counters are cumulative.
+type ServiceTracingSample struct {
+	// Active is true while the eBPF tracer is attached.
+	Active  bool
+	Devices []ServiceTracingDevice
+	// Events by kind, as processed by the connection table.
+	Creates       uint64
+	Connects      uint64
+	Resets        uint64
+	Destroys      uint64
+	ContextCloses uint64
+	// UnknownQPs counts events for QPs the table never saw created.
+	UnknownQPs uint64
+	// Events lost by reason.
+	RingBufferDropped uint64
+	ParseErrors       uint64
+	DecodeErrors      uint64
+}
+
+// RegisterServiceTracingCallback registers an OTel callback reporting the
+// service tracer's state: rpingmesh.agent.service_trace_active,
+// service_connections and service_flows (by source_rdma_device and, for the
+// flows, by state probed/unresolved), service_trace_events_total (by kind)
+// and service_trace_dropped_total (by reason). read must be cheap; it runs
+// once per collection cycle. It is an error to call this without
+// WithServiceTracing.
+func (mc *MetricsCollector) RegisterServiceTracingCallback(read func() ServiceTracingSample) error {
+	if mc.service == nil {
+		return fmt.Errorf("service tracing instruments are not registered")
+	}
+	_, err := mc.meter.RegisterCallback(
+		func(_ context.Context, o metric.Observer) error {
+			s := read()
+			var active int64
+			if s.Active {
+				active = 1
+			}
+			o.ObserveInt64(mc.serviceTraceActive, active)
+			for _, d := range s.Devices {
+				dev := attribute.String("source_rdma_device", deviceMetricLabel(d.RdmaDevice))
+				o.ObserveInt64(mc.serviceConnections, int64(d.Connections), metric.WithAttributes(dev))
+				o.ObserveInt64(mc.serviceFlows, int64(d.FlowsProbed),
+					metric.WithAttributes(dev, attribute.String("state", "probed")))
+				o.ObserveInt64(mc.serviceFlows, int64(d.FlowsUnresolved),
+					metric.WithAttributes(dev, attribute.String("state", "unresolved")))
+			}
+			for kind, n := range map[string]uint64{
+				"create": s.Creates, "connect": s.Connects, "reset": s.Resets,
+				"destroy": s.Destroys, "context_close": s.ContextCloses, "unknown_qp": s.UnknownQPs,
+			} {
+				o.ObserveInt64(mc.serviceTraceEvents, int64(n), metric.WithAttributes(attribute.String("kind", kind)))
+			}
+			for reason, n := range map[string]uint64{
+				"ring_buffer": s.RingBufferDropped, "parse": s.ParseErrors, "decode": s.DecodeErrors,
+			} {
+				o.ObserveInt64(mc.serviceTraceDropped, int64(n), metric.WithAttributes(attribute.String("reason", reason)))
+			}
+			return nil
+		},
+		mc.serviceTraceActive, mc.serviceConnections, mc.serviceFlows, mc.serviceTraceEvents, mc.serviceTraceDropped,
+	)
+	if err != nil {
+		return fmt.Errorf("register service tracing callback: %w", err)
 	}
 	return nil
 }

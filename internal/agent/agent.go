@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/agent/controller_client"
+	"github.com/yuuki/rpingmesh/internal/agent/servicetrace"
 	"github.com/yuuki/rpingmesh/internal/config"
 	"github.com/yuuki/rpingmesh/internal/lldp"
 	"github.com/yuuki/rpingmesh/internal/probe"
@@ -104,6 +105,11 @@ type Agent struct {
 	// watchdog throttles every prober under CPU/memory pressure; nil when
 	// self-protection is disabled.
 	watchdog *Watchdog
+
+	// serviceMonitor turns traced application connections into service
+	// tracing targets; nil when service tracing is disabled or its eBPF
+	// tracer could not start (see createServiceTracing).
+	serviceMonitor *ServiceMonitor
 
 	// metricsResultsActive records whether a metrics consumer will drain
 	// a.results. When false the fan-in never sends on it: a full channel
@@ -255,6 +261,7 @@ func (a *Agent) Initialize(ctx context.Context) error {
 	a.createResultsFanIn()
 	a.createAnalysisReporter()
 	a.createWatchdog()
+	a.createServiceTracing()
 
 	if err := a.createResponders(); err != nil {
 		return err
@@ -781,6 +788,55 @@ func (a *Agent) createWatchdog() {
 		Msg("Self-protection watchdog created")
 }
 
+// createServiceTracing starts the eBPF tracer and creates the service
+// monitor that turns traced application connections into SERVICE_TRACING
+// targets for every prober, if service tracing is enabled. A tracer that
+// cannot start (no eBPF on this platform, no kernel BTF, missing CAP_BPF /
+// CAP_PERFMON, ib_uverbs not loaded) is logged and the agent continues
+// without service tracing, the way it continues without metrics. Requires
+// the probers, the gRPC client and the metrics collector.
+func (a *Agent) createServiceTracing() {
+	if !a.cfg.ServiceTracingEnabled {
+		return
+	}
+	tracer, err := servicetrace.Open()
+	if err != nil {
+		a.logger.Warn().Err(err).
+			Msg("Service tracing is enabled but the eBPF tracer could not start; continuing without it")
+		if a.metrics != nil {
+			inactive := telemetry.ServiceTracingSample{}
+			if err := a.metrics.RegisterServiceTracingCallback(func() telemetry.ServiceTracingSample { return inactive }); err != nil {
+				a.logger.Warn().Err(err).Msg("Failed to register service tracing metric callback")
+			}
+		}
+		return
+	}
+
+	devices := make([]ServiceDevice, 0, len(a.rnics))
+	for _, r := range a.rnics {
+		r.prober.SetServiceTracingRate(float64(a.cfg.ServiceTracingProbeRatePerSecond), a.cfg.ServiceTracingProbeIntervalMS)
+		devices = append(devices, ServiceDevice{
+			Name:     r.dev.Info.DeviceName,
+			GID:      r.dev.Info.GID,
+			IPAddr:   r.dev.Info.IPAddr,
+			Port:     r.dev.Info.ActivePort,
+			GIDIndex: r.dev.Info.ActiveGIDIndex,
+			Prober:   r.prober,
+		})
+	}
+	a.serviceMonitor = NewServiceMonitor(a.grpcClient, tracer, a.cfg.AgentID, devices, a.cfg.PinglistUpdateIntervalSec)
+	if a.metrics != nil {
+		if err := a.metrics.RegisterServiceTracingCallback(a.serviceMonitor.Stats); err != nil {
+			a.logger.Warn().Err(err).Msg("Failed to register service tracing metric callback")
+		}
+	}
+	a.logger.Info().
+		Int("devices", len(devices)).
+		Int("probe_rate_per_second", a.cfg.ServiceTracingProbeRatePerSecond).
+		Uint32("probe_interval_ms", a.cfg.ServiceTracingProbeIntervalMS).
+		Msg("Service tracing started: eBPF tracer attached to the uverbs entry points")
+}
+
 // createClusterMonitors creates one ClusterMonitor per device, each
 // requesting its pinglist with that device's own GID as requester_gid and
 // feeding the targets to that device's prober. Requires the probers.
@@ -918,6 +974,11 @@ func (a *Agent) Start(ctx context.Context) error {
 			return fmt.Errorf("failed to start cluster monitor for %s: %w", r.dev.Info.DeviceName, err)
 		}
 	}
+	if a.serviceMonitor != nil {
+		if err := a.serviceMonitor.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start service monitor: %w", err)
+		}
+	}
 
 	a.startHeartbeat(ctx)
 
@@ -948,12 +1009,15 @@ func (a *Agent) Stop(ctx context.Context) {
 
 	a.stopDeviceWatch()
 
-	// Monitors first so no new pinglists arrive; the heartbeat before the
-	// gRPC client closes, since both use it.
+	// Monitors first so no new pinglists or service targets arrive; the
+	// heartbeat before the gRPC client closes, since both use it.
 	for _, r := range a.rnics {
 		if r.monitor != nil {
 			r.monitor.Stop()
 		}
+	}
+	if a.serviceMonitor != nil {
+		a.serviceMonitor.Stop()
 	}
 	a.stopHeartbeat()
 
@@ -1151,7 +1215,8 @@ func (a *Agent) createMetricsCollector(ctx context.Context) {
 		telemetry.WithTargetRnicLabels(targetRnicLabels(a.cfg)),
 		telemetry.WithCardinalityLimit(a.cfg.MetricsCardinalityLimit),
 		telemetry.WithProberDelayTargetTor(a.cfg.MetricsProberDelayTargetTor),
-		telemetry.WithResponderDelayTargetTor(a.cfg.MetricsResponderDelayTargetTor))
+		telemetry.WithResponderDelayTargetTor(a.cfg.MetricsResponderDelayTargetTor),
+		telemetry.WithServiceTracing(a.cfg.ServiceTracingEnabled))
 	if err != nil {
 		a.logger.Warn().Err(err).
 			Msg("Failed to create metrics collector, continuing without metrics")
@@ -1281,7 +1346,11 @@ func (a *Agent) createResultsFanIn() {
 		go func(p *Prober) {
 			defer a.resultsWg.Done()
 			for result := range p.Results() {
-				if a.analysisResults != nil {
+				// Service tracing results measure the service network at
+				// their own rate; the per-path summaries the analyzer
+				// evaluates against the cluster SLA are built from the
+				// controller's pinglists only.
+				if a.analysisResults != nil && !result.ServiceTracing {
 					select {
 					case a.analysisResults <- result:
 					default:

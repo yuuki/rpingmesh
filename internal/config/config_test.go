@@ -628,6 +628,35 @@ func TestAgentConfig_Validate(t *testing.T) {
 		{"negative tor-mesh probe rate", func(c *AgentConfig) { c.TorMeshProbeRatePerSecond = -1 }, "tor_mesh_probe_rate_per_second"},
 		{"negative inter-tor probe rate", func(c *AgentConfig) { c.InterTorProbeRatePerSecond = -1 }, "inter_tor_probe_rate_per_second"},
 		{"differentiated probe rates", func(c *AgentConfig) { c.TorMeshProbeRatePerSecond = 10; c.InterTorProbeRatePerSecond = 1 }, ""},
+		{"negative service tracing rate", func(c *AgentConfig) { c.ServiceTracingProbeRatePerSecond = -1 }, "service_tracing_probe_rate_per_second"},
+		{"service tracing disabled ignores a zero rate", func(c *AgentConfig) { c.ServiceTracingProbeRatePerSecond = 0 }, ""},
+		{
+			"service tracing enabled needs a rate",
+			func(c *AgentConfig) {
+				c.ServiceTracingEnabled = true
+				c.ServiceTracingProbeRatePerSecond = 0
+				c.ServiceTracingProbeIntervalMS = 10
+			},
+			"service_tracing_probe_rate_per_second",
+		},
+		{
+			"service tracing enabled needs an interval",
+			func(c *AgentConfig) {
+				c.ServiceTracingEnabled = true
+				c.ServiceTracingProbeRatePerSecond = 100
+				c.ServiceTracingProbeIntervalMS = 0
+			},
+			"service_tracing_probe_interval_ms",
+		},
+		{
+			"service tracing enabled with rate and interval",
+			func(c *AgentConfig) {
+				c.ServiceTracingEnabled = true
+				c.ServiceTracingProbeRatePerSecond = 100
+				c.ServiceTracingProbeIntervalMS = 10
+			},
+			"",
+		},
 		{"analysis reporting needs a window", func(c *AgentConfig) { c.AnalysisReportEnabled = true }, "analysis_window_sec"},
 		{"analysis reporting with a window", func(c *AgentConfig) { c.AnalysisReportEnabled = true; c.AnalysisWindowSec = 30 }, ""},
 		{"tls_mode disabled requires no certificate files", func(c *AgentConfig) { c.TLSMode = TLSModeDisabled }, ""},

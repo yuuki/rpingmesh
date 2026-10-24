@@ -26,6 +26,7 @@ func simSchedule(t *testing.T, p *Prober, dur time.Duration, before func(now tim
 	passes := [...]sendPass{
 		{ptype: controller_agent.PinglistType_TOR_MESH},
 		{ptype: controller_agent.PinglistType_INTER_TOR},
+		{ptype: controller_agent.PinglistType_SERVICE_TRACING},
 	}
 	var seenGen uint64
 	sends := make(map[string][]time.Time)

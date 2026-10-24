@@ -83,6 +83,12 @@ type ProbeResult struct {
 	TargetRdmaDevice string
 	TargetNetdev     string
 	TargetSampled    bool
+	// ServiceTracing marks a probe sent along a traced service flow (a
+	// SERVICE_TRACING target, see internal/agent/servicetrace) rather than
+	// a controller pinglist target. Such results measure the service
+	// network and are recorded on the rpingmesh.service.* instruments,
+	// never on the cluster-monitoring ones.
+	ServiceTracing bool
 }
 
 // InvalidKind classifies why CalculateRTT rejected a measurement. The values

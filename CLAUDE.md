@@ -22,8 +22,9 @@ make build-agent       # CGO_ENABLED=1, links librdmabridge.a
 make clean           # Remove bin/, dist/, zig/zig-out/, zig/.zig-cache/
 ```
 
-After modifying `.proto` files: run `make generate-proto`. Generated `*.pb.go` files are not committed, so a fresh checkout also needs it before `build-controller`/`build-agent`. There is no eBPF code and no `make generate-bpf`.
+After modifying `.proto` files: run `make generate-proto`. Generated `*.pb.go` files are not committed, so a fresh checkout also needs it before `build-controller`/`build-agent`.
 After modifying Zig source in `zig/src/`: run `make build-zig` before `make build-agent`.
+After modifying the eBPF program under `internal/agent/servicetrace/bpf/`: run `make generate-bpf` (needs a clang with the BPF backend; on macOS set `BPF2GO_CC=/opt/homebrew/opt/llvm/bin/clang BPF2GO_STRIP=/opt/homebrew/opt/llvm/bin/llvm-strip`) and commit the regenerated `uverbs_*_bpfel.{go,o}`. `make check-bpf` verifies the program compiles and the `.go` bindings are current; `make build-agent` never needs clang.
 
 ### Testing
 
@@ -37,20 +38,21 @@ make test-scripts                               # Python tests for scripts/topol
 make test-all                                   # test-zig + go test on all packages except ./e2e/... (Linux, full Cgo/RDMA build env)
 ```
 
-`make test` covers every pure-Go package (`internal/probe`, `internal/config`, `internal/telemetry`, `internal/lldp`, `internal/logging`, `internal/buildinfo`, `internal/controller/...`, `internal/agent/controller_client`, `cmd/controller`); the controller packages need `make generate-proto` first. `internal/rdmabridge`, `internal/agent`, and `cmd/agent` need Cgo, libibverbs, and `librdmabridge.a` (the Linux environment of `make test-all`). `./e2e/...` is excluded from `test-all`; run it with `make test-e2e-controller` (Docker + rqlite) or `make test-e2e` (privileged Docker with soft-RoCE; on macOS run `make setup-colima` once).
+`make test` covers every pure-Go package (`internal/probe`, `internal/config`, `internal/telemetry`, `internal/lldp`, `internal/logging`, `internal/buildinfo`, `internal/controller/...`, `internal/agent/controller_client`, `internal/agent/servicetrace`, `cmd/controller`); the controller packages need `make generate-proto` first. `internal/rdmabridge`, `internal/agent`, and `cmd/agent` need Cgo, libibverbs, and `librdmabridge.a` (the Linux environment of `make test-all`). `./e2e/...` is excluded from `test-all`; run it with `make test-e2e-controller` (Docker + rqlite) or `make test-e2e` (privileged Docker with soft-RoCE; on macOS run `make setup-colima` once). The eBPF tracer's load/attach test (`TestTracerOpenClose`) and the service-tracing e2e test (`TestServiceTracing`, which traces `ibv_rc_pingpong`) need root, kernel BTF and `ib_uverbs`; they skip elsewhere.
 
 ## Architecture
 
 R-Pingmesh is a clean-room redesign of the SIGCOMM 2024 R-Pingmesh system. It
 keeps the paper's core concepts (6-timestamp probing, UD QP per RNIC,
-ToR-mesh/inter-ToR pinglists, ECMP via flow_label) but implements the RDMA
-data path as a Zig static library. The Phase 1 Analyzer is implemented;
-topology-aware Phase 2 fault localization and eBPF service tracing are out of
-scope.
+ToR-mesh/inter-ToR pinglists, ECMP via flow_label, eBPF service tracing) but
+implements the RDMA data path as a Zig static library. The Phase 1 Analyzer
+and service tracing are implemented; topology-aware Phase 2 fault
+localization is out of scope.
 
 **Components:**
-- **Controller** (pure Go, `CGO_ENABLED=0`): manages agent registry in rqlite, distributes pinglists via gRPC.
-- **Agent** (Go + Cgo, `CGO_ENABLED=1`): opens RDMA devices via the Zig bridge and runs one Prober, Responder, and ClusterMonitor per device, plus a shared metrics exporter, analysis reporter, and optional watchdog (`internal/agent/agent.go`).
+- **Controller** (pure Go, `CGO_ENABLED=0`): manages agent registry in rqlite, distributes pinglists via gRPC, and resolves the remote RNICs of traced service flows (`GetTargetRnicInfo`).
+- **Agent** (Go + Cgo, `CGO_ENABLED=1`): opens RDMA devices via the Zig bridge and runs one Prober, Responder, and ClusterMonitor per device, plus a shared metrics exporter, analysis reporter, optional watchdog, and optional service monitor (`internal/agent/agent.go`).
+- **Service tracing** (`internal/agent/servicetrace`, Linux only, opt-in via `service_tracing_enabled`): a cilium/ebpf-loaded program with kprobes on `ib_uverbs_ioctl`/`ib_uverbs_write`/`ib_uverbs_close` parses the uverbs user-space ABI (QP create/modify/destroy commands) so it needs no BTF for the RDMA modules (OFED ships none); only `struct file`/`inode` are CO-RE relocated against vmlinux. A pure-Go `Table` folds the events into connections; `internal/agent/service_monitor.go` resolves their remote GIDs through the controller and feeds `SERVICE_TRACING` targets, each with the flow's effective flow label (`EffectiveFlowLabel` mirrors the kernel's `rdma_get_udp_sport` arithmetic), to the Prober's third, aggregate-rate-capped pass. Results are recorded on `rpingmesh.service.*` only and never reach the analysis reporter.
 
 ### Key Design Choices Requiring Cross-File Understanding
 

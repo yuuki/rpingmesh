@@ -101,6 +101,7 @@ func run(cmd *cobra.Command, args []string) error {
 		Strs("excluded_gid_cidrs", cfg.ExcludedGIDCIDRs).
 		Bool("mapped_devices_only", cfg.MappedDevicesOnly).
 		Int("gid_index", cfg.GIDIndex).
+		Bool("service_tracing_enabled", cfg.ServiceTracingEnabled).
 		Msg("Starting rpingmesh-agent")
 
 	// Create the agent instance.

@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"math/rand/v2"
 	"sort"
+	"strings"
 
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/probe"
@@ -286,6 +287,65 @@ func (g *PinglistGenerator) GenerateInterTorPinglist(
 	}
 
 	rc.logGenerated("Generated Inter-ToR pinglist", "excludeTorID", torID, len(targets))
+	return targets, nil
+}
+
+// GenerateServiceTargets resolves the destination GIDs of the service flows
+// the requester traced (R-Pingmesh service tracing) into PingTargets of type
+// SERVICE_TRACING. Each GID is looked up in the registry; GIDs that are not
+// registered (an RNIC without a running agent, or a stale registration) and
+// targets the requester must not probe (its own RNIC, other RNICs of its
+// host, a cross-address-family GID; see shouldProbe) are left out, so the
+// result may be shorter than the input. Duplicate and empty GIDs are
+// ignored. The targets carry no flow-label set: the agent probes each
+// service flow with that flow's own label, so FlowLabelCount is 1 and the
+// agent fills FlowLabel in. Planes are not checked: a flow that exists is
+// reachable by definition.
+func (g *PinglistGenerator) GenerateServiceTargets(
+	ctx context.Context,
+	requesterGID string,
+	targetGIDs []string,
+) ([]*controller_agent.PingTarget, error) {
+	rc := g.resolveRequester(ctx, requesterGID, "")
+
+	seen := make(map[string]struct{}, len(targetGIDs))
+	targets := make([]*controller_agent.PingTarget, 0, len(targetGIDs))
+	unregistered := 0
+	for _, gid := range targetGIDs {
+		gid = strings.TrimSpace(gid)
+		if gid == "" {
+			continue
+		}
+		if _, dup := seen[gid]; dup {
+			continue
+		}
+		seen[gid] = struct{}{}
+
+		rnic, err := g.registry.GetRNICByGID(ctx, gid)
+		if err != nil {
+			return nil, err
+		}
+		if rnic == nil {
+			unregistered++
+			continue
+		}
+		if !rc.shouldProbe(rnic) {
+			continue
+		}
+		t := g.buildPingTarget(requesterGID, rnic, controller_agent.PinglistType_SERVICE_TRACING)
+		t.FlowLabel = 0
+		t.FlowLabelSeed = 0
+		t.FlowLabelCount = 1
+		t.Sampled = false
+		targets = append(targets, t)
+	}
+
+	log.Info().
+		Str("requesterGID", requesterGID).
+		Int("requested", len(seen)).
+		Int("unregistered", unregistered).
+		Int("targetCount", len(targets)).
+		Msg("Resolved service tracing targets")
 	return targets, nil
 }
 

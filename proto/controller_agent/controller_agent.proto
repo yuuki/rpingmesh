@@ -12,7 +12,7 @@ service ControllerService {
     // GetPinglist returns the list of targets for an agent to probe.
     rpc GetPinglist(PinglistRequest) returns (PinglistResponse);
     // ReportProbeAnalysis reports per-path, window-aggregated probe summaries
-    // from an agent so the controller-side analyzer can detect SLA violations
+    // from an agent so the controller-side analyzer can detect SLO violations
     // (and, in a future phase, localize switch/link faults across agents).
     rpc ReportProbeAnalysis(ProbeAnalysisReport) returns (ProbeAnalysisAck);
     // GetTargetRnicInfo resolves the remote RNICs of the service flows an
@@ -226,10 +226,13 @@ message ProbeAnalysisReport {
 // ProbeAnalysisAck acknowledges a ProbeAnalysisReport.
 message ProbeAnalysisAck {
     bool accepted = 1;
-    // sla_violations is the number of summaries in the acked report that the
-    // controller-side analyzer flagged as SLA violations (loss and/or p99 RTT
+    // slo_violations is the number of summaries in the acked report that the
+    // controller-side analyzer flagged as SLO violations (loss and/or p99 RTT
     // threshold breaches). It gives the reporting agent operational feedback
     // and makes the ingest+detection path observable end-to-end without an
     // OTLP collector. 0 when the analyzer is disabled.
-    uint32 sla_violations = 2;
+    //
+    // Renamed from sla_violations; the field number is unchanged, so the
+    // wire format is the same and older agents and controllers interoperate.
+    uint32 slo_violations = 2;
 }

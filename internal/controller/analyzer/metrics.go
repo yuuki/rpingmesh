@@ -14,7 +14,7 @@ import (
 // to findings logs. A nil *Metrics is a valid no-op, so the analyzer can run
 // (logs only) when metrics export is unavailable.
 type Metrics struct {
-	slaViolations metric.Int64Counter
+	sloViolations metric.Int64Counter
 	pathSummaries metric.Int64Counter
 }
 
@@ -30,17 +30,17 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 		return nil, fmt.Errorf("create path_summaries_total counter: %w", err)
 	}
 
-	slaViolations, err := meter.Int64Counter(
-		"rpingmesh.analyzer.sla_violations_total",
+	sloViolations, err := meter.Int64Counter(
+		"rpingmesh.analyzer.slo_violations_total",
 		metric.WithDescription("Total number of SLO violations detected (by network: cluster or service; by kind: loss or rtt)"),
 		metric.WithUnit("{violation}"),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("create sla_violations_total counter: %w", err)
+		return nil, fmt.Errorf("create slo_violations_total counter: %w", err)
 	}
 
 	return &Metrics{
-		slaViolations: slaViolations,
+		sloViolations: sloViolations,
 		pathSummaries: pathSummaries,
 	}, nil
 }
@@ -62,7 +62,7 @@ func (m *Metrics) recordViolation(ctx context.Context, network, sourceTor, targe
 	if m == nil {
 		return
 	}
-	m.slaViolations.Add(ctx, 1, metric.WithAttributes(
+	m.sloViolations.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("network", network),
 		attribute.String("source_tor", sourceTor),
 		attribute.String("target_tor", targetTor),

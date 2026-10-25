@@ -370,7 +370,7 @@ var agentKeys = []keySpec{
 	{key: "service_tracing_enabled", def: DefaultServiceTracingEnabled, help: "Trace application RDMA connections with eBPF and probe their flows (Linux; needs CAP_BPF and CAP_PERFMON)"},
 	{key: "service_tracing_probe_rate_per_second", def: DefaultServiceTracingProbeRatePerSecond, help: "Aggregate service-tracing probe rate per RNIC, shared by all of its traced flows"},
 	{key: "service_tracing_probe_interval_ms", def: uint32(DefaultServiceTracingProbeIntervalMS), help: "Minimum interval in milliseconds between two passes over an RNIC's traced flows"},
-	{key: "analysis_report_enabled", def: true, help: "Enable per-path window aggregation and SLA reporting to the controller"},
+	{key: "analysis_report_enabled", def: true, help: "Enable per-path window aggregation and SLO reporting to the controller"},
 	{key: "analysis_window_sec", def: uint32(DefaultAnalysisWindowSec), help: "Per-path aggregation window length in seconds"},
 	{key: "tls_mode", def: TLSModeDisabled, help: "gRPC transport security mode for the controller connection (disabled|tls|mtls)"},
 	{key: "tls_cert_file", def: "", help: "Client certificate file (required when tls-mode=mtls)"},

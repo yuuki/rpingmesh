@@ -245,7 +245,7 @@ func (c *GRPCControllerClient) ReportProbeAnalysis(
 	c.logger.Debug().
 		Str("agent_id", report.GetAgentId()).
 		Bool("accepted", resp.GetAccepted()).
-		Uint32("sla_violations", resp.GetSlaViolations()).
+		Uint32("slo_violations", resp.GetSloViolations()).
 		Msg("Probe analysis reported")
 
 	return resp, nil

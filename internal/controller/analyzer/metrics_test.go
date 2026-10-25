@@ -61,9 +61,9 @@ func TestMetrics_RecordViolationAttributes(t *testing.T) {
 	m.recordViolation(ctx, NetworkCluster, "tor-a", "tor-c", KindRTT)
 	m.recordViolation(ctx, NetworkService, "tor-a", "tor-b", KindLoss)
 
-	sum := collectSum(t, reader, "rpingmesh.analyzer.sla_violations_total")
+	sum := collectSum(t, reader, "rpingmesh.analyzer.slo_violations_total")
 	if !sum.IsMonotonic {
-		t.Error("sla_violations_total is not monotonic; want a counter")
+		t.Error("slo_violations_total is not monotonic; want a counter")
 	}
 	if len(sum.DataPoints) != 3 {
 		t.Fatalf("got %d data points, want 3 (one per distinct attribute set)", len(sum.DataPoints))
@@ -116,9 +116,9 @@ func TestMetrics_ServiceViolationTaggedByNetwork(t *testing.T) {
 		serviceSummary("tor-a", "tor-b", 100, 50, 0, 1), // service loss violation
 	))
 
-	violations := collectSum(t, reader, "rpingmesh.analyzer.sla_violations_total")
+	violations := collectSum(t, reader, "rpingmesh.analyzer.slo_violations_total")
 	if len(violations.DataPoints) != 2 {
-		t.Fatalf("sla_violations_total data points = %d, want 2", len(violations.DataPoints))
+		t.Fatalf("slo_violations_total data points = %d, want 2", len(violations.DataPoints))
 	}
 	seen := map[string]bool{}
 	for _, dp := range violations.DataPoints {
@@ -157,9 +157,9 @@ func TestMetrics_RecordSummaryCountsIngested(t *testing.T) {
 
 	// The violating summary must have reached the violation counter with the
 	// analyzer's (label-mapped) ToR IDs.
-	violations := collectSum(t, reader, "rpingmesh.analyzer.sla_violations_total")
+	violations := collectSum(t, reader, "rpingmesh.analyzer.slo_violations_total")
 	if len(violations.DataPoints) != 1 {
-		t.Fatalf("sla_violations_total data points = %d, want 1", len(violations.DataPoints))
+		t.Fatalf("slo_violations_total data points = %d, want 1", len(violations.DataPoints))
 	}
 	got := violations.DataPoints[0].Attributes
 	wantAttrs := attribute.NewSet(

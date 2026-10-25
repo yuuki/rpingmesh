@@ -84,15 +84,15 @@ func TestLoadControllerConfig_Defaults(t *testing.T) {
 	if cfg.UnspecifiedMeshMaxTargets != DefaultUnspecifiedMeshMaxTargets {
 		t.Errorf("UnspecifiedMeshMaxTargets = %d, want %d", cfg.UnspecifiedMeshMaxTargets, DefaultUnspecifiedMeshMaxTargets)
 	}
-	if cfg.AnalyzerSLANetworkRTTP99Ns != DefaultAnalyzerSLANetworkRTTP99Ns {
-		t.Errorf("AnalyzerSLANetworkRTTP99Ns = %d, want %d", cfg.AnalyzerSLANetworkRTTP99Ns, DefaultAnalyzerSLANetworkRTTP99Ns)
+	if cfg.AnalyzerSLONetworkRTTP99Ns != DefaultAnalyzerSLONetworkRTTP99Ns {
+		t.Errorf("AnalyzerSLONetworkRTTP99Ns = %d, want %d", cfg.AnalyzerSLONetworkRTTP99Ns, DefaultAnalyzerSLONetworkRTTP99Ns)
 	}
 	// The service-network thresholds default to the cluster defaults.
-	if cfg.AnalyzerServiceSLOLossRatio != DefaultAnalyzerSLALossRatio {
-		t.Errorf("AnalyzerServiceSLOLossRatio = %v, want %v", cfg.AnalyzerServiceSLOLossRatio, DefaultAnalyzerSLALossRatio)
+	if cfg.AnalyzerServiceSLOLossRatio != DefaultAnalyzerSLOLossRatio {
+		t.Errorf("AnalyzerServiceSLOLossRatio = %v, want %v", cfg.AnalyzerServiceSLOLossRatio, DefaultAnalyzerSLOLossRatio)
 	}
-	if cfg.AnalyzerServiceSLONetworkRTTP99Ns != DefaultAnalyzerSLANetworkRTTP99Ns {
-		t.Errorf("AnalyzerServiceSLONetworkRTTP99Ns = %d, want %d", cfg.AnalyzerServiceSLONetworkRTTP99Ns, DefaultAnalyzerSLANetworkRTTP99Ns)
+	if cfg.AnalyzerServiceSLONetworkRTTP99Ns != DefaultAnalyzerSLONetworkRTTP99Ns {
+		t.Errorf("AnalyzerServiceSLONetworkRTTP99Ns = %d, want %d", cfg.AnalyzerServiceSLONetworkRTTP99Ns, DefaultAnalyzerSLONetworkRTTP99Ns)
 	}
 	if cfg.AnalyzerMetricsCardinalityLimit != DefaultAnalyzerMetricsCardinalityLimit {
 		t.Errorf("AnalyzerMetricsCardinalityLimit = %d, want %d", cfg.AnalyzerMetricsCardinalityLimit, DefaultAnalyzerMetricsCardinalityLimit)
@@ -250,16 +250,16 @@ func TestControllerConfig_Validate(t *testing.T) {
 			"analyzer enabled rejects loss ratio above one",
 			func(c *ControllerConfig) {
 				c.AnalyzerEnabled = true
-				c.AnalyzerSLALossRatio = 1.5
+				c.AnalyzerSLOLossRatio = 1.5
 				c.AnalyzerWindowRetention = 20
 			},
-			"analyzer_sla_loss_ratio",
+			"analyzer_slo_loss_ratio",
 		},
 		{
 			"analyzer enabled rejects service loss ratio above one",
 			func(c *ControllerConfig) {
 				c.AnalyzerEnabled = true
-				c.AnalyzerSLALossRatio = 0.02
+				c.AnalyzerSLOLossRatio = 0.02
 				c.AnalyzerServiceSLOLossRatio = 1.5
 				c.AnalyzerWindowRetention = 20
 			},
@@ -269,7 +269,7 @@ func TestControllerConfig_Validate(t *testing.T) {
 			"analyzer enabled rejects cardinality limit below the SDK default",
 			func(c *ControllerConfig) {
 				c.AnalyzerEnabled = true
-				c.AnalyzerSLALossRatio = 0.02
+				c.AnalyzerSLOLossRatio = 0.02
 				c.AnalyzerWindowRetention = 20
 				c.AnalyzerMetricsCardinalityLimit = 1999
 			},
@@ -279,7 +279,7 @@ func TestControllerConfig_Validate(t *testing.T) {
 			"analyzer enabled accepts zero cardinality limit (SDK default)",
 			func(c *ControllerConfig) {
 				c.AnalyzerEnabled = true
-				c.AnalyzerSLALossRatio = 0.02
+				c.AnalyzerSLOLossRatio = 0.02
 				c.AnalyzerWindowRetention = 20
 				c.AnalyzerMetricsCardinalityLimit = 0
 			},
@@ -287,12 +287,12 @@ func TestControllerConfig_Validate(t *testing.T) {
 		},
 		{
 			"analyzer enabled rejects zero window retention",
-			func(c *ControllerConfig) { c.AnalyzerEnabled = true; c.AnalyzerSLALossRatio = 0.02 },
+			func(c *ControllerConfig) { c.AnalyzerEnabled = true; c.AnalyzerSLOLossRatio = 0.02 },
 			"analyzer_window_retention",
 		},
 		{
 			"analyzer disabled ignores its thresholds",
-			func(c *ControllerConfig) { c.AnalyzerEnabled = false; c.AnalyzerSLALossRatio = -1 },
+			func(c *ControllerConfig) { c.AnalyzerEnabled = false; c.AnalyzerSLOLossRatio = -1 },
 			"",
 		},
 		{"otel collector addr with scheme", func(c *ControllerConfig) { c.OtelCollectorAddr = "grpc://collector:4317" }, "otel_collector_addr"},
@@ -1020,4 +1020,113 @@ func TestLoadConfig_LogFormatPrecedence(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoadControllerConfig_RenamedKeys covers the deprecated analyzer_sla_*
+// aliases of analyzer_slo_*: each source (file, env, flag) still sets the
+// new field, the load reports one deprecation per alias in use, the new key
+// wins when both are set, and a configuration without the old keys reports
+// nothing.
+func TestLoadControllerConfig_RenamedKeys(t *testing.T) {
+	t.Run("old keys in file", func(t *testing.T) {
+		path := writeYAML(t, "controller.yaml",
+			"analyzer_sla_loss_ratio: 0.05\nanalyzer_sla_network_rtt_p99_ns: 250000\n")
+		cfg, err := LoadControllerConfig(path, nil)
+		if err != nil {
+			t.Fatalf("LoadControllerConfig: %v", err)
+		}
+		if cfg.AnalyzerSLOLossRatio != 0.05 {
+			t.Errorf("AnalyzerSLOLossRatio = %v, want 0.05 (from analyzer_sla_loss_ratio)", cfg.AnalyzerSLOLossRatio)
+		}
+		if cfg.AnalyzerSLONetworkRTTP99Ns != 250000 {
+			t.Errorf("AnalyzerSLONetworkRTTP99Ns = %d, want 250000 (from analyzer_sla_network_rtt_p99_ns)", cfg.AnalyzerSLONetworkRTTP99Ns)
+		}
+		if len(cfg.Deprecations) != 2 {
+			t.Fatalf("Deprecations = %q, want one warning per old key", cfg.Deprecations)
+		}
+		for i, want := range []string{"analyzer_sla_loss_ratio", "analyzer_sla_network_rtt_p99_ns"} {
+			if !strings.Contains(cfg.Deprecations[i], `"`+want+`"`) || !strings.Contains(cfg.Deprecations[i], "deprecated") {
+				t.Errorf("Deprecations[%d] = %q, want a deprecation warning naming %q", i, cfg.Deprecations[i], want)
+			}
+		}
+	})
+
+	t.Run("old env var", func(t *testing.T) {
+		t.Setenv("RPINGMESH_ANALYZER_SLA_LOSS_RATIO", "0.1")
+		cfg, err := LoadControllerConfig("", nil)
+		if err != nil {
+			t.Fatalf("LoadControllerConfig: %v", err)
+		}
+		if cfg.AnalyzerSLOLossRatio != 0.1 {
+			t.Errorf("AnalyzerSLOLossRatio = %v, want 0.1 (from RPINGMESH_ANALYZER_SLA_LOSS_RATIO)", cfg.AnalyzerSLOLossRatio)
+		}
+		if len(cfg.Deprecations) != 1 || !strings.Contains(cfg.Deprecations[0], "RPINGMESH_ANALYZER_SLA_LOSS_RATIO") {
+			t.Errorf("Deprecations = %q, want one warning naming the env var", cfg.Deprecations)
+		}
+	})
+
+	t.Run("new env var", func(t *testing.T) {
+		t.Setenv("RPINGMESH_ANALYZER_SLO_NETWORK_RTT_P99_NS", "750000")
+		cfg, err := LoadControllerConfig("", nil)
+		if err != nil {
+			t.Fatalf("LoadControllerConfig: %v", err)
+		}
+		if cfg.AnalyzerSLONetworkRTTP99Ns != 750000 {
+			t.Errorf("AnalyzerSLONetworkRTTP99Ns = %d, want 750000", cfg.AnalyzerSLONetworkRTTP99Ns)
+		}
+		if len(cfg.Deprecations) != 0 {
+			t.Errorf("Deprecations = %q, want none for the new key", cfg.Deprecations)
+		}
+	})
+
+	t.Run("old flag", func(t *testing.T) {
+		flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+		BindControllerFlags(flags)
+		if err := flags.Parse([]string{"--analyzer-sla-loss-ratio=0.2"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		cfg, err := LoadControllerConfig("", flags)
+		if err != nil {
+			t.Fatalf("LoadControllerConfig: %v", err)
+		}
+		if cfg.AnalyzerSLOLossRatio != 0.2 {
+			t.Errorf("AnalyzerSLOLossRatio = %v, want 0.2 (from --analyzer-sla-loss-ratio)", cfg.AnalyzerSLOLossRatio)
+		}
+		if len(cfg.Deprecations) != 1 || !strings.Contains(cfg.Deprecations[0], "--analyzer-sla-loss-ratio") {
+			t.Errorf("Deprecations = %q, want one warning naming the flag", cfg.Deprecations)
+		}
+	})
+
+	t.Run("new key wins over old key", func(t *testing.T) {
+		// The old key comes from the environment, which outranks the file
+		// for one key; the new key still wins because it is set at all.
+		path := writeYAML(t, "controller.yaml", "analyzer_slo_loss_ratio: 0.03\n")
+		t.Setenv("RPINGMESH_ANALYZER_SLA_LOSS_RATIO", "0.5")
+		cfg, err := LoadControllerConfig(path, nil)
+		if err != nil {
+			t.Fatalf("LoadControllerConfig: %v", err)
+		}
+		if cfg.AnalyzerSLOLossRatio != 0.03 {
+			t.Errorf("AnalyzerSLOLossRatio = %v, want 0.03 (new key set, old key ignored)", cfg.AnalyzerSLOLossRatio)
+		}
+		if len(cfg.Deprecations) != 1 || !strings.Contains(cfg.Deprecations[0], "ignored") {
+			t.Errorf("Deprecations = %q, want one warning that the old key is ignored", cfg.Deprecations)
+		}
+	})
+
+	t.Run("old key is validated under the new name", func(t *testing.T) {
+		path := writeYAML(t, "controller.yaml", "analyzer_sla_loss_ratio: 1.5\n")
+		_, err := LoadControllerConfig(path, nil)
+		checkErr(t, err, "analyzer_slo_loss_ratio")
+	})
+
+	t.Run("no old keys", func(t *testing.T) {
+		cfg, err := LoadControllerConfig("", nil)
+		if err != nil {
+			t.Fatalf("LoadControllerConfig: %v", err)
+		}
+		if len(cfg.Deprecations) != 0 {
+			t.Errorf("Deprecations = %q, want none", cfg.Deprecations)
+		}
+	})
 }

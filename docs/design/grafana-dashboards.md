@@ -53,7 +53,7 @@ temporality, which is what a Prometheus-style backend expects.
 | `rpingmesh.agent.self_throttle` | Float64 ObservableGauge | none | Self-protection rate multiplier: 1.0 = unthrottled, floor 0.1 |
 | `rpingmesh.event_ring_dropped_total` | Int64 ObservableCounter | `ring` ∈ {`prober`, `responder`} | Completion events dropped on a full ring |
 | `rpingmesh.analyzer.path_summaries_total` | Int64 Counter | none | Per-path window summaries ingested by the analyzer |
-| `rpingmesh.analyzer.sla_violations_total` | Int64 Counter | `network` ∈ {`cluster`, `service`}, `source_tor`, `target_tor`, `kind` ∈ {`loss`, `rtt`} | SLO violations detected by the analyzer; `network` keeps the service-tracing paths apart from the cluster ones |
+| `rpingmesh.analyzer.slo_violations_total` | Int64 Counter | `network` ∈ {`cluster`, `service`}, `source_tor`, `target_tor`, `kind` ∈ {`loss`, `rtt`} | SLO violations detected by the analyzer; `network` keeps the service-tracing paths apart from the cluster ones |
 
 The network RTT histogram and the two delay histograms use separate explicit
 bucket ladders in nanoseconds, sized from production RoCEv2 leaf-spine
@@ -64,8 +64,8 @@ including empty ones, so boundaries where no samples land are pure cost.
   `2 000`, 500 ns steps to 4 µs, 1 µs steps from 5 µs to 10 µs, then
   `12 500, 15 000, 20 000, 25 000, 50 000, 100 000, 500 000, 1 000 000,
   2 500 000, 5 000 000, 10 000 000`. Resolution is densest in 2–25 µs, where 99.99% of samples
-  fall. `500 000` is the default `analyzer_sla_network_rtt_p99_ns`, so
-  `le="500000"` gives the share of probes within the SLA threshold; the
+  fall. `500 000` is the default `analyzer_slo_network_rtt_p99_ns`, so
+  `le="500000"` gives the share of probes within the SLO threshold; the
   controller logs a warning at startup when its threshold is not a boundary.
   The 1, 2.5, 5 and 10 ms boundaries keep congestion (for example a PFC
   pause storm) measurable. `histogram_quantile` interpolates linearly inside
@@ -116,7 +116,7 @@ and never reads the exported histograms.
   do the same.
 - The analyzer's path aggregator fixes a path's target ToR when its window
   opens. If an agent switches to a real ToR ID mid-window, the analyzer's
-  `sla_violations_total` labels can carry the previous target ToR until that
+  `slo_violations_total` labels can carry the previous target ToR until that
   window closes.
 
 ### Estimating the series count
@@ -272,7 +272,7 @@ dots replaced:
 | `rpingmesh.agent.self_throttle` | `rpingmesh_agent_self_throttle` |
 | `rpingmesh.event_ring_dropped_total` | `rpingmesh_event_ring_dropped_total` |
 | `rpingmesh.analyzer.path_summaries_total` | `rpingmesh_analyzer_path_summaries_total` |
-| `rpingmesh.analyzer.sla_violations_total` | `rpingmesh_analyzer_sla_violations_total` |
+| `rpingmesh.analyzer.slo_violations_total` | `rpingmesh_analyzer_slo_violations_total` |
 
 `_bucket`, `_sum`, and `_count` are structural histogram series, not name
 suffixes, so the strategy does not affect them. The seed script emits the
@@ -329,7 +329,7 @@ correctly.
 **Mesh Overview** (`uid: rpingmesh-mesh-overview`) is the fleet-wide entry
 point:
 
-- **Fleet-health stat row:** probe rate, success ratio, SLA-violation rate,
+- **Fleet-health stat row:** probe rate, success ratio, SLO-violation rate,
   worst agent self-throttle (`min(...self_throttle)`), and event-ring drop
   rate. These five numbers decide "call someone" versus "sleep".
 - **ToR × ToR loss matrix:** a Table panel whose instant, table-format query
@@ -340,8 +340,8 @@ point:
   is the fabric broken" view.
 - **Worst ToR pairs:** a companion `topk(20, ...)` table by loss %, which
   carries the drilldown data link (see Decision 4).
-- **Failures and SLA:** failure rate by `reason`, SLA-violation rate by
-  `kind`, and an instant SLA-violations-by-pair table that also links to the
+- **Failures and SLO:** failure rate by `reason`, SLO-violation rate by
+  `kind`, and an instant SLO-violations-by-pair table that also links to the
   drilldown.
 
 All success-ratio and loss % queries divide by
@@ -365,7 +365,7 @@ by the `source_tor` and `target_tor` template variables
 - Failure rate by `reason`.
 - Prober-delay and responder-delay p50/p99, which separate "the network is
   slow" from "an endpoint is stalling".
-- SLA-violation rate by `kind`.
+- SLO-violation rate by `kind`.
 
 Why two dashboards rather than one large board or many small ones: the mesh
 view is dense and fleet-scoped (no per-pair variables), so it works as a wall
@@ -383,7 +383,7 @@ label names (VictoriaMetrics, Prometheus 3+) can use it as is.
 |---|---|---|
 | `RpingmeshTorPairLoss` / `RpingmeshTorPairLossCritical` | warning / critical | ACK-timeout ratio per ToR pair > 1 % for 5 min / > 10 % for 3 min |
 | `RpingmeshTorPairNoSuccess` | critical | A pair is probed but nothing succeeds for 5 min (black hole) |
-| `RpingmeshSLAViolation` | warning | The analyzer flagged loss or p99-RTT SLA windows in the last 10 min |
+| `RpingmeshSLOViolation` | warning | The analyzer flagged loss or p99-RTT SLO windows in the last 10 min |
 | `RpingmeshProbeSendErrors` | warning | An agent keeps failing to post probes (local RNIC or driver) |
 | `RpingmeshEventRingDrops` | warning | An agent dropped completion events, so its loss may be an artifact |
 | `RpingmeshAgentSelfThrottled` | warning | Self-protection held the probe rate below 1× for 15 min |
@@ -395,12 +395,12 @@ Choices worth recording:
 
 - **Loss means timeouts, not "not success".** `invalid_rtt` is clock noise and
   `send_error` is local, so neither counts as fabric loss; send errors have
-  their own rule. The analyzer's loss SLA differs slightly: it also excludes
+  their own rule. The analyzer's loss SLO differs slightly: it also excludes
   invalid RTTs, but counts every failed probe (including send errors) as
   lost.
-- **No direct RTT alert.** The analyzer owns the RTT SLA
-  (`analyzer_sla_network_rtt_p99_ns` in the controller config) and
-  `RpingmeshSLAViolation` surfaces it, so the threshold lives in one place.
+- **No direct RTT alert.** The analyzer owns the RTT SLO
+  (`analyzer_slo_network_rtt_p99_ns` in the controller config) and
+  `RpingmeshSLOViolation` surfaces it, so the threshold lives in one place.
 - **Agent identity is normalized.** Depending on the pipeline, the agent
   appears as `instance` (from `service.instance.id`) or `host.name` (resource
   attributes promoted to labels). Per-agent rules build an `agent` label with
@@ -426,7 +426,7 @@ A matrix built with *Grouping to matrix* has **dynamic column names** (each
 header is a `target_tor` value), and its first field is named
 `source_tor\target_tor`. A per-cell link that carries both coordinates would
 have to reference that backslash-named field, which is fragile. The click path
-is therefore the companion "Worst ToR pairs" table (and the SLA-by-pair
+is therefore the companion "Worst ToR pairs" table (and the SLO-by-pair
 table), whose rows have stable `source_tor` and `target_tor` fields:
 
 ```
@@ -473,7 +473,7 @@ service panels stay empty on a pair with no traced flows.
   2.5 ms. That is adequate for distribution shape and regressions, which is
   the dashboards' job, so panels label quantiles as approximate. The analyzer
   also estimates per-path p50/p99 from fixed buckets, but it evaluates the
-  SLA per path (one RNIC pair) rather than per aggregated ToR pair, and
+  SLO per path (one RNIC pair) rather than per aggregated ToR pair, and
   dashboards surface its verdicts as counts instead of recomputing them.
 - **Cardinality and query cost.** Series grow with ToR pairs times source
   RNICs (see [Estimating the series count](#estimating-the-series-count)),
@@ -495,7 +495,7 @@ The stack is validated end to end without RDMA hardware:
    with per-line timestamps, so `rate()` and `histogram_quantile()` have
    enough points. The seed includes histogram buckets, success and failure
    counters split across two synthetic agents (to exercise the identity
-   contract), two lossy pairs, one high-RTT pair, SLA-violation counters,
+   contract), two lossy pairs, one high-RTT pair, SLO-violation counters,
    the self-throttle gauge, and ring drops.
 3. **Check Grafana health and provisioning** (`make obs-verify`, which runs
    `scripts/verify-observability.sh`): `GET /api/health` reports the
@@ -506,7 +506,7 @@ The stack is validated end to end without RDMA hardware:
    makes a query return nothing and fails the check.
 5. **Check the alert rules.** The script evaluates every rule expression
    against the seed. Exactly the alerts the seed was built to trigger
-   (`RpingmeshTorPairLoss` on the two lossy pairs and `RpingmeshSLAViolation`)
+   (`RpingmeshTorPairLoss` on the two lossy pairs and `RpingmeshSLOViolation`)
    must return series, and every other rule must stay quiet. It then checks
    that vmalert loaded all rules without evaluation errors. Running the check
    once per `NAME_STYLE` covers both metric-name styles.

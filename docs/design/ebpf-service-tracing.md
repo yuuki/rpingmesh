@@ -151,9 +151,9 @@ without controller-side evaluation. The analyzer now evaluates both, apart:
   `analyzer_service_slo_network_rtt_p99_ns` (independent settings whose
   defaults equal the cluster defaults) and the other summaries against the
   cluster thresholds. Findings carry `network` (`cluster` or `service`) in
-  the log and as an attribute of `rpingmesh.analyzer.sla_violations_total`;
+  the log and as an attribute of `rpingmesh.analyzer.slo_violations_total`;
   summing over `network` gives the series the counter carried before.
-  `ProbeAnalysisAck.sla_violations` counts both.
+  `ProbeAnalysisAck.slo_violations` counts both.
 - Per-server, not per-ToR. The paper reports service-network SLIs per server
   and does not aggregate them hierarchically by ToR, because the samples are
   spread unevenly: how many probes a path gets depends on how many flows the
@@ -180,7 +180,7 @@ without controller-side evaluation. The analyzer now evaluates both, apart:
   tick that finds a send still in flight leaves the completed windows in
   the aggregator for the next one.
 - Metric cardinality. `network` doubles the series
-  `rpingmesh.analyzer.sla_violations_total` can carry (up to
+  `rpingmesh.analyzer.slo_violations_total` can carry (up to
   `4 × T × (T−1)` for T ToRs, all at once in a wide outage); the controller
   raises the OTel SDK's per-instrument cap with
   `analyzer_metrics_cardinality_limit` (default 20000, about 70 ToRs).

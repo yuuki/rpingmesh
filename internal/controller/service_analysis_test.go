@@ -40,8 +40,8 @@ func TestReportProbeAnalysis_WithAnalyzer(t *testing.T) {
 	if !ack.GetAccepted() {
 		t.Errorf("Accepted = false, want true")
 	}
-	if ack.GetSlaViolations() != 2 {
-		t.Errorf("SlaViolations = %d, want 2", ack.GetSlaViolations())
+	if ack.GetSloViolations() != 2 {
+		t.Errorf("SloViolations = %d, want 2", ack.GetSloViolations())
 	}
 	if az.calls != 1 {
 		t.Errorf("analyzer.Ingest calls = %d, want 1", az.calls)

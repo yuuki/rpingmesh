@@ -64,7 +64,7 @@ gen() {
             for (b = 1; b <= nle; b++) if (b >= modal) hb[ik,b] += succ
             hcount[ik] += succ
             hsum[ik]   += succ * LE[modal]   # rough sum using modal bucket bound (ns)
-            # SLA violations for the bad pairs, attributed to instance 1
+            # SLO violations for the bad pairs, attributed to instance 1
             # only (the analyzer emits one violation per detection window,
             # not per contributing agent).
             # NOTE: gated on (t - start), not raw t: STEP (15s) shares a
@@ -74,9 +74,9 @@ gen() {
             # wall-clock time at invocation. Anchoring to the loop-relative
             # offset (always a multiple of STEP, starting at 0) makes it
             # fire deterministically regardless of when the script is run.
-            if (inst == 1 && i == 1 && j == 4) slaloss[key] += (((t - start) % 60 == 0) ? 1 : 0)
-            if (inst == 1 && i == 3 && j == 5) slaloss[key] += (((t - start) % 90 == 0) ? 1 : 0)
-            if (inst == 1 && i == 2 && j == 6) slartt[key]  += (((t - start) % 120 == 0) ? 1 : 0)
+            if (inst == 1 && i == 1 && j == 4) sloloss[key] += (((t - start) % 60 == 0) ? 1 : 0)
+            if (inst == 1 && i == 3 && j == 5) sloloss[key] += (((t - start) % 90 == 0) ? 1 : 0)
+            if (inst == 1 && i == 2 && j == 6) slortt[key]  += (((t - start) % 120 == 0) ? 1 : 0)
 
             lbl = "source_tor=\"" T[i] "\",target_tor=\"" T[j] "\",job=\"rpingmesh-agent\",instance=\"agent-" inst "\""
             printf "rpingmesh_probe_total{%s} %d %d\n", lbl, tot[ik], ts
@@ -102,13 +102,13 @@ gen() {
             printf "rpingmesh_responder_delay_ns_sum{%s} %d %d\n", lbl, hsum[ik], ts
             printf "rpingmesh_responder_delay_ns_count{%s} %d %d\n", lbl, hcount[ik], ts
           }
-          # analyzer SLA violations (job=rpingmesh-analyzer; the analyzer is
+          # analyzer SLO violations (job=rpingmesh-analyzer; the analyzer is
           # a separate, single process in this demo, so no instance split).
           albl = "network=\"cluster\",source_tor=\"" T[i] "\",target_tor=\"" T[j] "\",job=\"rpingmesh-analyzer\""
-          if (slaloss[key] > 0)
-            printf "rpingmesh_analyzer_sla_violations_total{%s,kind=\"loss\"} %d %d\n", albl, slaloss[key], ts
-          if (slartt[key] > 0)
-            printf "rpingmesh_analyzer_sla_violations_total{%s,kind=\"rtt\"} %d %d\n", albl, slartt[key], ts
+          if (sloloss[key] > 0)
+            printf "rpingmesh_analyzer_slo_violations_total{%s,kind=\"loss\"} %d %d\n", albl, sloloss[key], ts
+          if (slortt[key] > 0)
+            printf "rpingmesh_analyzer_slo_violations_total{%s,kind=\"rtt\"} %d %d\n", albl, slortt[key], ts
         }
       }
       # fleet-level analyzer + agent gauges

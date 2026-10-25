@@ -126,10 +126,97 @@ reads the flow's GID from sysfs and warns once per device and index.
 - Telemetry records such results on the `rpingmesh.service.*` instruments
   with the usual ToR-level attributes, and exposes the tracer through
   `rpingmesh.agent.service_trace_active`, `service_connections`,
-  `service_flows`, `service_trace_events_total` and
+  `service_flows`, `service_qps_unbound`, `service_trace_events_total` and
   `service_trace_dropped_total`. The results fan-in tees them to the
   analysis reporter as well, once the controller has reported
   `service_path_summaries` at registration (see below).
+
+### QPs that predate the agent
+
+After event consumption starts, the monitor inventories existing user QPs
+through RDMA netlink (`RDMA_NLDEV_CMD_GET` and `RES_QP_GET`). It repeats on
+the normal full-refresh interval, and after an unidentified lifecycle event
+invalidates recovered connections. Generic entries include device, local
+and remote QPN, type, state, port and owner task ID. The kernel-name
+attribute identifies kernel-owned QPs; missing PID alone does not, because
+a user QP can outlive its creator task. Kernel-owned and UD/raw/driver QPs
+are excluded. A generic entry without an address vector
+remains unbound and never becomes a probe target.
+
+For `mlx5_core` devices the monitor then attempts `RES_QP_GET_RAW` on
+untraced RTR/RTS QPs. The decoder reads the driver's PRM_QUERY_QP resource
+dump: big-endian INFO/COMMAND/RESOURCE/TERMINATE segments, with the resource
+ID selected by the command echo. It accepts complete 272-byte query-QP
+outputs and the 464-byte form with a QP context extension. It validates the
+command/resource QPN, state, transport, remote QPN and port, then reads the
+primary remote GID, flow label, source GID index, traffic class, SL and hop
+limit. The hardware UDP source port must equal the port the existing prober
+will derive from that label and the QPNs. Unknown layouts, errors, incomplete
+or aggregated segments, IB/RoCEv1 paths and port overrides stay unbound.
+The generic owner/type/state are queried again after each raw read to reject
+QPN reuse; no resource bytes or addresses are guessed.
+
+Raw queries require **CAP_NET_ADMIN**, in addition to the tracer's
+CAP_BPF/CAP_PERFMON. The optional example
+`packaging/systemd/rpingmesh-agent.service.d/20-qp-recovery.conf` grants it;
+the package ships this as documentation and never enables it automatically.
+The generic snapshot needs no additional capability and no `rdma` executable.
+Firmware must support the PRM_QUERY_QP resource-dump segment; unsupported
+devices, missing privilege or unsupported firmware preserve generic entries
+and live tracing. There is no new configuration flag.
+
+A generic call waits at most five seconds; the separate raw-recovery call
+waits at most thirty seconds. Refreshes run off the monitor's event/timer
+loop, so a slow driver cannot delay removal of an invalidated probe target.
+Each kernel socket belongs to its worker: a send/receive can execute a
+synchronous driver query even on a nonblocking socket. At most one kernel
+worker runs process-wide; later calls wait for its slot within their own
+deadline rather than accumulating stalled queries. Shutdown cancels callers
+without waiting for a stalled syscall; the worker closes its own socket
+when the kernel returns. Late results are discarded. A generic dump failure
+preserves the previous inventory; a raw failure retains generic unresolved
+entries and any successfully validated partial recovery.
+
+Recovered connections use `(device, local QPN)` and set `FromSnapshot`;
+context and handle remain zero. The generic ABI and mlx5 dump provide no
+uverbs context/handle, so a QPN is never treated as a uverbs handle. A traced
+create/open supersedes the exact device/QPN and subsequent tracer events
+use the usual identity. An unknown modify/destroy or a context close
+conservatively invalidates the device's snapshot connections and schedules
+a debounced resnapshot. This also handles owners that create QPs on a
+non-leader thread: netlink reports a TID, whereas tracer events carry a
+TGID. The monitor resolves `/proc/<tid>/status` for process-exit reaping.
+An exited creator thread can remove the netlink PID without destroying the
+QP; such resources remain eligible for recovery with an unknown owner.
+Unresolved owner identities are checked through subsequent netlink
+refreshes, rather than reaped from a missing TID. Old owner identities are
+never copied to a new snapshot based only on a device/QPN match. Recovered
+connections have no cgroup/service attribution.
+`unknown_qp` still counts events without a known uverbs identity, including
+ones whose QPs have driver-recovered connections.
+
+Collection captures per-device lifecycle generations. Results for a device
+that changed during collection are rejected and retried; other devices are
+accepted. Known UD/raw/driver queue activity does not advance the generation.
+An actively changing connected-QP set on the same device can delay recovery
+until a snapshot completes without such events. Successful refreshes replace
+snapshot resources without overwriting traced connections, and process-exit
+reconciliation reaps recovered connections as well. Netlink is an observation,
+not an atomic lifecycle history: dropped events and PID/QPN reuse can still
+leave data stale until a refresh. The host RDMA devices and PID namespace
+must be visible to the agent, as for the existing tracer.
+
+`rpingmesh.agent.service_qps_unbound{source_rdma_device}` counts only entries
+without a recovered address vector. Recovered connections contribute to the
+normal connection/flow gauges and SERVICE_TRACING targets; they do not invent
+create/connect events. No task ID, QPN, GID or raw bytes become metric labels.
+Physical mlx5 validation is opt-in (`TestServiceTracingRecoversMlx5Connections`);
+the portable fixtures are synthetic PRM layouts, not hardware captures.
+
+ABI references: Linux [mlx5_ifc.h](https://github.com/torvalds/linux/blob/master/include/linux/mlx5/mlx5_ifc.h),
+[mlx5 restrack](https://github.com/torvalds/linux/blob/master/drivers/infiniband/hw/mlx5/restrack.c),
+[QP path conversion](https://github.com/torvalds/linux/blob/master/drivers/infiniband/hw/mlx5/qp.c)
+and [RDMA netlink](https://github.com/torvalds/linux/blob/master/drivers/infiniband/core/nldev.c).
 
 ### Bounded service identity
 
@@ -258,6 +345,11 @@ agent package ships it as an example rather than installing it.
   aggregator's per-pinglist-type keying, the reporter's `pinglist_type`
   mapping, the fan-in's gating on `service_path_summaries`, and the
   analyzer's per-network thresholds and `network` attribute.
+- Snapshot tests cover nested netlink decoding, malformed/interrupted dumps,
+  snapshot/live-event ordering, failure retention, periodic refresh and
+  shutdown cancellation. `TestServiceTracingSnapshotsExistingQP` (soft-RoCE
+  e2e) creates a user QP before taking the snapshot and checks its inventory
+  and eventual removal without inventing a connection.
 - `TestTracerOpenClose` (Linux, root): loads and attaches the committed
   objects into the running kernel; CI runs it under `sudo`.
 - `TestServiceTracingTracesRCApplication` (soft-RoCE e2e): traces
@@ -269,8 +361,9 @@ agent package ships it as an example rather than installing it.
 
 ## Follow-ups
 
-- **Existing connections.** A snapshot from RDMA netlink
-  (`rdma resource show qp`) at startup would seed the table with QPs that
-  predate the agent, which the trace alone cannot see.
+- **Additional startup recovery drivers.** mlx5 PRM query-QP recovery is
+  implemented with strict layout checks; other drivers/formats remain
+  unbound. No supported snapshot supplies a uverbs context/handle, so
+  unknown-event correlation remains conservative and snapshot-based.
 - **DC transport.** mlx5's dynamically connected transport binds the remote
   per work request, not at RTR, and is invisible to this tracer.

@@ -786,6 +786,17 @@ sudo systemctl daemon-reload && sudo systemctl restart rpingmesh-agent.service
 Without the capabilities the agent logs `permission denied loading eBPF
 programs` at startup and keeps probing without service tracing.
 
+Existing mlx5 connections can also be recovered from the driver's raw QP
+dump when `CAP_NET_ADMIN` is available. The separate optional example
+`packaging/systemd/rpingmesh-agent.service.d/20-qp-recovery.conf` grants that
+capability in addition to the service-tracing drop-in. It is shipped under
+the package's examples directory, without being installed as a live grant.
+Without it, or on unsupported drivers/firmware, existing QPs remain visible
+on `rpingmesh.agent.service_qps_unbound`; live tracing continues. Recovery
+uses strict PRM layout and path checks, and physical mlx5 validation is
+opt-in. See [the service-tracing design](docs/design/ebpf-service-tracing.md#qps-that-predate-the-agent)
+for capability, firmware, lifecycle and test details.
+
 ### Running rqlite on the controller host
 
 The controller unit starts after `rqlite.service` and wants it. `rqlited`
@@ -859,6 +870,7 @@ With `service_tracing_enabled`, the agent also exports:
 |--------|------|-------------|
 | `rpingmesh.service.network_rtt_ns`, `prober_delay_ns`, `responder_delay_ns`, `probe_total`, `probe_success_total`, `probe_failed_total`, `probe_invalid_total` | as above | The same instruments for probes sent along traced service flows, with the same attributes and optional `service`. Service probes never count in the `rpingmesh.*` cluster instruments |
 | `rpingmesh.agent.service_trace_active` | Gauge | `1` while the eBPF tracer is attached, `0` when service tracing is degraded |
+| `rpingmesh.agent.service_qps_unbound` | Gauge | Existing connected-transport user QPs without a usable recovered address vector; by `source_rdma_device`, excluded from probe targets |
 | `rpingmesh.agent.service_connections` | Gauge | Connected application queue pairs traced on a local RNIC, by `source_rdma_device` and optional `service` |
 | `rpingmesh.agent.service_flows` | Gauge | Distinct traced flows of a local RNIC, by `source_rdma_device`, optional `service`, and `state` (`probed`, or `unresolved` when the remote RNIC has no registered agent) |
 | `rpingmesh.agent.service_trace_events_total` | Counter | Queue pair lifecycle events, by `kind` (`create`, `connect`, `reset`, `destroy`, `context_close`, `unknown_qp`) |

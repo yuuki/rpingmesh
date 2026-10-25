@@ -158,16 +158,104 @@
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } }
     },
     {
-      "id": 14, "type": "timeseries", "title": "SLA violations (pair)",
+      "id": 14, "type": "timeseries", "title": "SLO violations (pair, by network)",
       "gridPos": { "h": 7, "w": 24, "x": 0, "y": 32 },
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "sum by (kind) (rate({__name__=~\"rpingmesh[._]analyzer[._]sla_violations_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
-          "legendFormat": "{{kind}}", "range": true } ],
+          "expr": "sum by (network, kind) (rate({__name__=~\"rpingmesh[._]analyzer[._]sla_violations_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
+          "legendFormat": "{{network}} {{kind}}", "range": true } ],
       "fieldConfig": { "defaults": { "unit": "cps",
         "custom": { "drawStyle": "line", "fillOpacity": 15 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 19, "type": "row", "title": "Service network (traced application flows): the SLIs behind network=\"service\" violations",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "collapsed": false, "panels": []
+    },
+    {
+      "id": 20, "type": "stat", "title": "Service: success ratio (pair)",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "100 * sum(rate({__name__=~\"rpingmesh[._]service[._]probe_success_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])) / (sum(rate({__name__=~\"rpingmesh[._]service[._]probe_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])) > 0)",
+          "range": true } ],
+      "fieldConfig": { "defaults": { "unit": "percent", "color": { "mode": "thresholds" },
+        "thresholds": { "mode": "absolute", "steps": [ { "value": null, "color": "red" }, { "value": 99, "color": "yellow" }, { "value": 99.9, "color": "green" } ] } },
+        "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 21, "type": "stat", "title": "Service: probe rate (pair)",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum(rate({__name__=~\"rpingmesh[._]service[._]probe_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
+          "range": true } ],
+      "fieldConfig": { "defaults": { "unit": "cps", "color": { "mode": "thresholds" },
+        "thresholds": { "mode": "absolute", "steps": [ { "value": null, "color": "blue" } ] } },
+        "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 22, "type": "stat", "title": "Service: network RTT p50 (approx)",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate({__name__=~\"rpingmesh[._]service[._]network_rtt_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "range": true } ],
+      "fieldConfig": { "defaults": { "unit": "ns", "color": { "mode": "thresholds" },
+        "thresholds": { "mode": "absolute", "steps": [ { "value": null, "color": "green" }, { "value": 1000000, "color": "yellow" }, { "value": 5000000, "color": "red" } ] } },
+        "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 23, "type": "stat", "title": "Service: network RTT p99 (approx)",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate({__name__=~\"rpingmesh[._]service[._]network_rtt_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "range": true } ],
+      "fieldConfig": { "defaults": { "unit": "ns", "color": { "mode": "thresholds" },
+        "thresholds": { "mode": "absolute", "steps": [ { "value": null, "color": "green" }, { "value": 1000000, "color": "yellow" }, { "value": 5000000, "color": "red" } ] } },
+        "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 24, "type": "timeseries", "title": "Service: probe failures by reason (pair)",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (reason) (rate({__name__=~\"rpingmesh[._]service[._]probe_failed_total\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}", "range": true } ],
+      "fieldConfig": { "defaults": { "unit": "cps",
+        "custom": { "drawStyle": "line", "fillOpacity": 15, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 25, "type": "timeseries", "title": "Service: network RTT quantiles (approx, bucket-limited)",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate({__name__=~\"rpingmesh[._]service[._]network_rtt_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "legendFormat": "p50", "range": true },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "histogram_quantile(0.9, sum by (le) (rate({__name__=~\"rpingmesh[._]service[._]network_rtt_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "legendFormat": "p90", "range": true },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate({__name__=~\"rpingmesh[._]service[._]network_rtt_ns_bucket\",source_tor=\"$source_tor\",target_tor=\"$target_tor\"}[$__rate_interval])))",
+          "legendFormat": "p99", "range": true }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ns",
+        "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } }
     }
   ]
 }

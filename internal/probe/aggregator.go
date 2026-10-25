@@ -6,13 +6,18 @@ import (
 	"sync"
 )
 
-// PathKey identifies a single probe path: the source RNIC (this agent) and the
-// target RNIC. Aggregation is keyed by (source, target) rather than by target
-// alone so that a multi-rail host, where several local RNICs probe the same
-// target, keeps each source RNIC's path distinct.
+// PathKey identifies a single probe path: the source RNIC (this agent), the
+// target RNIC and the pinglist the target came from. Aggregation is keyed by
+// (source, target) rather than by target alone so that a multi-rail host,
+// where several local RNICs probe the same target, keeps each source RNIC's
+// path distinct. The pinglist type keeps the probes sent along a traced
+// service flow (PinglistServiceTracing: the service-tracing rate, the flow's
+// own flow label) out of the cluster summary of the same target RNIC, so the
+// controller can evaluate the service network against its own SLO thresholds.
 type PathKey struct {
-	SourceGID [16]byte
-	TargetGID [16]byte
+	SourceGID    [16]byte
+	TargetGID    [16]byte
+	PinglistType PinglistType
 }
 
 // PathSummary is a window-aggregated summary of one probe path. It mirrors the
@@ -26,6 +31,7 @@ type PathSummary struct {
 	TargetGID         [16]byte
 	TargetTorID       string
 	TargetQPN         uint32
+	PinglistType      PinglistType
 	WindowStartUnixNs uint64
 	WindowDurationMs  uint32
 	ProbeTotal        uint32
@@ -154,6 +160,7 @@ func (a *pathAccumulator) summary(key PathKey, windowDurationMs uint32) PathSumm
 		TargetGID:         key.TargetGID,
 		TargetTorID:       a.targetTorID,
 		TargetQPN:         a.targetQPN,
+		PinglistType:      key.PinglistType,
 		WindowStartUnixNs: a.windowStartNs,
 		WindowDurationMs:  windowDurationMs,
 		ProbeTotal:        a.total,
@@ -215,7 +222,7 @@ func (p *PathAggregator) AddResult(r *ProbeResult, recvUnixNs uint64) {
 	if r == nil {
 		return
 	}
-	key := PathKey{SourceGID: r.SourceGID, TargetGID: r.TargetGID}
+	key := PathKey{SourceGID: r.SourceGID, TargetGID: r.TargetGID, PinglistType: r.PinglistType}
 	ws := p.windowStart(recvUnixNs)
 
 	p.mu.Lock()

@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -129,10 +130,19 @@ type Agent struct {
 	lldpQuerier lldp.Querier
 	sysfsRoot   string
 
-	// perRnicTorLossWarned and planeSupportWarned make the "controller lacks
-	// feature" errors log once, not every heartbeat.
-	perRnicTorLossWarned bool
-	planeSupportWarned   bool
+	// perRnicTorLossWarned, planeSupportWarned and servicePathSummariesWarned
+	// make the "controller lacks feature" errors log once, not every
+	// heartbeat.
+	perRnicTorLossWarned       bool
+	planeSupportWarned         bool
+	servicePathSummariesWarned bool
+
+	// servicePathSummaries is set from the registration response when the
+	// controller evaluates SERVICE_TRACING path summaries apart from the
+	// cluster ones; until then the results fan-in keeps service results out
+	// of the analysis branch. Atomic because the fan-in goroutines read it
+	// while registration (and every heartbeat re-registration) writes it.
+	servicePathSummaries atomic.Bool
 
 	heartbeatStopCh chan struct{}
 	heartbeatWg     sync.WaitGroup
@@ -650,6 +660,27 @@ func (a *Agent) checkRegistrationPlaneSupport(resp *controller_agent.AgentRegist
 			"restricted to each device's plane, so cross-plane targets may time out. Upgrade the controller")
 }
 
+// applyRegistrationServiceAnalysisSupport records whether the controller
+// evaluates service path summaries apart from the cluster ones, which gates
+// the service branch of the analysis tee (see createResultsFanIn). It warns
+// once when service tracing and analysis reporting are both on but the
+// controller predates the support: service results then stay out of the
+// analysis reports rather than being judged as cluster paths. Runs on the
+// initial registration and on every heartbeat re-registration, so a
+// controller upgrade (or downgrade) takes effect without an agent restart.
+func (a *Agent) applyRegistrationServiceAnalysisSupport(resp *controller_agent.AgentRegistrationResponse) {
+	supported := resp.GetServicePathSummaries()
+	a.servicePathSummaries.Store(supported)
+	if supported || !a.cfg.ServiceTracingEnabled || !a.cfg.AnalysisReportEnabled || a.servicePathSummariesWarned {
+		return
+	}
+	a.servicePathSummariesWarned = true
+	a.logger.Warn().
+		Msg("Controller does not evaluate service-tracing path summaries (it predates them); " +
+			"service results are reported to the agent's rpingmesh.service.* metrics only, " +
+			"not to the analyzer. Upgrade the controller")
+}
+
 // usesPerDeviceTorIDs reports whether any device's ToR differs from the
 // host-wide tor_id.
 func (a *Agent) usesPerDeviceTorIDs() bool {
@@ -761,6 +792,11 @@ func (a *Agent) createAnalysisReporter() {
 		a.cfg.AnalysisWindowSec,
 		a.analysisResults,
 	)
+	// Service summaries go out only while the controller evaluates them
+	// apart from the cluster paths (set by registration, see
+	// applyRegistrationServiceAnalysisSupport); checked at send time so a
+	// downgrade seen at a heartbeat also stops summaries already aggregated.
+	a.analysisReporter.SetServiceSummariesAllowed(a.servicePathSummaries.Load)
 	a.logger.Info().
 		Uint32("window_sec", a.cfg.AnalysisWindowSec).
 		Msg("Analysis reporter created")
@@ -935,6 +971,7 @@ func (a *Agent) registerWithController(ctx context.Context) error {
 		if lastErr == nil {
 			a.applyRegistrationTorSupport(resp)
 			a.checkRegistrationPlaneSupport(resp)
+			a.applyRegistrationServiceAnalysisSupport(resp)
 			a.logger.Info().
 				Str("agent_id", a.cfg.AgentID).
 				Int("rnic_count", len(req.GetRnics())).
@@ -1150,6 +1187,7 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 				Msg("Controller no longer supports per-RNIC ToR IDs; ToR-mesh pinglists will be empty. Restart the agent or upgrade the controller")
 		}
 		a.checkRegistrationPlaneSupport(resp)
+		a.applyRegistrationServiceAnalysisSupport(resp)
 		a.logger.Debug().
 			Str("agent_id", a.cfg.AgentID).
 			Msg("Heartbeat re-registration succeeded")
@@ -1349,11 +1387,14 @@ func (a *Agent) createResultsFanIn() {
 		go func(p *Prober) {
 			defer a.resultsWg.Done()
 			for result := range p.Results() {
-				// Service tracing results measure the service network at
-				// their own rate; the per-path summaries the analyzer
-				// evaluates against the cluster SLA are built from the
-				// controller's pinglists only.
-				if a.analysisResults != nil && !result.ServiceTracing {
+				// Service tracing results are summarized apart from the
+				// cluster paths (the aggregator keys on the pinglist type)
+				// and evaluated against the service-network SLO thresholds
+				// by the controller. A controller that predates that would
+				// mix them into the cluster evaluation, so they are teed
+				// only once registration reported the support.
+				if a.analysisResults != nil &&
+					(!result.IsServiceTracing() || a.servicePathSummaries.Load()) {
 					select {
 					case a.analysisResults <- result:
 					default:

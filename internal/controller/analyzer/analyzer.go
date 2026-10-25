@@ -1,7 +1,13 @@
 // Package analyzer implements the controller-side, Phase 1 R-Pingmesh analyzer:
 // it ingests per-path window summaries reported by agents, retains the most
-// recent windows in memory, and flags per-path SLA violations (loss ratio and
-// p99 network-RTT threshold breaches).
+// recent windows in memory, and flags per-path SLO violations (the loss-ratio
+// and p99 network-RTT SLIs of a window over their thresholds).
+//
+// The paper's Analyzer evaluates the cluster network and the service network
+// separately. Summaries of pinglist_type SERVICE_TRACING (probes sent along
+// traced application flows) are therefore judged against their own
+// thresholds, and their findings carry network="service", apart from the
+// cluster paths (TOR_MESH, INTER_TOR) that may lead to the same target RNIC.
 //
 // It is deliberately in-process with the controller (a separate package so it
 // can later be split into a standalone binary): the topology needed for
@@ -26,14 +32,33 @@ const (
 	KindRTT  = "rtt"
 )
 
-// Config holds the analyzer's SLA thresholds and retention.
-type Config struct {
-	// SLALossRatio is the per-path loss ratio (probe_failed / probe_total)
+// Networks a path summary can belong to, used as the "network" metric
+// attribute and in finding logs: the cluster network (the controller's
+// ToR-mesh and inter-ToR pinglists) or the service network (paths of traced
+// application flows).
+const (
+	NetworkCluster = "cluster"
+	NetworkService = "service"
+)
+
+// Thresholds are the SLO thresholds one network's path windows are evaluated
+// against.
+type Thresholds struct {
+	// LossRatio is the per-path loss ratio (probe_failed / probe_total)
 	// above which a window is flagged as a loss violation.
-	SLALossRatio float64
-	// SLANetworkRTTP99Ns is the per-path p99 network-RTT threshold (ns) above
+	LossRatio float64
+	// NetworkRTTP99Ns is the per-path p99 network-RTT threshold (ns) above
 	// which a window is flagged as an RTT violation. 0 disables the RTT check.
-	SLANetworkRTTP99Ns uint64
+	NetworkRTTP99Ns uint64
+}
+
+// Config holds the analyzer's SLO thresholds and retention.
+type Config struct {
+	// Cluster applies to TOR_MESH and INTER_TOR summaries (and to summaries
+	// from agents that predate pinglist_type, which report 0 = TOR_MESH).
+	Cluster Thresholds
+	// Service applies to SERVICE_TRACING summaries.
+	Service Thresholds
 	// WindowRetention is the number of distinct windows retained in the
 	// in-memory ring (oldest evicted first). Must be >= 1.
 	WindowRetention int
@@ -123,10 +148,29 @@ func (a *Analyzer) Ingest(ctx context.Context, report *controller_agent.ProbeAna
 	return violatingSummaries
 }
 
-// evaluate checks a single summary against the SLA thresholds, emitting a
-// finding (log + metric) for each breach. It returns true if the summary
-// breached at least one threshold.
+// networkOf classifies a summary by the pinglist its target came from: the
+// service network for SERVICE_TRACING, the cluster network otherwise.
+func networkOf(s *controller_agent.PathSummary) string {
+	if s.GetPinglistType() == controller_agent.PinglistType_SERVICE_TRACING {
+		return NetworkService
+	}
+	return NetworkCluster
+}
+
+// thresholdsFor returns the SLO thresholds of the given network.
+func (a *Analyzer) thresholdsFor(network string) Thresholds {
+	if network == NetworkService {
+		return a.cfg.Service
+	}
+	return a.cfg.Cluster
+}
+
+// evaluate checks a single summary against the SLO thresholds of its network,
+// emitting a finding (log + metric) for each breach. It returns true if the
+// summary breached at least one threshold.
 func (a *Analyzer) evaluate(ctx context.Context, agentID string, s *controller_agent.PathSummary) bool {
+	network := networkOf(s)
+	thr := a.thresholdsFor(network)
 	sourceTor := s.GetSourceTorId()
 	targetTor := s.GetTargetTorId()
 	violated := false
@@ -135,24 +179,24 @@ func (a *Analyzer) evaluate(ctx context.Context, agentID string, s *controller_a
 	// by probe_total > 0 to avoid a spurious ratio on an empty window.
 	if total := s.GetProbeTotal(); total > 0 {
 		loss := float64(s.GetProbeFailed()) / float64(total)
-		if loss > a.cfg.SLALossRatio {
+		if loss > thr.LossRatio {
 			violated = true
-			a.metrics.recordViolation(ctx, sourceTor, targetTor, KindLoss)
-			a.logFinding(agentID, s, KindLoss).
+			a.metrics.recordViolation(ctx, network, sourceTor, targetTor, KindLoss)
+			a.logFinding(agentID, network, s, KindLoss).
 				Float64("loss_ratio", loss).
-				Float64("threshold", a.cfg.SLALossRatio).
-				Msg("SLA violation: packet loss")
+				Float64("threshold", thr.LossRatio).
+				Msg("SLO violation: packet loss")
 		}
 	}
 
 	// RTT violation: p99 network RTT over the threshold (0 disables the check).
-	if a.cfg.SLANetworkRTTP99Ns > 0 && s.GetNetworkRttP99Ns() > a.cfg.SLANetworkRTTP99Ns {
+	if thr.NetworkRTTP99Ns > 0 && s.GetNetworkRttP99Ns() > thr.NetworkRTTP99Ns {
 		violated = true
-		a.metrics.recordViolation(ctx, sourceTor, targetTor, KindRTT)
-		a.logFinding(agentID, s, KindRTT).
+		a.metrics.recordViolation(ctx, network, sourceTor, targetTor, KindRTT)
+		a.logFinding(agentID, network, s, KindRTT).
 			Uint64("p99_rtt_ns", s.GetNetworkRttP99Ns()).
-			Uint64("threshold_ns", a.cfg.SLANetworkRTTP99Ns).
-			Msg("SLA violation: high p99 network RTT")
+			Uint64("threshold_ns", thr.NetworkRTTP99Ns).
+			Msg("SLO violation: high p99 network RTT")
 	}
 
 	return violated
@@ -160,10 +204,15 @@ func (a *Analyzer) evaluate(ctx context.Context, agentID string, s *controller_a
 
 // logFinding builds a Warn-level event pre-populated with the identifying
 // fields common to every finding. GID-level detail is included here (findings
-// logs), never as a metric attribute.
-func (a *Analyzer) logFinding(agentID string, s *controller_agent.PathSummary, kind string) *zerolog.Event {
+// logs), never as a metric attribute. For the service network the per-path
+// fields (agent_id, source_gid, target_gid) are the per-server view the paper
+// recommends: service samples are spread unevenly over servers, so service
+// findings should be read per path, not summed per ToR.
+func (a *Analyzer) logFinding(agentID, network string, s *controller_agent.PathSummary, kind string) *zerolog.Event {
 	return a.logger.Warn().
 		Str("kind", kind).
+		Str("network", network).
+		Str("pinglist_type", s.GetPinglistType().String()).
 		Str("agent_id", agentID).
 		Str("source_gid", s.GetSourceGid()).
 		Str("source_tor", s.GetSourceTorId()).

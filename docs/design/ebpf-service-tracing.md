@@ -122,13 +122,72 @@ reads the flow's GID from sysfs and warns once per device and index.
   targets at the end of a slow pass, and single-label targets do not
   advance the per-GID flow-label rotation the pinglist target of the same
   remote relies on for ECMP coverage. Results carry
-  `ProbeResult.ServiceTracing`.
+  `ProbeResult.PinglistType` (`PinglistServiceTracing`).
 - Telemetry records such results on the `rpingmesh.service.*` instruments
   with the usual ToR-level attributes, and exposes the tracer through
   `rpingmesh.agent.service_trace_active`, `service_connections`,
   `service_flows`, `service_trace_events_total` and
-  `service_trace_dropped_total`. The results fan-in skips them for the
-  analysis reporter.
+  `service_trace_dropped_total`. The results fan-in tees them to the
+  analysis reporter as well, once the controller has reported
+  `service_path_summaries` at registration (see below).
+
+### Service network SLOs
+
+The paper's Analyzer evaluates the cluster network and the service network
+separately. Service probes are sent at the service-tracing rate along the
+flows' own labels, so folding them into the cluster summary of the same
+target RNIC would skew the cluster SLIs; keeping them out of the analyzer
+altogether, as the first implementation did, left the service network
+without controller-side evaluation. The analyzer now evaluates both, apart:
+
+- `ProbeResult.PinglistType` (a `probe` enum equal by value to the proto
+  `PinglistType`) records the pinglist a target came from, and the
+  `PathAggregator` keys its windows by (source GID, target GID, pinglist
+  type). A service flow to an RNIC that is also a pinglist target therefore
+  gets a window summary of its own, reported with
+  `PathSummary.pinglist_type = SERVICE_TRACING`.
+- The controller's analyzer evaluates `SERVICE_TRACING` summaries against
+  `analyzer_service_slo_loss_ratio` and
+  `analyzer_service_slo_network_rtt_p99_ns` (independent settings whose
+  defaults equal the cluster defaults) and the other summaries against the
+  cluster thresholds. Findings carry `network` (`cluster` or `service`) in
+  the log and as an attribute of `rpingmesh.analyzer.sla_violations_total`;
+  summing over `network` gives the series the counter carried before.
+  `ProbeAnalysisAck.sla_violations` counts both.
+- Per-server, not per-ToR. The paper reports service-network SLIs per server
+  and does not aggregate them hierarchically by ToR, because the samples are
+  spread unevenly: how many probes a path gets depends on how many flows the
+  application opened, so a ToR-level ratio would be dominated by the busiest
+  servers. The analyzer therefore judges each service path window on its own
+  and logs the finding with `agent_id`, `source_gid` and `target_gid`; the
+  `source_tor`/`target_tor` attributes on the counter only bound its
+  cardinality and are not a service SLI. Dashboards should read the agent's
+  `rpingmesh.service.*` instruments per agent instance (one per server)
+  rather than summed over the ToR attributes.
+- Rollout. `AgentRegistrationResponse.service_path_summaries` tells the
+  agent that the controller evaluates service summaries apart. A controller
+  that predates it ignores `pinglist_type` and would judge service paths as
+  cluster paths, so the agent tees service results into the analysis branch
+  only while the flag is set (re-read at every heartbeat re-registration)
+  and warns once when it is not; upgrade the controller first. The reporter
+  checks the flag again when it sends, so summaries aggregated before a
+  heartbeat learned of a downgrade are dropped rather than sent.
+- Reporter back-pressure. Service results arrive at up to
+  `service_tracing_probe_rate_per_second` per RNIC on top of the cluster
+  results, and the fan-in's tee into the analysis branch is non-blocking
+  (a full channel drops). The reporter therefore sends its periodic reports
+  on a goroutine of their own and keeps draining input during the RPC; a
+  tick that finds a send still in flight leaves the completed windows in
+  the aggregator for the next one.
+- Metric cardinality. `network` doubles the series
+  `rpingmesh.analyzer.sla_violations_total` can carry (up to
+  `4 × T × (T−1)` for T ToRs, all at once in a wide outage); the controller
+  raises the OTel SDK's per-instrument cap with
+  `analyzer_metrics_cardinality_limit` (default 20000, about 70 ToRs).
+- Dashboards. The ToR pair drilldown has a service-network row built on
+  `rpingmesh.service.*`, so a `network="service"` violation clicked in the
+  overview table lands on the SLIs of the service paths, not only on the
+  cluster ones.
 - The controller's `GetTargetRnicInfo` looks each GID up in the registry and
   applies the pinglist generator's self and same-host exclusion. The request
   is capped at 4096 GIDs; the agent batches at 1024.
@@ -156,7 +215,10 @@ agent package ships it as an example rather than installing it.
   (create/RTR/reset/destroy/close, handle reuse, context scoping, QP types),
   the kernel flow-label arithmetic, the sysfs lookups, the service monitor
   with a fake tracer and controller, the prober's service pass scheduling,
-  the telemetry instruments, config validation, and the controller RPC.
+  the telemetry instruments, config validation, the controller RPC, the
+  aggregator's per-pinglist-type keying, the reporter's `pinglist_type`
+  mapping, the fan-in's gating on `service_path_summaries`, and the
+  analyzer's per-network thresholds and `network` attribute.
 - `TestTracerOpenClose` (Linux, root): loads and attaches the committed
   objects into the running kernel; CI runs it under `sudo`.
 - `TestServiceTracingTracesRCApplication` (soft-RoCE e2e): traces
@@ -168,10 +230,6 @@ agent package ships it as an example rather than installing it.
 
 ## Follow-ups
 
-- **Controller-side service SLAs.** Service results are not reported to the
-  analyzer. A `pinglist_type` on `PathSummary` and a separate evaluation of
-  service paths would let the controller flag service-network violations
-  (the paper's Analyzer evaluates the two networks separately).
 - **Existing connections.** A snapshot from RDMA netlink
   (`rdma resource show qp`) at startup would seed the table with QPs that
   predate the agent, which the trace alone cannot see.

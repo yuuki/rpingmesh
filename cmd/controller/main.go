@@ -257,7 +257,11 @@ func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerServi
 	var provider *sdkmetric.MeterProvider
 	var metrics *analyzer.Metrics
 	if cfg.OtelCollectorAddr != "" {
-		p, err := telemetry.NewMeterProvider(context.Background(), cfg.OtelCollectorAddr, analyzerServiceName)
+		var providerOpts []sdkmetric.Option
+		if cfg.AnalyzerMetricsCardinalityLimit > 0 {
+			providerOpts = append(providerOpts, sdkmetric.WithCardinalityLimit(cfg.AnalyzerMetricsCardinalityLimit))
+		}
+		p, err := telemetry.NewMeterProvider(context.Background(), cfg.OtelCollectorAddr, analyzerServiceName, providerOpts...)
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to create analyzer meter provider; continuing with log-only findings")
 		} else {
@@ -273,25 +277,44 @@ func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerServi
 	}
 
 	az := analyzer.New(analyzer.Config{
-		SLALossRatio:       cfg.AnalyzerSLALossRatio,
-		SLANetworkRTTP99Ns: cfg.AnalyzerSLANetworkRTTP99Ns,
-		WindowRetention:    cfg.AnalyzerWindowRetention,
+		Cluster: analyzer.Thresholds{
+			LossRatio:       cfg.AnalyzerSLALossRatio,
+			NetworkRTTP99Ns: cfg.AnalyzerSLANetworkRTTP99Ns,
+		},
+		Service: analyzer.Thresholds{
+			LossRatio:       cfg.AnalyzerServiceSLOLossRatio,
+			NetworkRTTP99Ns: cfg.AnalyzerServiceSLONetworkRTTP99Ns,
+		},
+		WindowRetention: cfg.AnalyzerWindowRetention,
 	}, metrics)
 	svc.SetAnalyzer(az)
 
-	// Dashboards read the fraction of probes above the SLA threshold off the
-	// agents' rpingmesh.network_rtt_ns bucket at that boundary, which only
-	// exists when the threshold is one of the agent's default boundaries.
-	if sla := cfg.AnalyzerSLANetworkRTTP99Ns; sla != 0 && !telemetry.IsNetworkRTTBucketBoundary(sla) {
-		log.Warn().
-			Uint64("slaNetworkRttP99Ns", sla).
-			Msg("analyzer_sla_network_rtt_p99_ns is not a bucket boundary of the agents' rpingmesh.network_rtt_ns histogram; dashboards can only approximate the share of probes above it")
+	// Dashboards read the fraction of probes above the RTT threshold off the
+	// agents' rpingmesh.network_rtt_ns (or rpingmesh.service.network_rtt_ns)
+	// bucket at that boundary, which only exists when the threshold is one of
+	// the agent's default boundaries.
+	for _, t := range []struct {
+		key string
+		ns  uint64
+	}{
+		{"analyzer_sla_network_rtt_p99_ns", cfg.AnalyzerSLANetworkRTTP99Ns},
+		{"analyzer_service_slo_network_rtt_p99_ns", cfg.AnalyzerServiceSLONetworkRTTP99Ns},
+	} {
+		if t.ns != 0 && !telemetry.IsNetworkRTTBucketBoundary(t.ns) {
+			log.Warn().
+				Str("key", t.key).
+				Uint64("networkRttP99Ns", t.ns).
+				Msg("threshold is not a bucket boundary of the agents' network_rtt_ns histograms; dashboards can only approximate the share of probes above it")
+		}
 	}
 
 	log.Info().
 		Float64("slaLossRatio", cfg.AnalyzerSLALossRatio).
 		Uint64("slaNetworkRttP99Ns", cfg.AnalyzerSLANetworkRTTP99Ns).
+		Float64("serviceSloLossRatio", cfg.AnalyzerServiceSLOLossRatio).
+		Uint64("serviceSloNetworkRttP99Ns", cfg.AnalyzerServiceSLONetworkRTTP99Ns).
 		Int("windowRetention", cfg.AnalyzerWindowRetention).
+		Int("metricsCardinalityLimit", cfg.AnalyzerMetricsCardinalityLimit).
 		Bool("metricsEnabled", metrics != nil).
 		Msg("Analyzer enabled")
 

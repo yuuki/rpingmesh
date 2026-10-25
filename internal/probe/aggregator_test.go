@@ -362,3 +362,44 @@ func TestPathAggregator_CarriesSourceTor(t *testing.T) {
 		t.Errorf("source ToRs = %v, want leaf-a/leaf-b", got)
 	}
 }
+
+// TestPathAggregator_KeyedByPinglistType verifies that probes sent along a
+// traced service flow are summarized apart from the cluster probes to the
+// same target RNIC (the service rate and flow label would otherwise skew the
+// cluster window), and that every summary carries its pinglist type.
+func TestPathAggregator_KeyedByPinglistType(t *testing.T) {
+	src, tgt := gid(1), gid(2)
+	agg := NewPathAggregator(testWindowNs)
+
+	for i := 0; i < 4; i++ {
+		agg.AddResult(validResult(src, tgt, "tor-b", 42, 1000), win0Recv)
+	}
+	agg.AddResult(failedResult(src, tgt, "tor-b"), win0Recv)
+	for i := 0; i < 10; i++ {
+		r := validResult(src, tgt, "tor-b", 42, 5000)
+		r.PinglistType = PinglistServiceTracing
+		agg.AddResult(r, win0Recv)
+	}
+	for i := 0; i < 2; i++ {
+		r := failedResult(src, tgt, "tor-b")
+		r.PinglistType = PinglistServiceTracing
+		agg.AddResult(r, win0Recv)
+	}
+
+	summaries := agg.Collect(win1Recv)
+	if len(summaries) != 2 {
+		t.Fatalf("expected 2 summaries (cluster + service), got %d", len(summaries))
+	}
+	byType := map[PinglistType]PathSummary{}
+	for _, s := range summaries {
+		byType[s.PinglistType] = s
+	}
+	cluster, ok := byType[PinglistTorMesh]
+	if !ok || cluster.ProbeTotal != 5 || cluster.ProbeFailed != 1 || cluster.NetworkRTTMaxNs != 1000 {
+		t.Errorf("cluster summary = %+v (found %v), want total 5, failed 1, max RTT 1000", cluster, ok)
+	}
+	service, ok := byType[PinglistServiceTracing]
+	if !ok || service.ProbeTotal != 12 || service.ProbeFailed != 2 || service.NetworkRTTMinNs != 5000 {
+		t.Errorf("service summary = %+v (found %v), want total 12, failed 2, min RTT 5000", service, ok)
+	}
+}

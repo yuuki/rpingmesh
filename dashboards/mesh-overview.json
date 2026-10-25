@@ -149,8 +149,8 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "sum by (kind) (rate({__name__=~\"rpingmesh[._]analyzer[._]sla_violations_total\"}[$__rate_interval]))",
-          "legendFormat": "{{kind}}", "range": true } ],
+          "expr": "sum by (network, kind) (rate({__name__=~\"rpingmesh[._]analyzer[._]sla_violations_total\"}[$__rate_interval]))",
+          "legendFormat": "{{network}} {{kind}}", "range": true } ],
       "fieldConfig": { "defaults": { "unit": "cps",
         "custom": { "drawStyle": "line", "fillOpacity": 15 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
@@ -161,14 +161,14 @@
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-          "expr": "sum by (source_tor, target_tor, kind) (increase({__name__=~\"rpingmesh[._]analyzer[._]sla_violations_total\"}[$__range]))",
+          "expr": "sum by (network, source_tor, target_tor, kind) (increase({__name__=~\"rpingmesh[._]analyzer[._]sla_violations_total\"}[$__range]))",
           "format": "table", "instant": true, "range": false } ],
       "transformations": [
         { "id": "organize",
           "options": {
             "excludeByName": { "Time": true, "job": true },
             "renameByName": { "Value": "Violations" },
-            "indexByName": { "source_tor": 0, "target_tor": 1, "kind": 2, "Violations": 3 } } } ],
+            "indexByName": { "network": 0, "source_tor": 1, "target_tor": 2, "kind": 3, "Violations": 4 } } } ],
       "fieldConfig": {
         "defaults": { "decimals": 0,
           "links": [

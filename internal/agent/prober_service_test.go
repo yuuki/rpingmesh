@@ -250,12 +250,12 @@ func TestServiceTracing_DoesNotAdvancePinglistRotation(t *testing.T) {
 func TestFillTargetMetadata_ServiceTracing(t *testing.T) {
 	var result probe.ProbeResult
 	fillTargetMetadata(&result, 1, 7, serviceTargets(1)[0])
-	if !result.ServiceTracing || result.TargetSampled || result.FlowLabel != 7 {
+	if !result.IsServiceTracing() || result.TargetSampled || result.FlowLabel != 7 {
 		t.Errorf("service result: %+v", result)
 	}
 	var cluster probe.ProbeResult
 	fillTargetMetadata(&cluster, 2, 8, typedTargets(controller_agent.PinglistType_TOR_MESH, "tor", 1)[0])
-	if cluster.ServiceTracing {
+	if cluster.IsServiceTracing() || cluster.PinglistType != probe.PinglistTorMesh {
 		t.Error("a ToR-mesh result must not be flagged as service tracing")
 	}
 }

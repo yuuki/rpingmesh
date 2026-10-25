@@ -221,7 +221,7 @@ type collectorOptions struct {
 }
 
 // serviceMetricPrefix prefixes the instruments that record the probes sent
-// along traced service flows (probe.ProbeResult.ServiceTracing). They are
+// along traced service flows (probe.ProbeResult.IsServiceTracing). They are
 // separate from the default instruments so the cluster-monitoring series,
 // which measure controller-chosen paths at a fixed rate, are never mixed
 // with service-network samples taken at the service-tracing rate.
@@ -785,7 +785,7 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 	// A probe along a traced service flow measures the service network: it
 	// goes to the rpingmesh.service.* instruments only, with the same
 	// ToR-level attributes, and never to the destination-RNIC instruments.
-	if result.ServiceTracing {
+	if result.IsServiceTracing() {
 		if mc.service != nil {
 			mc.service.record(ctx, outcome, attrSet, proberDelayAttrs, responderDelayAttrs)
 		}

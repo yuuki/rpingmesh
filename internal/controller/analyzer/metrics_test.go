@@ -48,35 +48,45 @@ func collectSum(t *testing.T, reader *sdkmetric.ManualReader, name string) metri
 	return metricdata.Sum[int64]{}
 }
 
-// TestMetrics_RecordViolationAttributes verifies that an SLA violation is
-// counted under exactly the ToR-level attributes source_tor, target_tor and
-// kind, with no GID-level attribute (the project-wide cardinality rule).
+// TestMetrics_RecordViolationAttributes verifies that an SLO violation is
+// counted under exactly the ToR-level attributes network, source_tor,
+// target_tor and kind, with no GID-level attribute (the project-wide
+// cardinality rule), and that the two networks are separate series.
 func TestMetrics_RecordViolationAttributes(t *testing.T) {
 	m, reader := newTestMetrics(t)
 	ctx := context.Background()
 
-	m.recordViolation(ctx, "tor-a", "tor-b", KindLoss)
-	m.recordViolation(ctx, "tor-a", "tor-b", KindLoss)
-	m.recordViolation(ctx, "tor-a", "tor-c", KindRTT)
+	m.recordViolation(ctx, NetworkCluster, "tor-a", "tor-b", KindLoss)
+	m.recordViolation(ctx, NetworkCluster, "tor-a", "tor-b", KindLoss)
+	m.recordViolation(ctx, NetworkCluster, "tor-a", "tor-c", KindRTT)
+	m.recordViolation(ctx, NetworkService, "tor-a", "tor-b", KindLoss)
 
 	sum := collectSum(t, reader, "rpingmesh.analyzer.sla_violations_total")
 	if !sum.IsMonotonic {
 		t.Error("sla_violations_total is not monotonic; want a counter")
 	}
-	if len(sum.DataPoints) != 2 {
-		t.Fatalf("got %d data points, want 2 (one per distinct attribute set)", len(sum.DataPoints))
+	if len(sum.DataPoints) != 3 {
+		t.Fatalf("got %d data points, want 3 (one per distinct attribute set)", len(sum.DataPoints))
 	}
 
 	want := map[attribute.Set]int64{
 		attribute.NewSet(
+			attribute.String("network", NetworkCluster),
 			attribute.String("source_tor", "tor-a"),
 			attribute.String("target_tor", "tor-b"),
 			attribute.String("kind", KindLoss),
 		): 2,
 		attribute.NewSet(
+			attribute.String("network", NetworkCluster),
 			attribute.String("source_tor", "tor-a"),
 			attribute.String("target_tor", "tor-c"),
 			attribute.String("kind", KindRTT),
+		): 1,
+		attribute.NewSet(
+			attribute.String("network", NetworkService),
+			attribute.String("source_tor", "tor-a"),
+			attribute.String("target_tor", "tor-b"),
+			attribute.String("kind", KindLoss),
 		): 1,
 	}
 	for _, dp := range sum.DataPoints {
@@ -88,9 +98,41 @@ func TestMetrics_RecordViolationAttributes(t *testing.T) {
 		if dp.Value != wantValue {
 			t.Errorf("attributes %v: value = %d, want %d", dp.Attributes.ToSlice(), dp.Value, wantValue)
 		}
-		if dp.Attributes.Len() != 3 {
-			t.Errorf("attributes %v: %d attributes, want exactly source_tor, target_tor, kind", dp.Attributes.ToSlice(), dp.Attributes.Len())
+		if dp.Attributes.Len() != 4 {
+			t.Errorf("attributes %v: %d attributes, want exactly network, source_tor, target_tor, kind", dp.Attributes.ToSlice(), dp.Attributes.Len())
 		}
+	}
+}
+
+// TestMetrics_ServiceViolationTaggedByNetwork verifies, through the
+// Analyzer, that a service-path violation lands on the counter with
+// network="service" and a cluster one with network="cluster".
+func TestMetrics_ServiceViolationTaggedByNetwork(t *testing.T) {
+	m, reader := newTestMetrics(t)
+	a := New(testConfig(), m)
+
+	a.Ingest(context.Background(), report(
+		summary("tor-a", "tor-b", 100, 50, 0, 1),        // cluster loss violation
+		serviceSummary("tor-a", "tor-b", 100, 50, 0, 1), // service loss violation
+	))
+
+	violations := collectSum(t, reader, "rpingmesh.analyzer.sla_violations_total")
+	if len(violations.DataPoints) != 2 {
+		t.Fatalf("sla_violations_total data points = %d, want 2", len(violations.DataPoints))
+	}
+	seen := map[string]bool{}
+	for _, dp := range violations.DataPoints {
+		network, ok := dp.Attributes.Value("network")
+		if !ok {
+			t.Fatalf("data point %v has no network attribute", dp.Attributes.ToSlice())
+		}
+		seen[network.AsString()] = true
+		if dp.Value != 1 {
+			t.Errorf("network %s: value = %d, want 1", network.AsString(), dp.Value)
+		}
+	}
+	if !seen[NetworkCluster] || !seen[NetworkService] {
+		t.Errorf("networks seen = %v, want both cluster and service", seen)
 	}
 }
 
@@ -121,6 +163,7 @@ func TestMetrics_RecordSummaryCountsIngested(t *testing.T) {
 	}
 	got := violations.DataPoints[0].Attributes
 	wantAttrs := attribute.NewSet(
+		attribute.String("network", NetworkCluster),
 		attribute.String("source_tor", "tor-a"),
 		attribute.String("target_tor", "tor-c"),
 		attribute.String("kind", KindLoss),
@@ -135,5 +178,5 @@ func TestMetrics_RecordSummaryCountsIngested(t *testing.T) {
 func TestMetrics_NilIsNoop(t *testing.T) {
 	var m *Metrics
 	m.recordSummary(context.Background())
-	m.recordViolation(context.Background(), "tor-a", "tor-b", KindRTT)
+	m.recordViolation(context.Background(), NetworkCluster, "tor-a", "tor-b", KindRTT)
 }

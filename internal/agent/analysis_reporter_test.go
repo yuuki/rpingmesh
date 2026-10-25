@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -277,6 +278,7 @@ func TestAnalysisReporter_PeriodicCollectsWhenLive(t *testing.T) {
 	r.nowFn = func() time.Time { return time.Unix(2, 0) } // window [0,1s) complete
 
 	r.collectAndReport(context.Background()) // live ctx: must collect + send
+	r.sendWg.Wait()                          // the send runs on its own goroutine
 	if fake.reportCount() != 1 {
 		t.Fatalf("live periodic report did not send: reportCount=%d, want 1", fake.reportCount())
 	}
@@ -332,5 +334,160 @@ func TestAnalysisReporter_PerResultSourceTorWins(t *testing.T) {
 	}
 	if got := summaries[0].GetSourceTorId(); got != "leaf-a" {
 		t.Errorf("SourceTorId = %q, want leaf-a", got)
+	}
+}
+
+// TestAnalysisReporter_PinglistTypeMappedToProto verifies that the pinglist
+// type of each summary reaches the controller, converted by value to the
+// proto enum, so the analyzer can evaluate service paths apart from cluster
+// ones.
+func TestAnalysisReporter_PinglistTypeMappedToProto(t *testing.T) {
+	fake := &fakeSender{}
+	input := make(chan *probe.ProbeResult, 4)
+	r := NewAnalysisReporter(fake, "agent-1", "tor-a", 3600, input)
+	r.Start(context.Background())
+
+	input <- validProbeResult(srcGID(1), srcGID(2), "tor-b", 42)
+	service := validProbeResult(srcGID(1), srcGID(2), "tor-b", 42)
+	service.PinglistType = probe.PinglistServiceTracing
+	input <- service
+	inter := validProbeResult(srcGID(1), srcGID(3), "tor-c", 43)
+	inter.PinglistType = probe.PinglistInterTor
+	input <- inter
+	close(input)
+	r.Wait()
+
+	got := map[controller_agent.PinglistType]int{}
+	for _, s := range fake.allSummaries() {
+		got[s.GetPinglistType()]++
+	}
+	want := map[controller_agent.PinglistType]int{
+		controller_agent.PinglistType_TOR_MESH:        1,
+		controller_agent.PinglistType_SERVICE_TRACING: 1,
+		controller_agent.PinglistType_INTER_TOR:       1,
+	}
+	for typ, n := range want {
+		if got[typ] != n {
+			t.Errorf("summaries of type %s = %d, want %d (all: %v)", typ, got[typ], n, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("summary types = %v, want exactly %v", got, want)
+	}
+}
+
+// TestPinglistTypeMirrorsProto pins the by-value conversion between
+// probe.PinglistType and the proto enum that fillTargetMetadata and the
+// reporter's toProto rely on.
+func TestPinglistTypeMirrorsProto(t *testing.T) {
+	for _, tc := range []struct {
+		p     probe.PinglistType
+		proto controller_agent.PinglistType
+	}{
+		{probe.PinglistTorMesh, controller_agent.PinglistType_TOR_MESH},
+		{probe.PinglistInterTor, controller_agent.PinglistType_INTER_TOR},
+		{probe.PinglistServiceTracing, controller_agent.PinglistType_SERVICE_TRACING},
+	} {
+		if int32(tc.p) != int32(tc.proto) {
+			t.Errorf("probe.%s = %d, proto %s = %d; values must match", tc.p, tc.p, tc.proto, tc.proto)
+		}
+	}
+}
+
+// TestAnalysisReporter_DropsServiceSummariesWhenControllerLacksSupport covers
+// a controller downgrade: service results were aggregated while the
+// controller evaluated them apart, then a heartbeat learned of an older
+// controller. The flag is re-checked at send time, so the service summary is
+// dropped instead of being judged as a cluster path, while the cluster
+// summary of the same window is still sent.
+func TestAnalysisReporter_DropsServiceSummariesWhenControllerLacksSupport(t *testing.T) {
+	fake := &fakeSender{}
+	r := NewAnalysisReporter(fake, "agent-1", "tor-a", 30, nil)
+	var supported atomic.Bool
+	supported.Store(true)
+	r.SetServiceSummariesAllowed(supported.Load)
+
+	src, tgt := srcGID(1), srcGID(2)
+	service := validProbeResult(src, tgt, "tor-b", 42)
+	service.PinglistType = probe.PinglistServiceTracing
+	r.agg.AddResult(validProbeResult(src, tgt, "tor-b", 42), 0)
+	r.agg.AddResult(service, 0)
+
+	supported.Store(false) // the controller was downgraded
+	r.flushFinal()
+	summaries := fake.allSummaries()
+	if len(summaries) != 1 || summaries[0].GetPinglistType() != controller_agent.PinglistType_TOR_MESH {
+		t.Fatalf("summaries sent = %+v, want only the cluster summary", summaries)
+	}
+
+	// Only service summaries aggregated: nothing is sent at all.
+	r.agg.AddResult(service, 0)
+	r.flushFinal()
+	if fake.reportCount() != 1 {
+		t.Errorf("reportCount = %d, want 1 (a report of only dropped summaries must not be sent)", fake.reportCount())
+	}
+
+	// Supported again (controller upgraded): service summaries flow.
+	supported.Store(true)
+	r.agg.AddResult(service, 0)
+	r.flushFinal()
+	if got := fake.allSummaries(); len(got) != 2 || got[1].GetPinglistType() != controller_agent.PinglistType_SERVICE_TRACING {
+		t.Errorf("summaries after re-enable = %+v, want the service summary added", got)
+	}
+}
+
+// blockingSender holds every ReportProbeAnalysis call until release is closed.
+type blockingSender struct {
+	*fakeSender
+	release chan struct{}
+}
+
+func (b *blockingSender) ReportProbeAnalysis(
+	ctx context.Context, report *controller_agent.ProbeAnalysisReport,
+) (*controller_agent.ProbeAnalysisAck, error) {
+	<-b.release
+	return b.fakeSender.ReportProbeAnalysis(ctx, report)
+}
+
+// TestAnalysisReporter_SlowSendDoesNotStallInput verifies that a periodic
+// send blocked in its RPC does not stop the reporter from draining its input:
+// results arriving during the send are aggregated. On the drain loop the send
+// would leave the fan-in's non-blocking tee dropping results once the channel
+// filled.
+func TestAnalysisReporter_SlowSendDoesNotStallInput(t *testing.T) {
+	fake := &blockingSender{fakeSender: &fakeSender{}, release: make(chan struct{})}
+	input := make(chan *probe.ProbeResult, 2) // tiny buffer: a stalled loop blocks the sends below
+	r := NewAnalysisReporter(fake, "agent-1", "tor-a", 3600, input)
+	r.nowFn = func() time.Time { return time.Unix(7200, 0) } // window [0,3600s) is complete
+
+	src, tgt := srcGID(1), srcGID(2)
+	r.agg.AddResult(validProbeResult(src, tgt, "tor-b", 42), 0)
+	r.collectAndReport(context.Background()) // the send now blocks in the RPC
+	r.Start(context.Background())
+
+	const n = 50
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < n; i++ {
+		select {
+		case input <- validProbeResult(src, tgt, "tor-b", 42):
+		case <-deadline:
+			t.Fatalf("input blocked after %d results while a send was in flight: the drain loop is stalled", i)
+		}
+	}
+
+	// A tick while the send is still in flight must not collect: the
+	// second window stays in the aggregator for the next collection.
+	r.collectAndReport(context.Background())
+
+	close(fake.release)
+	close(input)
+	r.Wait()
+
+	if fake.reportCount() != 2 {
+		t.Fatalf("reportCount = %d, want 2 (blocked periodic send + final flush)", fake.reportCount())
+	}
+	summaries := fake.allSummaries()
+	if len(summaries) != 2 || summaries[1].GetProbeTotal() != n {
+		t.Errorf("summaries = %+v, want the final window with ProbeTotal %d", summaries, n)
 	}
 }

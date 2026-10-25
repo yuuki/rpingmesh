@@ -105,7 +105,10 @@ serialization. Go calls it through the C ABI in `zig/include/rdma_bridge.h`.
 **Analyzer.** Agents aggregate probe results per path over fixed windows and
 send `PathSummary` batches to the controller with `ReportProbeAnalysis`. The
 in-process analyzer flags windows whose loss ratio or p99 network RTT exceeds
-the configured thresholds, and reports them in logs and OTLP metrics.
+the configured SLO thresholds, and reports them in logs and OTLP metrics. The
+cluster network (the controller's pinglists) and the service network (the
+paths of traced application flows) are summarized and evaluated apart, each
+against its own thresholds.
 
 ### Repository layout
 
@@ -587,7 +590,10 @@ devices; `summarize_qos_facts.py` reports such ports as override outliers.
 | `analyzer_enabled` | `true` | Run the Phase 1 analyzer |
 | `analyzer_sla_loss_ratio` | `0.02` | Loss ratio above which a window violates the SLA |
 | `analyzer_sla_network_rtt_p99_ns` | `500000` | p99 network RTT above which a window violates the SLA; `0` disables the check |
+| `analyzer_service_slo_loss_ratio` | `0.02` | Loss ratio above which a service-network window (a traced service flow's path) violates its SLO |
+| `analyzer_service_slo_network_rtt_p99_ns` | `500000` | p99 network RTT above which a service-network window violates its SLO; `0` disables the check |
 | `analyzer_window_retention` | `20` | Number of recent windows kept in memory |
+| `analyzer_metrics_cardinality_limit` | `20000` | Maximum attribute sets per analyzer metric instrument; extra sets fold into one `otel.metric.overflow="true"` series. `rpingmesh.analyzer.sla_violations_total` can need up to 4 × T × (T−1) series for T ToRs, all at once in a wide outage; the default covers about 70 ToRs. `0` keeps the OTel SDK default (2000); otherwise at least 2000 |
 | `otel_collector_addr` | `localhost:4317` | OTLP/gRPC collector for analyzer metrics |
 | `log_level`, `log_format` | `info`, `console` | As for the agent |
 | `tls_mode` | `disabled` | `disabled`, `tls`, or `mtls` |
@@ -859,7 +865,7 @@ Analyzer metrics, exported by the controller with
 | Metric | Type | Attributes | Description |
 |--------|------|-----------|-------------|
 | `rpingmesh.analyzer.path_summaries_total` | Counter | — | Ingested per-path window summaries |
-| `rpingmesh.analyzer.sla_violations_total` | Counter | `source_tor`, `target_tor`, `kind` (`loss`, `rtt`) | Detected SLA violations |
+| `rpingmesh.analyzer.sla_violations_total` | Counter | `network` (`cluster`, `service`), `source_tor`, `target_tor`, `kind` (`loss`, `rtt`) | Detected SLO violations; `network` separates the controller's pinglist paths from the paths of traced service flows |
 
 By default no metric carries a GID or any other identity of the destination
 RNIC, because a fabric with thousands of RNICs would produce an unbounded number
@@ -1168,9 +1174,27 @@ pass visits them in a new random order, the paper's shuffled pinglist.
 flow is probed at that interval (the paper's 10 ms) and with many flows the
 cap paces them. The self-protection multiplier scales this rate too.
 
-Results are recorded on the `rpingmesh.service.*` instruments only and are
-excluded from the analysis reporter, so the cluster SLA summaries keep
-measuring the controller's paths at the controller's rate.
+**Results.** Service probes are recorded on the `rpingmesh.service.*`
+instruments, never on the cluster ones. The analysis reporter summarizes
+them too, but apart from the cluster paths: the path aggregator keys its
+windows by (source RNIC, target RNIC, pinglist type), so a service flow to
+an RNIC that is also a pinglist target gets a summary of its own, reported
+with `pinglist_type: SERVICE_TRACING`. The controller's analyzer evaluates
+those summaries against `analyzer_service_slo_loss_ratio` and
+`analyzer_service_slo_network_rtt_p99_ns` instead of the cluster thresholds
+and tags their findings `network="service"`, so the service-tracing rate and
+the flows' labels never skew the cluster evaluation. The paper's Analyzer
+reports the service network per server rather than hierarchically per ToR:
+the number of samples a path gets depends on how many flows the application
+opened, so a ToR-level ratio would be dominated by the busiest servers. The
+analyzer therefore judges each service path window on its own and logs the
+finding with the agent and both GIDs; the ToR attributes on the counter only
+bound its cardinality. Read the `rpingmesh.service.*` instruments per agent
+(one per server) rather than summed over `source_tor` and `target_tor`. A
+controller that predates `pinglist_type` answers registration with
+`service_path_summaries: false`, and the agent then keeps service results
+out of its reports (warning once) instead of letting them be judged as
+cluster paths.
 
 ### Staleness in the registry
 
@@ -1256,9 +1280,7 @@ acceptable; GIDs and other destination-RNIC identities are not.
   such as DC, or connections that existed before the agent started. It
   needs a kernel with BTF (`/sys/kernel/btf/vmlinux`), BPF ring buffers
   (Linux 5.8) and `CAP_BPF`/`CAP_PERFMON`; otherwise the agent runs without
-  it. Service results stay in the agent's `rpingmesh.service.*` metrics and
-  are not reported to the controller's analyzer. See
-  [the design](docs/design/ebpf-service-tracing.md).
+  it. See [the design](docs/design/ebpf-service-tracing.md).
 - **No recovery from RNIC failures at runtime.** If a device fails or
   disappears after startup, its Prober and Responder stop working until the
   agent restarts. See [the design](docs/design/rnic-runtime-reinit.md).

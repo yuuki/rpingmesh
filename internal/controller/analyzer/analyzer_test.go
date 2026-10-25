@@ -10,10 +10,17 @@ import (
 
 func testConfig() Config {
 	return Config{
-		SLALossRatio:       0.02,
-		SLANetworkRTTP99Ns: 500_000,
-		WindowRetention:    3,
+		Cluster:         Thresholds{LossRatio: 0.02, NetworkRTTP99Ns: 500_000},
+		Service:         Thresholds{LossRatio: 0.10, NetworkRTTP99Ns: 2_000_000},
+		WindowRetention: 3,
 	}
+}
+
+// serviceSummary is summary for a path of a traced service flow.
+func serviceSummary(sourceTor, targetTor string, total, failed uint32, p99 uint64, windowStart uint64) *controller_agent.PathSummary {
+	s := summary(sourceTor, targetTor, total, failed, p99, windowStart)
+	s.PinglistType = controller_agent.PinglistType_SERVICE_TRACING
+	return s
 }
 
 func summary(sourceTor, targetTor string, total, failed uint32, p99 uint64, windowStart uint64) *controller_agent.PathSummary {
@@ -83,12 +90,67 @@ func TestAnalyzer_BothViolationsCountSummaryOnce(t *testing.T) {
 
 func TestAnalyzer_RTTCheckDisabledWhenThresholdZero(t *testing.T) {
 	cfg := testConfig()
-	cfg.SLANetworkRTTP99Ns = 0 // disable RTT check
+	cfg.Cluster.NetworkRTTP99Ns = 0 // disable RTT check
 	a := New(cfg, nil)
 
 	// Huge p99 but no loss: with the RTT check disabled, no violation.
 	if v := a.Ingest(context.Background(), report(summary("tor-a", "tor-b", 100, 0, 9_000_000, 1))); v != 0 {
 		t.Errorf("RTT check disabled: got %d violations, want 0", v)
+	}
+}
+
+// TestAnalyzer_ServiceSummariesUseServiceThresholds verifies that a
+// SERVICE_TRACING summary is judged against the service-network thresholds
+// and a cluster summary of the same path against the cluster ones, so a
+// service flow's loss or RTT never trips (or hides behind) the cluster SLO.
+func TestAnalyzer_ServiceSummariesUseServiceThresholds(t *testing.T) {
+	a := New(testConfig(), nil)
+	ctx := context.Background()
+
+	// loss 0.05: above the cluster threshold (0.02), below the service one (0.10).
+	if v := a.Ingest(ctx, report(summary("tor-a", "tor-b", 100, 5, 0, 1))); v != 1 {
+		t.Errorf("cluster loss 0.05: got %d violations, want 1", v)
+	}
+	if v := a.Ingest(ctx, report(serviceSummary("tor-a", "tor-b", 100, 5, 0, 1))); v != 0 {
+		t.Errorf("service loss 0.05: got %d violations, want 0", v)
+	}
+	// loss 0.20: above both.
+	if v := a.Ingest(ctx, report(serviceSummary("tor-a", "tor-b", 100, 20, 0, 1))); v != 1 {
+		t.Errorf("service loss 0.20: got %d violations, want 1", v)
+	}
+
+	// p99 1 ms: above the cluster threshold (500 µs), below the service one (2 ms).
+	if v := a.Ingest(ctx, report(summary("tor-a", "tor-b", 100, 0, 1_000_000, 2))); v != 1 {
+		t.Errorf("cluster p99 1ms: got %d violations, want 1", v)
+	}
+	if v := a.Ingest(ctx, report(serviceSummary("tor-a", "tor-b", 100, 0, 1_000_000, 2))); v != 0 {
+		t.Errorf("service p99 1ms: got %d violations, want 0", v)
+	}
+	if v := a.Ingest(ctx, report(serviceSummary("tor-a", "tor-b", 100, 0, 2_000_001, 2))); v != 1 {
+		t.Errorf("service p99 above threshold: got %d violations, want 1", v)
+	}
+
+	// Inter-ToR summaries are cluster paths too.
+	inter := summary("tor-a", "tor-c", 100, 5, 0, 3)
+	inter.PinglistType = controller_agent.PinglistType_INTER_TOR
+	if v := a.Ingest(ctx, report(inter)); v != 1 {
+		t.Errorf("inter-ToR loss 0.05: got %d violations, want 1", v)
+	}
+}
+
+// TestAnalyzer_ServiceRTTCheckDisabledIndependently verifies that the two
+// networks' RTT checks are switched off independently.
+func TestAnalyzer_ServiceRTTCheckDisabledIndependently(t *testing.T) {
+	cfg := testConfig()
+	cfg.Service.NetworkRTTP99Ns = 0
+	a := New(cfg, nil)
+	ctx := context.Background()
+
+	if v := a.Ingest(ctx, report(serviceSummary("tor-a", "tor-b", 100, 0, 9_000_000, 1))); v != 0 {
+		t.Errorf("service RTT check disabled: got %d violations, want 0", v)
+	}
+	if v := a.Ingest(ctx, report(summary("tor-a", "tor-b", 100, 0, 9_000_000, 1))); v != 1 {
+		t.Errorf("cluster RTT check still on: got %d violations, want 1", v)
 	}
 }
 

@@ -139,6 +139,9 @@ func (s *ControllerService) RegisterAgent(
 		Message:        "Successfully registered agent",
 		PerRnicTorId:   true,
 		PerRnicPlaneId: true,
+		// The analyzer evaluates SERVICE_TRACING path summaries against the
+		// service-network thresholds, so agents may report them.
+		ServicePathSummaries: true,
 	}, nil
 }
 

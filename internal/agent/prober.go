@@ -1029,7 +1029,8 @@ func fillTargetMetadata(result *probe.ProbeResult, seqNum uint64, flowLabel uint
 	// An older controller never sets Sampled, but every inter-ToR target is
 	// sampled.
 	result.TargetSampled = target.GetSampled() || isInterTor(target)
-	result.ServiceTracing = target.GetPinglistType() == controller_agent.PinglistType_SERVICE_TRACING
+	// probe.PinglistType mirrors the proto enum by value.
+	result.PinglistType = probe.PinglistType(target.GetPinglistType())
 	if parsedGID, err := probe.ParseGID(target.GetTargetGid()); err == nil {
 		result.TargetGID = parsedGID
 	}

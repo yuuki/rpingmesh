@@ -25,6 +25,34 @@ All notable changes to this project are documented in this file.
   logged and the agent continues without it.
 - `GetTargetRnicInfo` controller RPC, resolving the destination GIDs of
   traced flows into probe targets, and `PinglistType.SERVICE_TRACING`.
+- The controller's analyzer evaluates the service network apart from the
+  cluster network, as the paper's Analyzer does. The agent's path aggregator
+  keys its windows by (source RNIC, target RNIC, pinglist type) and reports
+  the type in the new `PathSummary.pinglist_type`; `SERVICE_TRACING`
+  summaries are judged against the new `analyzer_service_slo_loss_ratio` and
+  `analyzer_service_slo_network_rtt_p99_ns` thresholds (defaults equal to the
+  cluster ones) and their findings carry `network="service"`.
+  `rpingmesh.analyzer.sla_violations_total` gains a `network` attribute
+  (`cluster` or `service`); the committed dashboards and the
+  `RpingmeshSLAViolation` rule group by it, and the ToR pair drilldown gets
+  a service-network row (success ratio, probe rate, RTT quantiles, failure
+  reasons from `rpingmesh.service.*`). Agents report service summaries only
+  to a controller that answers registration with `service_path_summaries`,
+  checked both when results enter the analysis branch and when summaries
+  are sent, so an older controller (or one downgraded while the agent runs)
+  never judges them as cluster paths; upgrade the controller first.
+- `analyzer_metrics_cardinality_limit` (default 20000) raises the OTel
+  SDK's per-instrument cap of 2000 attribute sets for the analyzer, whose
+  violation counter can need `4 × T × (T−1)` series for T ToRs now that it
+  carries `network`.
+
+### Fixed
+
+- The agent's analysis reporter sends its periodic reports on a goroutine
+  of their own. A send is a synchronous RPC; on the drain loop it stopped
+  the reporter from reading results for its duration, and the fan-in's
+  non-blocking tee then dropped results once its channel filled, which at
+  service-tracing rates took a second or two of controller latency.
 - `make generate-bpf` / `make check-bpf`, a systemd drop-in granting
   `CAP_BPF` and `CAP_PERFMON`
   (`packaging/systemd/rpingmesh-agent.service.d/10-service-tracing.conf`,

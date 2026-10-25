@@ -9,10 +9,10 @@ import (
 )
 
 // Metrics holds the analyzer's OTLP instruments. All attributes are ToR-level
-// only (source_tor, target_tor, kind), matching the project-wide convention of
-// never using GID-level cardinality on metrics; GID detail goes to findings
-// logs. A nil *Metrics is a valid no-op, so the analyzer can run (logs only)
-// when metrics export is unavailable.
+// only (network, source_tor, target_tor, kind), matching the project-wide
+// convention of never using GID-level cardinality on metrics; GID detail goes
+// to findings logs. A nil *Metrics is a valid no-op, so the analyzer can run
+// (logs only) when metrics export is unavailable.
 type Metrics struct {
 	slaViolations metric.Int64Counter
 	pathSummaries metric.Int64Counter
@@ -32,7 +32,7 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 
 	slaViolations, err := meter.Int64Counter(
 		"rpingmesh.analyzer.sla_violations_total",
-		metric.WithDescription("Total number of SLA violations detected (by kind: loss or rtt)"),
+		metric.WithDescription("Total number of SLO violations detected (by network: cluster or service; by kind: loss or rtt)"),
 		metric.WithUnit("{violation}"),
 	)
 	if err != nil {
@@ -53,13 +53,17 @@ func (m *Metrics) recordSummary(ctx context.Context) {
 	m.pathSummaries.Add(ctx, 1)
 }
 
-// recordViolation increments the SLA-violation counter for the given ToR pair
-// and violation kind.
-func (m *Metrics) recordViolation(ctx context.Context, sourceTor, targetTor, kind string) {
+// recordViolation increments the violation counter for the given network
+// (NetworkCluster or NetworkService), ToR pair and violation kind. The
+// network attribute is what lets a dashboard keep the two networks apart;
+// a sum over it gives the series the counter carried before service paths
+// were evaluated.
+func (m *Metrics) recordViolation(ctx context.Context, network, sourceTor, targetTor, kind string) {
 	if m == nil {
 		return
 	}
 	m.slaViolations.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("network", network),
 		attribute.String("source_tor", sourceTor),
 		attribute.String("target_tor", targetTor),
 		attribute.String("kind", kind),

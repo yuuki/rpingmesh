@@ -314,11 +314,11 @@ wait:
 			if !ok {
 				break wait
 			}
-			if r.ServiceTracing && r.Success {
+			if r.IsServiceTracing() && r.Success {
 				got = r
 				break wait
 			}
-			t.Logf("result: service=%v success=%v reason=%q", r.ServiceTracing, r.Success, r.FailureReason)
+			t.Logf("result: service=%v success=%v reason=%q", r.IsServiceTracing(), r.Success, r.FailureReason)
 		case <-deadline:
 			break wait
 		}

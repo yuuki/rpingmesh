@@ -608,16 +608,16 @@ func TestBucketBoundaries_StrictlyIncreasing(t *testing.T) {
 	}
 }
 
-// TestNetworkRTTBucketBoundaries_ContainsDefaultSLA verifies that the default
-// analyzer SLA threshold (config.DefaultAnalyzerSLANetworkRTTP99Ns) is an RTT
+// TestNetworkRTTBucketBoundaries_ContainsDefaultSLO verifies that the default
+// analyzer SLO threshold (config.DefaultAnalyzerSLONetworkRTTP99Ns) is an RTT
 // bucket boundary, so dashboards can read the share of probes above it off
 // one bucket, and that the RTT ladder still reaches 10ms for congestion.
-func TestNetworkRTTBucketBoundaries_ContainsDefaultSLA(t *testing.T) {
-	if !IsNetworkRTTBucketBoundary(config.DefaultAnalyzerSLANetworkRTTP99Ns) {
-		t.Errorf("default analyzer SLA %dns is not a network RTT bucket boundary",
-			uint64(config.DefaultAnalyzerSLANetworkRTTP99Ns))
+func TestNetworkRTTBucketBoundaries_ContainsDefaultSLO(t *testing.T) {
+	if !IsNetworkRTTBucketBoundary(config.DefaultAnalyzerSLONetworkRTTP99Ns) {
+		t.Errorf("default analyzer SLO %dns is not a network RTT bucket boundary",
+			uint64(config.DefaultAnalyzerSLONetworkRTTP99Ns))
 	}
-	if IsNetworkRTTBucketBoundary(config.DefaultAnalyzerSLANetworkRTTP99Ns + 1) {
+	if IsNetworkRTTBucketBoundary(config.DefaultAnalyzerSLONetworkRTTP99Ns + 1) {
 		t.Error("IsNetworkRTTBucketBoundary accepted a non-boundary value")
 	}
 	if last := networkRTTBucketBoundaries[len(networkRTTBucketBoundaries)-1]; last < 10_000_000 {

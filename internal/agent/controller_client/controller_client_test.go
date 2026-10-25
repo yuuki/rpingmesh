@@ -333,7 +333,7 @@ func TestGetPinglist_Success(t *testing.T) {
 func TestReportProbeAnalysis_Success(t *testing.T) {
 	srv := &fakeControllerServer{
 		reportFunc: func(_ *controller_agent.ProbeAnalysisReport) (*controller_agent.ProbeAnalysisAck, error) {
-			return &controller_agent.ProbeAnalysisAck{Accepted: true, SlaViolations: 2}, nil
+			return &controller_agent.ProbeAnalysisAck{Accepted: true, SloViolations: 2}, nil
 		},
 	}
 	c := newTestClient(t, srv)
@@ -351,8 +351,8 @@ func TestReportProbeAnalysis_Success(t *testing.T) {
 	if !ack.GetAccepted() {
 		t.Errorf("ack.Accepted = false, want true")
 	}
-	if ack.GetSlaViolations() != 2 {
-		t.Errorf("ack.SlaViolations = %d, want 2", ack.GetSlaViolations())
+	if ack.GetSloViolations() != 2 {
+		t.Errorf("ack.SloViolations = %d, want 2", ack.GetSloViolations())
 	}
 	if srv.reportCalls != 1 {
 		t.Errorf("server saw %d ReportProbeAnalysis calls, want 1", srv.reportCalls)

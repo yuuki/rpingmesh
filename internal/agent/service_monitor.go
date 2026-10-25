@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -109,15 +110,17 @@ type serviceDeviceState struct {
 // interval, since a peer agent that restarts gets a new responder QPN.
 type ServiceMonitor struct {
 	lifecycle
-	agentID  string
-	resolver serviceTargetResolver
-	source   serviceEventSource
-	table    *servicetrace.Table
+	agentID     string
+	resolver    serviceTargetResolver
+	source      serviceEventSource
+	table       *servicetrace.Table
+	snapshotQPs func(context.Context, map[uint32]string) ([]servicetrace.QPResource, error)
+	recoverQPs  func(context.Context, map[uint32]string, []servicetrace.QPResource) ([]servicetrace.QPResource, error)
 
 	devices map[string]*serviceDeviceState
 	// devNumbers maps the uverbs device number of Event.Dev to the RDMA
 	// device name, read from sysfs and re-read on an unknown number (a
-	// device that appeared after startup). Owned by the monitor goroutine.
+	// device that appeared after startup). Publication is guarded by statsMu.
 	devNumbers map[uint32]string
 	sysfsRoot  string
 
@@ -170,6 +173,8 @@ func NewServiceMonitor(
 		resolver:        resolver,
 		source:          source,
 		table:           servicetrace.NewTable(),
+		snapshotQPs:     servicetrace.SnapshotQPs,
+		recoverQPs:      servicetrace.RecoverQPs,
 		devices:         make(map[string]*serviceDeviceState, len(devices)),
 		devNumbers:      make(map[uint32]string),
 		sysfsRoot:       servicetrace.DefaultSysfsRoot,
@@ -234,10 +239,14 @@ func (m *ServiceMonitor) Stop() {
 // handleEvent runs on the tracer's reader goroutine: it must stay cheap.
 func (m *ServiceMonitor) handleEvent(ev servicetrace.Event) {
 	if m.table.Apply(ev) {
-		select {
-		case m.changed <- struct{}{}:
-		default:
-		}
+		m.signalChanged()
+	}
+}
+
+func (m *ServiceMonitor) signalChanged() {
+	select {
+	case m.changed <- struct{}{}:
+	default:
 	}
 }
 
@@ -245,6 +254,34 @@ func (m *ServiceMonitor) handleEvent(ev servicetrace.Event) {
 // interval, and, while some flows are unresolved, after every retry period.
 func (m *ServiceMonitor) run(ctx context.Context) {
 	defer m.wg.Done()
+	// Stop must interrupt a snapshot or controller RPC as well as the
+	// timer loop. Cancelling the child context also releases this watcher.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-m.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	// Snapshot/firmware reads must not stall lifecycle-driven target
+	// removal. Only one refresh runs per monitor, joined on shutdown.
+	refreshDone := make(chan struct{}, 1)
+	refreshBusy := false
+	startRefresh := func() {
+		if refreshBusy || ctx.Err() != nil {
+			return
+		}
+		refreshBusy = true
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			m.refreshQPs(ctx)
+			refreshDone <- struct{}{}
+		}()
+	}
+	startRefresh()
 
 	ticker := time.NewTicker(m.refreshInterval)
 	defer ticker.Stop()
@@ -275,11 +312,20 @@ func (m *ServiceMonitor) run(ctx context.Context) {
 			}
 		case <-debounce.C:
 			pending = false
+			if m.table.SnapshotDirty() {
+				startRefresh()
+			}
 			armRetry(m.rebuild(ctx, false))
 		case <-retry.C:
 			armRetry(m.rebuild(ctx, false))
 		case <-ticker.C:
+			startRefresh()
 			armRetry(m.rebuild(ctx, true))
+		case <-refreshDone:
+			refreshBusy = false
+			if m.table.SnapshotDirty() {
+				m.signalChanged()
+			}
 		}
 	}
 }
@@ -290,6 +336,25 @@ func (m *ServiceMonitor) run(ctx context.Context) {
 func (m *ServiceMonitor) processAlive(pid uint32) bool {
 	_, err := os.Stat(filepath.Join(m.procRoot, strconv.FormatUint(uint64(pid), 10)))
 	return err == nil
+}
+
+// Netlink reports an owner task ID. Resolve its thread group while it is
+// visible; absence stays unknown rather than being treated as a TGID.
+func (m *ServiceMonitor) processTGID(pid uint32) uint32 {
+	data, err := os.ReadFile(filepath.Join(m.procRoot, strconv.FormatUint(uint64(pid), 10), "status"))
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "Tgid:" {
+			id, err := strconv.ParseUint(fields[1], 10, 32)
+			if err == nil {
+				return uint32(id)
+			}
+		}
+	}
+	return 0
 }
 
 // reconcile repairs what lost events may have left behind before a rebuild:
@@ -320,7 +385,64 @@ func (m *ServiceMonitor) loadDeviceNumbers() {
 		m.logger.Warn().Err(err).Msg("Cannot list uverbs devices in sysfs; traced connections cannot be attributed to RDMA devices")
 		return
 	}
+	m.statsMu.Lock()
 	m.devNumbers = devs
+	m.statsMu.Unlock()
+}
+
+// refreshQPs runs outside the event reader. A failed or interrupted dump
+// leaves the last successful inventory intact and never disables tracing.
+func (m *ServiceMonitor) refreshQPs(ctx context.Context) {
+	m.loadDeviceNumbers()
+	devices := make(map[uint32]string)
+	for dev, name := range m.deviceNumberSnapshot() {
+		if _, ok := m.devices[name]; ok {
+			devices[dev] = name
+		}
+	}
+	generation := m.table.EventGeneration()
+	qps, err := m.snapshotQPs(ctx, devices)
+	if err != nil {
+		if ctx.Err() == nil {
+			m.logger.Warn().Err(err).Msg("Cannot snapshot existing QPs through RDMA netlink; live service tracing continues")
+		}
+		return
+	}
+	qps = m.table.UntracedQPs(qps)
+	owners := make(map[uint32]uint32)
+	for i := range qps {
+		pid := qps[i].PID
+		if _, seen := owners[pid]; pid != 0 && !seen {
+			owners[pid] = m.processTGID(pid)
+		}
+		qps[i].OwnerTGID = owners[pid]
+	}
+	if len(qps) > 0 {
+		recovered, err := m.recoverQPs(ctx, devices, qps)
+		if err != nil && ctx.Err() == nil {
+			m.logger.Warn().Err(err).Msg("Some existing QPs lack a supported raw address vector; keeping them unbound")
+		}
+		if recovered != nil {
+			qps = recovered
+		}
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	changed, accepted := m.table.ReconcileQPsIfCurrent(qps, generation)
+	if changed || !accepted {
+		m.signalChanged()
+	}
+	m.logger.Debug().Int("unbound_qps", len(m.table.UnboundQPs())).
+		Bool("accepted", accepted).Msg("Refreshed existing QPs and supported driver address vectors")
+}
+
+// Device maps are immutable after publication. Readers can retain a map
+// while the background refresh publishes a new sysfs snapshot.
+func (m *ServiceMonitor) deviceNumberSnapshot() map[uint32]string {
+	m.statsMu.Lock()
+	defer m.statsMu.Unlock()
+	return m.devNumbers
 }
 
 // connectionsByDevice groups the live connections by monitored RDMA device
@@ -331,12 +453,14 @@ func (m *ServiceMonitor) connectionsByDevice() (map[string][]servicetrace.Connec
 	perDevice := make(map[string][]servicetrace.Connection)
 	var other uint64
 	rescanned := false
+	devNumbers := m.deviceNumberSnapshot()
 	for _, c := range m.table.Connections() {
-		name, ok := m.devNumbers[c.Dev]
+		name, ok := devNumbers[c.Dev]
 		if !ok && !rescanned {
 			rescanned = true
 			m.loadDeviceNumbers()
-			name, ok = m.devNumbers[c.Dev]
+			devNumbers = m.deviceNumberSnapshot()
+			name, ok = devNumbers[c.Dev]
 		}
 		if !ok || m.devices[name] == nil {
 			other++
@@ -602,11 +726,13 @@ func (m *ServiceMonitor) checkSourceGID(d *serviceDeviceState, c servicetrace.Co
 // Stats returns the sample for the service tracing metrics.
 func (m *ServiceMonitor) Stats() telemetry.ServiceTracingSample {
 	counters := m.table.Counters()
+	unbound := m.table.UnboundQPs()
 	src := m.source.Stats()
 	m.statsMu.Lock()
 	defer m.statsMu.Unlock()
 	s := telemetry.ServiceTracingSample{
 		Active:            m.active,
+		UnboundQPs:        make(map[string]int, len(m.devices)),
 		Creates:           counters.Creates,
 		Connects:          counters.Connects,
 		Resets:            counters.Resets,
@@ -616,6 +742,14 @@ func (m *ServiceMonitor) Stats() telemetry.ServiceTracingSample {
 		RingBufferDropped: src.RingBufferDropped,
 		ParseErrors:       src.ParseErrors,
 		DecodeErrors:      src.DecodeErrors,
+	}
+	for name := range m.devices {
+		s.UnboundQPs[name] = 0
+	}
+	for _, qp := range unbound {
+		if name := m.devNumbers[qp.Dev]; m.devices[name] != nil {
+			s.UnboundQPs[name]++
+		}
 	}
 	names := make([]string, 0, len(m.devices))
 	for name := range m.devices {

@@ -84,7 +84,7 @@ type windowBucket struct {
 	summaries         []*controller_agent.PathSummary
 }
 
-// Analyzer ingests reported summaries, retains recent windows, and detects SLA
+// Analyzer ingests reported summaries, retains recent windows, and detects SLO
 // violations. It is safe for concurrent use (Ingest may be called from many
 // gRPC handler goroutines).
 type Analyzer struct {
@@ -117,9 +117,9 @@ func New(cfg Config, metrics *Metrics) *Analyzer {
 }
 
 // Ingest processes one reported batch of per-path window summaries: it records
-// each summary, evaluates SLA thresholds, emits findings (logs + metrics), and
+// each summary, evaluates SLO thresholds, emits findings (logs + metrics), and
 // retains the summaries in the in-memory window ring. It returns the number of
-// summaries flagged with at least one SLA violation.
+// summaries flagged with at least one SLO violation.
 func (a *Analyzer) Ingest(ctx context.Context, report *controller_agent.ProbeAnalysisReport) int {
 	if report == nil {
 		return 0

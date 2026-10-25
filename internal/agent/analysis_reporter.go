@@ -267,7 +267,7 @@ func (r *AnalysisReporter) report(ctx context.Context, summaries []probe.PathSum
 		r.logger.Debug().
 			Int("summary_count", len(batch)).
 			Bool("accepted", ack.GetAccepted()).
-			Uint32("sla_violations", ack.GetSlaViolations()).
+			Uint32("slo_violations", ack.GetSloViolations()).
 			Msg("Reported probe analysis window")
 	}
 }

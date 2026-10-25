@@ -33,13 +33,16 @@ unspecified_mesh_max_targets: 32
 # service_tracing_enabled in agent.yaml) are evaluated apart, each against
 # its own thresholds; findings carry network="cluster" or "service".
 analyzer_enabled: true
-analyzer_sla_loss_ratio: 0.02            # cluster per-path loss ratio (0..1) that is a violation
-analyzer_sla_network_rtt_p99_ns: 500000  # cluster per-path p99 network-RTT (ns) that is a violation (0 disables)
+analyzer_slo_loss_ratio: 0.02            # cluster per-path loss ratio (0..1) that is a violation
+analyzer_slo_network_rtt_p99_ns: 500000  # cluster per-path p99 network-RTT (ns) that is a violation (0 disables)
+# analyzer_sla_loss_ratio and analyzer_sla_network_rtt_p99_ns are the
+# deprecated names of the two keys above. They still work, with a warning at
+# startup, until the next minor release.
 analyzer_service_slo_loss_ratio: 0.02            # service-network per-path loss ratio (0..1) that is a violation
 analyzer_service_slo_network_rtt_p99_ns: 500000  # service-network per-path p99 network-RTT (ns) that is a violation (0 disables)
 analyzer_window_retention: 20            # recent windows retained in memory
 # Attribute sets per analyzer instrument before they fold into one overflow
-# series: sla_violations_total needs up to 4 x T x (T-1) for T ToRs (network x
+# series: slo_violations_total needs up to 4 x T x (T-1) for T ToRs (network x
 # ToR pair x kind), all at once in a wide outage. 20000 covers ~70 ToRs;
 # 0 = OTel SDK default (2000), otherwise >= 2000.
 analyzer_metrics_cardinality_limit: 20000

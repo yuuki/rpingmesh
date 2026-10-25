@@ -78,6 +78,11 @@ func run(cmd *cobra.Command, args []string) error {
 	if _, err := logging.Setup(cfg.LogFormat, cfg.LogLevel); err != nil {
 		return fmt.Errorf("failed to set up logging: %w", err)
 	}
+	// Deprecated keys still take effect; warn so the operator renames them
+	// before the release that drops the aliases.
+	for _, msg := range cfg.Deprecations {
+		log.Warn().Msg(msg)
+	}
 
 	log.Info().
 		Str("listenAddr", cfg.ListenAddr).
@@ -278,8 +283,8 @@ func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerServi
 
 	az := analyzer.New(analyzer.Config{
 		Cluster: analyzer.Thresholds{
-			LossRatio:       cfg.AnalyzerSLALossRatio,
-			NetworkRTTP99Ns: cfg.AnalyzerSLANetworkRTTP99Ns,
+			LossRatio:       cfg.AnalyzerSLOLossRatio,
+			NetworkRTTP99Ns: cfg.AnalyzerSLONetworkRTTP99Ns,
 		},
 		Service: analyzer.Thresholds{
 			LossRatio:       cfg.AnalyzerServiceSLOLossRatio,
@@ -297,7 +302,7 @@ func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerServi
 		key string
 		ns  uint64
 	}{
-		{"analyzer_sla_network_rtt_p99_ns", cfg.AnalyzerSLANetworkRTTP99Ns},
+		{"analyzer_slo_network_rtt_p99_ns", cfg.AnalyzerSLONetworkRTTP99Ns},
 		{"analyzer_service_slo_network_rtt_p99_ns", cfg.AnalyzerServiceSLONetworkRTTP99Ns},
 	} {
 		if t.ns != 0 && !telemetry.IsNetworkRTTBucketBoundary(t.ns) {
@@ -309,8 +314,8 @@ func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerServi
 	}
 
 	log.Info().
-		Float64("slaLossRatio", cfg.AnalyzerSLALossRatio).
-		Uint64("slaNetworkRttP99Ns", cfg.AnalyzerSLANetworkRTTP99Ns).
+		Float64("sloLossRatio", cfg.AnalyzerSLOLossRatio).
+		Uint64("sloNetworkRttP99Ns", cfg.AnalyzerSLONetworkRTTP99Ns).
 		Float64("serviceSloLossRatio", cfg.AnalyzerServiceSLOLossRatio).
 		Uint64("serviceSloNetworkRttP99Ns", cfg.AnalyzerServiceSLONetworkRTTP99Ns).
 		Int("windowRetention", cfg.AnalyzerWindowRetention).

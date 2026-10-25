@@ -778,7 +778,7 @@ func (a *Agent) createResponders() error {
 	return nil
 }
 
-// createAnalysisReporter creates the per-path window aggregation and SLA
+// createAnalysisReporter creates the per-path window aggregation and SLO
 // reporting to the controller, if enabled. It consumes the analysis branch
 // created by createResultsFanIn.
 func (a *Agent) createAnalysisReporter() {

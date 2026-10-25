@@ -143,6 +143,10 @@ func newTestServiceMonitor(t *testing.T, resolver *fakeResolver, source *fakeEve
 	m := NewServiceMonitor(resolver, source, "agent-a", []ServiceDevice{{
 		Name: "mlx5_0", GID: localGIDStr, IPAddr: "10.0.0.1", Port: 1, GIDIndex: 3, Prober: prober,
 	}}, 300)
+	m.recoverQPs = func(_ context.Context, _ map[uint32]string, qps []servicetrace.QPResource) ([]servicetrace.QPResource, error) {
+		return qps, nil
+	}
+	m.snapshotQPs = func(context.Context, map[uint32]string) ([]servicetrace.QPResource, error) { return nil, nil }
 	m.sysfsRoot = root
 	// A fake /proc in which the traced process (pid 7) exists.
 	m.procRoot = filepath.Join(root, "proc")
@@ -473,5 +477,162 @@ func TestServiceMonitor_SourceGIDMismatchWarnsOnce(t *testing.T) {
 	// The flow is still probed: the mismatch is a warning, not a filter.
 	if targets, _ := prober.last(); len(targets) != 1 {
 		t.Fatalf("mismatched source GID must still be probed, got %v", targets)
+	}
+}
+
+func TestServiceMonitorSnapshotsExistingQPs(t *testing.T) {
+	source := &fakeEventSource{}
+	m := newTestServiceMonitor(t, &fakeResolver{}, source, &fakeServiceProber{})
+	m.refreshInterval = 20 * time.Millisecond
+	calls := 0 // accessed only on the monitor goroutine
+	m.snapshotQPs = func(_ context.Context, devices map[uint32]string) ([]servicetrace.QPResource, error) {
+		source.mu.Lock()
+		started := source.started
+		source.mu.Unlock()
+		if started != 1 || len(devices) != 1 || devices[testUverbsDev] != "mlx5_0" {
+			t.Errorf("snapshot before event consumption or with wrong devices: started=%d devices=%v", started, devices)
+		}
+		calls++
+		if calls == 1 {
+			return []servicetrace.QPResource{{Dev: testUverbsDev, LocalQPN: 0x100, RemoteQPN: 0x200, QPType: servicetrace.QPTypeRC, QPState: servicetrace.QPStateRTS, PID: 7}}, nil
+		}
+		if calls == 2 {
+			return nil, errors.New("dump failed")
+		}
+		return nil, nil
+	}
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	deadline := time.Now().Add(time.Second)
+	for m.Stats().UnboundQPs["mlx5_0"] != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if s := m.Stats(); s.UnboundQPs["mlx5_0"] != 1 || len(m.table.Connections()) != 0 || s.Creates != 0 {
+		t.Fatalf("startup snapshot: %+v", s)
+	}
+	for m.Stats().UnboundQPs["mlx5_0"] != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if s := m.Stats(); s.UnboundQPs["mlx5_0"] != 0 {
+		t.Fatalf("periodic refresh did not drop stale QP: %+v", s)
+	}
+}
+
+func TestServiceMonitorSnapshotFailurePreservesInventory(t *testing.T) {
+	m := newTestServiceMonitor(t, &fakeResolver{}, &fakeEventSource{}, &fakeServiceProber{})
+	m.loadDeviceNumbers()
+	m.table.ReconcileQPs([]servicetrace.QPResource{{Dev: testUverbsDev, LocalQPN: 1, QPType: servicetrace.QPTypeRC, PID: 7}})
+	m.snapshotQPs = func(context.Context, map[uint32]string) ([]servicetrace.QPResource, error) {
+		return nil, errors.New("dump interrupted")
+	}
+	m.refreshQPs(context.Background())
+	if m.table.QPCount() != 1 || m.Stats().UnboundQPs["mlx5_0"] != 1 {
+		t.Fatal("failed dump erased inventory")
+	}
+}
+
+func TestServiceMonitorStopCancelsSnapshot(t *testing.T) {
+	m := newTestServiceMonitor(t, &fakeResolver{}, &fakeEventSource{}, &fakeServiceProber{})
+	started := make(chan struct{})
+	m.snapshotQPs = func(ctx context.Context, _ map[uint32]string) ([]servicetrace.QPResource, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot did not start")
+	}
+	done := make(chan struct{})
+	go func() { m.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not cancel the snapshot")
+	}
+}
+
+func TestServiceMonitorRecoveredQPBecomesTarget(t *testing.T) {
+	resolver := &fakeResolver{targets: map[string]*controller_agent.PingTarget{
+		remoteGIDStr: {TargetGid: remoteGIDStr, TargetQpn: 77, TargetTorId: "tor-b"},
+	}}
+	source, prober := &fakeEventSource{}, &fakeServiceProber{}
+	m := newTestServiceMonitor(t, resolver, source, prober)
+	qp := servicetrace.QPResource{Dev: testUverbsDev, LocalQPN: 0x100, RemoteQPN: 0x200, QPType: servicetrace.QPTypeRC, QPState: servicetrace.QPStateRTS, Port: 1, PID: 7}
+	m.snapshotQPs = func(context.Context, map[uint32]string) ([]servicetrace.QPResource, error) {
+		return []servicetrace.QPResource{qp}, nil
+	}
+	m.recoverQPs = func(_ context.Context, _ map[uint32]string, qps []servicetrace.QPResource) ([]servicetrace.QPResource, error) {
+		qps[0].Recovered = &servicetrace.Connection{Dev: qp.Dev, LocalQPN: qp.LocalQPN, RemoteQPN: qp.RemoteQPN, QPType: qp.QPType, PID: qp.PID, RemoteGID: remoteGID, FlowLabel: 0x12345, SGIDIndex: 3, Port: 1, FromSnapshot: true}
+		return qps, nil
+	}
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	targets := waitForUpdate(t, prober, 0)
+	if len(targets) != 1 || targets[0].GetFlowLabel() != 0x12345 || targets[0].GetTargetQpn() != 77 || targets[0].GetPinglistType() != controller_agent.PinglistType_SERVICE_TRACING {
+		t.Fatalf("recovered target = %v", targets)
+	}
+	if s := m.Stats(); s.Devices[0].Connections != 1 || s.UnboundQPs["mlx5_0"] != 0 || s.Connects != 0 {
+		t.Fatalf("recovered connection stats = %+v", s)
+	}
+}
+
+func TestServiceMonitorRecoveryDoesNotStallLifecycleRemoval(t *testing.T) {
+	resolver := &fakeResolver{targets: map[string]*controller_agent.PingTarget{
+		remoteGIDStr: {TargetGid: remoteGIDStr, TargetQpn: 77},
+	}}
+	source, prober := &fakeEventSource{}, &fakeServiceProber{}
+	m := newTestServiceMonitor(t, resolver, source, prober)
+	qp := servicetrace.QPResource{Dev: testUverbsDev, LocalQPN: 0x100, QPType: servicetrace.QPTypeRC, PID: 7, Recovered: &servicetrace.Connection{Dev: testUverbsDev, LocalQPN: 0x100, RemoteQPN: 0x200, QPType: servicetrace.QPTypeRC, PID: 7, RemoteGID: remoteGID, SGIDIndex: 3, Port: 1}}
+	m.table.ReconcileQPs([]servicetrace.QPResource{qp})
+	m.loadDeviceNumbers()
+	m.rebuild(context.Background(), false)
+	_, before := prober.last()
+	started := make(chan struct{})
+	m.snapshotQPs = func(context.Context, map[uint32]string) ([]servicetrace.QPResource, error) {
+		return []servicetrace.QPResource{qp}, nil
+	}
+	m.recoverQPs = func(ctx context.Context, _ map[uint32]string, _ []servicetrace.QPResource) ([]servicetrace.QPResource, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not start")
+	}
+	source.Emit(servicetrace.Event{Kind: servicetrace.KindQPDestroy, Dev: testUverbsDev, Context: 0x1000, QPHandle: 99, PID: 7})
+	if targets := waitForUpdate(t, prober, before); len(targets) != 0 {
+		t.Fatalf("stalled recovery kept invalidated targets: %v", targets)
+	}
+}
+
+func TestServiceMonitorResolvesNetlinkOwnerThreadGroup(t *testing.T) {
+	m := newTestServiceMonitor(t, &fakeResolver{}, &fakeEventSource{}, &fakeServiceProber{})
+	dir := filepath.Join(m.procRoot, "1001")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "status"), []byte("Name:\tworker\nTgid:\t7\nPid:\t1001\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.processTGID(1001); got != 7 {
+		t.Fatalf("owner TGID = %d", got)
+	}
+	if got := m.processTGID(9999); got != 0 {
+		t.Fatalf("unknown owner TGID = %d", got)
 	}
 }

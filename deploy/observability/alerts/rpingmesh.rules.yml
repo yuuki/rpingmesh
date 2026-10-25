@@ -15,8 +15,8 @@
 # PromQL functions need VictoriaMetrics or Prometheus 3+.
 #
 # Thresholds are starting points; tune them per fabric. RTT is not alerted on
-# directly: the controller's analyzer owns the RTT SLA
-# (analyzer_sla_network_rtt_p99_ns), and RpingmeshSLAViolation surfaces it, so
+# directly: the controller's analyzer owns the RTT SLO
+# (analyzer_slo_network_rtt_p99_ns), and RpingmeshSLOViolation surfaces it, so
 # the threshold lives in one place. See docs/design/grafana-dashboards.md.
 
 groups:
@@ -65,11 +65,13 @@ groups:
           description: "Probes between these ToRs are being sent but none succeeded for 5 minutes."
 
       # The analyzer applies the per-path loss and p99 network-RTT SLO
-      # thresholds configured on the controller (analyzer_sla_* for the
+      # thresholds configured on the controller (analyzer_slo_* for the
       # cluster network, analyzer_service_slo_* for the service network).
-      - alert: RpingmeshSLAViolation
+      # Renamed from RpingmeshSLAViolation together with the counter
+      # (sla_violations_total -> slo_violations_total, no alias emitted).
+      - alert: RpingmeshSLOViolation
         expr: |
-          sum by (network, source_tor, target_tor, kind) (increase({__name__=~"rpingmesh[._]analyzer[._]sla_violations_total"}[10m])) > 0
+          sum by (network, source_tor, target_tor, kind) (increase({__name__=~"rpingmesh[._]analyzer[._]slo_violations_total"}[10m])) > 0
         for: 0m
         labels:
           severity: warning
@@ -157,4 +159,4 @@ groups:
           severity: warning
         annotations:
           summary: "R-Pingmesh analyzer is not ingesting path summaries"
-          description: "Agents are probing but the controller's analyzer received no path summaries for 10 minutes, so SLA violations are not being detected."
+          description: "Agents are probing but the controller's analyzer received no path summaries for 10 minutes, so SLO violations are not being detected."

@@ -5,7 +5,7 @@ Phase 1 analyzer merged in PR #36.
 
 ## Goals
 
-- Turn the per-path SLA violations that Phase 1 detects into **fault
+- Turn the per-path SLO violations that Phase 1 detects into **fault
   localization**: name the ToR switch (and, once a fabric model exists, the
   link or spine) most likely responsible for a correlated set of degraded
   paths.
@@ -72,7 +72,7 @@ Phase 1 analyzer merged in PR #36.
   table, or path→link mapping.
 - **OTLP.** `analyzer/metrics.go` registers
   `rpingmesh.analyzer.path_summaries_total` and
-  `rpingmesh.analyzer.sla_violations_total{network,source_tor,target_tor,kind}`.
+  `rpingmesh.analyzer.slo_violations_total{network,source_tor,target_tor,kind}`.
   `setupAnalyzer` in `cmd/controller/main.go` creates the meter
   `rpingmesh.analyzer` on a provider tagged `service.name=rpingmesh-analyzer`
   and wires the analyzer with `svc.SetAnalyzer`. Phase 2 metrics register on
@@ -118,10 +118,10 @@ hysteresis state. The localizer therefore runs only on closed windows:
   windows past `Ws`, so a busy cluster need not wait for the wall clock.
 - A **sweeper** goroutine (period about one window) runs `Localize(W)` exactly
   once for the oldest closed, not-yet-localized window. `Ingest` stays a pure
-  ingest/retain/SLA path. The sweeper needs Start/Stop wiring in
+  ingest/retain/SLO path. The sweeper needs Start/Stop wiring in
   `cmd/controller/main.go`; the Phase 1 analyzer has no goroutine today.
 - **Late summaries** for an already-localized window are retained and still
-  checked against the SLA, but they do not re-run localization. They increment
+  checked against the SLO, but they do not re-run localization. They increment
   `rpingmesh.analyzer.late_summaries_total` so `grace` can be tuned.
   Re-opening a window would make hysteresis order-dependent.
 
@@ -144,7 +144,7 @@ EdgeStat {
     rttP99Ns        uint64   // see "Cross-agent quantile synthesis"
     agentsReporting int      // distinct agent_id
     pathsReporting  int      // distinct (source_gid, target_gid)
-    degraded        bool     // lossRatio > SLALossRatio OR rttP99Ns > SLANetworkRTTP99Ns
+    degraded        bool     // lossRatio > SLOLossRatio OR rttP99Ns > SLONetworkRTTP99Ns
 }
 ```
 
@@ -159,8 +159,8 @@ registry snapshot (`TopologySnapshot()`, built from `ListAllRNICs`) is still
 needed to tell a missing intra-ToR edge caused by a single-RNIC ToR from one
 caused by missing reports.
 
-The `degraded` flag reuses the Phase 1 thresholds (`Config.SLALossRatio`,
-`Config.SLANetworkRTTP99Ns`), so an edge-level verdict agrees with the
+The `degraded` flag reuses the Phase 1 thresholds (`Config.SLOLossRatio`,
+`Config.SLONetworkRTTP99Ns`), so an edge-level verdict agrees with the
 per-path findings already logged.
 
 #### Required retention change
@@ -531,7 +531,7 @@ first.
   persistence stays off by default. If forensic history is a hard requirement,
   an external TSDB or OLAP sink may fit better. *(User input needed.)*
 - **e2e signal for an opened finding.** The controller e2e stack has no OTLP
-  collector. `ProbeAnalysisAck` carries only `accepted` and `sla_violations`,
+  collector. `ProbeAnalysisAck` carries only `accepted` and `slo_violations`,
   and it is returned before the window closes, so it cannot report a
   localization result. Options: run a collector in that stack, assert on
   controller logs, or add a diagnostic RPC.

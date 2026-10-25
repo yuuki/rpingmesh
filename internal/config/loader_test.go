@@ -11,15 +11,18 @@ import (
 
 // TestKeyTablesMatchFlags checks, for each binary, that the key table and
 // the registered flags describe the same configuration: every flag maps to
-// a table key with the same default, every table key that is not noFlag has
-// a flag, every table key has a Viper default, and no key is listed twice.
+// a table key with the same default (or is the deprecated flag of a renamed
+// key), every table key that is not noFlag has a flag, every renamed key has
+// a deprecated flag under its old name, every table key has a Viper default,
+// and no key is listed twice.
 func TestKeyTablesMatchFlags(t *testing.T) {
 	for name, tc := range map[string]struct {
-		bind  func(*pflag.FlagSet)
-		specs []keySpec
+		bind    func(*pflag.FlagSet)
+		specs   []keySpec
+		renamed []renamedKey
 	}{
-		"agent":      {BindAgentFlags, agentKeys},
-		"controller": {BindControllerFlags, controllerKeys},
+		"agent":      {BindAgentFlags, agentKeys, nil},
+		"controller": {BindControllerFlags, controllerKeys, controllerRenamedKeys},
 	} {
 		t.Run(name, func(t *testing.T) {
 			byFlag := make(map[string]keySpec, len(tc.specs))
@@ -29,6 +32,16 @@ func TestKeyTablesMatchFlags(t *testing.T) {
 				}
 				byFlag[s.flagName()] = s
 			}
+			deprecatedFlags := make(map[string]renamedKey, len(tc.renamed))
+			for _, r := range tc.renamed {
+				if _, isKey := byFlag[keySpec{key: r.old}.flagName()]; isKey {
+					t.Errorf("renamed key %q is still in the key table", r.old)
+				}
+				if _, ok := byFlag[keySpec{key: r.new}.flagName()]; !ok {
+					t.Errorf("renamed key %q points at %q, which is not in the key table", r.old, r.new)
+				}
+				deprecatedFlags[keySpec{key: r.old}.flagName()] = r
+			}
 
 			flags := pflag.NewFlagSet(name, pflag.ContinueOnError)
 			tc.bind(flags)
@@ -36,6 +49,16 @@ func TestKeyTablesMatchFlags(t *testing.T) {
 			seen := make(map[string]bool)
 			flags.VisitAll(func(f *pflag.Flag) {
 				seen[f.Name] = true
+				if r, ok := deprecatedFlags[f.Name]; ok {
+					if f.Deprecated == "" {
+						t.Errorf("flag --%s of renamed key %q is not marked deprecated", f.Name, r.old)
+					}
+					newSpec := byFlag[keySpec{key: r.new}.flagName()]
+					if want := fmt.Sprint(newSpec.def); f.DefValue != want {
+						t.Errorf("deprecated flag --%s default = %q, want %q (key %q)", f.Name, f.DefValue, want, r.new)
+					}
+					return
+				}
 				s, ok := byFlag[f.Name]
 				if !ok {
 					t.Errorf("flag --%s has no key table entry", f.Name)
@@ -55,6 +78,11 @@ func TestKeyTablesMatchFlags(t *testing.T) {
 			for _, s := range tc.specs {
 				if !s.noFlag && !seen[s.flagName()] {
 					t.Errorf("key %q has no registered flag --%s", s.key, s.flagName())
+				}
+			}
+			for flag, r := range deprecatedFlags {
+				if !seen[flag] {
+					t.Errorf("renamed key %q has no deprecated flag --%s", r.old, flag)
 				}
 			}
 

@@ -27,7 +27,7 @@ This implementation keeps the paper's core measurement design:
   flow label, so the probes take the service traffic's ECMP paths.
 
 The RDMA data path is a Zig static library; the agent, controller, and
-telemetry are written in Go. A per-path SLA analyzer (the paper's "Phase 1"
+telemetry are written in Go. A per-path SLO analyzer (the paper's "Phase 1"
 analysis) runs in the controller. Topology-aware fault localization is not
 implemented (see [Limitations](#limitations)).
 
@@ -588,12 +588,12 @@ devices; `summarize_qos_facts.py` reports such ports as override outliers.
 | `ecmp_coverage_probability` | `0.9` | Target probability (`p`) of covering every ECMP path |
 | `ecmp_max_flow_labels` | `64` | Cap on flow labels per target (at most 4096) |
 | `analyzer_enabled` | `true` | Run the Phase 1 analyzer |
-| `analyzer_sla_loss_ratio` | `0.02` | Loss ratio above which a window violates the SLA |
-| `analyzer_sla_network_rtt_p99_ns` | `500000` | p99 network RTT above which a window violates the SLA; `0` disables the check |
+| `analyzer_slo_loss_ratio` | `0.02` | Loss ratio above which a window violates the SLO |
+| `analyzer_slo_network_rtt_p99_ns` | `500000` | p99 network RTT above which a window violates the SLO; `0` disables the check |
 | `analyzer_service_slo_loss_ratio` | `0.02` | Loss ratio above which a service-network window (a traced service flow's path) violates its SLO |
 | `analyzer_service_slo_network_rtt_p99_ns` | `500000` | p99 network RTT above which a service-network window violates its SLO; `0` disables the check |
 | `analyzer_window_retention` | `20` | Number of recent windows kept in memory |
-| `analyzer_metrics_cardinality_limit` | `20000` | Maximum attribute sets per analyzer metric instrument; extra sets fold into one `otel.metric.overflow="true"` series. `rpingmesh.analyzer.sla_violations_total` can need up to 4 × T × (T−1) series for T ToRs, all at once in a wide outage; the default covers about 70 ToRs. `0` keeps the OTel SDK default (2000); otherwise at least 2000 |
+| `analyzer_metrics_cardinality_limit` | `20000` | Maximum attribute sets per analyzer metric instrument; extra sets fold into one `otel.metric.overflow="true"` series. `rpingmesh.analyzer.slo_violations_total` can need up to 4 × T × (T−1) series for T ToRs, all at once in a wide outage; the default covers about 70 ToRs. `0` keeps the OTel SDK default (2000); otherwise at least 2000 |
 | `otel_collector_addr` | `localhost:4317` | OTLP/gRPC collector for analyzer metrics |
 | `log_level`, `log_format` | `info`, `console` | As for the agent |
 | `tls_mode` | `disabled` | `disabled`, `tls`, or `mtls` |
@@ -602,6 +602,13 @@ devices; `summarize_qos_facts.py` reports such ports as override outliers.
 
 The controller also accepts `tls_server_name` for symmetry with the agent but
 ignores it.
+
+`analyzer_sla_loss_ratio` and `analyzer_sla_network_rtt_p99_ns` are the
+deprecated names of the two cluster thresholds. They still work from the file,
+the `RPINGMESH_ANALYZER_SLA_*` environment variables and the
+`--analyzer-sla-*` flags, and the controller logs a warning at startup for
+each one in use; when an old and a new name are both set, the new one wins.
+The old names are removed in the next minor release.
 
 The RNICs without a ToR form one shared virtual rack. Their ToR-mesh pinglist
 is capped by `unspecified_mesh_max_targets` so that a fleet that forgot to set
@@ -779,6 +786,17 @@ sudo systemctl daemon-reload && sudo systemctl restart rpingmesh-agent.service
 Without the capabilities the agent logs `permission denied loading eBPF
 programs` at startup and keeps probing without service tracing.
 
+Existing mlx5 connections can also be recovered from the driver's raw QP
+dump when `CAP_NET_ADMIN` is available. The separate optional example
+`packaging/systemd/rpingmesh-agent.service.d/20-qp-recovery.conf` grants that
+capability in addition to the service-tracing drop-in. It is shipped under
+the package's examples directory, without being installed as a live grant.
+Without it, or on unsupported drivers/firmware, existing QPs remain visible
+on `rpingmesh.agent.service_qps_unbound`; live tracing continues. Recovery
+uses strict PRM layout and path checks, and physical mlx5 validation is
+opt-in. See [the service-tracing design](docs/design/ebpf-service-tracing.md#qps-that-predate-the-agent)
+for capability, firmware, lifecycle and test details.
+
 ### Running rqlite on the controller host
 
 The controller unit starts after `rqlite.service` and wants it. `rqlited`
@@ -816,6 +834,15 @@ Releases that made `tor_id` optional also need the following care:
   probing, so stop untagged agents, or delete their registry rows, before
   rolling back.
 
+The release that renamed the analyzer's "SLA" identifiers to SLO vocabulary
+(see the changelog) renames the violation counter to
+`rpingmesh.analyzer.slo_violations_total` without an alias: point dashboards
+and alert rules at the new name and at `RpingmeshSLOViolation` when upgrading
+the controller. The old `analyzer_sla_*` controller keys keep working for one
+minor release with a startup warning; rename them before upgrading to the
+release after it. The `ProbeAnalysisAck` field rename keeps its field number,
+so agents and controllers of different versions still interoperate.
+
 ## Observability
 
 ### Metrics
@@ -843,6 +870,7 @@ With `service_tracing_enabled`, the agent also exports:
 |--------|------|-------------|
 | `rpingmesh.service.network_rtt_ns`, `prober_delay_ns`, `responder_delay_ns`, `probe_total`, `probe_success_total`, `probe_failed_total`, `probe_invalid_total` | as above | The same instruments for probes sent along traced service flows, with the same attributes and optional `service`. Service probes never count in the `rpingmesh.*` cluster instruments |
 | `rpingmesh.agent.service_trace_active` | Gauge | `1` while the eBPF tracer is attached, `0` when service tracing is degraded |
+| `rpingmesh.agent.service_qps_unbound` | Gauge | Existing connected-transport user QPs without a usable recovered address vector; by `source_rdma_device`, excluded from probe targets |
 | `rpingmesh.agent.service_connections` | Gauge | Connected application queue pairs traced on a local RNIC, by `source_rdma_device` and optional `service` |
 | `rpingmesh.agent.service_flows` | Gauge | Distinct traced flows of a local RNIC, by `source_rdma_device`, optional `service`, and `state` (`probed`, or `unresolved` when the remote RNIC has no registered agent) |
 | `rpingmesh.agent.service_trace_events_total` | Counter | Queue pair lifecycle events, by `kind` (`create`, `connect`, `reset`, `destroy`, `context_close`, `unknown_qp`) |
@@ -865,7 +893,7 @@ Analyzer metrics, exported by the controller with
 | Metric | Type | Attributes | Description |
 |--------|------|-----------|-------------|
 | `rpingmesh.analyzer.path_summaries_total` | Counter | — | Ingested per-path window summaries |
-| `rpingmesh.analyzer.sla_violations_total` | Counter | `network` (`cluster`, `service`), `source_tor`, `target_tor`, `kind` (`loss`, `rtt`) | Detected SLO violations; `network` separates the controller's pinglist paths from the paths of traced service flows |
+| `rpingmesh.analyzer.slo_violations_total` | Counter | `network` (`cluster`, `service`), `source_tor`, `target_tor`, `kind` (`loss`, `rtt`) | Detected SLO violations; `network` separates the controller's pinglist paths from the paths of traced service flows |
 
 By default no metric carries a GID or any other identity of the destination
 RNIC, because a fabric with thousands of RNICs would produce an unbounded number
@@ -933,7 +961,7 @@ The repository contains a local metrics stack: an OpenTelemetry collector
 forwards OTLP metrics to VictoriaMetrics, Grafana shows two provisioned
 dashboards without custom plugins, and vmalert evaluates the rules in
 `deploy/observability/alerts/rpingmesh.rules.yml`. The rules cover probe loss,
-black-holed ToR pairs, analyzer SLA violations, probe send errors, event-ring
+black-holed ToR pairs, analyzer SLO violations, probe send errors, event-ring
 drops, self-throttling, agents that stop reporting, and broken telemetry or
 analyzer pipelines.
 
@@ -1307,7 +1335,7 @@ acceptable; GIDs and other destination-RNIC identities are not.
 
 ## Limitations
 
-- **No fault localization.** The analyzer detects per-path SLA violations but
+- **No fault localization.** The analyzer detects per-path SLO violations but
   does not locate the faulty switch or link (the paper's Phase 2). It keeps
   summaries only in a bounded in-memory window. See
   [the Phase 2 design](docs/design/analyzer-phase2-localization.md).

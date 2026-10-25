@@ -8,16 +8,16 @@ import (
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
-// TestReportProbeAnalysisSLADetection exercises the full ReportProbeAnalysis
+// TestReportProbeAnalysisSLODetection exercises the full ReportProbeAnalysis
 // path against a real controller (with its analyzer enabled by default): a
 // pseudo-agent reports a batch of per-path window summaries, one of which
-// breaches the default loss SLA and one the default p99-RTT SLA, and the
-// controller's analyzer must flag exactly those. The ack's sla_violations
+// breaches the default loss SLO and one the default p99-RTT SLO, and the
+// controller's analyzer must flag exactly those. The ack's slo_violations
 // count is the observable end-to-end signal (no OTLP collector needed here).
 //
 // It runs in the RDMA-free e2e-controller compose stack
 // (docker-compose.e2e-controller.yml), like the registration/pinglist tests.
-func TestReportProbeAnalysisSLADetection(t *testing.T) {
+func TestReportProbeAnalysisSLODetection(t *testing.T) {
 	client := newClient(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -78,9 +78,9 @@ func TestReportProbeAnalysisSLADetection(t *testing.T) {
 	if !ack.GetAccepted() {
 		t.Fatalf("report not accepted; is the analyzer enabled on the controller?")
 	}
-	// Two of the three summaries breach an SLA (loss, rtt); the third is clean.
-	if ack.GetSlaViolations() != 2 {
-		t.Errorf("SlaViolations = %d, want 2 (1 loss + 1 rtt, 1 clean)", ack.GetSlaViolations())
+	// Two of the three summaries breach an SLO (loss, rtt); the third is clean.
+	if ack.GetSloViolations() != 2 {
+		t.Errorf("SloViolations = %d, want 2 (1 loss + 1 rtt, 1 clean)", ack.GetSloViolations())
 	}
 }
 
@@ -115,7 +115,7 @@ func TestReportProbeAnalysisNoViolations(t *testing.T) {
 	if !ack.GetAccepted() {
 		t.Fatalf("report not accepted")
 	}
-	if ack.GetSlaViolations() != 0 {
-		t.Errorf("SlaViolations = %d, want 0", ack.GetSlaViolations())
+	if ack.GetSloViolations() != 0 {
+		t.Errorf("SloViolations = %d, want 0", ack.GetSloViolations())
 	}
 }

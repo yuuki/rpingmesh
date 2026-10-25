@@ -26,7 +26,7 @@ type registryClient interface {
 // probeAnalyzer is the subset of the analyzer used by ReportProbeAnalysis,
 // declared at the point of use so the service can be unit tested against a
 // fake and so the controller package does not hard-depend on the analyzer's
-// concrete type. Ingest returns the number of SLA-violating summaries.
+// concrete type. Ingest returns the number of SLO-violating summaries.
 type probeAnalyzer interface {
 	Ingest(ctx context.Context, report *controller_agent.ProbeAnalysisReport) int
 }
@@ -38,7 +38,7 @@ type ControllerService struct {
 	controller_agent.UnimplementedControllerServiceServer
 	registry registryClient
 	pinglist *pinglist.PinglistGenerator
-	// analyzer ingests reported per-path summaries and detects SLA violations.
+	// analyzer ingests reported per-path summaries and detects SLO violations.
 	// nil when the analyzer is disabled, in which case ReportProbeAnalysis
 	// accepts-and-drops.
 	analyzer probeAnalyzer
@@ -241,7 +241,7 @@ func (s *ControllerService) GetTargetRnicInfo(
 }
 
 // ReportProbeAnalysis ingests a batch of per-path window summaries reported by
-// an agent and returns an ack carrying the number of SLA-violating summaries
+// an agent and returns an ack carrying the number of SLO-violating summaries
 // the analyzer detected. When no analyzer is configured, it accepts-and-drops
 // (Accepted=false) so agents (which treat reporting as best-effort) are not
 // forced to error.
@@ -266,11 +266,11 @@ func (s *ControllerService) ReportProbeAnalysis(
 	log.Debug().
 		Str("agentID", req.GetAgentId()).
 		Int("summaryCount", len(req.GetSummaries())).
-		Int("slaViolations", violations).
+		Int("sloViolations", violations).
 		Msg("Ingested probe analysis report")
 
 	return &controller_agent.ProbeAnalysisAck{
 		Accepted:      true,
-		SlaViolations: uint32(violations),
+		SloViolations: uint32(violations),
 	}, nil
 }

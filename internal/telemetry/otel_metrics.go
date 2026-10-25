@@ -50,7 +50,7 @@ import (
 // magnitude: histogram_quantile interpolates linearly inside a bucket, so a
 // single 1ms-10ms bucket would report every sample in it as ~5.5ms at p50.
 // It also keeps 500us, the default
-// analyzer_sla_network_rtt_p99_ns, so the fraction of samples above the SLA
+// analyzer_slo_network_rtt_p99_ns, so the fraction of samples above the SLO
 // threshold can be read off one bucket.
 //
 // These boundaries are independent of internal/probe's rttBucketBoundariesNs:
@@ -76,7 +76,7 @@ var delayBucketBoundaries = []float64{
 
 // IsNetworkRTTBucketBoundary reports whether ns is an explicit bucket
 // boundary of rpingmesh.network_rtt_ns. The controller uses it to warn when
-// its analyzer SLA threshold cannot be read off a single histogram bucket.
+// its analyzer SLO threshold cannot be read off a single histogram bucket.
 func IsNetworkRTTBucketBoundary(ns uint64) bool {
 	for _, b := range networkRTTBucketBoundaries {
 		if uint64(b) == ns {
@@ -325,6 +325,7 @@ type MetricsCollector struct {
 	serviceLabels       map[string]bool
 	serviceTraceActive  metric.Int64ObservableGauge
 	serviceConnections  metric.Int64ObservableGauge
+	serviceQPsUnbound   metric.Int64ObservableGauge
 	serviceFlows        metric.Int64ObservableGauge
 	serviceTraceEvents  metric.Int64ObservableCounter
 	serviceTraceDropped metric.Int64ObservableCounter
@@ -654,6 +655,8 @@ func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOpt
 			"Whether the eBPF service tracer is attached (1) or service tracing is degraded (0)", "1")
 		mc.serviceConnections = r.gauge("rpingmesh.agent.service_connections",
 			"Connected application queue pairs traced on a local RNIC", "{connection}")
+		mc.serviceQPsUnbound = r.gauge("rpingmesh.agent.service_qps_unbound",
+			"Existing user QPs without a usable recovered address vector", "{qp}")
 		mc.serviceFlows = r.gauge("rpingmesh.agent.service_flows",
 			"Distinct traced service flows of a local RNIC, by whether their remote RNIC resolved to a probe target", "{flow}")
 		mc.serviceTraceEvents = r.observableCounter("rpingmesh.agent.service_trace_events_total",
@@ -1074,6 +1077,10 @@ type ServiceTracingSample struct {
 	// Active is true while the eBPF tracer is attached.
 	Active  bool
 	Devices []ServiceTracingDevice
+	// UnboundQPs counts generic netlink QPs by device. These lack both a
+	// uverbs identity and an address vector, so service attribution and
+	// probing are unavailable. No service labels are attached.
+	UnboundQPs map[string]int
 	// Events by kind, as processed by the connection table.
 	Creates       uint64
 	Connects      uint64
@@ -1099,7 +1106,8 @@ type labelledCount struct {
 // service tracer's state: rpingmesh.agent.service_trace_active,
 // service_connections and service_flows (by source_rdma_device and, for the
 // flows, by state probed/unresolved), service_trace_events_total (by kind)
-// and service_trace_dropped_total (by reason). read must be cheap; it runs
+// and service_trace_dropped_total (by reason), plus service_qps_unbound
+// (by source_rdma_device only). read must be cheap; it runs
 // once per collection cycle. It is an error to call this without
 // WithServiceTracing.
 func (mc *MetricsCollector) RegisterServiceTracingCallback(read func() ServiceTracingSample) error {
@@ -1114,6 +1122,9 @@ func (mc *MetricsCollector) RegisterServiceTracingCallback(read func() ServiceTr
 				active = 1
 			}
 			o.ObserveInt64(mc.serviceTraceActive, active)
+			for name, count := range s.UnboundQPs {
+				o.ObserveInt64(mc.serviceQPsUnbound, int64(count), metric.WithAttributes(attribute.String("source_rdma_device", deviceMetricLabel(name))))
+			}
 			for _, d := range mc.serviceDeviceSamples(s.Devices) {
 				dev := attribute.String("source_rdma_device", deviceMetricLabel(d.RdmaDevice))
 				attrs := []attribute.KeyValue{dev}
@@ -1139,7 +1150,7 @@ func (mc *MetricsCollector) RegisterServiceTracingCallback(read func() ServiceTr
 			}
 			return nil
 		},
-		mc.serviceTraceActive, mc.serviceConnections, mc.serviceFlows, mc.serviceTraceEvents, mc.serviceTraceDropped,
+		mc.serviceTraceActive, mc.serviceConnections, mc.serviceQPsUnbound, mc.serviceFlows, mc.serviceTraceEvents, mc.serviceTraceDropped,
 	)
 	if err != nil {
 		return fmt.Errorf("register service tracing callback: %w", err)

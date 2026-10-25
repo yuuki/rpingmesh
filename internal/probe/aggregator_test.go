@@ -174,7 +174,7 @@ func TestPathAggregator_P99CapturesTail(t *testing.T) {
 // for the off-by-one in the old round-half-up rank: 151 valid samples with only
 // 2 slow ones. Nearest-rank p99 = ceil(0.99*151) = ceil(149.49) = 150, which
 // lands on a slow sample; round-half-up gives round(149.99) = 149 (the fast
-// bucket) and would hide the SLA breach.
+// bucket) and would hide the SLO breach.
 func TestPathAggregator_P99NearestRankCapturesRareTail(t *testing.T) {
 	src, tgt := gid(1), gid(2)
 	agg := NewPathAggregator(testWindowNs)

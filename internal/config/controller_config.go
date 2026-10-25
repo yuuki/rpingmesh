@@ -51,18 +51,18 @@ const (
 	// see probe.MaxDistinctFlowLabels, which the agent also clamps to.
 	MaxEcmpFlowLabels = probe.MaxDistinctFlowLabels
 
-	// DefaultAnalyzerSLALossRatio is the default per-path loss ratio
+	// DefaultAnalyzerSLOLossRatio is the default per-path loss ratio
 	// (probe_failed / probe_total) above which the analyzer flags a window as
-	// a loss SLA violation.
-	DefaultAnalyzerSLALossRatio = 0.02
-	// DefaultAnalyzerSLANetworkRTTP99Ns is the default per-path p99 network-RTT
-	// threshold (ns) above which the analyzer flags an RTT SLA violation.
-	DefaultAnalyzerSLANetworkRTTP99Ns = 500_000
+	// a loss SLO violation.
+	DefaultAnalyzerSLOLossRatio = 0.02
+	// DefaultAnalyzerSLONetworkRTTP99Ns is the default per-path p99 network-RTT
+	// threshold (ns) above which the analyzer flags an RTT SLO violation.
+	DefaultAnalyzerSLONetworkRTTP99Ns = 500_000
 	// DefaultAnalyzerWindowRetention is the default number of distinct windows
 	// the analyzer retains in its in-memory ring.
 	DefaultAnalyzerWindowRetention = 20
 	// DefaultAnalyzerMetricsCardinalityLimit is the default cap on attribute
-	// sets per analyzer instrument. rpingmesh.analyzer.sla_violations_total
+	// sets per analyzer instrument. rpingmesh.analyzer.slo_violations_total
 	// has one series per (network, source_tor, target_tor, kind): at most
 	// 4 x T x (T-1) for T ToRs, all of which can appear at once in a wide
 	// outage, when the labels matter most. 20000 covers about 70 ToRs; the
@@ -98,10 +98,10 @@ type ControllerConfig struct {
 	EcmpMaxFlowLabels       int     `mapstructure:"ecmp_max_flow_labels"`
 
 	// Analyzer (Phase 1) settings. AnalyzerEnabled turns on ingestion of
-	// agent-reported per-path summaries and SLA-violation detection.
+	// agent-reported per-path summaries and SLO-violation detection.
 	AnalyzerEnabled            bool    `mapstructure:"analyzer_enabled"`
-	AnalyzerSLALossRatio       float64 `mapstructure:"analyzer_sla_loss_ratio"`
-	AnalyzerSLANetworkRTTP99Ns uint64  `mapstructure:"analyzer_sla_network_rtt_p99_ns"`
+	AnalyzerSLOLossRatio       float64 `mapstructure:"analyzer_slo_loss_ratio"`
+	AnalyzerSLONetworkRTTP99Ns uint64  `mapstructure:"analyzer_slo_network_rtt_p99_ns"`
 	// AnalyzerServiceSLOLossRatio and AnalyzerServiceSLONetworkRTTP99Ns are
 	// the SLO thresholds for the service network: path summaries of probes
 	// sent along traced application flows (pinglist_type SERVICE_TRACING),
@@ -131,6 +131,22 @@ type ControllerConfig struct {
 	TLSKeyFile    string `mapstructure:"tls_key_file"`
 	TLSCAFile     string `mapstructure:"tls_ca_file"`
 	TLSServerName string `mapstructure:"tls_server_name"`
+
+	// Deprecations lists, one message each, the deprecated configuration
+	// keys the loaded configuration used (see controllerRenamedKeys). The
+	// binary logs them as warnings once logging is configured; they are not
+	// errors, since the old keys still take effect.
+	Deprecations []string `mapstructure:"-"`
+}
+
+// controllerRenamedKeys are the controller keys that were renamed. The old
+// names keep working as deprecated aliases (see applyRenamedKeys) until the
+// next minor release. The analyzer thresholds were renamed from "SLA" to
+// "SLO": they are internal objectives on the measured loss ratio and p99 RTT
+// (the SLIs), not a customer agreement.
+var controllerRenamedKeys = []renamedKey{
+	{old: "analyzer_sla_loss_ratio", new: "analyzer_slo_loss_ratio"},
+	{old: "analyzer_sla_network_rtt_p99_ns", new: "analyzer_slo_network_rtt_p99_ns"},
 }
 
 // controllerKeys is the single source of controller config keys, defaults
@@ -149,11 +165,11 @@ var controllerKeys = []keySpec{
 	{key: "ecmp_paths_assumed", def: DefaultEcmpPathsAssumed, help: "Assumed ECMP fabric width (m) for Eq.(1) flow-label coverage sizing"},
 	{key: "ecmp_coverage_probability", def: DefaultEcmpCoverageProbability, help: "Target probability (p, in (0,1)) that generated flow labels cover all ECMP paths"},
 	{key: "ecmp_max_flow_labels", def: DefaultEcmpMaxFlowLabels, help: "Hard cap on the number of flow labels per target (bounds probe amplification)"},
-	{key: "analyzer_enabled", def: true, help: "Enable the Phase 1 analyzer (ingest agent summaries, detect SLA violations)"},
-	{key: "analyzer_sla_loss_ratio", def: DefaultAnalyzerSLALossRatio, help: "Per-path loss ratio (0..1) above which a window is an SLA violation"},
-	{key: "analyzer_sla_network_rtt_p99_ns", def: uint64(DefaultAnalyzerSLANetworkRTTP99Ns), help: "Per-path p99 network-RTT threshold (ns) above which a window is an SLA violation (0 disables)"},
-	{key: "analyzer_service_slo_loss_ratio", def: DefaultAnalyzerSLALossRatio, help: "Service-network (service tracing) per-path loss ratio (0..1) above which a window is an SLO violation"},
-	{key: "analyzer_service_slo_network_rtt_p99_ns", def: uint64(DefaultAnalyzerSLANetworkRTTP99Ns), help: "Service-network (service tracing) per-path p99 network-RTT threshold (ns) above which a window is an SLO violation (0 disables)"},
+	{key: "analyzer_enabled", def: true, help: "Enable the Phase 1 analyzer (ingest agent summaries, detect SLO violations)"},
+	{key: "analyzer_slo_loss_ratio", def: DefaultAnalyzerSLOLossRatio, help: "Per-path loss ratio (0..1) above which a window is an SLO violation"},
+	{key: "analyzer_slo_network_rtt_p99_ns", def: uint64(DefaultAnalyzerSLONetworkRTTP99Ns), help: "Per-path p99 network-RTT threshold (ns) above which a window is an SLO violation (0 disables)"},
+	{key: "analyzer_service_slo_loss_ratio", def: DefaultAnalyzerSLOLossRatio, help: "Service-network (service tracing) per-path loss ratio (0..1) above which a window is an SLO violation"},
+	{key: "analyzer_service_slo_network_rtt_p99_ns", def: uint64(DefaultAnalyzerSLONetworkRTTP99Ns), help: "Service-network (service tracing) per-path p99 network-RTT threshold (ns) above which a window is an SLO violation (0 disables)"},
 	{key: "analyzer_window_retention", def: DefaultAnalyzerWindowRetention, help: "Number of recent windows the analyzer retains in memory"},
 	{key: "analyzer_metrics_cardinality_limit", def: DefaultAnalyzerMetricsCardinalityLimit, help: "Maximum attribute sets per analyzer metric instrument (0 = OTel SDK default 2000, otherwise >= 2000)"},
 	{key: "otel_collector_addr", def: DefaultControllerOtelCollectorAddr, help: "OTLP gRPC collector endpoint for analyzer metrics"},
@@ -176,6 +192,7 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 	if err != nil {
 		return nil, err
 	}
+	deprecations := applyRenamedKeys(v, flags, controllerRenamedKeys)
 
 	config := &ControllerConfig{
 		ListenAddr:                v.GetString("listen_addr"),
@@ -192,8 +209,8 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		EcmpMaxFlowLabels:         v.GetInt("ecmp_max_flow_labels"),
 
 		AnalyzerEnabled:                   v.GetBool("analyzer_enabled"),
-		AnalyzerSLALossRatio:              v.GetFloat64("analyzer_sla_loss_ratio"),
-		AnalyzerSLANetworkRTTP99Ns:        v.GetUint64("analyzer_sla_network_rtt_p99_ns"),
+		AnalyzerSLOLossRatio:              v.GetFloat64("analyzer_slo_loss_ratio"),
+		AnalyzerSLONetworkRTTP99Ns:        v.GetUint64("analyzer_slo_network_rtt_p99_ns"),
 		AnalyzerServiceSLOLossRatio:       v.GetFloat64("analyzer_service_slo_loss_ratio"),
 		AnalyzerServiceSLONetworkRTTP99Ns: v.GetUint64("analyzer_service_slo_network_rtt_p99_ns"),
 		AnalyzerWindowRetention:           v.GetInt("analyzer_window_retention"),
@@ -204,6 +221,8 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		TLSKeyFile:                        v.GetString("tls_key_file"),
 		TLSCAFile:                         v.GetString("tls_ca_file"),
 		TLSServerName:                     v.GetString("tls_server_name"),
+
+		Deprecations: deprecations,
 	}
 
 	if err := config.Validate(); err != nil {
@@ -213,10 +232,12 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 	return config, nil
 }
 
-// BindControllerFlags binds common controller CLI flags to a pflag.FlagSet.
-// These flags can later be bound to a viper instance for unified config resolution.
+// BindControllerFlags binds common controller CLI flags to a pflag.FlagSet,
+// plus a hidden, deprecated flag for every renamed key. These flags can
+// later be bound to a viper instance for unified config resolution.
 func BindControllerFlags(flags *pflag.FlagSet) {
 	registerFlags(flags, controllerKeys)
+	registerDeprecatedFlags(flags, controllerKeys, controllerRenamedKeys)
 }
 
 // Validate checks that the controller configuration is well-formed. It
@@ -328,8 +349,8 @@ func (c *ControllerConfig) validateAnalyzer() error {
 	// A loss ratio is a probability in [0, 1]; outside that range the
 	// threshold is meaningless (a negative ratio flags everything, > 1
 	// flags nothing).
-	if c.AnalyzerSLALossRatio < 0 || c.AnalyzerSLALossRatio > 1 {
-		return fmt.Errorf("analyzer_sla_loss_ratio must be in [0, 1], got: %v", c.AnalyzerSLALossRatio)
+	if c.AnalyzerSLOLossRatio < 0 || c.AnalyzerSLOLossRatio > 1 {
+		return fmt.Errorf("analyzer_slo_loss_ratio must be in [0, 1], got: %v", c.AnalyzerSLOLossRatio)
 	}
 	if c.AnalyzerServiceSLOLossRatio < 0 || c.AnalyzerServiceSLOLossRatio > 1 {
 		return fmt.Errorf("analyzer_service_slo_loss_ratio must be in [0, 1], got: %v", c.AnalyzerServiceSLOLossRatio)

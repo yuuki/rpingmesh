@@ -32,9 +32,9 @@ All notable changes to this project are documented in this file.
   summaries are judged against the new `analyzer_service_slo_loss_ratio` and
   `analyzer_service_slo_network_rtt_p99_ns` thresholds (defaults equal to the
   cluster ones) and their findings carry `network="service"`.
-  `rpingmesh.analyzer.sla_violations_total` gains a `network` attribute
-  (`cluster` or `service`); the committed dashboards and the
-  `RpingmeshSLAViolation` rule group by it, and the ToR pair drilldown gets
+  `rpingmesh.analyzer.slo_violations_total` (see Changed) gains a `network`
+  attribute (`cluster` or `service`); the committed dashboards and the
+  `RpingmeshSLOViolation` rule group by it, and the ToR pair drilldown gets
   a service-network row (success ratio, probe rate, RTT quantiles, failure
   reasons from `rpingmesh.service.*`). Agents report service summaries only
   to a controller that answers registration with `service_path_summaries`,
@@ -58,6 +58,37 @@ All notable changes to this project are documented in this file.
   (`packaging/systemd/rpingmesh-agent.service.d/10-service-tracing.conf`,
   shipped as an example by the agent package), and a soft-RoCE e2e test that
   traces `ibv_rc_pingpong`.
+
+### Changed
+
+- The analyzer's quality targets are called SLOs, and the per-path loss ratio
+  and p99 network RTT they are checked against SLIs, instead of "SLA": an SLA
+  is a customer contract, these are internal objectives. The public
+  identifiers follow the vocabulary:
+  - the controller keys `analyzer_sla_loss_ratio` and
+    `analyzer_sla_network_rtt_p99_ns` are now `analyzer_slo_loss_ratio` and
+    `analyzer_slo_network_rtt_p99_ns` (flags `--analyzer-slo-*`, environment
+    `RPINGMESH_ANALYZER_SLO_*`), matching the `analyzer_service_slo_*` keys
+    added above;
+  - the counter `rpingmesh.analyzer.sla_violations_total` is now
+    `rpingmesh.analyzer.slo_violations_total`, with no alias: the old name
+    is no longer emitted, so update dashboards and alert rules that read it
+    when upgrading the controller. The committed dashboards and alert rules
+    read the new name, and the `RpingmeshSLAViolation` rule is now
+    `RpingmeshSLOViolation`;
+  - `ProbeAnalysisAck.sla_violations` is now `slo_violations`. The field
+    number is unchanged, so the wire format is identical and agents and
+    controllers of different versions interoperate; only the generated Go
+    field (`SloViolations`) and the proto JSON name change.
+
+### Deprecated
+
+- The old `analyzer_sla_*` keys, with their flags and environment variables,
+  keep working for one minor release: a value set under an old name feeds the
+  new key when the new one is not set, the new key wins when both are, and
+  the controller logs a warning at startup for every old name in use. The
+  aliases are removed in the next minor release: rename the keys before
+  upgrading to it.
 
 ## [0.8.0] - 2026-10-22
 

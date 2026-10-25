@@ -50,7 +50,7 @@ import (
 // magnitude: histogram_quantile interpolates linearly inside a bucket, so a
 // single 1ms-10ms bucket would report every sample in it as ~5.5ms at p50.
 // It also keeps 500us, the default
-// analyzer_sla_network_rtt_p99_ns, so the fraction of samples above the SLA
+// analyzer_slo_network_rtt_p99_ns, so the fraction of samples above the SLO
 // threshold can be read off one bucket.
 //
 // These boundaries are independent of internal/probe's rttBucketBoundariesNs:
@@ -76,7 +76,7 @@ var delayBucketBoundaries = []float64{
 
 // IsNetworkRTTBucketBoundary reports whether ns is an explicit bucket
 // boundary of rpingmesh.network_rtt_ns. The controller uses it to warn when
-// its analyzer SLA threshold cannot be read off a single histogram bucket.
+// its analyzer SLO threshold cannot be read off a single histogram bucket.
 func IsNetworkRTTBucketBoundary(ns uint64) bool {
 	for _, b := range networkRTTBucketBoundaries {
 		if uint64(b) == ns {

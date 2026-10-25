@@ -95,14 +95,14 @@ echo >&2
 
 echo "== Alert rule expressions against the seeded data ==" >&2
 # The seed has two lossy ToR pairs (tor-a->tor-d 6%, tor-c->tor-e 4%) and
-# analyzer SLA violations, and nothing else alert-worthy in its last 10 min.
+# analyzer SLO violations, and nothing else alert-worthy in its last 10 min.
 # Exactly these alerts' expressions must return series; any other firing rule
 # is a false positive. (`for:` durations are not evaluated here.)
 RULES="${SCRIPT_DIR}/../deploy/observability/alerts/rpingmesh.rules.yml"
 if ! python3 - "${VM_URL}" "${RULES}" <<'PY'
 import json, re, sys, urllib.parse, urllib.request
 vm, rules = sys.argv[1], sys.argv[2]
-expected = {"RpingmeshTorPairLoss", "RpingmeshSLAViolation"}
+expected = {"RpingmeshTorPairLoss", "RpingmeshSLOViolation"}
 # Minimal parser for this file's layout (avoids a PyYAML dependency):
 # "- alert: Name" followed by "expr: |" and an indented block.
 alerts, cur, block = {}, None, None

@@ -86,7 +86,7 @@ func newViper(configName, configPath string, flags *pflag.FlagSet, specs []keySp
 	v := viper.New()
 	setDefaults(v, specs)
 
-	v.SetEnvPrefix("RPINGMESH")
+	v.SetEnvPrefix(envPrefix)
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 
@@ -150,4 +150,99 @@ func readConfigFile(v *viper.Viper, configPath string) error {
 		return fmt.Errorf("failed to read config file: %w", err)
 	}
 	return nil
+}
+
+// envPrefix is the prefix of the environment variables both binaries read:
+// the key listen_addr is set by RPINGMESH_LISTEN_ADDR.
+const envPrefix = "RPINGMESH"
+
+// envName returns the environment variable that sets key, as AutomaticEnv
+// derives it: the prefix, an underscore and the upper-cased key.
+func envName(key string) string {
+	return envPrefix + "_" + strings.ToUpper(key)
+}
+
+// renamedKey records a configuration key that was renamed. The old key stays
+// usable as a deprecated alias: a value set under it in the config file, its
+// environment variable or its hidden CLI flag feeds the new key when the new
+// key itself is not set explicitly, and the loader reports the use so the
+// binary can log a deprecation warning once logging is configured (the log
+// format and level are themselves configuration, so the loader cannot log).
+type renamedKey struct {
+	old, new string
+}
+
+// specByKey returns the spec of key in specs.
+func specByKey(specs []keySpec, key string) (keySpec, bool) {
+	for _, s := range specs {
+		if s.key == key {
+			return s, true
+		}
+	}
+	return keySpec{}, false
+}
+
+// registerDeprecatedFlags defines, for every renamed key, a CLI flag under
+// the old name with the type and default of the new key's spec, and marks it
+// deprecated: pflag hides it from --help and prints a notice when it is
+// used. bindPFlags later binds it to the old key, where applyRenamedKeys
+// picks it up like a value from the config file or the environment. It
+// panics when a new key has no spec: the tables are static, so that is a
+// programming error caught by the package tests.
+func registerDeprecatedFlags(flags *pflag.FlagSet, specs []keySpec, renamed []renamedKey) {
+	for _, r := range renamed {
+		spec, ok := specByKey(specs, r.new)
+		if !ok {
+			panic(fmt.Sprintf("config: renamed key %q has no spec for its new name %q", r.old, r.new))
+		}
+		old := keySpec{key: r.old, def: spec.def, help: "Deprecated alias of --" + spec.flagName()}
+		registerFlags(flags, []keySpec{old})
+		if err := flags.MarkDeprecated(old.flagName(), "use --"+spec.flagName()); err != nil {
+			panic(fmt.Sprintf("config: mark flag --%s deprecated: %v", old.flagName(), err))
+		}
+	}
+}
+
+// explicitlySet reports whether key has a value from a source the operator
+// controls: a changed CLI flag, a non-empty environment variable or the
+// config file. Viper's IsSet also counts the key's default, so it cannot
+// tell an explicit value from the default. The environment check mirrors
+// AutomaticEnv: an empty variable counts as unset.
+func explicitlySet(v *viper.Viper, flags *pflag.FlagSet, key string) bool {
+	if flags != nil {
+		if f := flags.Lookup(keySpec{key: key}.flagName()); f != nil && f.Changed {
+			return true
+		}
+	}
+	if val, ok := os.LookupEnv(envName(key)); ok && val != "" {
+		return true
+	}
+	return v.InConfig(key)
+}
+
+// applyRenamedKeys resolves the deprecated aliases in renamed on v and
+// returns one warning per alias in use, for the binary to log. An alias
+// whose new key is also set explicitly is ignored, whatever the sources: an
+// operator who has already migrated can leave the old key in place until
+// the next config edit, and the new key never changes meaning depending on
+// which source set it.
+func applyRenamedKeys(v *viper.Viper, flags *pflag.FlagSet, renamed []renamedKey) []string {
+	var warnings []string
+	for _, r := range renamed {
+		if !explicitlySet(v, flags, r.old) {
+			continue
+		}
+		oldSpec, newSpec := keySpec{key: r.old}, keySpec{key: r.new}
+		if explicitlySet(v, flags, r.new) {
+			warnings = append(warnings, fmt.Sprintf(
+				"config key %q (--%s, %s) is deprecated and ignored because %q is also set; remove it",
+				r.old, oldSpec.flagName(), envName(r.old), r.new))
+			continue
+		}
+		v.Set(r.new, v.Get(r.old))
+		warnings = append(warnings, fmt.Sprintf(
+			"config key %q (--%s, %s) is deprecated and will be removed in the next minor release; rename it to %q (--%s, %s), which takes the same value",
+			r.old, oldSpec.flagName(), envName(r.old), r.new, newSpec.flagName(), envName(r.new)))
+	}
+	return warnings
 }

@@ -85,14 +85,16 @@ func (f *fakeResolver) callCount() int {
 
 // fakeServiceProber records every UpdateServiceTargets call.
 type fakeServiceProber struct {
-	mu      sync.Mutex
-	updates [][]*controller_agent.PingTarget
+	mu       sync.Mutex
+	updates  [][]*controller_agent.PingTarget
+	services map[*controller_agent.PingTarget][]string
 }
 
-func (f *fakeServiceProber) UpdateServiceTargets(targets []*controller_agent.PingTarget) {
+func (f *fakeServiceProber) UpdateServiceTargets(targets []*controller_agent.PingTarget, services map[*controller_agent.PingTarget][]string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.updates = append(f.updates, targets)
+	f.services = services
 }
 
 func (f *fakeServiceProber) last() ([]*controller_agent.PingTarget, int) {

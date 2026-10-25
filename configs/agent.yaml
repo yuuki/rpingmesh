@@ -82,6 +82,17 @@ service_tracing_probe_rate_per_second: 100
 # Minimum interval between two passes over an RNIC's traced flows, i.e. the
 # per-flow probe interval when the rate cap does not bind.
 service_tracing_probe_interval_ms: 10
+# Optional service attribution. Each entry maps a cgroup v2 path
+# below /sys/fs/cgroup, including its descendants, to a fixed service label.
+# The longest matching path wins. The configured names plus _unspecified are
+# the entire label set; an empty list disables the service metric attribute.
+# RPINGMESH_SERVICE_TRACING_SERVICE_LABELS accepts a JSON array; [] disables it.
+service_tracing_service_labels: []
+# service_tracing_service_labels:
+#   - cgroup_path: /system.slice/training.service
+#     service: training.service
+#   - cgroup_path: /kubepods.slice/kubepods-burstable.slice
+#     service: training-namespace
 
 # Analyzer reporting (Phase 1)
 # When enabled, the agent aggregates probe results per path over fixed windows

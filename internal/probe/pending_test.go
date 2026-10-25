@@ -1,6 +1,9 @@
 package probe
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 // TestPendingMeasurement_InOrder verifies the normal case where the send-side
 // timestamps are applied first, then the first ACK, then the second ACK.
@@ -28,7 +31,7 @@ func TestPendingMeasurement_InOrder(t *testing.T) {
 
 	got := m.Result()
 	want := ProbeResult{T1: 100, T2: 101, T3: 200, T4: 202, T5: 301, T6: 302}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Result = %+v, want %+v", got, want)
 	}
 }
@@ -55,7 +58,7 @@ func TestPendingMeasurement_OutOfOrder(t *testing.T) {
 
 	got := m.Result()
 	want := ProbeResult{T1: 100, T2: 101, T3: 200, T4: 202, T5: 301, T6: 302}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Result = %+v, want %+v", got, want)
 	}
 }
@@ -83,7 +86,7 @@ func TestPendingMeasurement_BothAcksBeforeSend(t *testing.T) {
 
 	got := m.Result()
 	want := ProbeResult{T1: 100, T2: 101, T3: 200, T4: 202, T5: 301, T6: 302}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Result = %+v, want %+v", got, want)
 	}
 }
@@ -107,7 +110,7 @@ func TestPendingMeasurement_OneAckBeforeSend(t *testing.T) {
 
 	got := m.Result()
 	want := ProbeResult{T1: 100, T2: 101, T3: 200, T4: 202, T5: 301, T6: 302}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Result = %+v, want %+v", got, want)
 	}
 }

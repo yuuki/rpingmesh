@@ -436,6 +436,13 @@ table), whose rows have stable `source_tor` and `target_tor` fields:
 The matrix carries no links. The operator spots the hot cell and clicks the
 same pair in the adjacent table.
 
+The SLO-by-pair table lists both networks (`network` column). The link
+carries only the ToR pair, so the drilldown shows the cluster SLIs of the
+pair in its first rows and the service-network SLIs (`rpingmesh.service.*`:
+success ratio, probe rate, RTT quantiles, failure reasons) in a row of its
+own, which is where a `network="service"` violation is explained. The
+service panels stay empty on a pair with no traced flows.
+
 ## Alternatives considered
 
 - **Native Table + Grouping to matrix vs the ESnet Matrix panel vs a custom

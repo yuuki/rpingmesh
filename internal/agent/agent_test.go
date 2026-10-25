@@ -928,3 +928,28 @@ func TestAgent_ApplyRegistrationServiceAnalysisSupport(t *testing.T) {
 		t.Error("servicePathSummaries = false after a supporting re-registration, want true")
 	}
 }
+
+// TestAgent_CreateAnalysisReporter_GatesServiceSummariesOnController verifies
+// that the reporter's send-time gate follows the controller's registration
+// flag, so a downgrade seen at a heartbeat also stops summaries that were
+// already aggregated.
+func TestAgent_CreateAnalysisReporter_GatesServiceSummariesOnController(t *testing.T) {
+	a := newTestAgent(nil, nil)
+	a.cfg.AnalysisReportEnabled = true
+	a.createResultsFanIn()
+	a.createAnalysisReporter()
+	if a.analysisReporter.serviceAllowed == nil {
+		t.Fatal("reporter has no service gate")
+	}
+	if a.analysisReporter.serviceAllowed() {
+		t.Error("service summaries allowed before registration reported support")
+	}
+	a.applyRegistrationServiceAnalysisSupport(&controller_agent.AgentRegistrationResponse{Success: true, ServicePathSummaries: true})
+	if !a.analysisReporter.serviceAllowed() {
+		t.Error("service summaries not allowed after registration reported support")
+	}
+	a.applyRegistrationServiceAnalysisSupport(&controller_agent.AgentRegistrationResponse{Success: true})
+	if a.analysisReporter.serviceAllowed() {
+		t.Error("service summaries still allowed after a downgrade seen at re-registration")
+	}
+}

@@ -593,6 +593,7 @@ devices; `summarize_qos_facts.py` reports such ports as override outliers.
 | `analyzer_service_slo_loss_ratio` | `0.02` | Loss ratio above which a service-network window (a traced service flow's path) violates its SLO |
 | `analyzer_service_slo_network_rtt_p99_ns` | `500000` | p99 network RTT above which a service-network window violates its SLO; `0` disables the check |
 | `analyzer_window_retention` | `20` | Number of recent windows kept in memory |
+| `analyzer_metrics_cardinality_limit` | `20000` | Maximum attribute sets per analyzer metric instrument; extra sets fold into one `otel.metric.overflow="true"` series. `rpingmesh.analyzer.sla_violations_total` can need up to 4 × T × (T−1) series for T ToRs, all at once in a wide outage; the default covers about 70 ToRs. `0` keeps the OTel SDK default (2000); otherwise at least 2000 |
 | `otel_collector_addr` | `localhost:4317` | OTLP/gRPC collector for analyzer metrics |
 | `log_level`, `log_format` | `info`, `console` | As for the agent |
 | `tls_mode` | `disabled` | `disabled`, `tls`, or `mtls` |

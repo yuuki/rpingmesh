@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -50,8 +51,33 @@ type AnalysisReporter struct {
 	// nowFn is injectable so tests can control window boundaries.
 	nowFn func() time.Time
 
+	// serviceAllowed reports whether SERVICE_TRACING summaries may be sent,
+	// i.e. the controller evaluates them apart from the cluster paths (see
+	// Agent.applyRegistrationServiceAnalysisSupport). It is checked at send
+	// time, not only when results enter the fan-in: summaries aggregated
+	// before a heartbeat learned of a controller downgrade are dropped
+	// rather than judged as cluster paths by the older controller. nil
+	// allows them (tests).
+	serviceAllowed func() bool
+
+	// sendWg tracks the in-flight periodic send and sending admits one at a
+	// time. A send is a synchronous RPC that can take seconds; running it on
+	// the drain loop would stop the loop from reading input, and the
+	// fan-in's non-blocking tee would then drop results once the channel
+	// filled (service tracing alone can deliver hundreds per second). So
+	// sends run on their own goroutine; windows that complete while one is
+	// in flight stay in the aggregator and are collected at the next tick.
+	sendWg  sync.WaitGroup
+	sending atomic.Bool
+
 	logger zerolog.Logger
 	wg     sync.WaitGroup
+}
+
+// SetServiceSummariesAllowed installs the predicate consulted before sending
+// SERVICE_TRACING summaries (see serviceAllowed). Call it before Start.
+func (r *AnalysisReporter) SetServiceSummariesAllowed(allowed func() bool) {
+	r.serviceAllowed = allowed
 }
 
 // NewAnalysisReporter constructs a reporter aggregating into windowSec-long
@@ -134,7 +160,11 @@ func (r *AnalysisReporter) run(ctx context.Context) {
 }
 
 // collectAndReport performs one periodic window collection: it harvests the
-// completed windows and sends them.
+// completed windows and sends them on a goroutine of their own, so the drain
+// loop keeps reading input while the RPC is in flight (see sendWg). If the
+// previous send has not finished, nothing is collected: the completed windows
+// stay in the aggregator and the next tick picks them up, so a slow
+// controller delays summaries but never loses them.
 //
 // It is a no-op once ctx is cancelled (shutdown has begun). This is important:
 // Collect removes the completed windows from the aggregator, so if the
@@ -147,12 +177,29 @@ func (r *AnalysisReporter) collectAndReport(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-	r.report(ctx, r.agg.Collect(uint64(r.nowFn().UnixNano())))
+	if !r.sending.CompareAndSwap(false, true) {
+		r.logger.Debug().Msg("Previous analysis report still in flight; completed windows wait for the next tick")
+		return
+	}
+	summaries := r.agg.Collect(uint64(r.nowFn().UnixNano()))
+	if len(summaries) == 0 {
+		r.sending.Store(false)
+		return
+	}
+	r.sendWg.Add(1)
+	go func() {
+		defer r.sendWg.Done()
+		defer r.sending.Store(false)
+		r.report(ctx, summaries)
+	}()
 }
 
 // flushFinal emits any remaining (including in-progress) window summaries on a
 // fresh context, since run's context may already be cancelled at this point.
+// It first lets an in-flight periodic send finish, so the final report follows
+// it and no two sends run at once.
 func (r *AnalysisReporter) flushFinal() {
+	r.sendWg.Wait()
 	summaries := r.agg.Flush()
 	if len(summaries) == 0 {
 		return
@@ -162,10 +209,35 @@ func (r *AnalysisReporter) flushFinal() {
 	r.report(ctx, summaries)
 }
 
+// dropUnsupportedService removes SERVICE_TRACING summaries when the controller
+// does not evaluate them apart from the cluster paths (serviceAllowed is false),
+// filtering summaries in place; Collect and Flush hand over fresh slices.
+func (r *AnalysisReporter) dropUnsupportedService(summaries []probe.PathSummary) []probe.PathSummary {
+	if r.serviceAllowed == nil || r.serviceAllowed() {
+		return summaries
+	}
+	kept := summaries[:0]
+	dropped := 0
+	for _, s := range summaries {
+		if s.PinglistType == probe.PinglistServiceTracing {
+			dropped++
+			continue
+		}
+		kept = append(kept, s)
+	}
+	if dropped > 0 {
+		r.logger.Debug().
+			Int("dropped", dropped).
+			Msg("Dropping service path summaries: the controller does not evaluate them apart from cluster paths")
+	}
+	return kept
+}
+
 // report batches summaries into bounded ProbeAnalysisReport messages and sends
 // them best-effort. Any send error is logged and the batch dropped; monitoring
 // is best-effort and must never stall probing.
 func (r *AnalysisReporter) report(ctx context.Context, summaries []probe.PathSummary) {
+	summaries = r.dropUnsupportedService(summaries)
 	if len(summaries) == 0 {
 		return
 	}

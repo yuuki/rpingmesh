@@ -169,7 +169,25 @@ without controller-side evaluation. The analyzer now evaluates both, apart:
   that predates it ignores `pinglist_type` and would judge service paths as
   cluster paths, so the agent tees service results into the analysis branch
   only while the flag is set (re-read at every heartbeat re-registration)
-  and warns once when it is not; upgrade the controller first.
+  and warns once when it is not; upgrade the controller first. The reporter
+  checks the flag again when it sends, so summaries aggregated before a
+  heartbeat learned of a downgrade are dropped rather than sent.
+- Reporter back-pressure. Service results arrive at up to
+  `service_tracing_probe_rate_per_second` per RNIC on top of the cluster
+  results, and the fan-in's tee into the analysis branch is non-blocking
+  (a full channel drops). The reporter therefore sends its periodic reports
+  on a goroutine of their own and keeps draining input during the RPC; a
+  tick that finds a send still in flight leaves the completed windows in
+  the aggregator for the next one.
+- Metric cardinality. `network` doubles the series
+  `rpingmesh.analyzer.sla_violations_total` can carry (up to
+  `4 × T × (T−1)` for T ToRs, all at once in a wide outage); the controller
+  raises the OTel SDK's per-instrument cap with
+  `analyzer_metrics_cardinality_limit` (default 20000, about 70 ToRs).
+- Dashboards. The ToR pair drilldown has a service-network row built on
+  `rpingmesh.service.*`, so a `network="service"` violation clicked in the
+  overview table lands on the SLIs of the service paths, not only on the
+  cluster ones.
 - The controller's `GetTargetRnicInfo` looks each GID up in the registry and
   applies the pinglist generator's self and same-host exclusion. The request
   is capped at 4096 GIDs; the agent batches at 1024.

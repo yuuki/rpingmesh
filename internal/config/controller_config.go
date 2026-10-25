@@ -61,6 +61,15 @@ const (
 	// DefaultAnalyzerWindowRetention is the default number of distinct windows
 	// the analyzer retains in its in-memory ring.
 	DefaultAnalyzerWindowRetention = 20
+	// DefaultAnalyzerMetricsCardinalityLimit is the default cap on attribute
+	// sets per analyzer instrument. rpingmesh.analyzer.sla_violations_total
+	// has one series per (network, source_tor, target_tor, kind): at most
+	// 4 x T x (T-1) for T ToRs, all of which can appear at once in a wide
+	// outage, when the labels matter most. 20000 covers about 70 ToRs; the
+	// OTel SDK default of 2000 would fold the series of a 23-ToR fabric into
+	// one overflow series. The analyzer is a single process, so the memory
+	// is bounded fleet-wide.
+	DefaultAnalyzerMetricsCardinalityLimit = 20000
 	// DefaultControllerOtelCollectorAddr is the default OTLP gRPC collector
 	// endpoint the analyzer exports its metrics to.
 	DefaultControllerOtelCollectorAddr = "localhost:4317"
@@ -101,6 +110,13 @@ type ControllerConfig struct {
 	AnalyzerServiceSLOLossRatio       float64 `mapstructure:"analyzer_service_slo_loss_ratio"`
 	AnalyzerServiceSLONetworkRTTP99Ns uint64  `mapstructure:"analyzer_service_slo_network_rtt_p99_ns"`
 	AnalyzerWindowRetention           int     `mapstructure:"analyzer_window_retention"`
+	// AnalyzerMetricsCardinalityLimit caps the attribute sets each analyzer
+	// instrument keeps; extra sets fold into one otel.metric.overflow
+	// series. 0 keeps the OTel SDK default (2000); otherwise it must be at
+	// least MinMetricsCardinalityLimit, as for the agent's
+	// metrics_cardinality_limit. See DefaultAnalyzerMetricsCardinalityLimit
+	// for the sizing.
+	AnalyzerMetricsCardinalityLimit int `mapstructure:"analyzer_metrics_cardinality_limit"`
 	// OtelCollectorAddr is the OTLP gRPC endpoint the analyzer exports its
 	// metrics to (service.name=rpingmesh-analyzer). Only used when the analyzer
 	// is enabled; export is best-effort.
@@ -139,6 +155,7 @@ var controllerKeys = []keySpec{
 	{key: "analyzer_service_slo_loss_ratio", def: DefaultAnalyzerSLALossRatio, help: "Service-network (service tracing) per-path loss ratio (0..1) above which a window is an SLO violation"},
 	{key: "analyzer_service_slo_network_rtt_p99_ns", def: uint64(DefaultAnalyzerSLANetworkRTTP99Ns), help: "Service-network (service tracing) per-path p99 network-RTT threshold (ns) above which a window is an SLO violation (0 disables)"},
 	{key: "analyzer_window_retention", def: DefaultAnalyzerWindowRetention, help: "Number of recent windows the analyzer retains in memory"},
+	{key: "analyzer_metrics_cardinality_limit", def: DefaultAnalyzerMetricsCardinalityLimit, help: "Maximum attribute sets per analyzer metric instrument (0 = OTel SDK default 2000, otherwise >= 2000)"},
 	{key: "otel_collector_addr", def: DefaultControllerOtelCollectorAddr, help: "OTLP gRPC collector endpoint for analyzer metrics"},
 	{key: "tls_mode", def: TLSModeDisabled, help: "gRPC transport security mode (disabled|tls|mtls)"},
 	{key: "tls_cert_file", def: "", help: "Server certificate file (required when tls-mode is tls or mtls)"},
@@ -180,6 +197,7 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		AnalyzerServiceSLOLossRatio:       v.GetFloat64("analyzer_service_slo_loss_ratio"),
 		AnalyzerServiceSLONetworkRTTP99Ns: v.GetUint64("analyzer_service_slo_network_rtt_p99_ns"),
 		AnalyzerWindowRetention:           v.GetInt("analyzer_window_retention"),
+		AnalyzerMetricsCardinalityLimit:   v.GetInt("analyzer_metrics_cardinality_limit"),
 		OtelCollectorAddr:                 v.GetString("otel_collector_addr"),
 		TLSMode:                           v.GetString("tls_mode"),
 		TLSCertFile:                       v.GetString("tls_cert_file"),
@@ -319,6 +337,13 @@ func (c *ControllerConfig) validateAnalyzer() error {
 	// The window ring must retain at least one window.
 	if c.AnalyzerWindowRetention < 1 {
 		return fmt.Errorf("analyzer_window_retention must be >= 1, got: %d", c.AnalyzerWindowRetention)
+	}
+	// As for the agent: a negative limit would disable the SDK's cap and a
+	// limit below the SDK default would cap every instrument harder than
+	// the default does.
+	if c.AnalyzerMetricsCardinalityLimit != 0 && c.AnalyzerMetricsCardinalityLimit < MinMetricsCardinalityLimit {
+		return fmt.Errorf("analyzer_metrics_cardinality_limit must be 0 (OTel SDK default) or >= %d, got: %d",
+			MinMetricsCardinalityLimit, c.AnalyzerMetricsCardinalityLimit)
 	}
 	return nil
 }

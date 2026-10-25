@@ -94,6 +94,9 @@ func TestLoadControllerConfig_Defaults(t *testing.T) {
 	if cfg.AnalyzerServiceSLONetworkRTTP99Ns != DefaultAnalyzerSLANetworkRTTP99Ns {
 		t.Errorf("AnalyzerServiceSLONetworkRTTP99Ns = %d, want %d", cfg.AnalyzerServiceSLONetworkRTTP99Ns, DefaultAnalyzerSLANetworkRTTP99Ns)
 	}
+	if cfg.AnalyzerMetricsCardinalityLimit != DefaultAnalyzerMetricsCardinalityLimit {
+		t.Errorf("AnalyzerMetricsCardinalityLimit = %d, want %d", cfg.AnalyzerMetricsCardinalityLimit, DefaultAnalyzerMetricsCardinalityLimit)
+	}
 	if cfg.TLSMode != TLSModeDisabled {
 		t.Errorf("TLSMode = %q, want %q (backward-compatible default)", cfg.TLSMode, TLSModeDisabled)
 	}
@@ -261,6 +264,26 @@ func TestControllerConfig_Validate(t *testing.T) {
 				c.AnalyzerWindowRetention = 20
 			},
 			"analyzer_service_slo_loss_ratio",
+		},
+		{
+			"analyzer enabled rejects cardinality limit below the SDK default",
+			func(c *ControllerConfig) {
+				c.AnalyzerEnabled = true
+				c.AnalyzerSLALossRatio = 0.02
+				c.AnalyzerWindowRetention = 20
+				c.AnalyzerMetricsCardinalityLimit = 1999
+			},
+			"analyzer_metrics_cardinality_limit",
+		},
+		{
+			"analyzer enabled accepts zero cardinality limit (SDK default)",
+			func(c *ControllerConfig) {
+				c.AnalyzerEnabled = true
+				c.AnalyzerSLALossRatio = 0.02
+				c.AnalyzerWindowRetention = 20
+				c.AnalyzerMetricsCardinalityLimit = 0
+			},
+			"",
 		},
 		{
 			"analyzer enabled rejects zero window retention",

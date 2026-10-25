@@ -792,6 +792,11 @@ func (a *Agent) createAnalysisReporter() {
 		a.cfg.AnalysisWindowSec,
 		a.analysisResults,
 	)
+	// Service summaries go out only while the controller evaluates them
+	// apart from the cluster paths (set by registration, see
+	// applyRegistrationServiceAnalysisSupport); checked at send time so a
+	// downgrade seen at a heartbeat also stops summaries already aggregated.
+	a.analysisReporter.SetServiceSummariesAllowed(a.servicePathSummaries.Load)
 	a.logger.Info().
 		Uint32("window_sec", a.cfg.AnalysisWindowSec).
 		Msg("Analysis reporter created")

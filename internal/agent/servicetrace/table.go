@@ -6,9 +6,12 @@ import (
 )
 
 // Connection is one connected application QP: a QP of a connected transport
-// (RC, UC, XRC) that the tracer saw reach RTR with an address vector. It is
-// the agent's view of one service flow.
+// (RC, UC, XRC) whose address vector was traced at RTR or recovered from
+// a supported driver snapshot. It is the agent's view of one service flow.
 type Connection struct {
+	// FromSnapshot identifies driver-recovered connections with no uverbs
+	// context/handle. Their lifetime is reconciled by device/QPN.
+	FromSnapshot bool
 	// Dev is the device number of the uverbs node (see Event.Dev); Context
 	// and Handle identify the QP within the tracer.
 	Dev     uint32
@@ -85,20 +88,26 @@ type Table struct {
 	mu       sync.Mutex
 	ctxs     map[uint64]*uverbsContext
 	counters Counters
+	// snapshotQPs holds netlink resources without a uverbs identity. Some
+	// have a driver-recovered connection; the others remain unbound.
+	snapshotQPs   map[qpResourceKey]QPResource
+	generation    map[uint32]uint64
+	snapshotDirty bool
 }
 
 // NewTable returns an empty table.
 func NewTable() *Table {
-	return &Table{ctxs: make(map[uint64]*uverbsContext)}
+	return &Table{ctxs: make(map[uint64]*uverbsContext), snapshotQPs: make(map[qpResourceKey]QPResource), generation: make(map[uint32]uint64)}
 }
 
 // Apply folds ev into the table and reports whether the set of connections
-// changed (a connection appeared, disappeared or was replaced), so the
-// caller knows when to rebuild its probe targets.
+// changed or a snapshot needs refreshing, so the caller knows when to
+// rebuild its probe targets.
 func (t *Table) Apply(ev Event) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	t.advanceGeneration(ev)
 	switch ev.Kind {
 	case KindQPCreate:
 		return t.applyCreate(ev)
@@ -134,6 +143,9 @@ func (c *uverbsContext) hasConnection() bool {
 
 func (t *Table) applyCreate(ev Event) bool {
 	t.counters.Creates++
+	key := qpResourceKey{ev.Dev, ev.QPNum}
+	hadSnapshot := t.snapshotQPs[key].Recovered != nil
+	delete(t.snapshotQPs, key)
 	c := t.ctxs[ev.Context]
 	if c == nil {
 		c = &uverbsContext{dev: ev.Dev, pid: ev.PID, qps: make(map[uint32]*qpEntry)}
@@ -149,14 +161,14 @@ func (t *Table) applyCreate(ev Event) bool {
 		comm:     ev.Comm,
 		cgroupID: ev.CgroupID,
 	}
-	return prev != nil && prev.conn != nil
+	return hadSnapshot || (prev != nil && prev.conn != nil)
 }
 
 func (t *Table) applyModify(ev Event) bool {
 	c, q := t.lookup(ev)
 	if q == nil {
 		t.counters.UnknownQPs++
-		return false
+		return t.invalidateSnapshotDevice(ev)
 	}
 	switch {
 	case ev.IsConnect():
@@ -182,7 +194,7 @@ func (t *Table) applyDestroy(ev Event) bool {
 	c, q := t.lookup(ev)
 	if q == nil {
 		t.counters.UnknownQPs++
-		return false
+		return t.invalidateSnapshotDevice(ev)
 	}
 	delete(c.qps, ev.QPHandle)
 	if len(c.qps) == 0 {
@@ -193,12 +205,13 @@ func (t *Table) applyDestroy(ev Event) bool {
 
 func (t *Table) applyContextClose(ev Event) bool {
 	t.counters.ContextCloses++
+	changed := t.invalidateSnapshotDevice(ev)
 	c := t.ctxs[ev.Context]
 	if c == nil {
-		return false
+		return changed
 	}
 	delete(t.ctxs, ev.Context)
-	return c.hasConnection()
+	return changed || c.hasConnection()
 }
 
 // newConnection builds the connection an RTR transition establishes.
@@ -237,7 +250,10 @@ func newConnection(c *uverbsContext, q *qpEntry, ev Event) *Connection {
 // buffer can drop events under load, and a lost close would otherwise leave
 // the process's connections in the table forever; the owner's existence is
 // the one fact user space can check without the kernel's help. Contexts
-// whose owner pid is unknown (0) are kept.
+// whose owner pid is unknown (0) are kept. Snapshot resources are also
+// reaped only using a resolved OwnerTGID. An unresolved creator TID may
+// exit while other threads keep the QP alive; refreshes check those QPs.
+// No context events are invented for snapshot resources.
 func (t *Table) ReapContexts(alive func(pid uint32) bool) (removed int, changed bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -246,9 +262,18 @@ func (t *Table) ReapContexts(alive func(pid uint32) bool) (removed int, changed 
 			continue
 		}
 		delete(t.ctxs, key)
+		t.generation[c.dev]++
 		removed++
 		t.counters.ContextCloses++
 		changed = changed || c.hasConnection()
+	}
+	for key, qp := range t.snapshotQPs {
+		owner := qp.OwnerTGID
+		if owner != 0 && !alive(owner) {
+			delete(t.snapshotQPs, key)
+			t.generation[qp.Dev]++
+			changed = changed || qp.Recovered != nil
+		}
 	}
 	return removed, changed
 }
@@ -266,6 +291,11 @@ func (t *Table) Connections() []Connection {
 			}
 		}
 	}
+	for _, qp := range t.snapshotQPs {
+		if qp.Recovered != nil {
+			out = append(out, *qp.Recovered)
+		}
+	}
 	sort.Slice(out, func(i, j int) bool {
 		a, b := out[i], out[j]
 		if a.Dev != b.Dev {
@@ -274,16 +304,19 @@ func (t *Table) Connections() []Connection {
 		if a.Context != b.Context {
 			return a.Context < b.Context
 		}
-		return a.Handle < b.Handle
+		if a.Handle != b.Handle {
+			return a.Handle < b.Handle
+		}
+		return a.LocalQPN < b.LocalQPN
 	})
 	return out
 }
 
-// QPCount returns the number of QPs the table tracks, connected or not.
+// QPCount returns the number of traced and snapshot QPs, connected or not.
 func (t *Table) QPCount() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	n := 0
+	n := len(t.snapshotQPs)
 	for _, c := range t.ctxs {
 		n += len(c.qps)
 	}
@@ -295,4 +328,169 @@ func (t *Table) Counters() Counters {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.counters
+}
+
+type qpResourceKey struct {
+	dev uint32
+	qpn uint32
+}
+
+// ReconcileQPs replaces snapshot resources without modifying traced entries.
+// The monitor uses ReconcileQPsIfCurrent to guard collection against events.
+func (t *Table) ReconcileQPs(resources []QPResource) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.reconcileQPs(resources)
+}
+
+// EventGeneration identifies the lifecycle state before a snapshot starts.
+func (t *Table) EventGeneration() map[uint32]uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[uint32]uint64, len(t.generation))
+	for dev, generation := range t.generation {
+		out[dev] = generation
+	}
+	return out
+}
+
+// SnapshotDirty reports whether an unidentifiable lifecycle event invalidated
+// snapshot resources and should trigger a debounced refresh.
+func (t *Table) SnapshotDirty() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.snapshotDirty
+}
+
+// ReconcileQPsIfCurrent rejects late snapshot results when any lifecycle
+// event arrived on that device during collection. Unchanged devices are
+// accepted independently. It returns connection changes/overall acceptance.
+func (t *Table) ReconcileQPsIfCurrent(resources []QPResource, generation map[uint32]uint64) (bool, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	blocked := make(map[uint32]bool)
+	var current []QPResource
+	for _, qp := range resources {
+		if t.generation[qp.Dev] != generation[qp.Dev] {
+			blocked[qp.Dev] = true
+		} else {
+			current = append(current, qp)
+		}
+	}
+	for _, qp := range t.snapshotQPs {
+		if t.generation[qp.Dev] != generation[qp.Dev] {
+			blocked[qp.Dev] = true
+			current = append(current, qp)
+		}
+	}
+	changed := t.reconcileQPs(current)
+	t.snapshotDirty = len(blocked) > 0
+	return changed, !t.snapshotDirty
+}
+
+// UntracedQPs excludes known uverbs QPs before expensive driver queries.
+func (t *Table) UntracedQPs(resources []QPResource) []QPResource {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	known := t.knownQPs()
+	var out []QPResource
+	for _, qp := range resources {
+		if !known[qpResourceKey{qp.Dev, qp.LocalQPN}] {
+			out = append(out, qp)
+		}
+	}
+	return out
+}
+
+func (t *Table) knownQPs() map[qpResourceKey]bool {
+	known := make(map[qpResourceKey]bool)
+	for _, c := range t.ctxs {
+		for _, q := range c.qps {
+			known[qpResourceKey{c.dev, q.qpn}] = true
+		}
+	}
+	return known
+}
+
+func (t *Table) reconcileQPs(resources []QPResource) bool {
+	known := t.knownQPs()
+	next := make(map[qpResourceKey]QPResource)
+	for _, qp := range resources {
+		key := qpResourceKey{qp.Dev, qp.LocalQPN}
+		if qp.Kernel || !IsConnectedType(qp.QPType) || known[key] {
+			continue
+		}
+		if qp.Recovered != nil {
+			conn := *qp.Recovered // own the value, never the caller's pointer
+			conn.Context, conn.Handle, conn.FromSnapshot = 0, 0, true
+			qp.Recovered = &conn
+		}
+		next[key] = qp
+	}
+	changed := false
+	for key, qp := range t.snapshotQPs {
+		other := next[key].Recovered
+		if qp.Recovered != nil && (other == nil || *qp.Recovered != *other) {
+			changed = true
+		}
+	}
+	for key, qp := range next {
+		if qp.Recovered != nil && t.snapshotQPs[key].Recovered == nil {
+			changed = true
+		}
+	}
+	t.snapshotQPs, t.snapshotDirty = next, false
+	return changed
+}
+
+// A uverbs handle cannot be inferred from PID or a remote QPN. The netlink
+// owner is a TID, the event carries a TGID, and contexts can be shared across
+// processes. Invalidate the device conservatively instead of guessing.
+func (t *Table) invalidateSnapshotDevice(ev Event) bool {
+	matched := false
+	for key, qp := range t.snapshotQPs {
+		if qp.Dev == ev.Dev {
+			qp.Recovered = nil
+			t.snapshotQPs[key] = qp
+			matched = true
+		}
+	}
+	t.snapshotDirty = t.snapshotDirty || matched
+	return matched
+}
+
+// UnboundQPs returns snapshot QPs lacking a recovered address vector.
+// They cannot be returned by Connections or used as probe targets.
+func (t *Table) UnboundQPs() []QPResource {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]QPResource, 0, len(t.snapshotQPs))
+	for _, qp := range t.snapshotQPs {
+		if qp.Recovered == nil {
+			out = append(out, qp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Dev != out[j].Dev {
+			return out[i].Dev < out[j].Dev
+		}
+		return out[i].LocalQPN < out[j].LocalQPN
+	})
+	return out
+}
+
+// Epochs are per device. Known UD/raw/driver QPs cannot affect a recovered
+// connected QP, and must not starve recovery during unrelated queue churn.
+func (t *Table) advanceGeneration(ev Event) {
+	dev := ev.Dev
+	if c := t.ctxs[ev.Context]; c != nil {
+		dev = c.dev
+		if q := c.qps[ev.QPHandle]; q != nil && ev.Kind != KindContextClose && ev.Kind != KindQPCreate && !IsConnectedType(q.qpType) {
+			return
+		}
+	}
+	if ev.Kind == KindQPCreate && !IsConnectedType(ev.QPType) {
+		return
+	}
+	t.generation[dev]++
 }

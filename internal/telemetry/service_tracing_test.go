@@ -106,7 +106,8 @@ func attrKey(set attribute.Set) string {
 func TestRegisterServiceTracingCallback(t *testing.T) {
 	mc, reader := newTestCollector(t, WithServiceTracing(true))
 	sample := ServiceTracingSample{
-		Active: true,
+		Active:     true,
+		UnboundQPs: map[string]int{"mlx5_0": 4},
 		Devices: []ServiceTracingDevice{
 			{RdmaDevice: "mlx5_0", Connections: 3, FlowsProbed: 2, FlowsUnresolved: 1},
 			{RdmaDevice: "", Connections: 1},
@@ -121,6 +122,10 @@ func TestRegisterServiceTracingCallback(t *testing.T) {
 
 	if got := gaugeValues(t, rm, "rpingmesh.agent.service_trace_active"); got[attrKey(*attribute.EmptySet())] != 1 {
 		t.Errorf("service_trace_active = %v, want 1", got)
+	}
+	unbound := gaugeValues(t, rm, "rpingmesh.agent.service_qps_unbound")
+	if unbound[attrKey(attribute.NewSet(attribute.String("source_rdma_device", "mlx5_0")))] != 4 {
+		t.Errorf("service_qps_unbound = %v", unbound)
 	}
 	conns := gaugeValues(t, rm, "rpingmesh.agent.service_connections")
 	if conns[attrKey(attribute.NewSet(attribute.String("source_rdma_device", "mlx5_0")))] != 3 ||
@@ -153,5 +158,25 @@ func TestRegisterServiceTracingCallback_RequiresOption(t *testing.T) {
 	mc, _ := newTestCollector(t)
 	if err := mc.RegisterServiceTracingCallback(func() ServiceTracingSample { return ServiceTracingSample{} }); err == nil {
 		t.Fatal("expected an error without WithServiceTracing")
+	}
+}
+
+func TestUnboundQPsHaveOnlyDeviceLabels(t *testing.T) {
+	mc, reader := newTestCollector(t, WithServiceTracing(true), WithServiceLabels([]string{"training"}))
+	if err := mc.RegisterServiceTracingCallback(func() ServiceTracingSample {
+		return ServiceTracingSample{Active: true, UnboundQPs: map[string]int{"mlx5_0": 4}}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rm := otelmetrics.Collect(t, reader)
+	g := otelmetrics.Find(rm, "rpingmesh.agent.service_qps_unbound").Data.(metricdata.Gauge[int64])
+	if len(g.DataPoints) != 1 {
+		t.Fatalf("unbound QP data points = %v", g.DataPoints)
+	}
+	for _, dp := range g.DataPoints {
+		attrs := dp.Attributes
+		if attrs.Len() != 1 || !otelmetrics.HasAttributes(attrs, map[string]string{"source_rdma_device": "mlx5_0"}) {
+			t.Fatalf("unbound QP attributes = %v", attrs.ToSlice())
+		}
 	}
 }

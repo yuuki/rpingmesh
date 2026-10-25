@@ -340,3 +340,179 @@ wait:
 	t.Logf("service probe: seq=%d flow_label=%#x T1..T6=%d,%d,%d,%d,%d,%d rtt_valid=%v network_rtt=%dns",
 		got.SequenceNum, got.FlowLabel, got.T1, got.T2, got.T3, got.T4, got.T5, got.T6, rtt.Valid, rtt.NetworkRTT)
 }
+
+// TestServiceTracingSnapshotsExistingQP creates a QP before the connection
+// table exists, as happens when an agent starts during a long-running job.
+// Generic netlink must inventory it without fabricating a probeable flow.
+func TestServiceTracingSnapshotsExistingQP(t *testing.T) {
+	if os.Getenv("RDMA_E2E_ENABLED") != "1" {
+		t.Skip("RDMA_E2E_ENABLED not set; run via make test-e2e")
+	}
+	pingpong, err := exec.LookPath("ibv_rc_pingpong")
+	if err != nil {
+		t.Fatal(err)
+	}
+	devices, err := servicetrace.UverbsDevices("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	server := exec.CommandContext(ctx, pingpong, "-d", responderDeviceName, "-g", strconv.Itoa(gidIndex), "-p", "18516", "-n", "1")
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if server.ProcessState == nil {
+			server.Process.Kill()
+			server.Wait()
+		}
+	}()
+	var resource servicetrace.QPResource
+	for resource.PID == 0 {
+		qps, err := servicetrace.SnapshotQPs(ctx, devices)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, qp := range qps {
+			if qp.PID == uint32(server.Process.Pid) && qp.QPType == servicetrace.QPTypeRC {
+				resource = qp
+			}
+		}
+		if ctx.Err() != nil {
+			t.Fatal("pre-existing QP did not appear in RDMA netlink")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	table := servicetrace.NewTable()
+	table.ReconcileQPs([]servicetrace.QPResource{resource})
+	if table.QPCount() != 1 || len(table.UnboundQPs()) != 1 || len(table.Connections()) != 0 {
+		t.Fatal("existing QP was lost or became a connection without an address vector")
+	}
+	if err := server.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	server.Wait()
+	for {
+		qps, err := servicetrace.SnapshotQPs(ctx, devices)
+		if err != nil {
+			t.Fatal(err)
+		}
+		table.ReconcileQPs(qps)
+		found := false
+		for _, qp := range table.UnboundQPs() {
+			found = found || (qp.Dev == resource.Dev && qp.LocalQPN == resource.LocalQPN && qp.PID == resource.PID)
+		}
+		if !found {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal("exited process's QP remains in the snapshot")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Opt-in physical mlx5 check: starts an RC job before inventory/recovery.
+// It needs two routable mlx5 ports and CAP_NET_ADMIN. The ordinary soft-RoCE
+// suite skips this test because rxe does not expose mlx5 resource dumps.
+func TestServiceTracingRecoversMlx5Connections(t *testing.T) {
+	device, peer := os.Getenv("RPINGMESH_MLX5_E2E_DEVICE"), os.Getenv("RPINGMESH_MLX5_E2E_PEER_DEVICE")
+	peerIP := os.Getenv("RPINGMESH_MLX5_E2E_PEER_IP")
+	if device == "" || peer == "" || peerIP == "" {
+		t.Skip("set RPINGMESH_MLX5_E2E_DEVICE, RPINGMESH_MLX5_E2E_PEER_DEVICE and RPINGMESH_MLX5_E2E_PEER_IP for physical mlx5 validation")
+	}
+	index := 3
+	if value := os.Getenv("RPINGMESH_MLX5_E2E_GID_INDEX"); value != "" {
+		var err error
+		index, err = strconv.Atoi(value)
+		if err != nil || index < 0 || index > 255 {
+			t.Fatal("invalid mlx5 GID index")
+		}
+	}
+	pingpong, err := exec.LookPath("ibv_rc_pingpong")
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := servicetrace.UverbsDevices("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	devices := make(map[uint32]string)
+	for dev, name := range all {
+		if name == device || name == peer {
+			devices[dev] = name
+		}
+	}
+	if len(devices) != 2 {
+		t.Fatal("two distinct mlx5 RDMA devices are required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	start := func(name string, remote ...string) *exec.Cmd {
+		args := []string{"-d", name, "-g", strconv.Itoa(index), "-p", "18517", "-n", "1000000000", "-s", "64"}
+		cmd := exec.CommandContext(ctx, pingpong, append(args, remote...)...)
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+		return cmd
+	}
+	server := start(peer)
+	// Wait for the server's INIT QP instead of assuming a startup delay.
+	for {
+		qps, err := servicetrace.SnapshotQPs(ctx, devices)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, qp := range qps {
+			found = found || qp.PID == uint32(server.Process.Pid)
+		}
+		if found {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	client := start(device, peerIP)
+	var connected []servicetrace.QPResource
+	for len(connected) != 2 {
+		qps, err := servicetrace.SnapshotQPs(ctx, devices)
+		if err != nil {
+			t.Fatal(err)
+		}
+		connected = nil
+		for _, qp := range qps {
+			if (qp.PID == uint32(server.Process.Pid) || qp.PID == uint32(client.Process.Pid)) && qp.QPState == servicetrace.QPStateRTS {
+				connected = append(connected, qp)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	recovered, err := servicetrace.RecoverQPs(ctx, devices, connected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := servicetrace.NewTable()
+	table.ReconcileQPs(recovered)
+	conns := table.Connections()
+	if len(conns) != 2 || len(table.UnboundQPs()) != 0 {
+		t.Fatalf("mlx5 connections were not recovered: %+v", recovered)
+	}
+	for _, c := range conns {
+		if c.RemoteGID == ([16]byte{}) || c.LocalQPN == 0 || c.RemoteQPN == 0 || !c.FromSnapshot {
+			t.Fatalf("incomplete recovered mlx5 connection: %+v", c)
+		}
+	}
+	if conns[0].LocalQPN != conns[1].RemoteQPN || conns[1].LocalQPN != conns[0].RemoteQPN || conns[0].EffectiveFlowLabel() != conns[1].EffectiveFlowLabel() {
+		t.Fatalf("recovered peer identities disagree: %+v", conns)
+	}
+}

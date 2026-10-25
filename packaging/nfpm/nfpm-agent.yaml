@@ -91,6 +91,14 @@ contents:
     file_info:
       mode: 0644
 
+  # Additional privilege for optional mlx5 raw QP recovery; never installed
+  # as a live capability grant by the package.
+  - src: packaging/systemd/rpingmesh-agent.service.d/20-qp-recovery.conf
+    dst: /usr/share/doc/rpingmesh-agent/examples/rpingmesh-agent.service.d/20-qp-recovery.conf
+    type: doc
+    file_info:
+      mode: 0644
+
 scripts:
   postinstall: packaging/nfpm/scripts/postinstall-agent.sh
   preremove: packaging/nfpm/scripts/preremove-agent.sh

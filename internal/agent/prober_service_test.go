@@ -69,7 +69,7 @@ func TestServiceTracing_AggregateRate(t *testing.T) {
 	p := newSimProber(500*time.Millisecond, tor, nil)
 	p.SetPerTypeRateLimit(2, 1)
 	p.SetServiceTracingRate(100, 10)
-	p.UpdateServiceTargets(svc)
+	p.UpdateServiceTargets(svc, nil)
 
 	const dur = 10 * time.Second
 	sends := simSchedule(t, p, dur, nil)
@@ -85,7 +85,7 @@ func TestServiceTracing_IntervalFloor(t *testing.T) {
 	svc := serviceTargets(2)
 	p := newSimProber(500*time.Millisecond, nil, nil)
 	p.SetServiceTracingRate(1000, 10)
-	p.UpdateServiceTargets(svc)
+	p.UpdateServiceTargets(svc, nil)
 
 	const dur = 5 * time.Second
 	sends := simSchedule(t, p, dur, nil)
@@ -99,7 +99,7 @@ func TestServiceTracing_ThrottleScalesRate(t *testing.T) {
 	svc := serviceTargets(4)
 	p := newSimProber(500*time.Millisecond, nil, nil)
 	p.SetServiceTracingRate(100, 10)
-	p.UpdateServiceTargets(svc)
+	p.UpdateServiceTargets(svc, nil)
 	p.SetRateMultiplier(0.5)
 
 	const dur = 10 * time.Second
@@ -116,7 +116,7 @@ func TestServiceTracing_IndependentLists(t *testing.T) {
 	svc := serviceTargets(3)
 	p := newSimProber(500*time.Millisecond, tor, nil)
 	p.SetServiceTracingRate(100, 10)
-	p.UpdateServiceTargets(svc)
+	p.UpdateServiceTargets(svc, nil)
 
 	p.UpdateTargets(typedTargets(controller_agent.PinglistType_TOR_MESH, "tor", 3))
 	p.targetsMu.RLock()
@@ -127,7 +127,7 @@ func TestServiceTracing_IndependentLists(t *testing.T) {
 		t.Fatalf("after pinglist refresh: %d service targets, %d pinglist targets; want 3 and 3", nSvc, nTor)
 	}
 
-	p.UpdateServiceTargets(nil)
+	p.UpdateServiceTargets(nil, nil)
 	p.targetsMu.RLock()
 	nTor = len(p.targets)
 	nSvc = len(p.serviceTargets)
@@ -149,7 +149,7 @@ func TestServiceTracing_IndependentLists(t *testing.T) {
 func TestServiceTracing_PassIsShuffled(t *testing.T) {
 	svc := serviceTargets(16)
 	p := newTestProber()
-	p.UpdateServiceTargets(svc)
+	p.UpdateServiceTargets(svc, nil)
 
 	p.targetsMu.RLock()
 	defer p.targetsMu.RUnlock()
@@ -214,7 +214,7 @@ func TestServiceTracing_UpdatesDoNotRestartPinglistPasses(t *testing.T) {
 		if now.Sub(lastUpdate) >= time.Second {
 			lastUpdate = now
 			n++
-			p.UpdateServiceTargets(serviceTargets(1 + n%3))
+			p.UpdateServiceTargets(serviceTargets(1+n%3), nil)
 		}
 	})
 	assertRate(t, sends, tor, dur, 0.5, "tor-mesh")

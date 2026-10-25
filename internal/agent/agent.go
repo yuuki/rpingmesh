@@ -857,6 +857,10 @@ func (a *Agent) createServiceTracing() {
 		})
 	}
 	a.serviceMonitor = NewServiceMonitor(a.grpcClient, tracer, a.cfg.AgentID, devices, a.cfg.PinglistUpdateIntervalSec)
+	a.serviceMonitor.serviceMapping = make(map[string]string, len(a.cfg.ServiceTracingServiceLabels))
+	for _, mapping := range a.cfg.ServiceTracingServiceLabels {
+		a.serviceMonitor.serviceMapping[mapping.CgroupPath] = mapping.Service
+	}
 	a.registerServiceTracingMetrics(a.serviceMonitor.Stats)
 	a.logger.Info().
 		Int("devices", len(devices)).
@@ -1257,7 +1261,8 @@ func (a *Agent) createMetricsCollector(ctx context.Context) {
 		telemetry.WithCardinalityLimit(a.cfg.MetricsCardinalityLimit),
 		telemetry.WithProberDelayTargetTor(a.cfg.MetricsProberDelayTargetTor),
 		telemetry.WithResponderDelayTargetTor(a.cfg.MetricsResponderDelayTargetTor),
-		telemetry.WithServiceTracing(a.cfg.ServiceTracingEnabled))
+		telemetry.WithServiceTracing(a.cfg.ServiceTracingEnabled),
+		telemetry.WithServiceLabels(serviceMetricLabels(a.cfg)))
 	if err != nil {
 		a.logger.Warn().Err(err).
 			Msg("Failed to create metrics collector, continuing without metrics")

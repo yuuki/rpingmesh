@@ -218,6 +218,7 @@ type collectorOptions struct {
 	// serviceTracing registers the rpingmesh.service.* instruments and the
 	// tracer gauges (see WithServiceTracing).
 	serviceTracing bool
+	serviceLabels  map[string]bool
 }
 
 // serviceMetricPrefix prefixes the instruments that record the probes sent
@@ -321,6 +322,7 @@ type MetricsCollector struct {
 	// service holds the rpingmesh.service.* instruments and the tracer
 	// gauges; nil unless WithServiceTracing enabled them.
 	service             *probeInstruments
+	serviceLabels       map[string]bool
 	serviceTraceActive  metric.Int64ObservableGauge
 	serviceConnections  metric.Int64ObservableGauge
 	serviceFlows        metric.Int64ObservableGauge
@@ -616,6 +618,7 @@ func registerInstruments(provider *sdkmetric.MeterProvider, options collectorOpt
 		meterProvider:           provider,
 		meter:                   r.meter,
 		targetRnicLabels:        options.targetRnicLabels,
+		serviceLabels:           options.serviceLabels,
 		proberDelayTargetTor:    options.proberDelayTargetTor,
 		responderDelayTargetTor: options.responderDelayTargetTor,
 		logger:                  log.With().Str("component", "telemetry").Logger(),
@@ -787,7 +790,7 @@ func (mc *MetricsCollector) RecordProbeResult(result *probe.ProbeResult, rtt *pr
 	// ToR-level attributes, and never to the destination-RNIC instruments.
 	if result.IsServiceTracing() {
 		if mc.service != nil {
-			mc.service.record(ctx, outcome, attrSet, proberDelayAttrs, responderDelayAttrs)
+			mc.recordServiceProbe(ctx, result, outcome, labels)
 		}
 		if outcome.invalid() {
 			mc.logInvalidRTT(result, rtt, labels)
@@ -1053,6 +1056,8 @@ func (mc *MetricsCollector) RegisterSelfThrottleCallback(read func() float64) er
 // RegisterServiceTracingCallback.
 type ServiceTracingDevice struct {
 	RdmaDevice string
+	// Service is a configured name, or empty when attribution is disabled.
+	Service string
 	// Connections is the number of connected application QPs traced on the
 	// device.
 	Connections int
@@ -1109,13 +1114,17 @@ func (mc *MetricsCollector) RegisterServiceTracingCallback(read func() ServiceTr
 				active = 1
 			}
 			o.ObserveInt64(mc.serviceTraceActive, active)
-			for _, d := range s.Devices {
+			for _, d := range mc.serviceDeviceSamples(s.Devices) {
 				dev := attribute.String("source_rdma_device", deviceMetricLabel(d.RdmaDevice))
-				o.ObserveInt64(mc.serviceConnections, int64(d.Connections), metric.WithAttributes(dev))
+				attrs := []attribute.KeyValue{dev}
+				if len(mc.serviceLabels) > 0 {
+					attrs = append(attrs, attribute.String("service", d.Service))
+				}
+				o.ObserveInt64(mc.serviceConnections, int64(d.Connections), metric.WithAttributes(attrs...))
 				o.ObserveInt64(mc.serviceFlows, int64(d.FlowsProbed),
-					metric.WithAttributes(dev, attribute.String("state", "probed")))
+					withAttribute(attrs, "state", "probed"))
 				o.ObserveInt64(mc.serviceFlows, int64(d.FlowsUnresolved),
-					metric.WithAttributes(dev, attribute.String("state", "unresolved")))
+					withAttribute(attrs, "state", "unresolved"))
 			}
 			for _, e := range []labelledCount{
 				{"create", s.Creates}, {"connect", s.Connects}, {"reset", s.Resets},

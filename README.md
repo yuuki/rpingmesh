@@ -841,10 +841,10 @@ With `service_tracing_enabled`, the agent also exports:
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `rpingmesh.service.network_rtt_ns`, `prober_delay_ns`, `responder_delay_ns`, `probe_total`, `probe_success_total`, `probe_failed_total`, `probe_invalid_total` | as above | The same instruments for probes sent along traced service flows, with the same attributes. Service probes never count in the `rpingmesh.*` cluster instruments |
+| `rpingmesh.service.network_rtt_ns`, `prober_delay_ns`, `responder_delay_ns`, `probe_total`, `probe_success_total`, `probe_failed_total`, `probe_invalid_total` | as above | The same instruments for probes sent along traced service flows, with the same attributes and optional `service`. Service probes never count in the `rpingmesh.*` cluster instruments |
 | `rpingmesh.agent.service_trace_active` | Gauge | `1` while the eBPF tracer is attached, `0` when service tracing is degraded |
-| `rpingmesh.agent.service_connections` | Gauge | Connected application queue pairs traced on a local RNIC, by `source_rdma_device` |
-| `rpingmesh.agent.service_flows` | Gauge | Distinct traced flows of a local RNIC, by `source_rdma_device` and `state` (`probed`, or `unresolved` when the remote RNIC has no registered agent) |
+| `rpingmesh.agent.service_connections` | Gauge | Connected application queue pairs traced on a local RNIC, by `source_rdma_device` and optional `service` |
+| `rpingmesh.agent.service_flows` | Gauge | Distinct traced flows of a local RNIC, by `source_rdma_device`, optional `service`, and `state` (`probed`, or `unresolved` when the remote RNIC has no registered agent) |
 | `rpingmesh.agent.service_trace_events_total` | Counter | Queue pair lifecycle events, by `kind` (`create`, `connect`, `reset`, `destroy`, `context_close`, `unknown_qp`) |
 | `rpingmesh.agent.service_trace_dropped_total` | Counter | Events lost before reaching the connection table, by `reason` (`ring_buffer`, `parse`, `decode`) |
 
@@ -1195,6 +1195,43 @@ controller that predates `pinglist_type` answers registration with
 `service_path_summaries: false`, and the agent then keeps service results
 out of its reports (warning once) instead of letting them be judged as
 cluster paths.
+
+**Service identity (optional).** Set `service_tracing_service_labels` in the
+agent's YAML to add a `service` attribute to every `rpingmesh.service.*`
+instrument and the `service_connections` / `service_flows` gauges:
+
+```yaml
+service_tracing_service_labels:
+  - cgroup_path: /system.slice/training.service
+    service: training.service
+  - cgroup_path: /kubepods.slice/kubepods-burstable.slice/pod123
+    service: training-namespace/training-job
+```
+
+Paths start at the host's cgroup v2 mount (`/sys/fs/cgroup`), match whole
+directories and their descendants, and use the longest match. Configure the
+actual pod path for the host's cgroup driver; Kubernetes metadata is not
+queried automatically. Several paths may use the same service name, for
+example to group pods into a namespace or a tenant. An empty list (the
+default) leaves the attribute absent. With a nonempty list, unmapped,
+unreadable, zero, or removed cgroup IDs use `_unspecified`; the only possible
+values are the configured service names plus this fixed fallback, even as
+jobs churn. Service names are 1–128 bytes, cannot start with `_`, and cannot
+have surrounding whitespace. Changes take effect after restarting the agent.
+`RPINGMESH_SERVICE_TRACING_SERVICE_LABELS` overrides the YAML with a JSON
+array of the same mappings; `[]` disables attribution.
+
+The agent resolves the traced cgroup IDs at each target rebuild, using cgroup
+file handles rather than process names. It needs read/search access to the
+host cgroup v2 hierarchy; this does not require additional capabilities.
+Directories on other filesystems, including cgroup v1 hierarchies in a
+hybrid layout, are left unresolved rather than matched by their numeric IDs.
+PID, comm, cgroup IDs, and paths are never metric attributes. The mapping
+and labels stay on the agent; controller summaries retain their existing
+per-path aggregation. A flow shared by several services is probed once and
+its result is recorded once per distinct service, including send failures
+and timeouts. Consequently, summing over `service` can count a shared flow
+more than once, but does not increase the service probe rate.
 
 ### Staleness in the registry
 

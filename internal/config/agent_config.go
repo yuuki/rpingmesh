@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/rs/zerolog"
 	"net"
@@ -282,6 +283,9 @@ type AgentConfig struct {
 	// passes over an RNIC's traced flows, i.e. the per-flow probe interval
 	// when the rate cap does not bind.
 	ServiceTracingProbeIntervalMS uint32 `mapstructure:"service_tracing_probe_interval_ms"`
+	// ServiceTracingServiceLabels is an opt-in allow-list of cgroup v2 path
+	// prefixes and their service metric labels. Empty disables attribution.
+	ServiceTracingServiceLabels []ServiceLabelMapping `mapstructure:"service_tracing_service_labels"`
 
 	// AnalysisReportEnabled turns on per-path window aggregation and reporting
 	// of PathSummary batches to the controller's analyzer via
@@ -370,6 +374,7 @@ var agentKeys = []keySpec{
 	{key: "service_tracing_enabled", def: DefaultServiceTracingEnabled, help: "Trace application RDMA connections with eBPF and probe their flows (Linux; needs CAP_BPF and CAP_PERFMON)"},
 	{key: "service_tracing_probe_rate_per_second", def: DefaultServiceTracingProbeRatePerSecond, help: "Aggregate service-tracing probe rate per RNIC, shared by all of its traced flows"},
 	{key: "service_tracing_probe_interval_ms", def: uint32(DefaultServiceTracingProbeIntervalMS), help: "Minimum interval in milliseconds between two passes over an RNIC's traced flows"},
+	{key: "service_tracing_service_labels", def: []ServiceLabelMapping{}, noFlag: true},
 	{key: "analysis_report_enabled", def: true, help: "Enable per-path window aggregation and SLA reporting to the controller"},
 	{key: "analysis_window_sec", def: uint32(DefaultAnalysisWindowSec), help: "Per-path aggregation window length in seconds"},
 	{key: "tls_mode", def: TLSModeDisabled, help: "gRPC transport security mode for the controller connection (disabled|tls|mtls)"},
@@ -466,6 +471,16 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		ThrottleCPUPercent:               v.GetFloat64("throttle_cpu_percent"),
 	}
 
+	if raw, ok := v.Get("service_tracing_service_labels").(string); ok {
+		// Environment variables are strings; Viper cannot decode a JSON
+		// array of mappings through UnmarshalKey's slice conversion hook.
+		err = json.Unmarshal([]byte(raw), &config.ServiceTracingServiceLabels)
+	} else {
+		err = v.UnmarshalKey("service_tracing_service_labels", &config.ServiceTracingServiceLabels)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("service_tracing_service_labels: %w", err)
+	}
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -702,6 +717,9 @@ func (c *AgentConfig) validateProbing() error {
 // only when the feature is enabled, so a disabled feature never blocks
 // startup over a knob it does not use.
 func (c *AgentConfig) validateServiceTracing() error {
+	if err := validateServiceLabels(c.ServiceTracingServiceLabels); err != nil {
+		return err
+	}
 	if c.ServiceTracingProbeRatePerSecond < 0 {
 		return fmt.Errorf("service_tracing_probe_rate_per_second must be >= 0, got: %d", c.ServiceTracingProbeRatePerSecond)
 	}

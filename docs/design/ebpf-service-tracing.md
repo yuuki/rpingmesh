@@ -131,6 +131,45 @@ reads the flow's GID from sysfs and warns once per device and index.
   analysis reporter as well, once the controller has reported
   `service_path_summaries` at registration (see below).
 
+### Bounded service identity
+
+`service_tracing_service_labels` is an opt-in agent YAML list of
+`{cgroup_path, service}` mappings. Its configured service names form the
+allow-list, so the label set is bounded across job churn, not only within
+one collection. The empty default preserves all existing metric attributes.
+For a nonempty list, the `service` attribute is present on every
+`rpingmesh.service.*` instrument and the `service_connections` and
+`service_flows` gauges. Unresolved identities use `_unspecified`; names
+starting with `_` are reserved.
+`RPINGMESH_SERVICE_TRACING_SERVICE_LABELS` accepts a JSON array with the
+same fields and overrides YAML; `[]` disables attribution.
+
+At each target rebuild the monitor resolves the connected QPs' cgroup IDs
+under `/sys/fs/cgroup`. It uses the full kernfs file handle ID, matches the
+longest configured directory prefix, and discards its resolution snapshot
+after rebuilding. Removed or unreadable cgroups and ID zero remain
+unresolved. The host cgroup v2 hierarchy must be visible and searchable;
+no extra capabilities are needed. Kubernetes pod or namespace names are
+configured explicitly rather than discovered through the Kubernetes API.
+The filesystem type is checked before reading each ID: cgroup v1 and other
+kernfs mounts can produce the same handle format and numeric IDs, but belong
+to different hierarchies and must remain unresolved.
+
+Grouping still uses (remote GID, effective flow label), so a shared flow is
+probed once at the existing aggregate rate. A local side table associates
+each target with its distinct services; the prober snapshots that table
+with each service pass and captures the services in its pending measurement.
+Target refreshes therefore cannot reattribute an in-flight success, send
+failure, or timeout. Telemetry records the result once per distinct service
+and applies the allow-list again. Connection gauges count QPs per service;
+flow gauges count each flow once per owning service and resolution state.
+Summing over services can therefore count shared flows more than once.
+
+No PID, comm, raw cgroup ID, path, or GID is exported as a service attribute.
+The mapping and labels never travel to the controller; its summaries and
+SLIs remain per-path. The OTel SDK cardinality limit still applies to the
+complete cross-product of service, device, ToR and outcome attributes.
+
 ### Service network SLOs
 
 The paper's Analyzer evaluates the cluster network and the service network
@@ -233,8 +272,5 @@ agent package ships it as an example rather than installing it.
 - **Existing connections.** A snapshot from RDMA netlink
   (`rdma resource show qp`) at startup would seed the table with QPs that
   predate the agent, which the trace alone cannot see.
-- **Service identity.** Events carry the cgroup id and comm; mapping them to
-  a bounded service label (a systemd slice or a Kubernetes pod) would allow
-  per-service attribution without unbounded metric attributes.
 - **DC transport.** mlx5's dynamically connected transport binds the remote
   per work request, not at RTR, and is invisible to this tracer.

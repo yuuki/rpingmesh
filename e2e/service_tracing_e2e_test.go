@@ -294,7 +294,7 @@ func TestServiceTracingProbePath(t *testing.T) {
 		FlowLabel:        serviceFlowLabel,
 		FlowLabelCount:   1,
 		PinglistType:     controller_agent.PinglistType_SERVICE_TRACING,
-	}})
+	}}, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

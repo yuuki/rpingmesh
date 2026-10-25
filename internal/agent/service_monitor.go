@@ -52,7 +52,7 @@ type serviceEventSource interface {
 
 // serviceProber receives the SERVICE_TRACING targets of one device.
 type serviceProber interface {
-	UpdateServiceTargets(targets []*controller_agent.PingTarget)
+	UpdateServiceTargets(targets []*controller_agent.PingTarget, services map[*controller_agent.PingTarget][]string)
 }
 
 // ServiceDevice is one local RNIC the service monitor builds targets for:
@@ -96,6 +96,7 @@ type serviceDeviceState struct {
 	warnedSGID map[uint8]bool
 	// Last rebuild's counts, for the metrics callback. Guarded by statsMu.
 	connections, flowsProbed, flowsUnresolved int
+	services                                  []telemetry.ServiceTracingDevice
 }
 
 // ServiceMonitor turns the tracer's QP lifecycle events into SERVICE_TRACING
@@ -133,7 +134,9 @@ type ServiceMonitor struct {
 
 	// procRoot is where process directories are looked up to reap the
 	// contexts of exited processes (see servicetrace.Table.ReapContexts).
-	procRoot string
+	procRoot        string
+	serviceMapping  map[string]string
+	resolveServices func(string, map[string]string, map[uint64]bool) map[uint64]string
 
 	nowFn func() time.Time
 
@@ -171,6 +174,7 @@ func NewServiceMonitor(
 		devNumbers:      make(map[uint32]string),
 		sysfsRoot:       servicetrace.DefaultSysfsRoot,
 		procRoot:        "/proc",
+		resolveServices: servicetrace.ResolveServices,
 		refreshInterval: interval,
 		debounce:        serviceRebuildDebounce,
 		unresolvedRetry: serviceUnresolvedRetry,
@@ -222,7 +226,7 @@ func (m *ServiceMonitor) Stop() {
 	m.active = false
 	m.statsMu.Unlock()
 	for _, d := range m.devices {
-		d.Prober.UpdateServiceTargets(nil)
+		d.Prober.UpdateServiceTargets(nil, nil)
 	}
 	m.logger.Info().Msg("Service monitor stopped")
 }
@@ -351,8 +355,20 @@ func (m *ServiceMonitor) connectionsByDevice() (map[string][]servicetrace.Connec
 func (m *ServiceMonitor) rebuild(ctx context.Context, resolveAll bool) (unresolvedLeft bool) {
 	m.reconcile()
 	perDevice, other := m.connectionsByDevice()
+	var services map[uint64]string
+	if len(m.serviceMapping) > 0 {
+		wanted := make(map[uint64]bool)
+		for _, conns := range perDevice {
+			for _, c := range conns {
+				if c.CgroupID != 0 {
+					wanted[c.CgroupID] = true
+				}
+			}
+		}
+		services = m.resolveServices("/sys/fs/cgroup", m.serviceMapping, wanted)
+	}
 	for name, d := range m.devices {
-		if m.rebuildDevice(ctx, d, perDevice[name], resolveAll) > 0 {
+		if m.rebuildDevice(ctx, d, perDevice[name], services, resolveAll) > 0 {
 			unresolvedLeft = true
 		}
 	}
@@ -370,19 +386,65 @@ func (m *ServiceMonitor) rebuild(ctx context.Context, resolveAll bool) (unresolv
 
 // rebuildDevice turns one device's connections into flows and targets and
 // returns the number of flows left unresolved.
-func (m *ServiceMonitor) rebuildDevice(ctx context.Context, d *serviceDeviceState, conns []servicetrace.Connection, resolveAll bool) int {
+func (m *ServiceMonitor) rebuildDevice(ctx context.Context, d *serviceDeviceState, conns []servicetrace.Connection, services map[uint64]string, resolveAll bool) int {
 	flows := make(map[serviceFlowKey]int)
+	flowServices := make(map[serviceFlowKey]map[string]bool)
+	counts := make(map[string]*telemetry.ServiceTracingDevice)
 	for _, c := range conns {
 		m.checkSourceGID(d, c)
-		flows[serviceFlowKey{remoteGID: c.RemoteGID, flowLabel: c.EffectiveFlowLabel()}]++
+		key := serviceFlowKey{remoteGID: c.RemoteGID, flowLabel: c.EffectiveFlowLabel()}
+		flows[key]++
+		if len(m.serviceMapping) > 0 {
+			label := services[c.CgroupID]
+			if label == "" {
+				label = probe.UnspecifiedServiceLabel
+			}
+			if flowServices[key] == nil {
+				flowServices[key] = make(map[string]bool)
+			}
+			flowServices[key][label] = true
+			if counts[label] == nil {
+				counts[label] = &telemetry.ServiceTracingDevice{RdmaDevice: d.Name, Service: label}
+			}
+			counts[label].Connections++
+		}
 	}
 	targets, unresolved := m.resolveFlows(ctx, d, flows, resolveAll)
-	d.Prober.UpdateServiceTargets(targets)
+	var targetServices map[*controller_agent.PingTarget][]string
+	if len(flowServices) > 0 {
+		targetServices = make(map[*controller_agent.PingTarget][]string, len(targets))
+	}
+	for key, labels := range flowServices {
+		entry := d.cache[probe.FormatGID(key.remoteGID)]
+		for label := range labels {
+			if entry != nil && entry.target != nil {
+				counts[label].FlowsProbed++
+			} else {
+				counts[label].FlowsUnresolved++
+			}
+		}
+	}
+	for _, target := range targets {
+		if len(flowServices) == 0 {
+			break
+		}
+		gid, _ := probe.ParseGID(target.GetTargetGid())
+		for label := range flowServices[serviceFlowKey{remoteGID: gid, flowLabel: target.GetFlowLabel()}] {
+			targetServices[target] = append(targetServices[target], label)
+		}
+		sort.Strings(targetServices[target])
+	}
+	d.Prober.UpdateServiceTargets(targets, targetServices)
 
 	m.statsMu.Lock()
 	d.connections = len(conns)
 	d.flowsProbed = len(targets)
 	d.flowsUnresolved = unresolved
+	d.services = nil
+	for _, count := range counts {
+		d.services = append(d.services, *count)
+	}
+	sort.Slice(d.services, func(i, j int) bool { return d.services[i].Service < d.services[j].Service })
 	m.statsMu.Unlock()
 
 	m.logger.Info().
@@ -562,6 +624,10 @@ func (m *ServiceMonitor) Stats() telemetry.ServiceTracingSample {
 	sort.Strings(names)
 	for _, name := range names {
 		d := m.devices[name]
+		if len(m.serviceMapping) > 0 {
+			s.Devices = append(s.Devices, d.services...)
+			continue
+		}
 		s.Devices = append(s.Devices, telemetry.ServiceTracingDevice{
 			RdmaDevice:      name,
 			Connections:     d.connections,

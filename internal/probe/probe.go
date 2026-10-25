@@ -91,7 +91,14 @@ type ProbeResult struct {
 	// cluster-monitoring ones) and is summarized apart from the cluster
 	// paths of the same target by the PathAggregator.
 	PinglistType PinglistType
+	// Services contains the bounded local service names sharing this flow,
+	// captured when sending. It is never reported to the controller.
+	Services []string
 }
+
+// UnspecifiedServiceLabel groups unresolved or unconfigured service identities.
+// Its reserved prefix prevents collisions with configured service names.
+const UnspecifiedServiceLabel = "_unspecified"
 
 // PinglistType identifies the pinglist a probe target belongs to. The values
 // equal those of the controller_agent.PinglistType proto enum, which this

@@ -61,6 +61,7 @@ type pendingProbe struct {
 	// flowLabel is the ECMP flow label this probe was sent with (one of the
 	// target's rotating set), so the result reports the path exercised.
 	flowLabel uint32
+	services  []string
 }
 
 // Prober sends probe packets to its targets, matches the ACK completions
@@ -92,9 +93,12 @@ type Prober struct {
 	// generations are guarded by targetsMu.
 	targets        []*controller_agent.PingTarget
 	serviceTargets []*controller_agent.PingTarget
-	targetsGen     uint64
-	serviceGen     uint64
-	targetsMu      sync.RWMutex
+	// serviceLabels is an immutable snapshot associated with serviceTargets.
+	// Passes and pending probes retain it across target refreshes.
+	serviceLabels map[*controller_agent.PingTarget][]string
+	targetsGen    uint64
+	serviceGen    uint64
+	targetsMu     sync.RWMutex
 
 	pending   map[uint64]*pendingProbe // sequence_num -> pending probe
 	pendingMu sync.Mutex
@@ -358,10 +362,13 @@ func (p *Prober) SetServiceTracingRate(pps float64, intervalMS uint32) {
 // UpdateServiceTargets replaces the SERVICE_TRACING targets, one per traced
 // service flow, each carrying that flow's own flow label. The pinglist
 // targets and their passes are untouched; only the service pass restarts.
-func (p *Prober) UpdateServiceTargets(targets []*controller_agent.PingTarget) {
+// The caller transfers ownership of targets, services, and their slices;
+// they must not be mutated after this call.
+func (p *Prober) UpdateServiceTargets(targets []*controller_agent.PingTarget, services map[*controller_agent.PingTarget][]string) {
 	p.targetsMu.Lock()
 	defer p.targetsMu.Unlock()
 	p.serviceTargets = targets
+	p.serviceLabels = services
 	p.serviceGen++
 	p.logger.Info().
 		Int("count", len(targets)).
@@ -605,6 +612,7 @@ type sendPass struct {
 	targets   []*controller_agent.PingTarget
 	next      int
 	notBefore time.Time
+	services  map[*controller_agent.PingTarget][]string
 }
 
 func (ps *sendPass) active() bool { return ps.next < len(ps.targets) }
@@ -674,7 +682,7 @@ func (p *Prober) probeLoop(ctx context.Context) {
 		if target == nil {
 			continue
 		}
-		p.sendProbe(target, p.flowLabelRotationEpoch(now))
+		p.sendProbe(target, p.flowLabelRotationEpoch(now), pass.services[target])
 	}
 }
 
@@ -707,6 +715,9 @@ func (p *Prober) nextSend(passes []sendPass, seen *seenGens, now time.Time) (*se
 		}
 		if !ps.active() && !now.Before(ps.notBefore) {
 			ps.targets = p.passTargetsLocked(ps.ptype)
+			if isService {
+				ps.services = p.serviceLabels
+			}
 			ps.next = 0
 			ps.notBefore = now.Add(p.passInterval(ps.ptype))
 		}
@@ -772,7 +783,7 @@ func targetsOfType(targets []*controller_agent.PingTarget, ptype controller_agen
 
 // sendProbe sends one probe to target, registering its pending entry, and
 // emits a failed result if the send fails.
-func (p *Prober) sendProbe(target *controller_agent.PingTarget, rotationEpoch uint64) {
+func (p *Prober) sendProbe(target *controller_agent.PingTarget, rotationEpoch uint64, services []string) {
 	counter := p.seqCounter.Add(1)
 	seqNum := (uint64(p.agentEpoch) << 32) | (counter & 0xFFFFFFFF)
 
@@ -802,6 +813,7 @@ func (p *Prober) sendProbe(target *controller_agent.PingTarget, rotationEpoch ui
 		meas:      probe.NewPendingMeasurement(),
 		createdAt: time.Now(),
 		flowLabel: flowLabel,
+		services:  services,
 	}
 	p.pendingMu.Lock()
 	p.pending[seqNum] = pp
@@ -823,7 +835,9 @@ func (p *Prober) sendProbe(target *controller_agent.PingTarget, rotationEpoch ui
 			Uint64("seq", seqNum).
 			Uint32("flow_label", flowLabel).
 			Msg("Failed to send probe packet")
-		p.emitResult(newFailedResult(seqNum, target, flowLabel, probe.FailureSendError, fmt.Sprintf("probe send failed: %v", result.Error)))
+		failed := newFailedResult(seqNum, target, flowLabel, probe.FailureSendError, fmt.Sprintf("probe send failed: %v", result.Error))
+		failed.Services = pp.services
+		p.emitResult(failed)
 		return
 	}
 
@@ -1009,6 +1023,7 @@ func (p *Prober) finalizeIfCompleteLocked(seqNum uint64, pp *pendingProbe) *prob
 	}
 	result := pp.meas.Result()
 	fillTargetMetadata(&result, seqNum, pp.flowLabel, pp.target)
+	result.Services = pp.services
 	result.Success = true
 	delete(p.pending, seqNum)
 	return &result
@@ -1118,6 +1133,7 @@ func (p *Prober) cleanupStalePending() {
 			// Keep any partial timestamps the measurement collected.
 			result := pp.meas.Result()
 			fillTargetMetadata(&result, seqNum, pp.flowLabel, pp.target)
+			result.Services = pp.services
 			result.FailureReason = probe.FailureTimeout
 			result.ErrorMessage = "timed out waiting for ACKs"
 			stale = append(stale, &result)

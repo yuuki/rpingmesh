@@ -19,7 +19,7 @@
 - [x] Add bounded BPF lifecycle/submission capture, generated objects and generation checks.
 - [x] Add Linux loader, live-identity checks, collector CLI and non-privileged tests.
 - [x] Add a user-run integration test using a synthetic provider ABI, covering success, failure, streams, overrides and teardown without RDMA hardware.
-- [x] Document exact privileged test commands and limitations, run non-privileged checks, obtain adversarial review and fix findings.
+- [x] Provide privileged test commands and limitations in chat, run non-privileged checks, obtain adversarial review and fix findings.
 
 The privileged integration test and actual application attachment must be reported as unexecuted until the user supplies their results.
 
@@ -36,5 +36,4 @@ The privileged integration test and actual application attachment must be report
   includes worker submission/destruction and full-registry exec reclamation.
 - Privileged integration, verifier acceptance and actual attachment: unexecuted.
 
-User-run commands and limitations are in
-[`dc-uprobe-collector.md`](../../design/dc-uprobe-collector.md).
+User-run commands and limitations are provided in the conversation.

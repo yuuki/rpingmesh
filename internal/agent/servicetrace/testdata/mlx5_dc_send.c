@@ -2,6 +2,7 @@
  * stdout is a private binary pipe to the Go test, never a fixture to commit.
  * Use only public rdma-core APIs. This is not a production capture adapter.
  */
+#define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <errno.h>
@@ -28,6 +29,14 @@ static void check(int rc, const char *step)
         errno = rc > 0 ? rc : errno;
         fail(step);
     }
+}
+
+static void control_wait(const char *status, int command)
+{
+    if (status && printf("%s\n", status) < 0)
+        fail("control status");
+    if (fflush(stdout) || getchar() != command)
+        fail("control command");
 }
 
 static unsigned parse_number(const char *s, unsigned max)
@@ -136,8 +145,9 @@ static void put32(uint8_t *out, uint32_t value)
 
 int main(int argc, char **argv)
 {
-    alarm(30);
-    if (argc != 4)
+    int controlled = argc == 5 && !strcmp(argv[4], "--controlled");
+    alarm(controlled ? 90 : 30);
+    if (argc != 4 && !controlled)
         fail("expected device, port and GID index arguments");
     unsigned port = parse_number(argv[2], 255);
     unsigned index = parse_number(argv[3], 255);
@@ -181,6 +191,9 @@ int main(int argc, char **argv)
     struct ibv_srq *srq = ibv_create_srq(pd, &srq_init);
     if (!srq)
         fail("SRQ creation");
+    /* The provider is loaded, but no DCIs exist until the observer attaches. */
+    if (controlled)
+        control_wait("ready", 'g');
     struct ibv_qp *dct[2] = {
         create_qp(ctx, pd, cq, srq, &av, pattr.active_mtu),
         create_qp(ctx, pd, cq, srq, &av, pattr.active_mtu),
@@ -245,7 +258,12 @@ int main(int argc, char **argv)
             fail("private record pipe");
         check(ibv_destroy_ah(ah), "AH destruction");
     }
+    /* Keep the DCI alive while the observer drains and validates the batch. */
+    if (controlled)
+        control_wait(NULL, 'd');
     check(ibv_destroy_qp(dci), "DCI destruction");
+    if (controlled)
+        control_wait("retired", 'x');
     for (unsigned i = 0; i < 2; ++i)
         check(ibv_destroy_qp(dct[i]), "DCT destruction");
     check(ibv_dereg_mr(mr), "MR deregistration");

@@ -116,11 +116,11 @@ func TestKernelInventoryRace(t *testing.T) {
 	table := NewTable()
 	generation := table.EventGeneration()
 	table.Apply(kernelConnect())
-	if _, accepted := table.ReconcileQPsIfCurrent(nil, generation); accepted || len(table.Connections()) != 1 {
+	if _, accepted := table.ReconcileQPsIfCurrent(nil, generation, map[uint32]string{devA: "mlx5_0", devB: "mlx5_9"}); accepted || len(table.Connections()) != 1 {
 		t.Fatal("stale empty inventory removed concurrent kernel connect")
 	}
 	generation = table.EventGeneration()
-	if changed, accepted := table.ReconcileQPsIfCurrent(nil, generation); !accepted || !changed || len(table.Connections()) != 0 {
+	if changed, accepted := table.ReconcileQPsIfCurrent(nil, generation, map[uint32]string{devA: "mlx5_0", devB: "mlx5_9"}); !accepted || !changed || len(table.Connections()) != 0 {
 		t.Fatal("fresh empty inventory failed to remove kernel connection")
 	}
 }
@@ -138,5 +138,32 @@ func TestDecodeKernelEvent(t *testing.T) {
 		if _, err := DecodeEvent(bad); err == nil {
 			t.Fatal("accepted malformed kernel event")
 		}
+	}
+}
+
+func TestKernelInventoryPreservesUnscannedDevices(t *testing.T) {
+	table := NewTable()
+	scanned := kernelConnect()
+	unscanned := scanned
+	unscanned.Dev, unscanned.Context = devB, scanned.Context+1
+	table.Apply(scanned)
+	table.Apply(unscanned)
+	generation := table.EventGeneration()
+	// Activity outside the inventory scope must neither be deleted nor
+	// mark an otherwise complete inventory as stale.
+	unscanned.TimestampNS++
+	table.Apply(unscanned)
+	changed, accepted := table.ReconcileQPsIfCurrent(nil, generation, map[uint32]string{devA: "mlx5_0"})
+	if !changed || !accepted || table.SnapshotDirty() {
+		t.Fatalf("changed=%v accepted=%v dirty=%v", changed, accepted, table.SnapshotDirty())
+	}
+	if conns := table.Connections(); len(conns) != 1 || conns[0].Dev != devB || table.QPCount() != 1 {
+		t.Fatalf("empty inventory removed an unscanned device: %+v", conns)
+	}
+	if changed, accepted := table.ReconcileQPsIfCurrent(nil, table.EventGeneration(), map[uint32]string{}); changed || !accepted || table.QPCount() != 1 {
+		t.Fatal("empty scope removed a connection")
+	}
+	if changed, accepted := table.ReconcileQPsIfCurrent(nil, table.EventGeneration(), map[uint32]string{devB: "mlx5_9"}); !changed || !accepted || table.QPCount() != 0 {
+		t.Fatal("fresh inventory of the remaining device did not reap it")
 	}
 }

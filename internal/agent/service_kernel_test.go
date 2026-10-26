@@ -45,3 +45,18 @@ func TestServiceMonitorKernelConnection(t *testing.T) {
 		t.Fatal("unresolved device was assigned a guessed device number")
 	}
 }
+
+func TestServiceMonitorKernelInventoryScope(t *testing.T) {
+	m := newTestServiceMonitor(t, &fakeResolver{}, &fakeEventSource{}, &fakeServiceProber{})
+	m.loadDeviceNumbers()
+	ev := connectTo(0x1234, 0, 202, 123, remoteGID, 3)
+	ev.Source, ev.DeviceName = servicetrace.SourceKernel, "mlx5_9"
+	ev.QPNum, ev.QPType, ev.IsGlobal = 101, servicetrace.QPTypeRC, 1
+	m.handleEvent(ev)
+	// mlx5_9 exists in sysfs but only mlx5_0 is monitored and inventoried.
+	m.refreshQPs(context.Background())
+	_, other := m.connectionsByDevice()
+	if other != 1 || m.table.QPCount() != 1 {
+		t.Fatalf("unmonitored kernel connection disappeared: other=%d qps=%d", other, m.table.QPCount())
+	}
+}

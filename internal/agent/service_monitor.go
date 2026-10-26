@@ -443,7 +443,7 @@ func (m *ServiceMonitor) refreshQPs(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-	changed, accepted := m.table.ReconcileQPsIfCurrent(qps, generation)
+	changed, accepted := m.table.ReconcileQPsIfCurrent(qps, generation, devices)
 	if changed || !accepted {
 		m.signalChanged()
 	}

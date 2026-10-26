@@ -101,7 +101,10 @@ inventory cycle. Reset, error and successful destroy remove the connection.
 Successful netlink inventories also remove missing, disconnected or
 detectably reused kernel QPs, with the same per-device generation check
 that protects user snapshots from concurrent events. Failed inventories
-leave connections intact. Reuse with identical QPN/type/remote QPN after
+leave connections intact. Reconciliation only removes connections on the
+successfully inventoried devices, including devices whose QP list is empty;
+connections on devices outside that scope retain their diagnostic counts.
+Reuse with identical QPN/type/remote QPN after
 lost lifecycle events cannot be distinguished by the generic inventory.
 
 Kernel workers' PID and cgroup are not service ownership. Kernel connections

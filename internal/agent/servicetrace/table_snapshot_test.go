@@ -106,10 +106,10 @@ func TestTableRejectsSnapshotRacingLifecycle(t *testing.T) {
 	generation := tb.EventGeneration()
 	tb.Apply(createEvent(ctxA, devA, 1, 0x100, QPTypeRC))
 	tb.Apply(Event{Kind: KindQPDestroy, Context: ctxA, QPHandle: 1})
-	if changed, accepted := tb.ReconcileQPsIfCurrent([]QPResource{qp}, generation); changed || accepted || tb.QPCount() != 0 {
+	if changed, accepted := tb.ReconcileQPsIfCurrent([]QPResource{qp}, generation, map[uint32]string{devA: "mlx5_0", devB: "mlx5_9"}); changed || accepted || tb.QPCount() != 0 {
 		t.Fatal("late raw snapshot resurrected a destroyed QP")
 	}
-	if _, accepted := tb.ReconcileQPsIfCurrent([]QPResource{qp}, tb.EventGeneration()); !accepted {
+	if _, accepted := tb.ReconcileQPsIfCurrent([]QPResource{qp}, tb.EventGeneration(), map[uint32]string{devA: "mlx5_0", devB: "mlx5_9"}); !accepted {
 		t.Fatal("unchanged lifecycle rejected a fresh snapshot")
 	}
 	if !tb.Apply(createEvent(ctxA, devA, 2, 0x100, QPTypeRC)) || len(tb.Connections()) != 0 || len(tb.UnboundQPs()) != 0 || tb.QPCount() != 1 {
@@ -125,8 +125,22 @@ func TestTableSnapshotIgnoresOtherDevicesAndKnownUDChurn(t *testing.T) {
 	tb.Apply(createEvent(ctxA, devA, 2, 0x102, QPTypeUD))
 	tb.Apply(Event{Kind: KindQPModify, Context: ctxA, QPHandle: 2, Dev: devA, PID: 42})
 	tb.Apply(Event{Kind: KindQPDestroy, Context: ctxA, QPHandle: 2, Dev: devA, PID: 42})
-	if _, accepted := tb.ReconcileQPsIfCurrent([]QPResource{qp}, generation); !accepted || len(tb.Connections()) != 1 {
+	if _, accepted := tb.ReconcileQPsIfCurrent([]QPResource{qp}, generation, map[uint32]string{devA: "mlx5_0", devB: "mlx5_9"}); !accepted || len(tb.Connections()) != 1 {
 		t.Fatal("unrelated device or known UD churn starved recovery")
+	}
+}
+
+func TestTableSnapshotInventoryScope(t *testing.T) {
+	tb := NewTable()
+	qp := recoveredResource(t, devB, 0x100, 42)
+	tb.ReconcileQPs([]QPResource{qp})
+	changed, accepted := tb.ReconcileQPsIfCurrent(nil, tb.EventGeneration(), map[uint32]string{devA: "mlx5_0"})
+	if changed || !accepted || len(tb.Connections()) != 1 {
+		t.Fatal("unscanned snapshot resource was removed")
+	}
+	changed, accepted = tb.ReconcileQPsIfCurrent(nil, tb.EventGeneration(), map[uint32]string{devB: "mlx5_9"})
+	if !changed || !accepted || tb.QPCount() != 0 {
+		t.Fatal("scanned snapshot resource was not removed")
 	}
 }
 

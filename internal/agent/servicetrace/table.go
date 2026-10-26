@@ -377,12 +377,17 @@ func (t *Table) SnapshotDirty() bool {
 // ReconcileQPsIfCurrent rejects late snapshot results when any lifecycle
 // event arrived on that device during collection. Unchanged devices are
 // accepted independently. It returns connection changes/overall acceptance.
-func (t *Table) ReconcileQPsIfCurrent(resources []QPResource, generation map[uint32]uint64) (bool, bool) {
+// devices is the successfully inventoried scope, including devices with no
+// QPs. Connections outside that scope are preserved; nil means no devices.
+func (t *Table) ReconcileQPsIfCurrent(resources []QPResource, generation map[uint32]uint64, devices map[uint32]string) (bool, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	blocked := make(map[uint32]bool)
 	var current []QPResource
 	for _, qp := range resources {
+		if _, scanned := devices[qp.Dev]; !scanned {
+			continue
+		}
 		if t.generation[qp.Dev] != generation[qp.Dev] {
 			blocked[qp.Dev] = true
 		} else {
@@ -390,16 +395,22 @@ func (t *Table) ReconcileQPsIfCurrent(resources []QPResource, generation map[uin
 		}
 	}
 	for _, qp := range t.snapshotQPs {
-		if t.generation[qp.Dev] != generation[qp.Dev] {
-			blocked[qp.Dev] = true
+		_, scanned := devices[qp.Dev]
+		if !scanned || t.generation[qp.Dev] != generation[qp.Dev] {
+			if scanned {
+				blocked[qp.Dev] = true
+			}
 			current = append(current, qp)
 		}
 	}
-	// Preserve kernel connections on devices changed during collection,
+	// Preserve kernel connections outside the scope or changed during collection,
 	// including a connection whose QP was absent from the older inventory.
 	for _, c := range t.kernelQPs {
-		if t.generation[c.Dev] != generation[c.Dev] {
-			blocked[c.Dev] = true
+		_, scanned := devices[c.Dev]
+		if !scanned || t.generation[c.Dev] != generation[c.Dev] {
+			if scanned {
+				blocked[c.Dev] = true
+			}
 			current = append(current, QPResource{Dev: c.Dev, LocalQPN: c.LocalQPN,
 				RemoteQPN: c.RemoteQPN, QPType: c.QPType, QPState: QPStateRTS, Kernel: true})
 		}

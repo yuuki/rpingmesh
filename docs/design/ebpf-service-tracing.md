@@ -440,8 +440,41 @@ and preserve multiple simultaneous remotes per DCI. It also needs bounded
 flow expiry and QP/process teardown, the actual RoCEv2 UDP source port
 (including DC stream behavior), and hardware packet-capture tests proving
 that probes select the same ECMP path. An unsupported binary/layout must
-leave DC disabled while connected-QP tracing continues. This investigation
-does not implement DC flow tracing or justify closing that part of #111.
+leave DC disabled while connected-QP tracing continues.
+
+### DC tracking core (not enabled at runtime)
+
+`servicetrace/mlx5_dc.go` now decodes the 64-byte mlx5 control/extended-AV
+prefix for SEND, SEND_IMM, RDMA_WRITE, RDMA_WRITE_IMM, and RDMA_READ. The
+layout reference is [rdma-core's public mlx5 header at a fixed revision](https://github.com/linux-rdma/rdma-core/blob/fdd5dbfb71a1f5c80b90f4e1d6340ce21338bf6c/providers/mlx5/mlx5dv.h).
+It checks the expected DCI QPN, segment count, extended AV, DCT, supported
+flags, and remote GID. Atomics, compact AVs, opcode modifiers and nonzero
+stream IDs are rejected. DC keys and payloads are not retained.
+
+The AV UDP source port and application flow label are separate fields. A
+zero flow label does **not** invoke the RC/UC/XRC QPN-derived fallback:
+libmlx5 may have selected a random AV source port when creating the AH.
+The decoder does not assert that this candidate is the actual wire port,
+or that a probe using it selects the same ECMP path.
+
+`servicetrace/dc_flows.go` retains multiple distinct AVs per DCI, with
+inactivity expiry, a total LRU capacity limit, DCI teardown and capture-loss
+reset. Its caller supplies a unique DCI lifetime token and orders observations
+using one monotonic clock. The caller must invalidate tokens before teardown
+and discard buffered events after capture loss; PID/QPN/pointer values alone
+are not lifetime identities. Observations older than the table clock are
+rejected. This core accepts only caller-confirmed submissions; staging,
+aborted/failed-batch filtering, ownership mapping and process-exit detection
+belong to the adapter and are not implemented yet.
+
+The WQE cannot establish that the QP is DC or RoCEv2 (UD shares its layout).
+An adapter must validate the actual provider/UCX build, establish the QP type,
+RoCEv2 GID, absence of stream mode (including stream zero) and QP-level UDP
+overrides, copy the prefix before slot reuse, and confirm submission. None of
+these prerequisites are inferred from plausible WQE bytes. There is currently
+no runtime adapter, enable option, monitor integration or hardware ECMP
+validation. Portable synthetic fixtures exercise parsing and flow lifetime
+only; this increment does not complete the DC part of #111.
 
 ## Follow-ups
 

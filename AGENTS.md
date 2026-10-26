@@ -58,6 +58,11 @@ Run active-development commands from the repository root.
 
 - Follow standard Go conventions and run `gofmt` on edited Go files.
 - Keep code comments and repository documentation in English.
+- Never include real environment identifiers or machine-specific operational
+  details in code comments, documentation, issues, or PRs. This includes
+  hostnames, IP addresses, cluster or partition names, usernames, local paths,
+  allocation IDs, and access routes. Use generic descriptions or synthetic
+  examples instead; keep actual validation-environment details out of Git.
 - Do not edit generated `proto/controller_agent/*.pb.go` files by hand.
 - After changing a `.proto` file, run `make generate-proto`.
 - Keep the Zig C ABI, `zig/include/rdma_bridge.h`, and

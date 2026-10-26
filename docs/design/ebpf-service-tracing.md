@@ -476,6 +476,38 @@ no runtime adapter, enable option, monitor integration or hardware ECMP
 validation. Portable synthetic fixtures exercise parsing and flow lifetime
 only; this increment does not complete the DC part of #111.
 
+### Opt-in DC hardware test
+
+`TestMLX5DCHardware` uses public libmlx5 APIs to create one non-stream DCI
+and two local DCTs. It submits three tiny messages with different address
+vectors, including one zero application flow label. Only after successful
+send and receive completions does the helper send a copied WQE prefix to the
+Go decoder through a private pipe. The test checks address fields against
+the requested AV, explicit-label UDP-port mapping, preservation of all three
+flows, and DCI teardown. The same port is used at both ends; this is a local
+hardware loopback test, not a network path test.
+
+Run it on authorized mlx5 hardware with DC support, an active Ethernet port,
+a configured RoCEv2 GID, a C compiler, and the libibverbs/libmlx5 development
+headers. RDMA device access and sufficient locked-memory allowance are
+required; BPF privileges are not. Set `RPINGMESH_DC_HARDWARE_TEST=1` and provide
+`RPINGMESH_DC_TEST_DEVICE`, `RPINGMESH_DC_TEST_PORT`, and
+`RPINGMESH_DC_TEST_GID_INDEX` through the local environment, then run:
+
+```sh
+go test ./internal/agent/servicetrace -run '^TestMLX5DCHardware$' -count=1 -v
+```
+
+Keep `-count=1` to execute hardware operations on every run instead of reusing
+Go's test-result cache. This also matters after changing the helper C source,
+which is compiled by a child process rather than the Go build system.
+
+Do not commit the environment values or raw capture data. The helper redacts
+its test DC access key; live addresses stay in memory and are not printed or
+stored as fixtures. A successful hardware run validates the decoder against
+actual provider-generated WQEs. It does **not** validate a production capture
+adapter, UCX's direct send path, actual wire UDP ports, or ECMP equivalence.
+
 ## Follow-ups
 
 - **Additional startup recovery drivers.** mlx5 PRM query-QP recovery is

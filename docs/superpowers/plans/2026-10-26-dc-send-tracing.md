@@ -23,7 +23,9 @@
 - [x] Add `dc_flows.go` and `dc_flows_test.go`: accept only adapter-confirmed submissions, require unique DCI lifetime tokens, retain distinct AVs, expire inactive entries, cap total entries, and clear one destroyed DCI or all entries after capture loss.
 - [x] Test endian offsets, malformed prefixes, zero application flow labels, multiple remotes, repeated sends, timestamp ordering, capacity, expiry, and lifetime teardown. Run race tests and vet.
 - [x] Document the implemented core and unimplemented attachment/ECMP validation. Obtain an independent adversarial review and address findings.
-- [ ] Inspect the target allocation and binaries, implement an adapter for that exact build, and compare observed fields with actual packets on mlx5 hardware. This step depends on SSH access and must not be replaced with guessed ABI offsets.
+- [x] Inspect an authorized hardware allocation and the provider's public interfaces without recording environment identifiers.
+- [x] Add an opt-in hardware helper and Go test using public APIs: one DCI, two DCTs, three AVs, confirmed send/receive completion, private WQE decoding, flow retention and teardown. Never save live addresses as fixtures.
+- [ ] Implement a validated send-path adapter and compare observed fields with actual packets on mlx5 hardware. This needs BPF/perf privileges for attachment and must not be replaced with guessed ABI offsets.
 
 ## Validation
 
@@ -42,4 +44,6 @@ Portable fixtures verify parsing and lifetime logic, not hardware packet equival
 - Decoder fuzzing passed for 10 seconds (4,193,240 executions).
 - The control/AV definitions match the pinned upstream header. The fixtures are synthetic, not packet captures.
 - Independent adversarial review reported no actionable P1–P3 findings in this increment.
-- Target access is still required for the final adapter task; no supported UCX/libmlx5 build is claimed.
+- The opt-in test passed on mlx5 hardware using unprivileged local DC send/receive operations. The successful WQE prefixes matched the decoded fields and explicit-label UDP-port mapping, including a zero-label send and multiple DCTs.
+- Hardware validation ran the cross-compiled test binary directly, without Go's result cache. Independent review found a P3 documentation omission: the published `go test` command now includes `-count=1` to force real execution on subsequent runs.
+- No production capture adapter or supported UCX/libmlx5 attachment profile is claimed. BPF attachment and wire/ECMP validation remain outstanding.

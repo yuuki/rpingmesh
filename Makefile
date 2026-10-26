@@ -2,7 +2,7 @@
 # Requires: Go 1.27.3+, Zig 0.17.0 (the version verified in e2e/CI), protoc,
 # clang, libibverbs-dev, librdmacm-dev
 
-.PHONY: all build build-zig build-go build-controller build-agent \
+.PHONY: all build build-zig build-go build-controller build-agent build-dc-trace \
         generate generate-proto generate-bpf check-bpf \
         clean test test-go test-zig test-scripts test-all vet \
         test-e2e setup-colima test-e2e-controller clean-e2e-controller \
@@ -115,6 +115,13 @@ check-bpf:
 		for f in kernel_x86_bpfel.go kernel_arm64_bpfel.go; do \
 			diff -u "$$f" "$$tmp/$$f" || { echo "ERROR: $$f is stale; run 'make generate-bpf'"; exit 1; }; \
 		done
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+		cd $(BPF_DIR) && GOPACKAGE=servicetrace go tool bpf2go -output-dir "$$tmp" \
+			-tags linux -target amd64,arm64 -type dc_batch -type dc_identity -type dc_config -no-global-types \
+			dc bpf/dc_trace.bpf.c -- -mcpu=v3 -I bpf -I bpf/include -O2 -g -Wall -Werror && \
+		for f in dc_x86_bpfel.go dc_arm64_bpfel.go; do \
+			diff -u "$$f" "$$tmp/$$f" || { echo "ERROR: $$f is stale; run 'make generate-bpf'"; exit 1; }; \
+		done
 	@echo "==> eBPF check complete"
 
 # Build Go binaries
@@ -131,6 +138,12 @@ build-agent:
 	@mkdir -p $(BIN_DIR)
 	CGO_ENABLED=1 go build -ldflags "$(GO_LDFLAGS)" -o $(AGENT_BIN) ./cmd/agent/
 	@echo "==> Agent built: $(AGENT_BIN)"
+
+# Experimental Linux-only, pure-Go diagnostic collector; not packaged/enabled
+# as part of the agent until privileged and wire-path validation is complete.
+build-dc-trace:
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 go build -o $(BIN_DIR)/rpingmesh-dc-trace ./cmd/dc-trace/
 
 # Pure-Go packages: no Cgo, no RDMA hardware, runnable on any OS. The
 # controller packages need the generated protobuf bindings (`make
@@ -364,6 +377,7 @@ help:
 	@echo "  build-go             Build Go controller and agent binaries"
 	@echo "  build-controller     Build controller binary only"
 	@echo "  build-agent          Build agent binary only"
+	@echo "  build-dc-trace       Build experimental DC collector (Linux only)"
 	@echo "  generate             Generate all code (proto)"
 	@echo "  generate-proto       Generate protobuf Go code"
 	@echo "  generate-bpf         Compile the service-tracing eBPF program (needs clang with the BPF backend)"

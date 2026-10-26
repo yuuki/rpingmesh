@@ -1,0 +1,280 @@
+//go:build linux
+
+package servicetrace
+
+import (
+	"bufio"
+	"context"
+	"debug/elf"
+	"encoding/binary"
+	"fmt"
+	"github.com/cilium/ebpf"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func buildDCFixture(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Fatal("DC fixture requires a C compiler")
+	}
+	file := filepath.Join(t.TempDir(), "dc-provider")
+	cmd := exec.Command("cc", "-std=c11", "-pthread", "-g", "-O0", "-fno-inline", "-fPIE", "-pie", "-Wl,--build-id", "-Wall", "-Wextra", "-Werror", "testdata/dc_provider_fixture.c", "-o", file)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("compile synthetic provider: %v\n%s", err, out)
+	}
+	return file
+}
+
+func TestDCProviderELF(t *testing.T) {
+	file := buildDCFixture(t)
+	p, err := inspectDCProvider(file, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.layout.QPBase != 24 || p.layout.QPNum != 8 || p.layout.ContextFD != 8 {
+		t.Fatal("incorrect synthetic provider layout")
+	}
+	if err := dcLibraryMapped(os.Getpid(), mustOpenDCFile(t, file)); err == nil {
+		t.Fatal("accepted an unmapped provider")
+	}
+	if _, err := inspectDCProvider(file, "/dev/null"); err == nil {
+		t.Fatal("accepted invalid debug ELF")
+	}
+	// Same structure layout with a distinct build ID must not be accepted.
+	copy, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ef, err := elf.Open(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	note := ef.Section(".note.gnu.build-id")
+	if note == nil || note.Size < 20 {
+		t.Fatal("missing synthetic build ID")
+	}
+	offset := note.Offset + 16 // note header followed by the GNU name
+	ef.Close()
+	copy[offset] ^= 1
+	mismatch := filepath.Join(t.TempDir(), "mismatch")
+	if err := os.WriteFile(mismatch, copy, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inspectDCProvider(file, mismatch); err == nil {
+		t.Fatal("accepted mismatching debug build ID")
+	}
+	copy[offset] ^= 1
+	// objcopy removes DWARF without changing the build ID: matching symbols
+	// and an ID alone must still be insufficient.
+	stripped := filepath.Join(t.TempDir(), "stripped")
+	if err := os.WriteFile(stripped, copy, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("objcopy", "--strip-debug", stripped).CombinedOutput(); err != nil {
+		t.Fatalf("strip synthetic DWARF: %v %s", err, out)
+	}
+	if _, err := inspectDCProvider(file, stripped); err == nil {
+		t.Fatal("accepted ELF without full DWARF")
+	}
+}
+
+func mustOpenDCFile(t *testing.T, path string) *os.File {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+func TestDCBPFSpec(t *testing.T) {
+	spec, err := loadDc()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Maps[dcMapDcSettings].ValueSize != uint32(4+binary.Size(dcLayout{})) ||
+		spec.Maps[dcMapDcPending].ValueSize != uint32(binary.Size(dcDcBatch{})) ||
+		binary.Size(dcDcBatch{}) != 1064 {
+		t.Fatal("DC BPF/Go ABI mismatch")
+	}
+}
+
+// The user explicitly enables this test under BPF/perf privileges. It needs
+// no RDMA hardware and must never silently skip after explicit enablement.
+func TestDCUprobeIntegration(t *testing.T) {
+	if os.Getenv("RPINGMESH_DC_UPROBE_TEST") != "1" {
+		t.Skip("user-run privileged DC uprobe test")
+	}
+	t.Run("leader-exit", func(t *testing.T) { testDCUprobeIntegration(t, false) })
+	t.Run("worker-exec", func(t *testing.T) { testDCUprobeIntegration(t, true) })
+}
+
+func testDCUprobeIntegration(t *testing.T, workerExec bool) {
+	file := buildDCFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	child := exec.CommandContext(ctx, file)
+	stdin, err := child.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { stdin.Close(); child.Process.Kill(); child.Wait() }()
+	scan := bufio.NewScanner(stdout)
+	if !scan.Scan() || scan.Text() != "ready" {
+		t.Fatal("fixture not ready")
+	}
+	root := t.TempDir()
+	for path, value := range map[string]string{
+		"class/infiniband_verbs/uverbs-test/dev":                 "1:3", // synthetic /dev/null identity
+		"class/infiniband_verbs/uverbs-test/ibdev":               "test-device",
+		"class/infiniband/test-device/ports/1/gid_attrs/types/0": "RoCE v2",
+		"class/infiniband/test-device/ports/1/gids/0":            "0000:0000:0000:0000:0000:ffff:c000:0201",
+	} {
+		path = filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(value), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, err := OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: file, DebugFile: file, Device: "test-device", Port: 1, sysfsRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	defer func() {
+		cancel()
+		err := <-done
+		c.Close()
+		if err != nil {
+			t.Error(err)
+		}
+	}()
+	command := func(op byte) {
+		t.Helper()
+		if _, err := fmt.Fprintf(stdin, "%c\n", op); err != nil {
+			t.Fatal(err)
+		}
+		if !scan.Scan() || (scan.Text() != "done" && scan.Text() != "ready") {
+			t.Fatal("fixture command failed")
+		}
+	}
+	await := func(predicate func(DCStats) bool) DCStats {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			s, err := c.Stats()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if predicate(s) {
+				return s
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("unexpected collector counters: %+v", s)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	command('c')
+	command('s')
+	await(func(s DCStats) bool { return s.AcceptedSends == 2 && s.ActiveFlows == 2 })
+	command('f')
+	await(func(s DCStats) bool { return s.FailedSubmissions == 1 && s.AcceptedSends == 2 })
+	command('a')
+	command('b')
+	await(func(s DCStats) bool { return s.UnsupportedBatches >= 1 && s.AcceptedSends == 2 })
+	command('v')
+	await(func(s DCStats) bool { return s.RejectedRecords == 1 && s.AcceptedSends == 2 })
+	command('d')
+	await(func(s DCStats) bool { return s.ActiveFlows == 0 })
+	command('c')
+	command('s') // same pointer and QPN, fresh lifetime
+	await(func(s DCStats) bool { return s.AcceptedSends == 4 && s.ActiveFlows == 2 })
+	command('r')
+	await(func(s DCStats) bool { return s.ActiveFlows == 0 })
+	for _, retire := range []byte{'u', 'z'} {
+		command('c')
+		command('s')
+		await(func(s DCStats) bool { return s.ActiveFlows == 2 })
+		command(retire)
+		await(func(s DCStats) bool { return s.ActiveFlows == 0 })
+	}
+	command('t')
+	command('s') // stream-enabled QP, even channel zero
+	await(func(s DCStats) bool { return s.UnsupportedBatches >= 2 && s.ActiveFlows == 0 })
+	command('d')
+	command('c')
+	command('s')
+	await(func(s DCStats) bool { return s.ActiveFlows == 2 })
+	// Fill all remaining registry slots with synthetic entries. exec must
+	// reclaim them before the new image can create another DCI.
+	for i := uint64(1); i < 4096; i++ {
+		if err := c.objs.DcQps.Update(i, dcDcIdentity{Token: i}, ebpf.UpdateNoExist); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command('e')
+	iter := c.objs.DcQps.Iterate()
+	var oldQP uint64
+	var oldID dcDcIdentity
+	if iter.Next(&oldQP, &oldID) {
+		t.Fatal("exec retained old QP registry entries")
+	}
+	if err := iter.Err(); err != nil {
+		t.Fatal(err)
+	}
+	await(func(s DCStats) bool { return s.ActiveFlows == 0 })
+	command('c')
+	command('s')
+	final := await(func(s DCStats) bool { return s.ActiveFlows == 2 })
+	command('w') // newly created worker thread shares the tracked DCI
+	await(func(s DCStats) bool { return s.AcceptedSends == final.AcceptedSends+2 && s.ActiveFlows == 2 })
+	command('y') // worker-thread destruction must retire its flows
+	await(func(s DCStats) bool { return s.ActiveFlows == 0 })
+	final, err = c.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.ReadErrors != 0 || final.MapErrors != 0 || final.RingLost != 0 {
+		t.Fatalf("capture errors: %+v", final)
+	}
+	if workerExec {
+		command('c')
+		command('s')
+		await(func(s DCStats) bool { return s.ActiveFlows == 2 })
+		command('q')
+	} else if _, err := fmt.Fprintln(stdin, "x"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		config, err := c.objs.DcSettings.LookupBytes(uint32(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if binary.LittleEndian.Uint32(config) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("process exit did not disable TGID filter")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	await(func(s DCStats) bool { return s.ActiveFlows == 0 })
+
+}

@@ -12,6 +12,10 @@
 // fields of the core kernel's struct file and struct inode are relocated
 // with CO-RE against the vmlinux BTF. See bpf/uverbs_trace.bpf.c.
 //
+// EnableKernelULP optionally adds ib_core probes for kernel-owned connected
+// QPs. Its separate object requires module BTF; failure does not disable the
+// uverbs tracer. DC per-send destinations are not supported.
+//
 // The eBPF program is loaded on Linux only; on other platforms Open returns
 // ErrUnsupported. Everything else in the package (event decoding, the
 // connection table, the kernel's flow-label arithmetic, the sysfs lookups) is

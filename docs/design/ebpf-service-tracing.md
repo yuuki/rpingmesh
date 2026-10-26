@@ -67,9 +67,52 @@ are local symbols of `ib_uverbs` but are present in kallsyms on both
 in-tree and out-of-tree stacks, and kprobes attach to them by name without
 BTF.
 
-The cost is scope: kernel ULPs (NVMe-oF, NFS over RDMA, Lustre) do not go
-through uverbs and are not traced, and the trace sees commands, not QPs that
-already existed. The paper's service (user-space DML over NCCL) is covered.
+The default tracer cannot see kernel ULPs (NVMe-oF, NFS over RDMA, Lustre),
+which do not go through uverbs. The optional module-BTF extension below
+handles their new connections. The trace sees commands, not QPs that
+already existed; supported user QPs can be recovered through snapshots.
+
+### Optional kernel ULP tracing
+
+Set `service_tracing_kernel_ulp_enabled: true` together with
+`service_tracing_enabled: true` to load a separate CO-RE object. The same
+setting is exposed as `--service-tracing-kernel-ulp-enabled` and
+`RPINGMESH_SERVICE_TRACING_KERNEL_ULP_ENABLED`. It is disabled by default.
+It requires `/sys/kernel/btf/ib_core`, in addition to the default tracer's
+vmlinux BTF, ring buffer and capability requirements. Missing/unreadable
+module BTF, incompatible types, or probe attachment failures produce a
+warning and leave uverbs tracing active. No guessed OFED offsets are used.
+
+The extension attaches entry/return probes to `ib_modify_qp` and
+`ib_destroy_qp_user` (the non-inline implementation behind `ib_destroy_qp`).
+It reads individual fields of `ib_qp`, `ib_qp_attr`, `rdma_ah_attr` and
+`ib_device` using module BTF. QPs with `uobject != NULL`, UD/raw/driver QPs,
+and non-RoCE address vectors are excluded. Events are staged per task and
+published only on successful return; every entry clears old staging. The
+destroy return probe never reads the potentially freed QP. The separate
+object shares the uverbs ring buffer and drop/parse counters.
+
+A successful RTR with a complete global address vector establishes a
+connection directly, without inventing a uverbs create or handle. Its
+identity is the `ib_qp` pointer in a separate namespace. The monitor maps
+the kernel device name to the same sysfs device number used for uverbs.
+Unknown names are discarded; the published device map is refreshed on each
+inventory cycle. Reset, error and successful destroy remove the connection.
+Successful netlink inventories also remove missing, disconnected or
+detectably reused kernel QPs, with the same per-device generation check
+that protects user snapshots from concurrent events. Failed inventories
+leave connections intact. Reuse with identical QPN/type/remote QPN after
+lost lifecycle events cannot be distinguished by the generic inventory.
+
+Kernel workers' PID and cgroup are not service ownership. Kernel connections
+have zero process/cgroup identity and use the existing `_unspecified` label
+when service labels are enabled. They are not reaped when a worker exits.
+Only connections established after attachment are discovered; this option
+does not recover pre-existing kernel QPs, attribute them to individual
+NVMe/NFS mounts, or observe changes that bypass these core entry points.
+As with user tracing, source GID mismatches and driver UDP-port behavior
+limit exact ECMP equivalence. Soft-RoCE is not hardware port-equivalence
+validation.
 
 ### Flow labels and the UDP source port
 
@@ -139,8 +182,10 @@ the normal full-refresh interval, and after an unidentified lifecycle event
 invalidates recovered connections. Generic entries include device, local
 and remote QPN, type, state, port and owner task ID. The kernel-name
 attribute identifies kernel-owned QPs; missing PID alone does not, because
-a user QP can outlive its creator task. Kernel-owned and UD/raw/driver QPs
-are excluded. A generic entry without an address vector
+a user QP can outlive its creator task. Kernel-owned QPs are used only to
+reconcile the optional kernel tracer's live connections; they and
+UD/raw/driver QPs are excluded from raw address-vector recovery.
+A generic entry without an address vector
 remains unbound and never becomes a probe target.
 
 For `mlx5_core` devices the monitor then attempts `RES_QP_GET_RAW` on
@@ -320,8 +365,8 @@ without controller-side evaluation. The analyzer now evaluates both, apart:
 
 ### Build and packaging
 
-The program is compiled by `bpf2go` (a `go.mod` tool) for `amd64` and
-`arm64` into committed `uverbs_*_bpfel.{go,o}` files, so `make build-agent`
+The programs are compiled by `bpf2go` (a `go.mod` tool) for `amd64` and
+`arm64` into committed `uverbs_*_bpfel.{go,o}` and `kernel_*_bpfel.{go,o}` files, so `make build-agent`
 needs no clang; `make generate-bpf` regenerates them and `make check-bpf`
 (run in CI) verifies the program still compiles and the Go bindings are
 current. The libbpf headers it includes are vendored under
@@ -352,12 +397,48 @@ agent package ships it as an example rather than installing it.
   and eventual removal without inventing a connection.
 - `TestTracerOpenClose` (Linux, root): loads and attaches the committed
   objects into the running kernel; CI runs it under `sudo`.
+- `TestKernelTracerOpenClose` (Linux, root, ib_core BTF): verifies default
+  isolation, CO-RE loading, all four optional probe attachments, shared
+  counters, repeated enabling and idempotent cleanup. Portable tests cover
+  kernel event decoding, separate identity namespaces, worker-independent
+  lifetime, reset/error/destroy, inventory races and device-to-probe routing.
+  These checks do not substitute for an NVMe/NFS/Lustre workload test or
+  mlx5 hardware verification of UDP source ports.
 - `TestServiceTracingTracesRCApplication` (soft-RoCE e2e): traces
   `ibv_rc_pingpong` between the two rxe devices and checks that each side's
   RTR carries the other's GID and QPN, that the table sees two connections
   with one effective flow label, and that nothing was dropped.
   `TestServiceTracingProbePath` sends a `SERVICE_TRACING` probe with an
   explicit label through the prober and checks the result.
+
+## DC transport investigation (#111)
+
+DC remains unsupported: no new option claims that a QP or an allocated
+address handle is an observed service flow. The existing raw decoder
+explicitly rejects driver/DC transports, including synthetic DCI/DCT
+contexts with plausible-looking remote address fields.
+
+The investigated observation points have different limitations:
+
+| Observation point | Finding | Decision |
+|-------------------|---------|----------|
+| Kernel mlx5 post-send | Userspace providers and UCX write WQEs and ring doorbells without entering this kernel path. | Cannot cover userspace DC traffic. |
+| Userspace DC setter / AH creation | rdma-core's `mlx5_send_wr_set_dc_addr` copies an AH and remote DCT into the current WQE. AH creation alone has neither proof of a send nor the DCI/DCT pairing; a setter can precede an aborted batch. | Needs a version-specific send/commit observation point and lifecycle tracking. |
+| UCX direct mlx5 path | UCX's `uct_dc_mlx5_set_dgram_seg` constructs the datagram segment directly from its endpoint AV. | A libmlx5-only uprobe would miss this path; instrumenting UCX requires a separate adapter. |
+| RDMA netlink raw QP | mlx5 `fill_res_qp_entry_raw` requests `MLX5_SGMT_TYPE_PRM_QUERY_QP` for one QPN. It is a QP context, not an enumeration of committed per-send AVs or DCI streams. | Do not infer a persistent remote from a DCI QP snapshot. |
+
+Sources: [rdma-core mlx5 send implementation](https://github.com/linux-rdma/rdma-core/blob/master/providers/mlx5/qp.c),
+[UCX direct DC WQE construction](https://github.com/openucx/ucx/blob/master/src/uct/ib/mlx5/dc/dc_mlx5_ep.c),
+and [Linux mlx5 resource dump implementation](https://github.com/torvalds/linux/blob/v6.12/drivers/infiniband/hw/mlx5/restrack.c).
+
+A future implementation must be explicitly mlx5-only and opt-in, pin and
+validate supported provider/UCX layouts, observe successful submission,
+and preserve multiple simultaneous remotes per DCI. It also needs bounded
+flow expiry and QP/process teardown, the actual RoCEv2 UDP source port
+(including DC stream behavior), and hardware packet-capture tests proving
+that probes select the same ECMP path. An unsupported binary/layout must
+leave DC disabled while connected-QP tracing continues. This investigation
+does not implement DC flow tracing or justify closing that part of #111.
 
 ## Follow-ups
 
@@ -366,4 +447,5 @@ agent package ships it as an example rather than installing it.
   unbound. No supported snapshot supplies a uverbs context/handle, so
   unknown-event correlation remains conservative and snapshot-based.
 - **DC transport.** mlx5's dynamically connected transport binds the remote
-  per work request, not at RTR, and is invisible to this tracer.
+  per work request, not at RTR. Implement and hardware-validate a bounded
+  send-path adapter after the prerequisites in the investigation above.

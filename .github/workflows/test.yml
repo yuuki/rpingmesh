@@ -72,12 +72,12 @@ jobs:
         run: go test -race $(go list ./... | grep -v '/e2e')
 
       # Load the service-tracing eBPF objects into the runner's kernel and
-      # attach them to the uverbs entry points, which needs root. The test
-      # skips itself when ib_uverbs cannot be loaded on the runner kernel.
+      # attach uverbs and optional kernel ULP probes, which needs root.
+      # Tests skip when their modules/BTF are unavailable on the runner.
       - name: Load the eBPF tracer into the kernel (root)
         run: |
           sudo modprobe ib_uverbs || echo "::warning::ib_uverbs not available; the tracer load test will skip"
-          sudo -E env "PATH=$PATH" go test -count=1 -v -run TestTracerOpenClose ./internal/agent/servicetrace/
+          sudo -E env "PATH=$PATH" go test -count=1 -v -run 'Test(Kernel)?TracerOpenClose' ./internal/agent/servicetrace/
 
   # Release-style portable agent build: links the agent in an Enterprise
   # Linux 9 container and fails if the binary needs a glibc newer than the

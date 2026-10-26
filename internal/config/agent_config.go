@@ -274,6 +274,9 @@ type AgentConfig struct {
 	// and a kernel with BTF, and continues without service tracing when
 	// the tracer cannot start.
 	ServiceTracingEnabled bool `mapstructure:"service_tracing_enabled"`
+	// ServiceTracingKernelULPEnabled additionally traces kernel-owned QPs.
+	// Requires ib_core module BTF; failure leaves uverbs tracing active.
+	ServiceTracingKernelULPEnabled bool `mapstructure:"service_tracing_kernel_ulp_enabled"`
 	// ServiceTracingProbeRatePerSecond caps the aggregate service-tracing
 	// probe rate of each RNIC (probes per second shared by all of its traced
 	// flows, visited in random order). It bounds the probe load whatever
@@ -372,6 +375,7 @@ var agentKeys = []keySpec{
 	{key: "inter_tor_probe_rate_per_second", def: DefaultInterTorProbeRatePerSecond, help: "Probe rate per second per inter-ToR target (0 = inherit target-probe-rate-per-second)"},
 	{key: "flow_label_rotation_period_sec", def: uint32(DefaultFlowLabelRotationPeriodSec), help: "Period (seconds) over which the rotating ~20% of each target's ECMP flow-label set is refreshed"},
 	{key: "service_tracing_enabled", def: DefaultServiceTracingEnabled, help: "Trace application RDMA connections with eBPF and probe their flows (Linux; needs CAP_BPF and CAP_PERFMON)"},
+	{key: "service_tracing_kernel_ulp_enabled", def: false, help: "Also trace kernel ULP connections (requires service tracing and ib_core module BTF)"},
 	{key: "service_tracing_probe_rate_per_second", def: DefaultServiceTracingProbeRatePerSecond, help: "Aggregate service-tracing probe rate per RNIC, shared by all of its traced flows"},
 	{key: "service_tracing_probe_interval_ms", def: uint32(DefaultServiceTracingProbeIntervalMS), help: "Minimum interval in milliseconds between two passes over an RNIC's traced flows"},
 	{key: "service_tracing_service_labels", def: []ServiceLabelMapping{}, noFlag: true},
@@ -454,6 +458,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		InterTorProbeRatePerSecond:       v.GetInt("inter_tor_probe_rate_per_second"),
 		FlowLabelRotationPeriodSec:       v.GetUint32("flow_label_rotation_period_sec"),
 		ServiceTracingEnabled:            v.GetBool("service_tracing_enabled"),
+		ServiceTracingKernelULPEnabled:   v.GetBool("service_tracing_kernel_ulp_enabled"),
 		ServiceTracingProbeRatePerSecond: v.GetInt("service_tracing_probe_rate_per_second"),
 		ServiceTracingProbeIntervalMS:    v.GetUint32("service_tracing_probe_interval_ms"),
 		AnalysisReportEnabled:            v.GetBool("analysis_report_enabled"),

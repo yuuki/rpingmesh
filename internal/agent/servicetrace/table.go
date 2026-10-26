@@ -5,10 +5,13 @@ import (
 	"sync"
 )
 
-// Connection is one connected application QP: a QP of a connected transport
+// Connection is one connected user or kernel QP: a QP of a connected transport
 // (RC, UC, XRC) whose address vector was traced at RTR or recovered from
 // a supported driver snapshot. It is the agent's view of one service flow.
 type Connection struct {
+	// Kernel identifies a connection owned by a kernel ULP, without a
+	// user process or cgroup owner.
+	Kernel bool
 	// FromSnapshot identifies driver-recovered connections with no uverbs
 	// context/handle. Their lifetime is reconciled by device/QPN.
 	FromSnapshot bool
@@ -81,7 +84,7 @@ type uverbsContext struct {
 	qps map[uint32]*qpEntry
 }
 
-// Table folds tracer events into the set of live connections. It is safe for
+// Table folds user and kernel tracer events into live connections. It is safe for
 // concurrent use: the tracer goroutine applies events while the service
 // monitor reads snapshots.
 type Table struct {
@@ -93,11 +96,12 @@ type Table struct {
 	snapshotQPs   map[qpResourceKey]QPResource
 	generation    map[uint32]uint64
 	snapshotDirty bool
+	kernelQPs     map[uint64]Connection // struct ib_qp pointer, separate from uverbs contexts
 }
 
 // NewTable returns an empty table.
 func NewTable() *Table {
-	return &Table{ctxs: make(map[uint64]*uverbsContext), snapshotQPs: make(map[qpResourceKey]QPResource), generation: make(map[uint32]uint64)}
+	return &Table{ctxs: make(map[uint64]*uverbsContext), snapshotQPs: make(map[qpResourceKey]QPResource), generation: make(map[uint32]uint64), kernelQPs: make(map[uint64]Connection)}
 }
 
 // Apply folds ev into the table and reports whether the set of connections
@@ -107,6 +111,10 @@ func (t *Table) Apply(ev Event) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if ev.Source == SourceKernel {
+		t.generation[ev.Dev]++
+		return t.applyKernel(ev)
+	}
 	t.advanceGeneration(ev)
 	switch ev.Kind {
 	case KindQPCreate:
@@ -284,6 +292,9 @@ func (t *Table) Connections() []Connection {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	var out []Connection
+	for _, c := range t.kernelQPs {
+		out = append(out, c)
+	}
 	for _, c := range t.ctxs {
 		for _, q := range c.qps {
 			if q.conn != nil {
@@ -312,11 +323,11 @@ func (t *Table) Connections() []Connection {
 	return out
 }
 
-// QPCount returns the number of traced and snapshot QPs, connected or not.
+// QPCount returns all user traced/snapshot QPs plus connected kernel QPs.
 func (t *Table) QPCount() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	n := len(t.snapshotQPs)
+	n := len(t.snapshotQPs) + len(t.kernelQPs)
 	for _, c := range t.ctxs {
 		n += len(c.qps)
 	}
@@ -335,7 +346,8 @@ type qpResourceKey struct {
 	qpn uint32
 }
 
-// ReconcileQPs replaces snapshot resources without modifying traced entries.
+// ReconcileQPs replaces user snapshots and reaps missing kernel connections
+// without modifying uverbs entries.
 // The monitor uses ReconcileQPsIfCurrent to guard collection against events.
 func (t *Table) ReconcileQPs(resources []QPResource) bool {
 	t.mu.Lock()
@@ -383,6 +395,15 @@ func (t *Table) ReconcileQPsIfCurrent(resources []QPResource, generation map[uin
 			current = append(current, qp)
 		}
 	}
+	// Preserve kernel connections on devices changed during collection,
+	// including a connection whose QP was absent from the older inventory.
+	for _, c := range t.kernelQPs {
+		if t.generation[c.Dev] != generation[c.Dev] {
+			blocked[c.Dev] = true
+			current = append(current, QPResource{Dev: c.Dev, LocalQPN: c.LocalQPN,
+				RemoteQPN: c.RemoteQPN, QPType: c.QPType, QPState: QPStateRTS, Kernel: true})
+		}
+	}
 	changed := t.reconcileQPs(current)
 	t.snapshotDirty = len(blocked) > 0
 	return changed, !t.snapshotDirty
@@ -413,6 +434,7 @@ func (t *Table) knownQPs() map[qpResourceKey]bool {
 }
 
 func (t *Table) reconcileQPs(resources []QPResource) bool {
+	changed := t.reconcileKernelQPs(resources)
 	known := t.knownQPs()
 	next := make(map[qpResourceKey]QPResource)
 	for _, qp := range resources {
@@ -427,7 +449,6 @@ func (t *Table) reconcileQPs(resources []QPResource) bool {
 		}
 		next[key] = qp
 	}
-	changed := false
 	for key, qp := range t.snapshotQPs {
 		other := next[key].Recovered
 		if qp.Recovered != nil && (other == nil || *qp.Recovered != *other) {

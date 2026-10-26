@@ -12,3 +12,4 @@ package servicetrace
 // output directory; keep the two in sync.
 
 //go:generate go tool bpf2go -tags linux -target amd64,arm64 -type qp_event -no-global-types uverbs bpf/uverbs_trace.bpf.c -- -I bpf -I bpf/include -O2 -g -Wall -Werror
+//go:generate go tool bpf2go -tags linux -target amd64,arm64 -type kernel_event -no-global-types kernel bpf/kernel_trace.bpf.c -- -I bpf -I bpf/include -O2 -g -Wall -Werror

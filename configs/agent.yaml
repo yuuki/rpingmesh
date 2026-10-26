@@ -75,6 +75,10 @@ flow_label_rotation_period_sec: 3600
 # kernel with BTF; when the tracer cannot start, the agent logs why and keeps
 # probing without service tracing.
 service_tracing_enabled: false
+# Also trace kernel ULP connections (NVMe-oF, NFS/RDMA, Lustre).
+# Requires /sys/kernel/btf/ib_core. Failure keeps uverbs tracing active.
+# Kernel connections have no userspace PID/cgroup service attribution.
+service_tracing_kernel_ulp_enabled: false
 # Aggregate service-tracing probe rate per RNIC, shared by all of its traced
 # flows (visited in random order each pass). The paper probes service flows
 # every 10 ms; with many flows the shared cap paces each flow more slowly.

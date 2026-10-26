@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-// Kind classifies a traced uverbs command. The values match the EV_*
+// Kind classifies a traced QP command. The values match the EV_*
 // constants of bpf/uverbs_trace.bpf.c.
 type Kind uint32
 
@@ -38,13 +38,15 @@ func (k Kind) String() string {
 }
 
 // Source reports how the command reached the kernel (the SRC_* constants of
-// the BPF program). It is diagnostic only.
+// the BPF program). SourceKernel selects a separate QP identity namespace;
+// the three uverbs sources otherwise share identical table semantics.
 type Source uint32
 
 const (
 	SourceWrite       Source = 1 // write(2) on the uverbs fd
 	SourceIoctlWrite  Source = 2 // the ioctl INVOKE_WRITE method carrying a write command
 	SourceIoctlNative Source = 3 // an ioctl-native method
+	SourceKernel      Source = 4 // an in-kernel ULP; a separate QP identity namespace
 )
 
 // QP types, enum ib_uverbs_qp_type.
@@ -85,6 +87,7 @@ type Event struct {
 	TimestampNS uint64
 	// Context identifies the uverbs context (one ibv_open_device) the
 	// command belongs to. QP handles are unique only within a context.
+	// For SourceKernel it is the ib_qp pointer, in a separate namespace.
 	Context uint64
 	// CgroupID, PID, TID and Comm identify the calling process.
 	CgroupID uint64
@@ -93,11 +96,14 @@ type Event struct {
 	Comm     string
 	Kind     Kind
 	Source   Source
+	// DeviceName is set only by the kernel extension. The monitor resolves
+	// it to Dev through sysfs before applying the event to the table.
+	DeviceName string
 	// Dev is the device number (dev_t) of the uverbs node the context was
 	// opened on; UverbsDevices maps it to the RDMA device name.
 	Dev      uint32
 	QPHandle uint32
-	// QPNum and QPType are set by create events.
+	// QPNum and QPType are set by create events and all kernel events.
 	QPNum  uint32
 	QPType uint32
 	// AttrMask, QPState and the address vector are set by modify events.
@@ -155,6 +161,19 @@ func DecodeEvent(raw []byte) (Event, error) {
 		comm = comm[:i]
 	}
 	ev.Comm = string(comm)
+	if ev.Source == SourceKernel {
+		if len(raw) != eventSize+64 {
+			return Event{}, fmt.Errorf("invalid kernel event size: %d", len(raw))
+		}
+		name := raw[eventSize:]
+		n := bytes.IndexByte(name, 0)
+		if n <= 0 {
+			return Event{}, fmt.Errorf("invalid kernel event device name")
+		}
+		ev.DeviceName = string(name[:n])
+		// A kernel workqueue's process/cgroup is not a service owner.
+		ev.PID, ev.TID, ev.CgroupID, ev.Comm = 0, 0, 0, ""
+	}
 	return ev, nil
 }
 

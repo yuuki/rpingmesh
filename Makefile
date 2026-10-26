@@ -108,6 +108,13 @@ check-bpf:
 		for f in uverbs_x86_bpfel.go uverbs_arm64_bpfel.go; do \
 			diff -u "$$f" "$$tmp/$$f" || { echo "ERROR: $$f is stale; run 'make generate-bpf'"; exit 1; }; \
 		done
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+		cd $(BPF_DIR) && GOPACKAGE=servicetrace go tool bpf2go -output-dir "$$tmp" \
+			-tags linux -target amd64,arm64 -type kernel_event -no-global-types \
+			kernel bpf/kernel_trace.bpf.c -- -I bpf -I bpf/include -O2 -g -Wall -Werror && \
+		for f in kernel_x86_bpfel.go kernel_arm64_bpfel.go; do \
+			diff -u "$$f" "$$tmp/$$f" || { echo "ERROR: $$f is stale; run 'make generate-bpf'"; exit 1; }; \
+		done
 	@echo "==> eBPF check complete"
 
 # Build Go binaries

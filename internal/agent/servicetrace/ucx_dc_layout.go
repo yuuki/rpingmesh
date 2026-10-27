@@ -8,7 +8,7 @@ import (
 )
 
 // ucxDCLayout describes the experimental UCX dc_mlx5 AM-short adapter. It
-// supports non-stream DCIs through verbs and the explicitly enabled DevX
+// supports verbs DCIs and explicitly enabled DevX DCIs and streams through the
 // lifecycle adapter. Other UCT operations are not observed.
 // Keep this order identical to struct ucx_dc_layout in the BPF program.
 type ucxDCLayout struct {
@@ -18,6 +18,7 @@ type ucxDCLayout struct {
 	WQPrevious, WQProducer                               uint32
 	WQDevXObject, WQDevXBuffer, InterfacePort            uint32
 	DevXContext, DevXQPN, DevXEnabled                    uint32
+	EPChannel, StreamsEnabled                            uint32
 }
 
 type ucxDCProvider struct {
@@ -34,6 +35,13 @@ func inspectUCXDC(library, debugFile string) (*ucxDCProvider, error) {
 }
 
 func inspectUCXDCMode(library, debugFile string, devx bool) (*ucxDCProvider, error) {
+	return inspectUCXDCStreams(library, debugFile, devx, false)
+}
+
+func inspectUCXDCStreams(library, debugFile string, devx, streams bool) (*ucxDCProvider, error) {
+	if streams && !devx {
+		return nil, fmt.Errorf("UCX streams require the DevX lifecycle adapter")
+	}
 	lib, err := elf.Open(library)
 	if err != nil {
 		return nil, err
@@ -86,6 +94,10 @@ func inspectUCXDCMode(library, debugFile string, devx bool) (*ucxDCProvider, err
 			dcDWARFField{&p.layout.WQDevXObject, "uct_ib_mlx5_txwq", "super.devx.obj", 8},
 			dcDWARFField{&p.layout.WQDevXBuffer, "uct_ib_mlx5_txwq", "super.devx.wq_buf", 8},
 			dcDWARFField{&p.layout.InterfacePort, "uct_dc_mlx5_iface", "super.super.super.config.port_num", 1})
+	}
+	if streams {
+		fields = append(fields, dcDWARFField{&p.layout.EPChannel, "uct_dc_mlx5_ep", "dci_channel_index", 1})
+		p.layout.StreamsEnabled = 1
 	}
 	types := make(map[string][]*dwarf.StructType)
 	r := data.Reader()
@@ -199,4 +211,13 @@ func CheckUCXDCDevX(provider, providerDebug, ucx, ucxDebug string) error {
 		return fmt.Errorf("UCX/provider architectures differ")
 	}
 	return nil
+}
+
+// CheckUCXDCStreams validates the optional DevX stream adapter without BPF.
+func CheckUCXDCStreams(provider, providerDebug, ucx, ucxDebug string) error {
+	if err := CheckUCXDCDevX(provider, providerDebug, ucx, ucxDebug); err != nil {
+		return err
+	}
+	_, err := inspectUCXDCStreams(ucx, ucxDebug, true, true)
+	return err
 }

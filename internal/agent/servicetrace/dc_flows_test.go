@@ -122,3 +122,32 @@ func TestDCFlowsConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestDCStreamFlowsRemainDistinct(t *testing.T) {
+	table, err := newDCFlowTable(8, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	prefix := dcPrefix(t)
+	for _, channel := range []byte{0, 1, 0} {
+		prefix[10] = channel
+		if err := table.observeStreamCommitted(1, 1, 0x12345, prefix, 2, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefix[10] = 0
+	if err := table.observeCommitted(2, 1, 0x12345, prefix, now); err != nil {
+		t.Fatal(err)
+	}
+	if len(table.snapshot(now)) != 3 {
+		t.Fatal("stream/non-stream flows merged")
+	}
+	table.forgetDCI(1)
+	if len(table.snapshot(now)) != 1 {
+		t.Fatal("stream retirement incomplete")
+	}
+	if len(table.snapshot(now.Add(time.Second))) != 0 {
+		t.Fatal("flow did not expire")
+	}
+}

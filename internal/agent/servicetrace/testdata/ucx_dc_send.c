@@ -28,7 +28,7 @@ static void gate(const char *message, int command)
 }
 
 struct receiver { unsigned count; unsigned mask; };
-static int use_devx;
+static int use_devx, use_streams;
 static ucs_status_t receive(void *arg, void *data, size_t length, unsigned flags)
 {
     struct receiver *r = arg;
@@ -87,8 +87,9 @@ static uct_iface_h open_iface(uct_md_h md, uct_worker_h worker, const char *devi
 {
     uct_iface_config_t *config;
     CHECK(uct_md_iface_config_read(md, "dc_mlx5", NULL, NULL, &config));
-    CHECK(uct_config_modify(config, "DC_TX_POLICY", "rand"));
+    CHECK(uct_config_modify(config, "DC_TX_POLICY", use_streams ? "hw_dcs" : "rand"));
     CHECK(uct_config_modify(config, "DC_NUM_DCI", "1"));
+    if (use_streams) CHECK(uct_config_modify(config, "DC_NUM_DCI_CHANNELS", "4"));
     uct_iface_params_t p = {0};
     p.field_mask = UCT_IFACE_PARAM_FIELD_OPEN_MODE | UCT_IFACE_PARAM_FIELD_DEVICE |
                    UCT_IFACE_PARAM_FIELD_RX_HEADROOM;
@@ -144,6 +145,9 @@ static void report_wqe(uct_ep_h endpoint)
         dv_qp.sq.stride != 64 || bytes != (size_t)dv_qp.sq.wqe_cnt * 64 ||
         (uint16_t)ntohl(*wq->dbrec) != wq->sw_pi) fail("UCX/provider SQ correspondence");
     const unsigned char *prefix = (const unsigned char *)wq->qstart + ((wq->prev_sw_pi * 64u) & (bytes - 1));
+    if (use_streams && (iface->tx.num_dci_channels != 4 ||
+        (((unsigned)prefix[9] << 8) | prefix[10]) != ep->dci_channel_index ||
+        ep->dci_channel_index >= 4)) fail("DCI stream correspondence");
     unsigned char record[68] = {0};
     uint32_t qpn = htonl(wq->super.qp_num);
     memcpy(record, &qpn, 4);
@@ -154,8 +158,10 @@ static void report_wqe(uct_ep_h endpoint)
 
 int main(int argc, char **argv)
 {
-    if (argc != 4 && (argc != 5 || strcmp(argv[4], "--devx"))) fail("expected device, port, GID index and optional --devx");
+    if (argc != 4 && (argc != 5 || (strcmp(argv[4], "--devx") && strcmp(argv[4], "--streams"))))
+        fail("expected device, port, GID index and optional --devx or --streams");
     use_devx = argc == 5;
+    use_streams = argc == 5 && !strcmp(argv[4], "--streams");
     alarm(60);
     if (setenv("UCX_IB_MLX5_DEVX", use_devx ? "yes" : "no", 1) || setenv("UCX_IB_GID_INDEX", argv[3], 1) ||
         setenv("UCX_LOG_LEVEL", "error", 1)) fail("environment");
@@ -172,19 +178,22 @@ int main(int argc, char **argv)
     gate("ready", 'g');
     uct_iface_h sender = open_iface(md, worker, device);
     uct_iface_h receivers[2];
-    uct_ep_h eps[2];
+    uct_ep_h eps[3];
+    unsigned ep_count = use_streams ? 3 : 2;
     struct receiver state[2] = {{0}};
     for (unsigned i = 0; i < 2; ++i) {
         receivers[i] = open_iface(md, worker, device);
         CHECK(uct_iface_set_am_handler(receivers[i], 1, receive, &state[i], 0));
-        eps[i] = connect_ep(sender, receivers[i]);
+    }
+    for (unsigned i = 0; i < ep_count; ++i) {
+        eps[i] = connect_ep(sender, receivers[use_streams ? i / 2 : i]);
     }
     for (uint64_t i = 0; i < 3; ++i) {
-        CHECK(uct_ep_am_short(eps[i % 2], 1, i, "test", 4));
-        report_wqe(eps[i % 2]);
+        CHECK(uct_ep_am_short(eps[i % ep_count], 1, i, "test", 4));
+        report_wqe(eps[i % ep_count]);
         while (state[0].count + state[1].count != i + 1) uct_worker_progress(worker);
     }
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0; i < ep_count; ++i) {
         ucs_status_t status;
         do {
             status = uct_ep_flush(eps[i], 0, NULL);
@@ -192,9 +201,9 @@ int main(int argc, char **argv)
         } while (status == UCS_INPROGRESS || status == UCS_ERR_NO_RESOURCE);
         if (status != UCS_OK) fail("send completion");
     }
-    if (state[0].mask != 5 || state[1].mask != 2) fail("receive destinations");
+    if (state[0].mask != (use_streams ? 3u : 5u) || state[1].mask != (use_streams ? 4u : 2u)) fail("receive destinations");
     gate("delivered", 'd');
-    for (unsigned i = 0; i < 2; ++i) uct_ep_destroy(eps[i]);
+    for (unsigned i = 0; i < ep_count; ++i) uct_ep_destroy(eps[i]);
     uct_iface_close(sender);
     for (unsigned i = 0; i < 2; ++i) uct_iface_close(receivers[i]);
     gate("retired", 'x');

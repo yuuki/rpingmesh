@@ -115,3 +115,28 @@ func FuzzDecodeMLX5DCAddress(f *testing.F) {
 		}
 	})
 }
+
+func TestDecodeMLX5DCStreamAddress(t *testing.T) {
+	for _, channels := range []uint32{2, 4, 128} {
+		for channel := uint16(0); uint32(channel) < channels; channel++ {
+			prefix := dcPrefix(t)
+			binary.BigEndian.PutUint16(prefix[9:11], channel)
+			a, err := decodeMLX5DCStreamAddress(prefix, 0x12345, channels)
+			if err != nil || a.StreamChannel != channel || uint32(a.StreamChannels) != channels || a.AVUDPSourcePort != 0xd234 {
+				t.Fatalf("stream decode: %+v, %v", a, err)
+			}
+		}
+		prefix := dcPrefix(t)
+		for _, channel := range []uint16{uint16(channels), 256, 65535} {
+			binary.BigEndian.PutUint16(prefix[9:11], channel)
+			if _, err := decodeMLX5DCStreamAddress(prefix, 0x12345, channels); err == nil {
+				t.Fatal("accepted out-of-range stream")
+			}
+		}
+	}
+	for _, channels := range []uint32{1, 3, 129, 256, 65536} {
+		if _, err := decodeMLX5DCStreamAddress(dcPrefix(t), 0x12345, channels); err == nil {
+			t.Fatal("accepted invalid channel count")
+		}
+	}
+}

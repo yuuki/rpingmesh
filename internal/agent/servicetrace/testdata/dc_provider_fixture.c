@@ -57,6 +57,11 @@ struct uct_dc_mlx5_ep {
 #else
     uint16_t dci;
 #endif
+#ifdef TEST_UCX_BAD_CHANNEL
+    uint16_t dci_channel_index;
+#else
+    uint8_t dci_channel_index;
+#endif
 };
 static struct uct_dc_dci ucx_dci;
 static struct uct_dc_dci *ucx_array[] = {&ucx_dci};
@@ -87,6 +92,7 @@ __attribute__((noinline)) int uct_dc_mlx5_iface_create_dci(struct uct_dc_mlx5_if
     ucx_dci.txwq.qstart = queue; ucx_dci.txwq.qend = queue + 64;
     ucx_dci.txwq.dbrec = &ucx_db;
     ucx_devx_active = 1;
+    ucx_ep.dci_channel_index = 0;
     *out = &ucx_dci;
     return 0;
 }
@@ -135,6 +141,8 @@ __attribute__((noinline)) int uct_dc_mlx5_ep_am_short(struct uct_dc_mlx5_ep *ep)
     memset(p, 0, 64);
     put32(p, ((pos & 0xffff) << 8) | 0x0a);
     put32(p + 4, (0x12345 << 8) | 4);
+    p[9] = ucx_mode == 6;
+    p[10] = ep->dci_channel_index + (ucx_mode == 7);
     memset(p + 16, 0xa5, 8);
     put32(p + 24, 0x80000010);
     p[30] = 0xc1; p[31] = 0x23; p[43] = 64;
@@ -215,10 +223,10 @@ int main(int argc, char **argv)
             break;
         }
         case 's': failure = 0; submit(2, 0); break;
-        case 'C': case 'S': case 'K': {
+        case 'C': case 'S': case 'K': case 'O': case 'T': {
             struct uct_dc_dci *result = NULL;
             devx_failure = op == 'K' ? EINVAL : 0;
-            uct_dc_mlx5_iface_create_dci(&ucx_iface, 0, op == 'S' ? 2 : 1, &result);
+            uct_dc_mlx5_iface_create_dci(&ucx_iface, 0, op == 'S' ? 2 : op == 'O' ? 0 : op == 'T' ? 3 : 1, &result);
             devx_failure = 0;
             break;
         }
@@ -233,8 +241,11 @@ int main(int argc, char **argv)
             devx_failure = 0;
             break;
         case 'X': mlx5dv_devx_obj_destroy(&devx_object); break;
-        case 'A': case 'F': case 'D': case 'B': case 'I': case 'Q': case 'W':
-            ucx_mode = op == 'F' ? 1 : op == 'D' ? 2 : op == 'B' ? 3 : op == 'I' ? 4 : op == 'Q' ? 5 : 0;
+        case '0': case '1': case '2':
+            ucx_ep.dci_channel_index = op - '0';
+            break;
+        case 'A': case 'F': case 'D': case 'B': case 'I': case 'Q': case 'W': case 'H': case 'L':
+            ucx_mode = op == 'F' ? 1 : op == 'D' ? 2 : op == 'B' ? 3 : op == 'I' ? 4 : op == 'Q' ? 5 : op == 'H' ? 6 : op == 'L' ? 7 : 0;
             if (op == 'W') storage.sq.cur_post = 65535;
             uct_dc_mlx5_ep_am_short(&ucx_ep);
             break;

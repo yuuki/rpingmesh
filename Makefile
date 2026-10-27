@@ -117,7 +117,7 @@ check-bpf:
 		done
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 		cd $(BPF_DIR) && GOPACKAGE=servicetrace go tool bpf2go -output-dir "$$tmp" \
-			-tags linux -target amd64,arm64 -type dc_batch -type dc_identity -type dc_config -no-global-types \
+			-tags linux -target amd64,arm64 -type dc_batch -type dc_devx_queue -type dc_identity -type dc_config -no-global-types \
 			dc bpf/dc_trace.bpf.c -- -mcpu=v3 -I bpf -I bpf/include -O2 -g -Wall -Werror && \
 		for f in dc_x86_bpfel.go dc_arm64_bpfel.go; do \
 			diff -u "$$f" "$$tmp/$$f" || { echo "ERROR: $$f is stale; run 'make generate-bpf'"; exit 1; }; \

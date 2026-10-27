@@ -125,6 +125,7 @@ func TestDCBPFSpec(t *testing.T) {
 		t.Fatal(err)
 	}
 	if spec.Maps[dcMapDcSettings].ValueSize != uint32(4+binary.Size(dcLayout{})) ||
+		spec.Maps[dcMapDcDevxQueues].ValueSize != uint32(binary.Size(dcDcDevxQueue{})) ||
 		spec.Maps[dcMapDcUcxLayout].ValueSize != uint32(binary.Size(ucxDCLayout{})) ||
 		spec.Maps[dcMapDcPending].ValueSize != uint32(binary.Size(dcDcBatch{})) ||
 		binary.Size(dcDcBatch{}) != 1064 {
@@ -149,7 +150,15 @@ func TestUCXDevXUprobeIntegration(t *testing.T) {
 	testDCUprobeIntegration(t, false, true)
 }
 
-func testDCUprobeIntegration(t *testing.T, workerExec, devx bool) {
+func TestUCXStreamUprobeIntegration(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_STREAM_UPROBE_TEST") != "1" {
+		t.Skip("user-run privileged UCX stream lifecycle test")
+	}
+	testDCUprobeIntegration(t, false, true, true)
+}
+
+func testDCUprobeIntegration(t *testing.T, workerExec, devx bool, streamOption ...bool) {
+	streams := len(streamOption) > 0 && streamOption[0]
 	file := buildDCFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -186,7 +195,7 @@ func testDCUprobeIntegration(t *testing.T, workerExec, devx bool) {
 		}
 	}
 	c, err := OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: file, DebugFile: file,
-		UCXLibrary: file, UCXDebugFile: file, UCXDevX: devx, Device: "test-device", Port: 1, sysfsRoot: root})
+		UCXLibrary: file, UCXDebugFile: file, UCXDevX: devx, UCXStreams: streams, Device: "test-device", Port: 1, sysfsRoot: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +320,7 @@ func testDCUprobeIntegration(t *testing.T, workerExec, devx bool) {
 	await(func(s DCStats) bool {
 		return s.UnsupportedBatches == before.UnsupportedBatches+5 && s.UCXSubmissions == 2 && s.ActiveFlows == 0
 	})
-	if devx {
+	if devx && !streams {
 		baseline, err := c.Stats()
 		if err != nil {
 			t.Fatal(err)
@@ -375,7 +384,7 @@ func testDCUprobeIntegration(t *testing.T, workerExec, devx bool) {
 		accepted(4, 0)
 		it := c.objs.DcDevxQueues.Iterate()
 		var key uint64
-		var queue [4]uint64
+		var queue dcDcDevxQueue
 		if it.Next(&key, &queue) || it.Err() != nil {
 			t.Fatal("exec retained DevX queue metadata")
 		}
@@ -385,6 +394,87 @@ func testDCUprobeIntegration(t *testing.T, workerExec, devx bool) {
 		accepted(5, 1)
 		command('X')
 		accepted(5, 0)
+	}
+	if streams {
+		baseline, err := c.Stats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		accepted := func(n uint64, active int) {
+			t.Helper()
+			await(func(s DCStats) bool { return s.AcceptedSends == baseline.AcceptedSends+n && s.ActiveFlows == active })
+		}
+		command('S')
+		command('A') // Not connected yet.
+		accepted(0, 0)
+		command('N')
+		command('A') // Stream zero is a stream flow.
+		accepted(1, 1)
+		command('1')
+		command('A') // Same address and QPN, different channel.
+		accepted(2, 2)
+		c.mu.Lock()
+		flows := c.table.snapshot(time.Now())
+		c.mu.Unlock()
+		seen := map[uint16]bool{}
+		for _, flow := range flows {
+			if flow.Address.StreamChannels != 2 {
+				t.Fatal("lost stream creation metadata")
+			}
+			seen[flow.Address.StreamChannel] = true
+		}
+		if !seen[0] || !seen[1] {
+			t.Fatal("stream flows were merged")
+		}
+		command('W') // Producer and ring wrap retain the stream.
+		accepted(3, 2)
+		for _, op := range []byte{'F', 'H', 'L', 'B'} {
+			command(op)
+		}
+		command('2')
+		command('A') // Out of the creation-time range.
+		accepted(3, 2)
+		command('M')
+		accepted(3, 0) // Failed modification still retires.
+		command('0')
+		command('N')
+		command('A')
+		accepted(3, 0)
+		command('S')
+		command('J')
+		command('A')
+		accepted(3, 0)
+		command('X')
+		for _, op := range []byte{'O', 'T', 'K'} {
+			command(op)
+			command('N')
+			command('A')
+			accepted(3, 0)
+			command('X')
+		}
+		command('S')
+		command('N')
+		command('1')
+		command('A')
+		accepted(4, 1)
+		command('e')
+		accepted(4, 0)
+		command('S')
+		command('N')
+		command('A')
+		accepted(5, 1)
+		command('X')
+		accepted(5, 0)
+		command('C')
+		command('N')
+		command('1')
+		command('A') // Non-stream DCI rejects nonzero channel.
+		accepted(5, 0)
+		command('0')
+		command('A')
+		accepted(6, 1)
+		command('X')
+		accepted(6, 0)
 	}
 	final, err = c.Stats()
 	if err != nil {
@@ -417,4 +507,11 @@ func testDCUprobeIntegration(t *testing.T, workerExec, devx bool) {
 	}
 	await(func(s DCStats) bool { return s.ActiveFlows == 0 })
 
+}
+
+func TestUCXStreamsRejectUnsupportedLayout(t *testing.T) {
+	file := buildDCFixture(t, "-DTEST_UCX_BAD_CHANNEL")
+	if err := CheckUCXDCStreams(file, file, file, file); err == nil {
+		t.Fatal("accepted incorrect endpoint channel width")
+	}
 }

@@ -20,31 +20,51 @@ func TestUCXDCHardware(t *testing.T) {
 	if os.Getenv("RPINGMESH_UCX_DC_HARDWARE_TEST") != "1" {
 		t.Skip("opt-in UCX DC hardware test")
 	}
-	testUCXDCHardware(t, false, false)
+	testUCXDCHardware(t, false, false, false)
 }
 
 func TestUCXDCUprobeHardware(t *testing.T) {
 	if os.Getenv("RPINGMESH_UCX_DC_UPROBE_TEST") != "1" {
 		t.Skip("user-run privileged UCX DC hardware test")
 	}
-	testUCXDCHardware(t, true, false)
+	testUCXDCHardware(t, true, false, false)
 }
 
 func TestUCXDevXDCHardware(t *testing.T) {
 	if os.Getenv("RPINGMESH_UCX_DEVX_HARDWARE_TEST") != "1" {
 		t.Skip("opt-in UCX DevX hardware test")
 	}
-	testUCXDCHardware(t, false, true)
+	testUCXDCHardware(t, false, true, false)
 }
 
 func TestUCXDevXDCUprobeHardware(t *testing.T) {
 	if os.Getenv("RPINGMESH_UCX_DEVX_UPROBE_TEST") != "1" {
 		t.Skip("user-run privileged UCX DevX hardware test")
 	}
-	testUCXDCHardware(t, true, true)
+	testUCXDCHardware(t, true, true, false)
 }
 
-func testUCXDCHardware(t *testing.T, attach, devx bool) {
+func TestUCXStreamDCHardware(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_STREAM_HARDWARE_TEST") != "1" {
+		t.Skip("opt-in UCX DCI stream hardware test")
+	}
+	testUCXDCHardware(t, false, true, true)
+}
+
+func TestUCXStreamDCUprobeHardware(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_STREAM_UPROBE_TEST") != "1" {
+		t.Skip("user-run privileged UCX DCI stream hardware test")
+	}
+	testUCXDCHardware(t, true, true, true)
+}
+
+func testUCXDCHardware(t *testing.T, attach, devx, streams bool) {
+	wantFlows := 2
+	var channels uint32
+	if streams {
+		wantFlows = 3
+		channels = 4
+	}
 	get := func(name string) string {
 		t.Helper()
 		value := os.Getenv(name)
@@ -71,10 +91,17 @@ func testUCXDCHardware(t *testing.T, attach, devx bool) {
 			t.Fatal(err)
 		}
 	}
+	if streams {
+		if err := CheckUCXDCStreams(library, debug, ucx, ucxDebug); err != nil {
+			t.Fatal(err)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	child := exec.CommandContext(ctx, get("RPINGMESH_UCX_DC_HELPER"), device, portText, gid)
-	if devx {
+	if streams {
+		child.Args = append(child.Args, "--streams")
+	} else if devx {
 		child.Args = append(child.Args, "--devx")
 	}
 	stdin, err := child.StdinPipe()
@@ -124,7 +151,7 @@ func testUCXDCHardware(t *testing.T, attach, devx bool) {
 	var c *DCCollector
 	if attach {
 		c, err = OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: library, DebugFile: debug,
-			UCXLibrary: ucx, UCXDebugFile: ucxDebug, UCXDevX: devx, Device: device, Port: uint8(port)})
+			UCXLibrary: ucx, UCXDebugFile: ucxDebug, UCXDevX: devx, UCXStreams: streams, Device: device, Port: uint8(port)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -147,6 +174,8 @@ func testUCXDCHardware(t *testing.T, attach, devx bool) {
 	status("delivered")
 	want := make(map[mlx5DCAddress]bool)
 	var qpn uint32
+	seenChannels := make(map[uint16]bool)
+	destinations := make(map[uint32]bool)
 	for i := 0; i < 3; i++ {
 		record := records[i*68 : (i+1)*68]
 		if !bytes.Equal(record[20:28], make([]byte, 8)) {
@@ -157,14 +186,24 @@ func testUCXDCHardware(t *testing.T, attach, devx bool) {
 			t.Fatal("expected one shared DCI")
 		}
 		qpn = n
-		address, err := decodeMLX5DCAddress(record[4:], qpn)
+		address, err := decodeMLX5DCStreamAddress(record[4:], qpn, channels)
 		if err != nil {
 			t.Fatalf("invalid UCX submitted prefix: %v", err)
 		}
+		if streams {
+			if seenChannels[address.StreamChannel] {
+				t.Fatal("expected three distinct streams")
+			}
+			seenChannels[address.StreamChannel] = true
+		}
+		destinations[address.RemoteDCT] = true
 		want[address] = true
 	}
-	if len(want) != 2 {
-		t.Fatal("expected two distinct destination flows")
+	if len(destinations) != 2 {
+		t.Fatal("expected two destination DCTs")
+	}
+	if len(want) != wantFlows {
+		t.Fatal("unexpected number of destination/stream flows")
 	}
 	await := func(active int) DCStats {
 		t.Helper()
@@ -184,7 +223,7 @@ func testUCXDCHardware(t *testing.T, attach, devx bool) {
 		}
 	}
 	if attach {
-		s := await(2)
+		s := await(wantFlows)
 		if s.UCXSubmissions != 3 || s.SubmittedBatches != 3 || s.ReadErrors != 0 || s.MapErrors != 0 ||
 			s.RingLost != 0 || s.RejectedRecords != 0 || s.FailedSubmissions != 0 {
 			t.Fatalf("unexpected UCX counters: %+v", s)
@@ -218,8 +257,8 @@ func testUCXDCHardware(t *testing.T, attach, devx bool) {
 		t.Fatal("UCX helper teardown failed")
 	}
 	if attach {
-		t.Logf("verified 3 UCX direct sends, 2 destination flows, and DCI retirement (DevX=%t)", devx)
+		t.Logf("verified 3 UCX direct sends, %d destination/stream flows, and DCI retirement (DevX=%t, streams=%t)", wantFlows, devx, streams)
 	} else {
-		t.Logf("verified selected libraries and 3 UCX direct sends with receive and flush completion (DevX=%t); BPF was not loaded", devx)
+		t.Logf("verified selected libraries and 3 UCX direct sends with receive and flush completion (DevX=%t, streams=%t); BPF was not loaded", devx, streams)
 	}
 }

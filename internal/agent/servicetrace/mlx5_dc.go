@@ -11,6 +11,8 @@ import (
 // In particular, FlowLabel == 0 must NOT use the connected-QP QPN calculation.
 type mlx5DCAddress struct {
 	LocalQPN        uint32
+	StreamChannel   uint16
+	StreamChannels  uint16
 	RemoteDCT       uint32
 	RemoteGID       [16]byte
 	RemoteMAC       [6]byte
@@ -32,6 +34,13 @@ type mlx5DCAddress struct {
 // this prefix before a ring slot is reused and associate it with a confirmed
 // submission. Access keys and payload bytes are never returned or retained.
 func decodeMLX5DCAddress(prefix []byte, expectedQPN uint32) (mlx5DCAddress, error) {
+	return decodeMLX5DCStreamAddress(prefix, expectedQPN, 0)
+}
+
+// decodeMLX5DCStreamAddress accepts streams only with an adapter-validated
+// creation-time channel count. Zero preserves the non-stream decoder contract.
+// Stream identity is retained separately; the AV port is never a wire-port claim.
+func decodeMLX5DCStreamAddress(prefix []byte, expectedQPN uint32, channels uint32) (mlx5DCAddress, error) {
 	var a mlx5DCAddress
 	if len(prefix) < 64 {
 		return a, fmt.Errorf("mlx5 DC WQE prefix: need 64 bytes, got %d", len(prefix))
@@ -42,10 +51,11 @@ func decodeMLX5DCAddress(prefix []byte, expectedQPN uint32) (mlx5DCAddress, erro
 	if expectedQPN == 0 || expectedQPN > 0xffffff || qpnDS>>8 != expectedQPN {
 		return a, fmt.Errorf("mlx5 DC WQE QPN does not match DCI")
 	}
-	// No opcode modifiers or streams have been validated by this decoder.
-	// Stream zero is also possible on a stream-enabled QP, hence the caller's
-	// independent requirement to exclude stream-enabled DCIs.
-	if ctrl>>24 != 0 || be.Uint16(prefix[9:11]) != 0 {
+	channel := be.Uint16(prefix[9:11])
+	if channels != 0 && (channels < 2 || channels > 128 || channels&(channels-1) != 0) {
+		return a, fmt.Errorf("invalid DCI stream channel count")
+	}
+	if ctrl>>24 != 0 || (channels == 0 && channel != 0) || (channels != 0 && uint32(channel) >= channels) {
 		return a, fmt.Errorf("mlx5 DC WQE opcode modifier or stream is unsupported")
 	}
 	minDS := uint32(4)
@@ -78,6 +88,7 @@ func decodeMLX5DCAddress(prefix []byte, expectedQPN uint32) (mlx5DCAddress, erro
 		return mlx5DCAddress{}, fmt.Errorf("mlx5 DC WQE has no remote GID")
 	}
 	a.LocalQPN = expectedQPN
+	a.StreamChannel, a.StreamChannels = channel, uint16(channels)
 	a.RemoteDCT = dct & 0xffffff
 	copy(a.RemoteMAC[:], prefix[36:42])
 	a.AVUDPSourcePort = port

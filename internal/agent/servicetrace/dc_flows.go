@@ -47,10 +47,14 @@ func newDCFlowTable(capacity int, ttl time.Duration) (*dcFlowTable, error) {
 // monotonic clock used by snapshot, not a hardware timestamp. Older events
 // are rejected; a live adapter must order events and filter destroyed tokens.
 func (t *dcFlowTable) observeCommitted(dci uint64, port uint8, qpn uint32, prefix []byte, now time.Time) error {
+	return t.observeStreamCommitted(dci, port, qpn, prefix, 0, now)
+}
+
+func (t *dcFlowTable) observeStreamCommitted(dci uint64, port uint8, qpn uint32, prefix []byte, channels uint32, now time.Time) error {
 	if dci == 0 || port == 0 || now.IsZero() {
 		return fmt.Errorf("DC observation needs a lifetime token, port and timestamp")
 	}
-	address, err := decodeMLX5DCAddress(prefix, qpn)
+	address, err := decodeMLX5DCStreamAddress(prefix, qpn, channels)
 	if err != nil {
 		return err
 	}

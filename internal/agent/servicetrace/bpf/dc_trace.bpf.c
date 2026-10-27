@@ -18,7 +18,7 @@ struct dc_identity { __u64 token; __u32 qpn; __s32 fd; __u32 port, state; };
 struct dc_batch {
     __u64 qp;
     struct dc_identity identity;
-    __u32 count, reserved;
+    __u32 count, stream_channels;
     __u8 prefix[MAX_BATCH][64];
 };
 struct dc_create_pending { __s32 fd; };
@@ -30,12 +30,14 @@ struct ucx_dc_layout {
     __u32 wq_previous, wq_producer;
     __u32 wq_devx_object, wq_devx_buffer, interface_port;
     __u32 devx_context, devx_qpn, devx_enabled;
+    __u32 ep_channel, streams_enabled;
 };
-struct dc_devx_queue { __u64 token, start, end, db; };
+struct dc_devx_queue { __u64 token, start, end, db; __u32 channels, reserved; };
+struct dc_devx_create_pending { __u64 result; __u32 channels, reserved; };
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 4096);
     __type(key, __u64); __type(value, struct dc_devx_queue); } dc_devx_queues SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 256);
-    __type(key, __u64); __type(value, __u64); } dc_devx_creating SEC(".maps");
+    __type(key, __u64); __type(value, struct dc_devx_create_pending); } dc_devx_creating SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 256);
     __type(key, __u64); __type(value, struct dc_modify_pending); } dc_devx_connecting SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
@@ -276,7 +278,7 @@ int dc_complete_enter(struct pt_regs *ctx)
      * out-of-line memset. Clear unused slots as well as the redacted keys. */
     for (__u32 i = 0; i < sizeof(b->prefix) / 8; i++)
         ((volatile __u64 *)b->prefix)[i] = 0;
-    b->reserved = 0;
+    b->stream_channels = 0;
     b->qp = qp; b->identity = *id; b->count = nreq;
     for (__u32 i = 0; i < MAX_BATCH; i++) {
         if (i >= nreq) break;
@@ -317,7 +319,7 @@ int dc_complete_exit(struct pt_regs *ctx)
 
 /* UCX dc_mlx5 AM-short returns UCS_OK only after ringing the doorbell. Its
  * helpers are inlined, so inspect the last posted WQE at the public function's
- * return. This deliberately excludes other UCT operations and DevX DCIs. */
+ * return. Other UCT operations are not observed. */
 SEC("uprobe")
 int dc_ucx_enter(struct pt_regs *ctx)
 {
@@ -356,7 +358,7 @@ int dc_ucx_exit(struct pt_regs *ctx)
     struct dc_identity *id = bpf_map_lookup_elem(&dc_qps, &qp);
     if (!current(id) || !id->port || id->state != 3 || id->qpn != qpn || (type == 0 && qp < l->qp_base)) goto unsupported;
     __u64 start = 0, end = 0, curr = 0, db = 0, provider_start = 0;
-    __u32 db_value = 0, blocks = 0, shift = 0;
+    __u32 db_value = 0, blocks = 0, shift = 0, channels = 0;
     __u16 previous = 0, producer = 0;
     if (READ(start, wq, u->wq_start) || READ(end, wq, u->wq_end) ||
         READ(curr, wq, u->wq_current) || READ(db, wq, u->wq_db) ||
@@ -366,6 +368,8 @@ int dc_ucx_exit(struct pt_regs *ctx)
         struct dc_devx_queue *saved = bpf_map_lookup_elem(&dc_devx_queues, &qp);
         if (!saved || saved->token != id->token || saved->start != start || saved->end != end || saved->db != db) goto unsupported;
         if (READ(provider_start, wq, u->wq_devx_buffer)) goto read_failed;
+        channels = saved->channels > 1 ? saved->channels : 0;
+        if (channels && !u->streams_enabled) goto unsupported;
         blocks = (end - start) >> 6;
         shift = 6;
     } else if (READ(provider_start, qp - l->qp_base, l->sq_start) ||
@@ -379,7 +383,7 @@ int dc_ucx_exit(struct pt_regs *ctx)
     if (!b) { count(4); return 0; }
     for (__u32 i = 0; i < sizeof(b->prefix) / 8; i++)
         ((volatile __u64 *)b->prefix)[i] = 0;
-    b->qp = qp; b->identity = *id; b->count = 1; b->reserved = 0;
+    b->qp = qp; b->identity = *id; b->count = 1; b->stream_channels = channels;
     __u64 wqe = start + ((__u64)(previous & (blocks - 1)) << 6);
     /* Never read the DC access key or message payload. */
     if (bpf_probe_read_user(b->prefix[0], 16, (void *)wqe) ||
@@ -391,6 +395,12 @@ int dc_ucx_exit(struct pt_regs *ctx)
     if ((ctrl & 0xff0000ff) != 0x0a || ((ctrl >> 8) & 0xffff) != previous ||
         (qpn_ds >> 8) != qpn || (qpn_ds & 192) || (qpn_ds & 63) < 4 ||
         ((qpn_ds & 63) + 3) / 4 != posted) goto unsupported;
+    __u16 channel = ((__u16)b->prefix[0][9] << 8) | b->prefix[0][10];
+    if (channels) {
+        __u8 expected = 0;
+        if (READ(expected, ep, u->ep_channel)) goto read_failed;
+        if (channel >= channels || channel != expected) goto unsupported;
+    } else if (channel) goto unsupported;
     if (bpf_ringbuf_output(&dc_events, b, sizeof(*b), 0)) count(5);
     else { count(0); count(8); if (type == 1) count(9); }
     return 0;
@@ -400,16 +410,20 @@ unsupported:
     count(2); return 0;
 }
 
-/* Register only successful UCX DCI creations with exactly one channel.
+/* Register successful UCX DCI creations with validated channel counts.
  * The opaque DevX object's layout comes from matching libmlx5 DWARF. */
 SEC("uprobe")
 int dc_devx_create_enter(struct pt_regs *ctx)
 {
     if (!layout()) return 0;
-    __u64 task = bpf_get_current_pid_tgid(), result = PT_REGS_PARM4(ctx);
+    __u64 task = bpf_get_current_pid_tgid();
+    __u32 zero = 0, channels = (__u8)PT_REGS_PARM3(ctx);
+    struct ucx_dc_layout *u = bpf_map_lookup_elem(&dc_ucx_layout, &zero);
     bpf_map_delete_elem(&dc_devx_creating, &task);
-    if ((__u8)PT_REGS_PARM3(ctx) != 1) { count(2); return 0; }
-    if (bpf_map_update_elem(&dc_devx_creating, &task, &result, BPF_ANY)) count(4);
+    if (!u || !channels || (channels & (channels - 1)) ||
+        (channels != 1 && !u->streams_enabled)) { count(2); return 0; }
+    struct dc_devx_create_pending p = {.result = PT_REGS_PARM4(ctx), .channels = channels};
+    if (bpf_map_update_elem(&dc_devx_creating, &task, &p, BPF_ANY)) count(4);
     return 0;
 }
 
@@ -419,9 +433,10 @@ int dc_devx_create_exit(struct pt_regs *ctx)
     struct dc_layout *l = layout();
     if (!l) return 0;
     __u64 task = bpf_get_current_pid_tgid();
-    __u64 *pending = bpf_map_lookup_elem(&dc_devx_creating, &task);
+    struct dc_devx_create_pending *pending = bpf_map_lookup_elem(&dc_devx_creating, &task);
     if (!pending) return 0;
-    __u64 result = *pending;
+    __u64 result = pending->result;
+    __u32 channels = pending->channels;
     bpf_map_delete_elem(&dc_devx_creating, &task);
     if (PT_REGS_RC(ctx)) return 0;
     __u32 zero = 0;
@@ -430,7 +445,7 @@ int dc_devx_create_exit(struct pt_regs *ctx)
     __u64 dci = 0, obj = 0, context = 0, buffer = 0;
     __u32 type = 0, qpn = 0;
     struct dc_identity id = {};
-    struct dc_devx_queue queue = {};
+    struct dc_devx_queue queue = {.channels = channels};
     if (READ(dci, result, 0)) goto failed;
     __u64 wq = dci + u->dci_wq;
     if (READ(type, wq, u->wq_type)) goto failed;

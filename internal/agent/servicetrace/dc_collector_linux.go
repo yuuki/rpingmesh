@@ -36,6 +36,7 @@ type DCOptions struct {
 	Library, DebugFile, Device string
 	UCXLibrary, UCXDebugFile   string
 	UCXDevX                    bool
+	UCXStreams                 bool
 	Port                       uint8
 	Capacity                   int
 	IdleTimeout                time.Duration
@@ -88,6 +89,9 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 		options.Device == "" || filepath.Base(options.Device) != options.Device || options.Device == "." || options.Device == ".." {
 		return nil, fmt.Errorf("DC collector requires a PID, provider/debug ELF, device and port")
 	}
+	if options.UCXStreams && !options.UCXDevX {
+		return nil, fmt.Errorf("UCX streams require UCX DevX")
+	}
 	if options.Capacity == 0 {
 		options.Capacity = 4096
 	}
@@ -138,7 +142,7 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 			return nil, err
 		}
 		ucxPinned = fmt.Sprintf("/proc/self/fd/%d", c.ucxLibrary.Fd())
-		ucx, err = inspectUCXDCMode(ucxPinned, options.UCXDebugFile, options.UCXDevX)
+		ucx, err = inspectUCXDCStreams(ucxPinned, options.UCXDebugFile, options.UCXDevX, options.UCXStreams)
 		if err != nil {
 			return nil, err
 		}
@@ -374,7 +378,7 @@ func (c *DCCollector) Run(ctx context.Context) error {
 func (c *DCCollector) consume(raw []byte, now time.Time) {
 	var b dcDcBatch
 	if len(raw) != binary.Size(b) || binary.Read(bytes.NewReader(raw), binary.LittleEndian, &b) != nil ||
-		b.Count == 0 || b.Count > 16 || b.Reserved != 0 || b.Identity.Port != uint32(c.options.Port) {
+		b.Count == 0 || b.Count > 16 || b.Identity.Port != uint32(c.options.Port) {
 		c.rejected.Add(1)
 		return
 	}
@@ -385,6 +389,15 @@ func (c *DCCollector) consume(raw []byte, now time.Time) {
 		c.rejected.Add(1)
 		return
 	}
+	// Stream metadata must still belong to this live DevX DCI.
+	if b.StreamChannels != 0 {
+		var queue dcDcDevxQueue
+		if !c.options.UCXStreams || b.Count != 1 ||
+			c.objs.DcDevxQueues.Lookup(b.Qp, &queue) != nil || queue.Token != id.Token || queue.Channels != b.StreamChannels {
+			c.rejected.Add(1)
+			return
+		}
+	}
 	// Validate the entire batch before admitting any of it.
 	for i := uint32(0); i < b.Count; i++ {
 		if b.Prefix[i][16]|b.Prefix[i][17]|b.Prefix[i][18]|b.Prefix[i][19]|
@@ -392,14 +405,14 @@ func (c *DCCollector) consume(raw []byte, now time.Time) {
 			c.rejected.Add(1)
 			return
 		}
-		a, err := decodeMLX5DCAddress(b.Prefix[i][:], id.Qpn)
+		a, err := decodeMLX5DCStreamAddress(b.Prefix[i][:], id.Qpn, b.StreamChannels)
 		if err != nil || !c.roceV2(a.SGIDIndex) {
 			c.rejected.Add(1)
 			return
 		}
 	}
 	for i := uint32(0); i < b.Count; i++ {
-		if err := c.table.observeCommitted(id.Token, uint8(id.Port), id.Qpn, b.Prefix[i][:], now); err != nil {
+		if err := c.table.observeStreamCommitted(id.Token, uint8(id.Port), id.Qpn, b.Prefix[i][:], b.StreamChannels, now); err != nil {
 			c.table.reset()
 			c.rejected.Add(1)
 			return

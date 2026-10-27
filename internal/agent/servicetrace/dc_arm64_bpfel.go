@@ -14,12 +14,12 @@ import (
 )
 
 type dcDcBatch struct {
-	_        structs.HostLayout
-	Qp       uint64
-	Identity dcDcIdentity
-	Count    uint32
-	Reserved uint32
-	Prefix   [16][64]uint8
+	_              structs.HostLayout
+	Qp             uint64
+	Identity       dcDcIdentity
+	Count          uint32
+	StreamChannels uint32
+	Prefix         [16][64]uint8
 }
 
 type dcDcConfig struct {
@@ -44,6 +44,16 @@ type dcDcConfig struct {
 		AttrPort     uint32
 		AttrAvPort   uint32
 	}
+}
+
+type dcDcDevxQueue struct {
+	_        structs.HostLayout
+	Token    uint64
+	Start    uint64
+	End      uint64
+	Db       uint64
+	Channels uint32
+	Reserved uint32
 }
 
 type dcDcIdentity struct {

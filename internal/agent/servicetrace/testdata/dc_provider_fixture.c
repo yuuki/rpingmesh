@@ -132,7 +132,7 @@ __attribute__((noinline)) int mlx5_send_wr_complete(struct ibv_qp_ex *qp)
 static void put32(unsigned char *p, uint32_t v)
 { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
 
-__attribute__((noinline)) int uct_dc_mlx5_ep_am_short(struct uct_dc_mlx5_ep *ep)
+static int ucx_post(struct uct_dc_mlx5_ep *ep)
 {
     if (ucx_mode == 1) return -2;
     struct uct_ib_mlx5_txwq *wq = &ep->super.super.iface->tx.dcis.buffer[ep->dci]->txwq;
@@ -157,6 +157,23 @@ __attribute__((noinline)) int uct_dc_mlx5_ep_am_short(struct uct_dc_mlx5_ep *ep)
     put32((unsigned char *)&ucx_db, (uint16_t)(pos + 1 + (ucx_mode == 3)));
     if (ucx_mode == 4) put32(p, (((pos + 1) & 0xffff) << 8) | 0x0a);
     return 0;
+}
+
+__attribute__((noinline)) int uct_dc_mlx5_ep_am_short(struct uct_dc_mlx5_ep *ep)
+{ return ucx_post(ep); }
+__attribute__((noinline)) int uct_dc_mlx5_ep_am_short_iov(struct uct_dc_mlx5_ep *ep)
+{ return ucx_post(ep); }
+__attribute__((noinline)) ssize_t uct_dc_mlx5_ep_am_bcopy(struct uct_dc_mlx5_ep *ep)
+{
+    if (ucx_mode == 8) uct_dc_mlx5_ep_am_short(ep);
+    int status = ucx_post(ep);
+    return status ? status : ucx_mode == 9 ? 0 : 12;
+}
+__attribute__((noinline)) int uct_dc_mlx5_ep_am_zcopy(struct uct_dc_mlx5_ep *ep)
+{
+    if (ucx_mode == 10) return 0; /* No submission: must not replay old data. */
+    int status = ucx_post(ep);
+    return status ? status : 1;
 }
 
 static void submit(unsigned n, int invalid)
@@ -241,6 +258,15 @@ int main(int argc, char **argv)
             devx_failure = 0;
             break;
         case 'X': mlx5dv_devx_obj_destroy(&devx_object); break;
+        case 'i': case 'j':
+            ucx_mode = op == 'j' ? 1 : 0;
+            uct_dc_mlx5_ep_am_short_iov(&ucx_ep); break;
+        case 'p': case 'l': case 'n': case 'o':
+            ucx_mode = op == 'l' ? 1 : op == 'n' ? 8 : op == 'o' ? 9 : 0;
+            uct_dc_mlx5_ep_am_bcopy(&ucx_ep); break;
+        case 'Z': case 'V': case 'Y':
+            ucx_mode = op == 'V' ? 1 : op == 'Y' ? 10 : 0;
+            uct_dc_mlx5_ep_am_zcopy(&ucx_ep); break;
         case '0': case '1': case '2':
             ucx_ep.dci_channel_index = op - '0';
             break;

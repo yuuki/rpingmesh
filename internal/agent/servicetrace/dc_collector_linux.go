@@ -37,6 +37,7 @@ type DCOptions struct {
 	UCXLibrary, UCXDebugFile   string
 	UCXDevX                    bool
 	UCXStreams                 bool
+	UCXAM                      bool
 	Port                       uint8
 	Capacity                   int
 	IdleTimeout                time.Duration
@@ -133,7 +134,7 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 	}
 	var ucx *ucxDCProvider
 	var ucxPinned string
-	if options.UCXLibrary != "" || options.UCXDebugFile != "" || options.UCXDevX {
+	if options.UCXLibrary != "" || options.UCXDebugFile != "" || options.UCXDevX || options.UCXAM {
 		if options.UCXLibrary == "" || options.UCXDebugFile == "" {
 			return nil, fmt.Errorf("UCX library and matching debug ELF must both be supplied")
 		}
@@ -142,7 +143,7 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 			return nil, err
 		}
 		ucxPinned = fmt.Sprintf("/proc/self/fd/%d", c.ucxLibrary.Fd())
-		ucx, err = inspectUCXDCStreams(ucxPinned, options.UCXDebugFile, options.UCXDevX, options.UCXStreams)
+		ucx, err = inspectUCXDCOperations(ucxPinned, options.UCXDebugFile, options.UCXDevX, options.UCXStreams, options.UCXAM)
 		if err != nil {
 			return nil, err
 		}
@@ -267,6 +268,11 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 			ret    bool
 		}
 		hooks := []ucxProbe{{ucx.symbol, c.objs.DcUcxExit, true}, {ucx.symbol, c.objs.DcUcxEnter, false}}
+		if options.UCXAM {
+			for i, enter := range []*ebpf.Program{c.objs.DcUcxEnter, c.objs.DcUcxBcopyEnter, c.objs.DcUcxZcopyEnter} {
+				hooks = append(hooks, ucxProbe{ucx.amSymbols[i], c.objs.DcUcxExit, true}, ucxProbe{ucx.amSymbols[i], enter, false})
+			}
+		}
 		if options.UCXDevX {
 			hooks = append(hooks, ucxProbe{ucx.connectSymbol, c.objs.DcDevxConnectExit, true},
 				ucxProbe{ucx.connectSymbol, c.objs.DcDevxConnectEnter, false},

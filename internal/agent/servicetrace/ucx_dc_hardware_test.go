@@ -58,7 +58,34 @@ func TestUCXStreamDCUprobeHardware(t *testing.T) {
 	testUCXDCHardware(t, true, true, true)
 }
 
-func testUCXDCHardware(t *testing.T, attach, devx, streams bool) {
+func TestUCXAMHardware(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_AM_HARDWARE_TEST") != "1" {
+		t.Skip("opt-in UCX AM hardware test")
+	}
+	testUCXAMHardware(t, false)
+}
+
+func TestUCXAMUprobeHardware(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_AM_UPROBE_TEST") != "1" {
+		t.Skip("user-run privileged UCX AM hardware test")
+	}
+	testUCXAMHardware(t, true)
+}
+
+func testUCXAMHardware(t *testing.T, attach bool) {
+	for _, backend := range []string{"verbs", "devx", "streams"} {
+		for _, operation := range []string{"short-iov", "bcopy", "zcopy"} {
+			t.Run(backend+"/"+operation, func(t *testing.T) { testUCXDCHardware(t, attach, backend != "verbs", backend == "streams", operation) })
+		}
+	}
+}
+
+func testUCXDCHardware(t *testing.T, attach, devx, streams bool, amOperation ...string) {
+	am := len(amOperation) > 0
+	operation := "short"
+	if am {
+		operation = amOperation[0]
+	}
 	wantFlows := 2
 	var channels uint32
 	if streams {
@@ -96,6 +123,11 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool) {
 			t.Fatal(err)
 		}
 	}
+	if am {
+		if err := CheckUCXDCAM(ucx, ucxDebug); err != nil {
+			t.Fatal(err)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	child := exec.CommandContext(ctx, get("RPINGMESH_UCX_DC_HELPER"), device, portText, gid)
@@ -103,6 +135,12 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool) {
 		child.Args = append(child.Args, "--streams")
 	} else if devx {
 		child.Args = append(child.Args, "--devx")
+	}
+	if am {
+		if !devx {
+			child.Args = append(child.Args, "--verbs")
+		}
+		child.Args = append(child.Args, operation)
 	}
 	stdin, err := child.StdinPipe()
 	if err != nil {
@@ -151,7 +189,7 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool) {
 	var c *DCCollector
 	if attach {
 		c, err = OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: library, DebugFile: debug,
-			UCXLibrary: ucx, UCXDebugFile: ucxDebug, UCXDevX: devx, UCXStreams: streams, Device: device, Port: uint8(port)})
+			UCXLibrary: ucx, UCXDebugFile: ucxDebug, UCXDevX: devx, UCXStreams: streams, UCXAM: am, Device: device, Port: uint8(port)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -257,8 +295,8 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool) {
 		t.Fatal("UCX helper teardown failed")
 	}
 	if attach {
-		t.Logf("verified 3 UCX direct sends, %d destination/stream flows, and DCI retirement (DevX=%t, streams=%t)", wantFlows, devx, streams)
+		t.Logf("verified 3 UCX direct sends, %d destination/stream flows, and DCI retirement (DevX=%t, streams=%t, AM=%s)", wantFlows, devx, streams, operation)
 	} else {
-		t.Logf("verified selected libraries and 3 UCX direct sends with receive and flush completion (DevX=%t, streams=%t); BPF was not loaded", devx, streams)
+		t.Logf("verified selected libraries and 3 UCX direct sends with receive and flush completion (DevX=%t, streams=%t, AM=%s); BPF was not loaded", devx, streams, operation)
 	}
 }

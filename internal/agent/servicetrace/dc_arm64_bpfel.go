@@ -98,8 +98,10 @@ const (
 	dcProgDcModifyEnter      = "dc_modify_enter"
 	dcProgDcModifyExit       = "dc_modify_exit"
 	dcProgDcRetire           = "dc_retire"
+	dcProgDcUcxBcopyEnter    = "dc_ucx_bcopy_enter"
 	dcProgDcUcxEnter         = "dc_ucx_enter"
 	dcProgDcUcxExit          = "dc_ucx_exit"
+	dcProgDcUcxZcopyEnter    = "dc_ucx_zcopy_enter"
 )
 
 // loadDc returns the embedded CollectionSpec for dc.
@@ -158,8 +160,10 @@ type dcProgramSpecs struct {
 	DcModifyEnter      *ebpf.ProgramSpec `ebpf:"dc_modify_enter"`
 	DcModifyExit       *ebpf.ProgramSpec `ebpf:"dc_modify_exit"`
 	DcRetire           *ebpf.ProgramSpec `ebpf:"dc_retire"`
+	DcUcxBcopyEnter    *ebpf.ProgramSpec `ebpf:"dc_ucx_bcopy_enter"`
 	DcUcxEnter         *ebpf.ProgramSpec `ebpf:"dc_ucx_enter"`
 	DcUcxExit          *ebpf.ProgramSpec `ebpf:"dc_ucx_exit"`
+	DcUcxZcopyEnter    *ebpf.ProgramSpec `ebpf:"dc_ucx_zcopy_enter"`
 }
 
 // dcMapSpecs contains maps before they are loaded into the kernel.
@@ -270,8 +274,10 @@ type dcPrograms struct {
 	DcModifyEnter      *ebpf.Program `ebpf:"dc_modify_enter"`
 	DcModifyExit       *ebpf.Program `ebpf:"dc_modify_exit"`
 	DcRetire           *ebpf.Program `ebpf:"dc_retire"`
+	DcUcxBcopyEnter    *ebpf.Program `ebpf:"dc_ucx_bcopy_enter"`
 	DcUcxEnter         *ebpf.Program `ebpf:"dc_ucx_enter"`
 	DcUcxExit          *ebpf.Program `ebpf:"dc_ucx_exit"`
+	DcUcxZcopyEnter    *ebpf.Program `ebpf:"dc_ucx_zcopy_enter"`
 }
 
 func (p *dcPrograms) Close() error {
@@ -290,8 +296,10 @@ func (p *dcPrograms) Close() error {
 		p.DcModifyEnter,
 		p.DcModifyExit,
 		p.DcRetire,
+		p.DcUcxBcopyEnter,
 		p.DcUcxEnter,
 		p.DcUcxExit,
+		p.DcUcxZcopyEnter,
 	)
 }
 

@@ -7,9 +7,10 @@ import (
 	"fmt"
 )
 
-// ucxDCLayout describes the experimental UCX dc_mlx5 AM-short adapter. It
+// ucxDCLayout describes the experimental UCX dc_mlx5 active-message adapter. It
 // supports verbs DCIs and explicitly enabled DevX DCIs and streams through the
-// lifecycle adapter. Other UCT operations are not observed.
+// lifecycle adapter. AM short-iov, bcopy and zcopy require separate opt-in.
+// RMA, atomics and tag operations are not observed.
 // Keep this order identical to struct ucx_dc_layout in the BPF program.
 type ucxDCLayout struct {
 	EPInterface, EPDCI, InterfaceBuffer, InterfaceLength uint32
@@ -24,6 +25,7 @@ type ucxDCLayout struct {
 type ucxDCProvider struct {
 	layout                      ucxDCLayout
 	symbol                      uint64
+	amSymbols                   [3]uint64
 	createSymbol, connectSymbol uint64
 	machine                     elf.Machine
 }
@@ -39,6 +41,10 @@ func inspectUCXDCMode(library, debugFile string, devx bool) (*ucxDCProvider, err
 }
 
 func inspectUCXDCStreams(library, debugFile string, devx, streams bool) (*ucxDCProvider, error) {
+	return inspectUCXDCOperations(library, debugFile, devx, streams, false)
+}
+
+func inspectUCXDCOperations(library, debugFile string, devx, streams, am bool) (*ucxDCProvider, error) {
 	if streams && !devx {
 		return nil, fmt.Errorf("UCX streams require the DevX lifecycle adapter")
 	}
@@ -165,6 +171,11 @@ func inspectUCXDCStreams(library, debugFile string, devx, streams bool) (*ucxDCP
 		return nil, err
 	}
 	wanted := map[string]*uint64{"uct_dc_mlx5_ep_am_short": &p.symbol}
+	if am {
+		for i, name := range []string{"uct_dc_mlx5_ep_am_short_iov", "uct_dc_mlx5_ep_am_bcopy", "uct_dc_mlx5_ep_am_zcopy"} {
+			wanted[name] = &p.amSymbols[i]
+		}
+	}
 	if devx {
 		wanted["uct_dc_mlx5_iface_create_dci"] = &p.createSymbol
 		wanted["uct_dc_mlx5_iface_dci_connect"] = &p.connectSymbol
@@ -219,5 +230,11 @@ func CheckUCXDCStreams(provider, providerDebug, ucx, ucxDebug string) error {
 		return err
 	}
 	_, err := inspectUCXDCStreams(ucx, ucxDebug, true, true)
+	return err
+}
+
+// CheckUCXDCAM validates the additional active-message submission symbols.
+func CheckUCXDCAM(library, debugFile string) error {
+	_, err := inspectUCXDCOperations(library, debugFile, false, false, true)
 	return err
 }

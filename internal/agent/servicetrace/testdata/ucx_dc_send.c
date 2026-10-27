@@ -29,6 +29,19 @@ static void gate(const char *message, int command)
 
 struct receiver { unsigned count; unsigned mask; };
 static int use_devx, use_streams;
+static const char *operation = "short";
+static unsigned completed;
+static void completion(uct_completion_t *comp)
+{
+    if (comp->status != UCS_OK) fail("zcopy completion");
+    ++completed;
+}
+static size_t pack_message(void *dest, void *arg)
+{
+    memcpy(dest, arg, 8);
+    memcpy((char *)dest + 8, "test", 4);
+    return 12;
+}
 static ucs_status_t receive(void *arg, void *data, size_t length, unsigned flags)
 {
     struct receiver *r = arg;
@@ -158,10 +171,13 @@ static void report_wqe(uct_ep_h endpoint)
 
 int main(int argc, char **argv)
 {
-    if (argc != 4 && (argc != 5 || (strcmp(argv[4], "--devx") && strcmp(argv[4], "--streams"))))
-        fail("expected device, port, GID index and optional --devx or --streams");
-    use_devx = argc == 5;
-    use_streams = argc == 5 && !strcmp(argv[4], "--streams");
+    if (argc < 4 || argc > 6 || (argc >= 5 && strcmp(argv[4], "--verbs") &&
+        strcmp(argv[4], "--devx") && strcmp(argv[4], "--streams"))) fail("invalid helper arguments");
+    use_devx = argc >= 5 && strcmp(argv[4], "--verbs");
+    use_streams = argc >= 5 && !strcmp(argv[4], "--streams");
+    if (argc == 6) operation = argv[5];
+    if (strcmp(operation, "short") && strcmp(operation, "short-iov") &&
+        strcmp(operation, "bcopy") && strcmp(operation, "zcopy")) fail("invalid AM operation");
     alarm(60);
     if (setenv("UCX_IB_MLX5_DEVX", use_devx ? "yes" : "no", 1) || setenv("UCX_IB_GID_INDEX", argv[3], 1) ||
         setenv("UCX_LOG_LEVEL", "error", 1)) fail("environment");
@@ -188,10 +204,27 @@ int main(int argc, char **argv)
     for (unsigned i = 0; i < ep_count; ++i) {
         eps[i] = connect_ep(sender, receivers[use_streams ? i / 2 : i]);
     }
+    char payload[4] = {'t', 'e', 's', 't'};
+    uct_mem_h memh = UCT_MEM_HANDLE_NULL;
+    int zcopy = !strcmp(operation, "zcopy");
+    if (zcopy) CHECK(uct_md_mem_reg(md, payload, sizeof(payload), UCT_MD_MEM_ACCESS_LOCAL_READ, &memh));
     for (uint64_t i = 0; i < 3; ++i) {
-        CHECK(uct_ep_am_short(eps[i % ep_count], 1, i, "test", 4));
+        uct_ep_h ep = eps[i % ep_count];
+        uct_iov_t iov[2] = {{.buffer = &i, .length = 8, .memh = UCT_MEM_HANDLE_NULL, .count = 1},
+                            {.buffer = payload, .length = 4, .memh = memh, .count = 1}};
+        uct_completion_t comp = {.func = completion, .count = 1, .status = UCS_OK};
+        if (!strcmp(operation, "short-iov")) {
+            CHECK(uct_ep_am_short_iov(ep, 1, iov, 2));
+        } else if (!strcmp(operation, "bcopy")) {
+            if (uct_ep_am_bcopy(ep, 1, pack_message, &i, 0) != 12) fail("bcopy submission");
+        } else if (zcopy) {
+            if (uct_ep_am_zcopy(ep, 1, &i, 8, &iov[1], 1, 0, &comp) != UCS_INPROGRESS) fail("zcopy submission");
+        } else {
+            CHECK(uct_ep_am_short(ep, 1, i, payload, 4));
+        }
         report_wqe(eps[i % ep_count]);
-        while (state[0].count + state[1].count != i + 1) uct_worker_progress(worker);
+        while (state[0].count + state[1].count != i + 1 || (zcopy && completed != i + 1))
+            uct_worker_progress(worker);
     }
     for (unsigned i = 0; i < ep_count; ++i) {
         ucs_status_t status;
@@ -201,6 +234,7 @@ int main(int argc, char **argv)
         } while (status == UCS_INPROGRESS || status == UCS_ERR_NO_RESOURCE);
         if (status != UCS_OK) fail("send completion");
     }
+    if (zcopy) CHECK(uct_md_mem_dereg(md, memh));
     if (state[0].mask != (use_streams ? 3u : 5u) || state[1].mask != (use_streams ? 4u : 2u)) fail("receive destinations");
     gate("delivered", 'd');
     for (unsigned i = 0; i < ep_count; ++i) uct_ep_destroy(eps[i]);

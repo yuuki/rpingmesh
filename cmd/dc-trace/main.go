@@ -32,8 +32,9 @@ func run() error {
 	flag.StringVar(&options.Library, "library", "", "target process's libmlx5 ELF")
 	flag.StringVar(&options.DebugFile, "debug", "", "matching full ELF/DWARF debug file")
 	flag.BoolVar(&options.UCXDevX, "ucx-devx", false, "also track non-stream UCX DevX DCIs; requires matching lifecycle symbols")
+	flag.BoolVar(&options.UCXAM, "ucx-am", false, "also track UCX AM short-iov, bcopy and zcopy submissions")
 	flag.BoolVar(&options.UCXStreams, "ucx-streams", false, "also track UCX DevX DCI streams; requires -ucx-devx")
-	flag.StringVar(&options.UCXLibrary, "ucx-library", "", "optional UCX dc_mlx5 provider ELF; AM-short only")
+	flag.StringVar(&options.UCXLibrary, "ucx-library", "", "optional UCX dc_mlx5 provider ELF; AM-short by default")
 	flag.StringVar(&options.UCXDebugFile, "ucx-debug", "", "matching full UCX ELF/DWARF debug file")
 	flag.IntVar(&options.PID, "pid", 0, "target process ID; attach before DCI creation")
 	flag.StringVar(&options.Device, "device", "", "RDMA device to observe")
@@ -65,6 +66,11 @@ func run() error {
 		}
 		if options.UCXStreams {
 			if err := servicetrace.CheckUCXDCStreams(options.Library, options.DebugFile, options.UCXLibrary, options.UCXDebugFile); err != nil {
+				return err
+			}
+		}
+		if options.UCXAM {
+			if err := servicetrace.CheckUCXDCAM(options.UCXLibrary, options.UCXDebugFile); err != nil {
 				return err
 			}
 		}

@@ -85,6 +85,9 @@ func TestDCProviderELF(t *testing.T) {
 	if _, err := inspectUCXDC(file, file); err != nil {
 		t.Fatal(err)
 	}
+	if err := CheckUCXDCAM(file, file); err != nil {
+		t.Fatal(err)
+	}
 	if err := CheckUCXDCDevX(file, file, file, file); err != nil {
 		t.Fatal(err)
 	}
@@ -157,8 +160,16 @@ func TestUCXStreamUprobeIntegration(t *testing.T) {
 	testDCUprobeIntegration(t, false, true, true)
 }
 
-func testDCUprobeIntegration(t *testing.T, workerExec, devx bool, streamOption ...bool) {
-	streams := len(streamOption) > 0 && streamOption[0]
+func TestUCXAMUprobeIntegration(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_AM_UPROBE_TEST") != "1" {
+		t.Skip("user-run privileged UCX AM submission test")
+	}
+	testDCUprobeIntegration(t, false, true, true, true)
+}
+
+func testDCUprobeIntegration(t *testing.T, workerExec, devx bool, adapterOptions ...bool) {
+	streams := len(adapterOptions) > 0 && adapterOptions[0]
+	am := len(adapterOptions) > 1 && adapterOptions[1]
 	file := buildDCFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -195,7 +206,7 @@ func testDCUprobeIntegration(t *testing.T, workerExec, devx bool, streamOption .
 		}
 	}
 	c, err := OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: file, DebugFile: file,
-		UCXLibrary: file, UCXDebugFile: file, UCXDevX: devx, UCXStreams: streams, Device: "test-device", Port: 1, sysfsRoot: root})
+		UCXLibrary: file, UCXDebugFile: file, UCXDevX: devx, UCXStreams: streams, UCXAM: am, Device: "test-device", Port: 1, sysfsRoot: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -475,6 +486,44 @@ func testDCUprobeIntegration(t *testing.T, workerExec, devx bool, streamOption .
 		accepted(6, 1)
 		command('X')
 		accepted(6, 0)
+	}
+	if am {
+		baseline, err := c.Stats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		accepted := func(n uint64, active int) {
+			t.Helper()
+			await(func(s DCStats) bool {
+				return s.AcceptedSends == baseline.AcceptedSends+n && s.UCXSubmissions == baseline.UCXSubmissions+n && s.ActiveFlows == active
+			})
+		}
+		command('c')
+		for i, op := range []byte{'i', 'p', 'o', 'Z'} {
+			command(op) // Includes bcopy length zero and asynchronous zcopy.
+			accepted(uint64(i+1), 1)
+		}
+		for _, op := range []byte{'j', 'l', 'V', 'Y'} {
+			command(op)
+		}
+		await(func(s DCStats) bool { return s.FailedSubmissions == baseline.FailedSubmissions+4 })
+		accepted(4, 1)
+		command('n') // Reentrant pack callback: reject both inner and outer.
+		await(func(s DCStats) bool { return s.UnsupportedBatches == baseline.UnsupportedBatches+1 })
+		accepted(4, 1)
+		command('A')
+		accepted(5, 1) // Pending state must recover after nesting.
+		command('d')
+		accepted(5, 0)
+		command('S')
+		command('N')
+		command('1')
+		for i, op := range []byte{'i', 'p', 'Z'} {
+			command(op)
+			accepted(uint64(i+6), 1)
+		}
+		command('X')
+		accepted(8, 0)
 	}
 	final, err = c.Stats()
 	if err != nil {

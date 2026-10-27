@@ -28,7 +28,16 @@ struct ucx_dc_layout {
     __u32 dci_wq, wq_type, wq_qp, wq_qpn;
     __u32 wq_start, wq_end, wq_current, wq_db;
     __u32 wq_previous, wq_producer;
+    __u32 wq_devx_object, wq_devx_buffer, interface_port;
+    __u32 devx_context, devx_qpn, devx_enabled;
 };
+struct dc_devx_queue { __u64 token, start, end, db; };
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 4096);
+    __type(key, __u64); __type(value, struct dc_devx_queue); } dc_devx_queues SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 256);
+    __type(key, __u64); __type(value, __u64); } dc_devx_creating SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 256);
+    __type(key, __u64); __type(value, struct dc_modify_pending); } dc_devx_connecting SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
     __type(key, __u32); __type(value, struct ucx_dc_layout); } dc_ucx_layout SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 256);
@@ -36,7 +45,7 @@ struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 256);
 
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
     __type(key, __u32); __type(value, struct dc_config); } dc_settings SEC(".maps");
-struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 9);
+struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 11);
     __type(key, __u32); __type(value, __u64); } dc_stats SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
     __type(key, __u32); __type(value, __u64); } dc_epoch SEC(".maps");
@@ -100,6 +109,9 @@ static __always_inline void invalidate_process(void)
     bpf_for_each_map_elem(&dc_modifying, clear_entry, 0, 0);
     bpf_for_each_map_elem(&dc_pending, clear_entry, 0, 0);
     bpf_for_each_map_elem(&dc_ucx_pending, clear_entry, 0, 0);
+    bpf_for_each_map_elem(&dc_devx_queues, clear_entry, 0, 0);
+    bpf_for_each_map_elem(&dc_devx_creating, clear_entry, 0, 0);
+    bpf_for_each_map_elem(&dc_devx_connecting, clear_entry, 0, 0);
 }
 
 SEC("raw_tracepoint/sched_process_exit")
@@ -177,6 +189,7 @@ int dc_retire(struct pt_regs *ctx)
     if (!layout()) return 0;
     __u64 qp = PT_REGS_PARM1(ctx);
     if (!bpf_map_delete_elem(&dc_qps, &qp)) count(6);
+    bpf_map_delete_elem(&dc_devx_queues, &qp);
     return 0;
 }
 
@@ -338,18 +351,25 @@ int dc_ucx_exit(struct pt_regs *ctx)
     __u64 wq = dci + u->dci_wq;
     __u32 type = 0, qpn = 0;
     if (READ(type, wq, u->wq_type)) goto read_failed;
-    if (type != 0) goto unsupported; /* UCT_IB_MLX5_OBJ_TYPE_VERBS */
-    if (READ(qp, wq, u->wq_qp) || READ(qpn, wq, u->wq_qpn)) goto read_failed;
+    if (type > 1 || (type == 1 && !u->devx_enabled)) goto unsupported;
+    if (READ(qp, wq, type == 1 ? u->wq_devx_object : u->wq_qp) || READ(qpn, wq, u->wq_qpn)) goto read_failed;
     struct dc_identity *id = bpf_map_lookup_elem(&dc_qps, &qp);
-    if (!current(id) || !id->port || id->state != 3 || id->qpn != qpn || qp < l->qp_base) goto unsupported;
+    if (!current(id) || !id->port || id->state != 3 || id->qpn != qpn || (type == 0 && qp < l->qp_base)) goto unsupported;
     __u64 start = 0, end = 0, curr = 0, db = 0, provider_start = 0;
     __u32 db_value = 0, blocks = 0, shift = 0;
     __u16 previous = 0, producer = 0;
     if (READ(start, wq, u->wq_start) || READ(end, wq, u->wq_end) ||
         READ(curr, wq, u->wq_current) || READ(db, wq, u->wq_db) ||
         READ(previous, wq, u->wq_previous) || READ(producer, wq, u->wq_producer) ||
-        READ(db_value, db, 0) || READ(provider_start, qp - l->qp_base, l->sq_start) ||
-        READ(blocks, qp - l->qp_base, l->sq_count) || READ(shift, qp - l->qp_base, l->sq_shift)) goto read_failed;
+        READ(db_value, db, 0)) goto read_failed;
+    if (type == 1) {
+        struct dc_devx_queue *saved = bpf_map_lookup_elem(&dc_devx_queues, &qp);
+        if (!saved || saved->token != id->token || saved->start != start || saved->end != end || saved->db != db) goto unsupported;
+        if (READ(provider_start, wq, u->wq_devx_buffer)) goto read_failed;
+        blocks = (end - start) >> 6;
+        shift = 6;
+    } else if (READ(provider_start, qp - l->qp_base, l->sq_start) ||
+               READ(blocks, qp - l->qp_base, l->sq_count) || READ(shift, qp - l->qp_base, l->sq_shift)) goto read_failed;
     __u16 posted = producer - previous;
     if (!start || start != provider_start || !blocks || blocks > (1 << 16) ||
         (blocks & (blocks - 1)) || shift != 6 || end - start != (__u64)blocks * 64 ||
@@ -372,10 +392,131 @@ int dc_ucx_exit(struct pt_regs *ctx)
         (qpn_ds >> 8) != qpn || (qpn_ds & 192) || (qpn_ds & 63) < 4 ||
         ((qpn_ds & 63) + 3) / 4 != posted) goto unsupported;
     if (bpf_ringbuf_output(&dc_events, b, sizeof(*b), 0)) count(5);
-    else { count(0); count(8); }
+    else { count(0); count(8); if (type == 1) count(9); }
     return 0;
 read_failed:
     count(3); return 0;
 unsupported:
     count(2); return 0;
+}
+
+/* Register only successful UCX DCI creations with exactly one channel.
+ * The opaque DevX object's layout comes from matching libmlx5 DWARF. */
+SEC("uprobe")
+int dc_devx_create_enter(struct pt_regs *ctx)
+{
+    if (!layout()) return 0;
+    __u64 task = bpf_get_current_pid_tgid(), result = PT_REGS_PARM4(ctx);
+    bpf_map_delete_elem(&dc_devx_creating, &task);
+    if ((__u8)PT_REGS_PARM3(ctx) != 1) { count(2); return 0; }
+    if (bpf_map_update_elem(&dc_devx_creating, &task, &result, BPF_ANY)) count(4);
+    return 0;
+}
+
+SEC("uretprobe")
+int dc_devx_create_exit(struct pt_regs *ctx)
+{
+    struct dc_layout *l = layout();
+    if (!l) return 0;
+    __u64 task = bpf_get_current_pid_tgid();
+    __u64 *pending = bpf_map_lookup_elem(&dc_devx_creating, &task);
+    if (!pending) return 0;
+    __u64 result = *pending;
+    bpf_map_delete_elem(&dc_devx_creating, &task);
+    if (PT_REGS_RC(ctx)) return 0;
+    __u32 zero = 0;
+    struct ucx_dc_layout *u = bpf_map_lookup_elem(&dc_ucx_layout, &zero);
+    if (!u || !u->devx_enabled) return 0;
+    __u64 dci = 0, obj = 0, context = 0, buffer = 0;
+    __u32 type = 0, qpn = 0;
+    struct dc_identity id = {};
+    struct dc_devx_queue queue = {};
+    if (READ(dci, result, 0)) goto failed;
+    __u64 wq = dci + u->dci_wq;
+    if (READ(type, wq, u->wq_type)) goto failed;
+    if (type != 1) return 0;
+    if (READ(obj, wq, u->wq_devx_object) || READ(id.qpn, wq, u->wq_qpn) ||
+        READ(context, obj, u->devx_context) || READ(qpn, obj, u->devx_qpn) ||
+        READ(id.fd, context, l->context_fd) || READ(buffer, wq, u->wq_devx_buffer) ||
+        READ(queue.start, wq, u->wq_start) || READ(queue.end, wq, u->wq_end) ||
+        READ(queue.db, wq, u->wq_db)) goto failed;
+    __u64 bytes = queue.end - queue.start;
+    if (!obj || !id.qpn || id.qpn > 0xffffff || qpn != id.qpn || id.fd < 0 ||
+        !buffer || buffer != queue.start || !queue.db || bytes < 64 || bytes > (1 << 22) ||
+        (bytes & (bytes - 1))) { count(2); return 0; }
+    id.token = next_token(); queue.token = id.token;
+    if (!id.token || bpf_map_update_elem(&dc_devx_queues, &obj, &queue, BPF_ANY) ||
+        bpf_map_update_elem(&dc_qps, &obj, &id, BPF_ANY)) {
+        bpf_map_delete_elem(&dc_devx_queues, &obj);
+        bpf_map_delete_elem(&dc_qps, &obj); count(4); return 0;
+    }
+    count(7); count(10);
+    return 0;
+failed:
+    count(3); return 0;
+}
+
+SEC("uprobe")
+int dc_devx_connect_enter(struct pt_regs *ctx)
+{
+    if (!layout()) return 0;
+    __u32 zero = 0;
+    struct ucx_dc_layout *u = bpf_map_lookup_elem(&dc_ucx_layout, &zero);
+    if (!u || !u->devx_enabled) return 0;
+    __u64 task = bpf_get_current_pid_tgid(), dci = PT_REGS_PARM2(ctx), obj = 0;
+    bpf_map_delete_elem(&dc_devx_connecting, &task);
+    __u32 type = 0;
+    if (READ(type, dci + u->dci_wq, u->wq_type)) { count(3); return 0; }
+    if (type != 1) return 0;
+    if (READ(obj, dci + u->dci_wq, u->wq_devx_object)) { count(3); return 0; }
+    struct dc_identity *id = bpf_map_lookup_elem(&dc_qps, &obj);
+    if (!current(id)) return 0;
+    if (id->state != 0) goto retire;
+    struct dc_modify_pending p = {.qp = obj, .identity = *id};
+    __u8 port = 0;
+    if (READ(port, PT_REGS_PARM1(ctx), u->interface_port)) { count(3); goto retire; }
+    if (!port) goto retire;
+    p.identity.port = port; p.identity.state = 3;
+    if (bpf_map_update_elem(&dc_devx_connecting, &task, &p, BPF_ANY)) { count(4); goto retire; }
+    id->state = 1; /* Only this task's initial connect may modify the object. */
+    return 0;
+retire:
+    bpf_map_delete_elem(&dc_devx_queues, &obj);
+    bpf_map_delete_elem(&dc_qps, &obj); count(6); return 0;
+}
+
+SEC("uretprobe")
+int dc_devx_connect_exit(struct pt_regs *ctx)
+{
+    if (!layout()) return 0;
+    __u64 task = bpf_get_current_pid_tgid();
+    struct dc_modify_pending *p = bpf_map_lookup_elem(&dc_devx_connecting, &task);
+    if (!p) return 0;
+    struct dc_identity *id = bpf_map_lookup_elem(&dc_qps, &p->qp);
+    if (current(id) && id->token == p->identity.token) {
+        if (PT_REGS_RC(ctx) || id->state != 1) {
+            bpf_map_delete_elem(&dc_devx_queues, &p->qp);
+            bpf_map_delete_elem(&dc_qps, &p->qp); count(6);
+        } else if (bpf_map_update_elem(&dc_qps, &p->qp, &p->identity, BPF_ANY)) {
+            bpf_map_delete_elem(&dc_devx_queues, &p->qp);
+            bpf_map_delete_elem(&dc_qps, &p->qp); count(4);
+        }
+    }
+    bpf_map_delete_elem(&dc_devx_connecting, &task);
+    return 0;
+}
+
+SEC("uprobe")
+int dc_devx_modify(struct pt_regs *ctx)
+{
+    if (!layout()) return 0;
+    __u64 obj = PT_REGS_PARM1(ctx), task = bpf_get_current_pid_tgid();
+    struct dc_identity *id = bpf_map_lookup_elem(&dc_qps, &obj);
+    if (!current(id)) return 0;
+    struct dc_modify_pending *p = bpf_map_lookup_elem(&dc_devx_connecting, &task);
+    if (id->state == 1 && p && p->qp == obj && p->identity.token == id->token) return 0;
+    /* All other modification attempts retire even if the command fails. */
+    bpf_map_delete_elem(&dc_devx_queues, &obj);
+    bpf_map_delete_elem(&dc_qps, &obj); count(6);
+    return 0;
 }

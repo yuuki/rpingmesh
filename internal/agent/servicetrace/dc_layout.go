@@ -19,9 +19,10 @@ type dcLayout struct {
 }
 
 type dcProvider struct {
-	layout  dcLayout
-	symbols map[string]uint64
-	machine elf.Machine
+	layout               dcLayout
+	symbols              map[string]uint64
+	machine              elf.Machine
+	devxContext, devxQPN uint32
 }
 
 var dcRequiredSymbols = []string{
@@ -33,6 +34,10 @@ var dcRequiredSymbols = []string{
 // symbol tables, version strings and plausible offsets are not substitutes.
 // This proves layout identity, not provider semantics or wire-port behavior.
 func inspectDCProvider(library, debugFile string) (*dcProvider, error) {
+	return inspectDCProviderMode(library, debugFile, false)
+}
+
+func inspectDCProviderMode(library, debugFile string, devx bool) (*dcProvider, error) {
 	lib, err := elf.Open(library)
 	if err != nil {
 		return nil, fmt.Errorf("open provider ELF: %w", err)
@@ -79,7 +84,10 @@ func inspectDCProvider(library, debugFile string) (*dcProvider, error) {
 		}
 		name, _ := e.Val(dwarf.AttrName).(string)
 		switch name {
-		case "mlx5_qp", "ibv_qp", "ibv_context", "mlx5dv_qp_init_attr", "ibv_qp_attr":
+		case "mlx5_qp", "ibv_qp", "ibv_context", "mlx5dv_qp_init_attr", "ibv_qp_attr", "mlx5dv_devx_obj":
+			if name == "mlx5dv_devx_obj" && !devx {
+				continue
+			}
 			t, err := data.Type(e.Offset)
 			if err != nil {
 				return nil, err
@@ -95,11 +103,7 @@ func inspectDCProvider(library, debugFile string) (*dcProvider, error) {
 		}
 	}
 	p := &dcProvider{symbols: make(map[string]uint64), machine: lib.Machine}
-	fields := []struct {
-		out        *uint32
-		root, path string
-		size       int64
-	}{
+	fields := []dcDWARFField{
 		{&p.layout.QPBase, "mlx5_qp", "verbs_qp", -1},
 		{&p.layout.QPNum, "ibv_qp", "qp_num", 4},
 		{&p.layout.QPType, "ibv_qp", "qp_type", 4},
@@ -116,6 +120,9 @@ func inspectDCProvider(library, debugFile string) (*dcProvider, error) {
 		{&p.layout.AttrState, "ibv_qp_attr", "qp_state", 4},
 		{&p.layout.AttrPort, "ibv_qp_attr", "port_num", 1},
 		{&p.layout.AttrAVPort, "ibv_qp_attr", "ah_attr.port_num", 1},
+	}
+	if devx {
+		fields = append(fields, dcDWARFField{&p.devxContext, "mlx5dv_devx_obj", "context", 8}, dcDWARFField{&p.devxQPN, "mlx5dv_devx_obj", "object_id", 4})
 	}
 	for _, f := range fields {
 		off, err := dcFieldOffset(types[f.root], f.path, f.size)
@@ -141,9 +148,13 @@ func inspectDCProvider(library, debugFile string) (*dcProvider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("full provider symbol table is required: %w", err)
 	}
+	required := append([]string(nil), dcRequiredSymbols...)
+	if devx {
+		required = append(required, "mlx5dv_devx_obj_modify", "mlx5dv_devx_obj_destroy")
+	}
 	for _, s := range syms {
 		wanted := s.Name == "mlx5dv_devx_qp_modify"
-		for _, name := range dcRequiredSymbols {
+		for _, name := range required {
 			wanted = wanted || s.Name == name
 		}
 		if !wanted {
@@ -161,7 +172,7 @@ func inspectDCProvider(library, debugFile string) (*dcProvider, error) {
 		}
 		p.symbols[s.Name] = offset
 	}
-	for _, name := range dcRequiredSymbols {
+	for _, name := range required {
 		if p.symbols[name] == 0 {
 			return nil, fmt.Errorf("required provider function %s is unavailable", name)
 		}
@@ -292,4 +303,11 @@ func dcBuildID(f *elf.File) ([]byte, error) {
 		b = b[npad+dpad:]
 	}
 	return nil, fmt.Errorf("provider ELF has no supported GNU build ID")
+}
+
+// dcDWARFField identifies a checked member in a complete ELF structure.
+type dcDWARFField struct {
+	out        *uint32
+	root, path string
+	size       int64
 }

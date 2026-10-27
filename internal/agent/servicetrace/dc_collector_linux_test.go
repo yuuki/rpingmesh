@@ -37,6 +37,13 @@ func TestUCXDCRejectsUnsupportedLayout(t *testing.T) {
 	}
 }
 
+func TestUCXDevXRejectsUnsupportedLayout(t *testing.T) {
+	file := buildDCFixture(t, "-DTEST_DEVX_BAD_QPN")
+	if err := CheckUCXDCDevX(file, file, file, file); err == nil {
+		t.Fatal("accepted an unsupported opaque DevX object ID width")
+	}
+}
+
 func TestDCProviderELF(t *testing.T) {
 	file := buildDCFixture(t)
 	p, err := inspectDCProvider(file, file)
@@ -76,6 +83,9 @@ func TestDCProviderELF(t *testing.T) {
 		t.Fatal("accepted mismatching debug build ID")
 	}
 	if _, err := inspectUCXDC(file, file); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckUCXDCDevX(file, file, file, file); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := inspectUCXDC(file, mismatch); err == nil {
@@ -128,11 +138,18 @@ func TestDCUprobeIntegration(t *testing.T) {
 	if os.Getenv("RPINGMESH_DC_UPROBE_TEST") != "1" {
 		t.Skip("user-run privileged DC uprobe test")
 	}
-	t.Run("leader-exit", func(t *testing.T) { testDCUprobeIntegration(t, false) })
-	t.Run("worker-exec", func(t *testing.T) { testDCUprobeIntegration(t, true) })
+	t.Run("leader-exit", func(t *testing.T) { testDCUprobeIntegration(t, false, false) })
+	t.Run("worker-exec", func(t *testing.T) { testDCUprobeIntegration(t, true, false) })
 }
 
-func testDCUprobeIntegration(t *testing.T, workerExec bool) {
+func TestUCXDevXUprobeIntegration(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_DEVX_UPROBE_TEST") != "1" {
+		t.Skip("user-run privileged UCX DevX lifecycle test")
+	}
+	testDCUprobeIntegration(t, false, true)
+}
+
+func testDCUprobeIntegration(t *testing.T, workerExec, devx bool) {
 	file := buildDCFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -169,7 +186,7 @@ func testDCUprobeIntegration(t *testing.T, workerExec bool) {
 		}
 	}
 	c, err := OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: file, DebugFile: file,
-		UCXLibrary: file, UCXDebugFile: file, Device: "test-device", Port: 1, sysfsRoot: root})
+		UCXLibrary: file, UCXDebugFile: file, UCXDevX: devx, Device: "test-device", Port: 1, sysfsRoot: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,6 +311,81 @@ func testDCUprobeIntegration(t *testing.T, workerExec bool) {
 	await(func(s DCStats) bool {
 		return s.UnsupportedBatches == before.UnsupportedBatches+5 && s.UCXSubmissions == 2 && s.ActiveFlows == 0
 	})
+	if devx {
+		baseline, err := c.Stats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		accepted := func(n uint64, active int) {
+			t.Helper()
+			await(func(s DCStats) bool {
+				return s.DevXSubmissions == n && s.AcceptedSends == baseline.AcceptedSends+n && s.ActiveFlows == active
+			})
+		}
+		command('C')
+		command('A') // Created but not connected.
+		await(func(s DCStats) bool {
+			return s.DevXCreated == 1 && s.UnsupportedBatches > baseline.UnsupportedBatches && s.DevXSubmissions == 0
+		})
+		command('N')
+		command('A')
+		accepted(1, 1)
+		command('F') // A failed call must not repeat the previous WQE.
+		await(func(s DCStats) bool {
+			return s.FailedSubmissions == baseline.FailedSubmissions+1 && s.DevXSubmissions == 1
+		})
+		command('B') // Doorbell mismatch.
+		accepted(1, 1)
+		command('W') // Ring and 16-bit producer wrap.
+		accepted(2, 1)
+		command('M') // Even a failed post-connect modification retires.
+		accepted(2, 0)
+		command('N')
+		command('A')
+		accepted(2, 0)
+		command('C') // Reused pointer and QPN, fresh lifetime.
+		command('N')
+		command('A')
+		accepted(3, 1)
+		command('X')
+		accepted(3, 0)
+		command('C')
+		command('J') // Failed connection.
+		command('A')
+		accepted(3, 0)
+		command('X')
+		command('S') // Multiple channels, even stream zero.
+		command('N')
+		command('A')
+		accepted(3, 0)
+		command('X')
+		command('K') // Failed creation.
+		command('A')
+		accepted(3, 0)
+		command('C')
+		command('M') // Modification outside initial connect also retires RESET.
+		command('N')
+		command('A')
+		accepted(3, 0)
+		command('C')
+		command('N')
+		command('A')
+		accepted(4, 1)
+		command('e')
+		accepted(4, 0)
+		it := c.objs.DcDevxQueues.Iterate()
+		var key uint64
+		var queue [4]uint64
+		if it.Next(&key, &queue) || it.Err() != nil {
+			t.Fatal("exec retained DevX queue metadata")
+		}
+		command('C')
+		command('N')
+		command('A')
+		accepted(5, 1)
+		command('X')
+		accepted(5, 0)
+	}
 	final, err = c.Stats()
 	if err != nil {
 		t.Fatal(err)

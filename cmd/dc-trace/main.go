@@ -31,6 +31,7 @@ func run() error {
 	var duration time.Duration
 	flag.StringVar(&options.Library, "library", "", "target process's libmlx5 ELF")
 	flag.StringVar(&options.DebugFile, "debug", "", "matching full ELF/DWARF debug file")
+	flag.BoolVar(&options.UCXDevX, "ucx-devx", false, "also track non-stream UCX DevX DCIs; requires matching lifecycle symbols")
 	flag.StringVar(&options.UCXLibrary, "ucx-library", "", "optional UCX dc_mlx5 provider ELF; AM-short only")
 	flag.StringVar(&options.UCXDebugFile, "ucx-debug", "", "matching full UCX ELF/DWARF debug file")
 	flag.IntVar(&options.PID, "pid", 0, "target process ID; attach before DCI creation")
@@ -50,6 +51,11 @@ func run() error {
 		}
 		if options.UCXLibrary != "" || options.UCXDebugFile != "" {
 			if err := servicetrace.CheckUCXDC(options.UCXLibrary, options.UCXDebugFile); err != nil {
+				return err
+			}
+		}
+		if options.UCXDevX {
+			if err := servicetrace.CheckUCXDCDevX(options.Library, options.DebugFile, options.UCXLibrary, options.UCXDebugFile); err != nil {
 				return err
 			}
 		}

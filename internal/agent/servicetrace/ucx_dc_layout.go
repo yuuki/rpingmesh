@@ -8,24 +8,32 @@ import (
 )
 
 // ucxDCLayout describes the experimental UCX dc_mlx5 AM-short adapter. It
-// supports verbs-created, non-stream DCIs, not DevX or other UCT operations.
+// supports non-stream DCIs through verbs and the explicitly enabled DevX
+// lifecycle adapter. Other UCT operations are not observed.
 // Keep this order identical to struct ucx_dc_layout in the BPF program.
 type ucxDCLayout struct {
 	EPInterface, EPDCI, InterfaceBuffer, InterfaceLength uint32
 	DCIWQ, WQType, WQQP, WQQPN                           uint32
 	WQStart, WQEnd, WQCurrent, WQDB                      uint32
 	WQPrevious, WQProducer                               uint32
+	WQDevXObject, WQDevXBuffer, InterfacePort            uint32
+	DevXContext, DevXQPN, DevXEnabled                    uint32
 }
 
 type ucxDCProvider struct {
-	layout  ucxDCLayout
-	symbol  uint64
-	machine elf.Machine
+	layout                      ucxDCLayout
+	symbol                      uint64
+	createSymbol, connectSymbol uint64
+	machine                     elf.Machine
 }
 
 // inspectUCXDC requires matching full DWARF rather than a version-based offset
 // table. Layout checks alone do not prove the semantics of an arbitrary build.
 func inspectUCXDC(library, debugFile string) (*ucxDCProvider, error) {
+	return inspectUCXDCMode(library, debugFile, false)
+}
+
+func inspectUCXDCMode(library, debugFile string, devx bool) (*ucxDCProvider, error) {
 	lib, err := elf.Open(library)
 	if err != nil {
 		return nil, err
@@ -57,11 +65,7 @@ func inspectUCXDC(library, debugFile string) (*ucxDCProvider, error) {
 		return nil, fmt.Errorf("full UCX DWARF is required: %w", err)
 	}
 	p := &ucxDCProvider{machine: lib.Machine}
-	fields := []struct {
-		out        *uint32
-		root, path string
-		size       int64
-	}{
+	fields := []dcDWARFField{
 		{&p.layout.EPInterface, "uct_dc_mlx5_ep", "super.super.iface", 8},
 		{&p.layout.EPDCI, "uct_dc_mlx5_ep", "dci", 2},
 		{&p.layout.InterfaceBuffer, "uct_dc_mlx5_iface", "tx.dcis.buffer", 8},
@@ -76,6 +80,12 @@ func inspectUCXDC(library, debugFile string) (*ucxDCProvider, error) {
 		{&p.layout.WQDB, "uct_ib_mlx5_txwq", "dbrec", 8},
 		{&p.layout.WQPrevious, "uct_ib_mlx5_txwq", "prev_sw_pi", 2},
 		{&p.layout.WQProducer, "uct_ib_mlx5_txwq", "sw_pi", 2},
+	}
+	if devx {
+		fields = append(fields,
+			dcDWARFField{&p.layout.WQDevXObject, "uct_ib_mlx5_txwq", "super.devx.obj", 8},
+			dcDWARFField{&p.layout.WQDevXBuffer, "uct_ib_mlx5_txwq", "super.devx.wq_buf", 8},
+			dcDWARFField{&p.layout.InterfacePort, "uct_dc_mlx5_iface", "super.super.super.config.port_num", 1})
 	}
 	types := make(map[string][]*dwarf.StructType)
 	r := data.Reader()
@@ -130,25 +140,41 @@ func inspectUCXDC(library, debugFile string) (*ucxDCProvider, error) {
 			}
 		}
 	}
+	if devx {
+		for _, s := range types["uct_ib_mlx5_txwq"] {
+			off, err := dcFieldOffset(s, "super", -1)
+			if err != nil || off != 0 {
+				return nil, fmt.Errorf("unsupported UCX QP base layout")
+			}
+		}
+	}
 	syms, err := dbg.Symbols()
 	if err != nil {
 		return nil, err
 	}
+	wanted := map[string]*uint64{"uct_dc_mlx5_ep_am_short": &p.symbol}
+	if devx {
+		wanted["uct_dc_mlx5_iface_create_dci"] = &p.createSymbol
+		wanted["uct_dc_mlx5_iface_dci_connect"] = &p.connectSymbol
+	}
 	for _, s := range syms {
-		if s.Name != "uct_dc_mlx5_ep_am_short" || elf.ST_TYPE(s.Info) != elf.STT_FUNC || s.Section == elf.SHN_UNDEF || s.Size == 0 {
+		target := wanted[s.Name]
+		if target == nil || elf.ST_TYPE(s.Info) != elf.STT_FUNC || s.Section == elf.SHN_UNDEF || s.Size == 0 {
 			continue
 		}
 		off, ok := dcExecutableOffset(lib, s.Value, s.Size)
 		if !ok {
 			continue
 		}
-		if p.symbol != 0 && p.symbol != off {
-			return nil, fmt.Errorf("ambiguous UCX AM-short function")
+		if *target != 0 && *target != off {
+			return nil, fmt.Errorf("ambiguous UCX function %s", s.Name)
 		}
-		p.symbol = off
+		*target = off
 	}
-	if p.symbol == 0 {
-		return nil, fmt.Errorf("UCX dc_mlx5 AM-short function is unavailable")
+	for name, target := range wanted {
+		if *target == 0 {
+			return nil, fmt.Errorf("required UCX function %s is unavailable", name)
+		}
 	}
 	return p, nil
 }
@@ -157,4 +183,20 @@ func inspectUCXDC(library, debugFile string) (*ucxDCProvider, error) {
 func CheckUCXDC(library, debugFile string) error {
 	_, err := inspectUCXDC(library, debugFile)
 	return err
+}
+
+// CheckUCXDCDevX additionally validates both libraries' DevX lifecycle layouts.
+func CheckUCXDCDevX(provider, providerDebug, ucx, ucxDebug string) error {
+	p, err := inspectDCProviderMode(provider, providerDebug, true)
+	if err != nil {
+		return err
+	}
+	u, err := inspectUCXDCMode(ucx, ucxDebug, true)
+	if err != nil {
+		return err
+	}
+	if p.machine != u.machine {
+		return fmt.Errorf("UCX/provider architectures differ")
+	}
+	return nil
 }

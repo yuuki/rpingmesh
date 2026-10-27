@@ -11,6 +11,13 @@
 #include <unistd.h>
 
 struct ibv_context { uint64_t padding; int cmd_fd; };
+struct mlx5dv_devx_obj { uint64_t padding; struct ibv_context *context;
+#ifdef TEST_DEVX_BAD_QPN
+    uint64_t object_id;
+#else
+    uint32_t object_id;
+#endif
+};
 struct ibv_qp { struct ibv_context *context; uint32_t qp_num; int qp_type; };
 struct ibv_qp_ex { struct ibv_qp qp_base; };
 struct verbs_qp { union { struct ibv_qp qp; struct ibv_qp_ex qp_ex; }; uint64_t padding; };
@@ -27,14 +34,19 @@ static int failure;
 
 /* Deliberately synthetic UCX layouts; no copied production offsets. */
 struct uct_ib_mlx5_txwq {
-    struct { int type; uint32_t qp_num; struct { struct ibv_qp *qp; } verbs; } super;
+    struct { int type; uint32_t qp_num; union {
+        struct { struct ibv_qp *qp; } verbs;
+        struct { void *wq_buf; uint64_t padding; struct mlx5dv_devx_obj *obj; } devx;
+    }; } super;
     uint16_t sw_pi, prev_sw_pi;
     void *qstart, *qend, *curr;
     uint32_t *dbrec;
 };
 struct uct_dc_dci { uint64_t padding; struct uct_ib_mlx5_txwq txwq; };
 struct uct_dc_mlx5_iface {
-    struct { struct { struct { struct { struct { uint64_t padding; } super; } super; } super; } super; } super;
+    struct { struct { struct { struct { struct { uint64_t padding; } super; } super;
+        struct { uint8_t port_num; } config;
+    } super; } super; } super;
     struct { struct { struct uct_dc_dci **buffer; uint16_t length; } dcis; } tx;
 };
 struct uct_dc_mlx5_ep {
@@ -52,6 +64,39 @@ static struct uct_dc_mlx5_iface ucx_iface;
 static struct uct_dc_mlx5_ep ucx_ep;
 static uint32_t ucx_db;
 static int ucx_mode;
+static int ucx_devx_active, devx_failure;
+static struct mlx5dv_devx_obj devx_object;
+
+__attribute__((noinline)) int mlx5dv_devx_obj_modify(struct mlx5dv_devx_obj *obj,
+                                                   void *in, size_t inlen, void *out, size_t outlen)
+{ (void)obj; (void)in; (void)inlen; (void)out; (void)outlen; return devx_failure; }
+__attribute__((noinline)) int mlx5dv_devx_obj_destroy(struct mlx5dv_devx_obj *obj)
+{ (void)obj; return 0; }
+
+__attribute__((noinline)) int uct_dc_mlx5_iface_create_dci(struct uct_dc_mlx5_iface *iface,
+                                                        uint16_t index, uint8_t channels,
+                                                        struct uct_dc_dci **out)
+{
+    (void)iface; (void)index; (void)channels;
+    if (devx_failure) return devx_failure;
+    memset(&ucx_dci, 0, sizeof(ucx_dci));
+    ucx_dci.txwq.super.type = 1;
+    ucx_dci.txwq.super.qp_num = devx_object.object_id = 0x12345;
+    ucx_dci.txwq.super.devx.wq_buf = queue;
+    ucx_dci.txwq.super.devx.obj = &devx_object;
+    ucx_dci.txwq.qstart = queue; ucx_dci.txwq.qend = queue + 64;
+    ucx_dci.txwq.dbrec = &ucx_db;
+    ucx_devx_active = 1;
+    *out = &ucx_dci;
+    return 0;
+}
+
+__attribute__((noinline)) int uct_dc_mlx5_iface_dci_connect(struct uct_dc_mlx5_iface *iface,
+                                                         struct uct_dc_dci *dci)
+{
+    (void)iface;
+    return mlx5dv_devx_obj_modify(dci->txwq.super.devx.obj, NULL, 0, NULL, 0);
+}
 
 __attribute__((noinline)) struct ibv_qp *mlx5dv_create_qp(struct ibv_context *ctx, void *unused,
                                                        struct mlx5dv_qp_init_attr *attr)
@@ -94,9 +139,9 @@ __attribute__((noinline)) int uct_dc_mlx5_ep_am_short(struct uct_dc_mlx5_ep *ep)
     put32(p + 24, 0x80000010);
     p[30] = 0xc1; p[31] = 0x23; p[43] = 64;
     p[58] = 0xff; p[59] = 0xff; p[60] = 192; p[62] = 2; p[63] = 1;
-    wq->super.type = ucx_mode == 2;
+    wq->super.type = ucx_devx_active || ucx_mode == 2;
     wq->super.qp_num = 0x12345 + (ucx_mode == 5);
-    wq->super.verbs.qp = &storage.verbs_qp.qp;
+    if (!ucx_devx_active) wq->super.verbs.qp = &storage.verbs_qp.qp;
     wq->prev_sw_pi = pos; wq->sw_pi = pos + 1;
     wq->qstart = queue; wq->qend = queue + 64;
     wq->curr = queue[(pos + 1) % 64];
@@ -147,12 +192,15 @@ int main(int argc, char **argv)
     puts("ready"); fflush(stdout);
     struct ibv_qp *qp = &storage.verbs_qp.qp;
     ucx_iface.tx.dcis.buffer = ucx_array; ucx_iface.tx.dcis.length = 1;
+    ucx_iface.super.super.super.config.port_num = 1;
     ucx_ep.super.super.iface = &ucx_iface;
+    devx_object.context = &ctx;
     int op;
     while ((op = getchar()) != EOF) {
         struct ibv_qp_attr attr = {.qp_state = 1, .port_num = 1, .ah_attr.port_num = 1};
         switch (op) {
         case 'c': case 't': {
+            ucx_devx_active = 0;
             struct mlx5dv_qp_init_attr init = {.comp_mask = op == 't' ? 10 : 2, .dc_init_attr.dc_type = 2};
             qp = mlx5dv_create_qp(&ctx, NULL, &init);
             mlx5_modify_qp(qp, &attr, 1 | 32);
@@ -167,6 +215,24 @@ int main(int argc, char **argv)
             break;
         }
         case 's': failure = 0; submit(2, 0); break;
+        case 'C': case 'S': case 'K': {
+            struct uct_dc_dci *result = NULL;
+            devx_failure = op == 'K' ? EINVAL : 0;
+            uct_dc_mlx5_iface_create_dci(&ucx_iface, 0, op == 'S' ? 2 : 1, &result);
+            devx_failure = 0;
+            break;
+        }
+        case 'N': case 'J':
+            devx_failure = op == 'J' ? EINVAL : 0;
+            uct_dc_mlx5_iface_dci_connect(&ucx_iface, &ucx_dci);
+            devx_failure = 0;
+            break;
+        case 'M':
+            devx_failure = EINVAL;
+            mlx5dv_devx_obj_modify(&devx_object, NULL, 0, NULL, 0);
+            devx_failure = 0;
+            break;
+        case 'X': mlx5dv_devx_obj_destroy(&devx_object); break;
         case 'A': case 'F': case 'D': case 'B': case 'I': case 'Q': case 'W':
             ucx_mode = op == 'F' ? 1 : op == 'D' ? 2 : op == 'B' ? 3 : op == 'I' ? 4 : op == 'Q' ? 5 : 0;
             if (op == 'W') storage.sq.cur_post = 65535;

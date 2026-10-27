@@ -35,6 +35,7 @@ type DCOptions struct {
 	PID                        int
 	Library, DebugFile, Device string
 	UCXLibrary, UCXDebugFile   string
+	UCXDevX                    bool
 	Port                       uint8
 	Capacity                   int
 	IdleTimeout                time.Duration
@@ -52,6 +53,8 @@ type DCStats struct {
 	Retired            uint64 `json:"retired"`
 	Created            uint64 `json:"created"`
 	UCXSubmissions     uint64 `json:"ucx_submissions"`
+	DevXSubmissions    uint64 `json:"devx_submissions"`
+	DevXCreated        uint64 `json:"devx_created"`
 	AcceptedSends      uint64 `json:"accepted_sends"`
 	RejectedRecords    uint64 `json:"rejected_records"`
 	ActiveFlows        int    `json:"active_flows"`
@@ -112,7 +115,7 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 	// Pin the actual inode throughout inspection and attachment, including
 	// when the library pathname is replaced during a package upgrade.
 	pinned := fmt.Sprintf("/proc/self/fd/%d", c.library.Fd())
-	profile, err := inspectDCProvider(pinned, options.DebugFile)
+	profile, err := inspectDCProviderMode(pinned, options.DebugFile, options.UCXDevX)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +129,7 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 	}
 	var ucx *ucxDCProvider
 	var ucxPinned string
-	if options.UCXLibrary != "" || options.UCXDebugFile != "" {
+	if options.UCXLibrary != "" || options.UCXDebugFile != "" || options.UCXDevX {
 		if options.UCXLibrary == "" || options.UCXDebugFile == "" {
 			return nil, fmt.Errorf("UCX library and matching debug ELF must both be supplied")
 		}
@@ -135,7 +138,7 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 			return nil, err
 		}
 		ucxPinned = fmt.Sprintf("/proc/self/fd/%d", c.ucxLibrary.Fd())
-		ucx, err = inspectUCXDC(ucxPinned, options.UCXDebugFile)
+		ucx, err = inspectUCXDCMode(ucxPinned, options.UCXDebugFile, options.UCXDevX)
 		if err != nil {
 			return nil, err
 		}
@@ -160,6 +163,10 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 		return nil, err
 	}
 	if ucx != nil {
+		if options.UCXDevX {
+			ucx.layout.DevXEnabled = 1
+			ucx.layout.DevXContext, ucx.layout.DevXQPN = profile.devxContext, profile.devxQPN
+		}
 		if err = c.objs.DcUcxLayout.Put(uint32(0), ucx.layout); err != nil {
 			return nil, err
 		}
@@ -207,21 +214,17 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 		return nil, fmt.Errorf("attach process-exec invalidation: %w", err)
 	}
 	c.links = append(c.links, execLink)
-	if ucx != nil {
-		ucxExe, err := link.OpenExecutable(ucxPinned)
-		if err != nil {
-			return nil, err
-		}
-		ret, err := ucxExe.Uretprobe("", c.objs.DcUcxExit, &link.UprobeOptions{Address: ucx.symbol})
-		if err != nil {
-			return nil, fmt.Errorf("attach UCX AM-short return: %w", err)
-		}
-		c.links = append(c.links, ret)
-		enter, err := ucxExe.Uprobe("", c.objs.DcUcxEnter, &link.UprobeOptions{Address: ucx.symbol})
-		if err != nil {
-			return nil, fmt.Errorf("attach UCX AM-short entry: %w", err)
-		}
-		c.links = append(c.links, enter)
+	if options.UCXDevX {
+		probes = append(probes, struct {
+			name string
+			prog *ebpf.Program
+			ret  bool
+		}{"mlx5dv_devx_obj_destroy", c.objs.DcRetire, false},
+			struct {
+				name string
+				prog *ebpf.Program
+				ret  bool
+			}{"mlx5dv_devx_obj_modify", c.objs.DcDevxModify, false})
 	}
 	probes = append(probes,
 		struct {
@@ -248,6 +251,38 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 			return nil, fmt.Errorf("attach DC %s: %w", p.name, err)
 		}
 		c.links = append(c.links, hook)
+	}
+	if ucx != nil {
+		ucxExe, err := link.OpenExecutable(ucxPinned)
+		if err != nil {
+			return nil, err
+		}
+		type ucxProbe struct {
+			offset uint64
+			prog   *ebpf.Program
+			ret    bool
+		}
+		hooks := []ucxProbe{{ucx.symbol, c.objs.DcUcxExit, true}, {ucx.symbol, c.objs.DcUcxEnter, false}}
+		if options.UCXDevX {
+			hooks = append(hooks, ucxProbe{ucx.connectSymbol, c.objs.DcDevxConnectExit, true},
+				ucxProbe{ucx.connectSymbol, c.objs.DcDevxConnectEnter, false},
+				ucxProbe{ucx.createSymbol, c.objs.DcDevxCreateExit, true},
+				ucxProbe{ucx.createSymbol, c.objs.DcDevxCreateEnter, false})
+		}
+		// Provider retirement hooks are active before UCX creation is enabled.
+		for _, h := range hooks {
+			var hook link.Link
+			opts := &link.UprobeOptions{Address: h.offset}
+			if h.ret {
+				hook, err = ucxExe.Uretprobe("", h.prog, opts)
+			} else {
+				hook, err = ucxExe.Uprobe("", h.prog, opts)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("attach UCX DC probe: %w", err)
+			}
+			c.links = append(c.links, hook)
+		}
 	}
 	if !c.alive() {
 		return nil, fmt.Errorf("target process exited during attachment")
@@ -461,7 +496,7 @@ func (c *DCCollector) prune(now time.Time) error {
 func (c *DCCollector) Stats() (DCStats, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var values [9]uint64
+	var values [11]uint64
 	for i := range values {
 		if err := c.objs.DcStats.Lookup(uint32(i), &values[i]); err != nil {
 			return DCStats{}, err
@@ -471,7 +506,7 @@ func (c *DCCollector) Stats() (DCStats, error) {
 		return DCStats{}, err
 	}
 	return DCStats{SubmittedBatches: values[0], FailedSubmissions: values[1], UnsupportedBatches: values[2],
-		ReadErrors: values[3], MapErrors: values[4], RingLost: values[5], Retired: values[6], Created: values[7], UCXSubmissions: values[8],
+		ReadErrors: values[3], MapErrors: values[4], RingLost: values[5], Retired: values[6], Created: values[7], UCXSubmissions: values[8], DevXSubmissions: values[9], DevXCreated: values[10],
 		AcceptedSends: c.accepted.Load(), RejectedRecords: c.rejected.Load(), ActiveFlows: len(c.table.snapshot(time.Now()))}, nil
 }
 

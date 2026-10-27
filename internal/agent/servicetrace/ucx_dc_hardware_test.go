@@ -20,17 +20,31 @@ func TestUCXDCHardware(t *testing.T) {
 	if os.Getenv("RPINGMESH_UCX_DC_HARDWARE_TEST") != "1" {
 		t.Skip("opt-in UCX DC hardware test")
 	}
-	testUCXDCHardware(t, false)
+	testUCXDCHardware(t, false, false)
 }
 
 func TestUCXDCUprobeHardware(t *testing.T) {
 	if os.Getenv("RPINGMESH_UCX_DC_UPROBE_TEST") != "1" {
 		t.Skip("user-run privileged UCX DC hardware test")
 	}
-	testUCXDCHardware(t, true)
+	testUCXDCHardware(t, true, false)
 }
 
-func testUCXDCHardware(t *testing.T, attach bool) {
+func TestUCXDevXDCHardware(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_DEVX_HARDWARE_TEST") != "1" {
+		t.Skip("opt-in UCX DevX hardware test")
+	}
+	testUCXDCHardware(t, false, true)
+}
+
+func TestUCXDevXDCUprobeHardware(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_DEVX_UPROBE_TEST") != "1" {
+		t.Skip("user-run privileged UCX DevX hardware test")
+	}
+	testUCXDCHardware(t, true, true)
+}
+
+func testUCXDCHardware(t *testing.T, attach, devx bool) {
 	get := func(name string) string {
 		t.Helper()
 		value := os.Getenv(name)
@@ -52,9 +66,17 @@ func testUCXDCHardware(t *testing.T, attach bool) {
 	if err := CheckUCXDC(ucx, ucxDebug); err != nil {
 		t.Fatal(err)
 	}
+	if devx {
+		if err := CheckUCXDCDevX(library, debug, ucx, ucxDebug); err != nil {
+			t.Fatal(err)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	child := exec.CommandContext(ctx, get("RPINGMESH_UCX_DC_HELPER"), device, portText, gid)
+	if devx {
+		child.Args = append(child.Args, "--devx")
+	}
 	stdin, err := child.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +124,7 @@ func testUCXDCHardware(t *testing.T, attach bool) {
 	var c *DCCollector
 	if attach {
 		c, err = OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: library, DebugFile: debug,
-			UCXLibrary: ucx, UCXDebugFile: ucxDebug, Device: device, Port: uint8(port)})
+			UCXLibrary: ucx, UCXDebugFile: ucxDebug, UCXDevX: devx, Device: device, Port: uint8(port)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -167,6 +189,12 @@ func testUCXDCHardware(t *testing.T, attach bool) {
 			s.RingLost != 0 || s.RejectedRecords != 0 || s.FailedSubmissions != 0 {
 			t.Fatalf("unexpected UCX counters: %+v", s)
 		}
+		if devx && (s.DevXSubmissions != 3 || s.DevXCreated == 0) {
+			t.Fatalf("DevX path was not captured: %+v", s)
+		}
+		if !devx && s.DevXSubmissions != 0 {
+			t.Fatal("unexpected DevX capture")
+		}
 		c.mu.Lock()
 		flows := c.table.snapshot(time.Now())
 		c.mu.Unlock()
@@ -190,8 +218,8 @@ func testUCXDCHardware(t *testing.T, attach bool) {
 		t.Fatal("UCX helper teardown failed")
 	}
 	if attach {
-		t.Log("verified 3 UCX direct sends, 2 destination flows, and DCI retirement")
+		t.Logf("verified 3 UCX direct sends, 2 destination flows, and DCI retirement (DevX=%t)", devx)
 	} else {
-		t.Log("verified selected libraries and 3 UCX direct sends with receive and flush completion; BPF was not loaded")
+		t.Logf("verified selected libraries and 3 UCX direct sends with receive and flush completion (DevX=%t); BPF was not loaded", devx)
 	}
 }

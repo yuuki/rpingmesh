@@ -28,6 +28,7 @@ static void gate(const char *message, int command)
 }
 
 struct receiver { unsigned count; unsigned mask; };
+static int use_devx;
 static ucs_status_t receive(void *arg, void *data, size_t length, unsigned flags)
 {
     struct receiver *r = arg;
@@ -127,14 +128,19 @@ static void report_wqe(uct_ep_h endpoint)
     uct_dc_mlx5_ep_t *ep = ucs_derived_of(endpoint, uct_dc_mlx5_ep_t);
     uct_dc_mlx5_iface_t *iface = ucs_derived_of(endpoint->iface, uct_dc_mlx5_iface_t);
     uct_ib_mlx5_txwq_t *wq = &uct_dc_mlx5_iface_dci(iface, ep->dci)->txwq;
-    if (wq->super.type != UCT_IB_MLX5_OBJ_TYPE_VERBS) fail("unexpected DevX DCI");
+    if (wq->super.type != (use_devx ? UCT_IB_MLX5_OBJ_TYPE_DEVX : UCT_IB_MLX5_OBJ_TYPE_VERBS))
+        fail("unexpected DCI backend");
     size_t bytes = (char *)wq->qend - (char *)wq->qstart;
     if (!bytes || (bytes & (bytes - 1))) fail("SQ extent");
     struct mlx5dv_qp dv_qp = {0};
     struct mlx5dv_obj obj = {0};
     obj.qp.in = wq->super.verbs.qp;
     obj.qp.out = &dv_qp;
-    if (mlx5dv_init_obj(&obj, MLX5DV_OBJ_QP) || dv_qp.sq.buf != wq->qstart ||
+    if (use_devx) {
+        if (!wq->super.devx.obj || wq->qstart != wq->super.devx.wq_buf ||
+            wq->dbrec != &wq->super.devx.dbrec->db[MLX5_SND_DBR] ||
+            (uint16_t)ntohl(*wq->dbrec) != wq->sw_pi) fail("DevX SQ correspondence");
+    } else if (mlx5dv_init_obj(&obj, MLX5DV_OBJ_QP) || dv_qp.sq.buf != wq->qstart ||
         dv_qp.sq.stride != 64 || bytes != (size_t)dv_qp.sq.wqe_cnt * 64 ||
         (uint16_t)ntohl(*wq->dbrec) != wq->sw_pi) fail("UCX/provider SQ correspondence");
     const unsigned char *prefix = (const unsigned char *)wq->qstart + ((wq->prev_sw_pi * 64u) & (bytes - 1));
@@ -148,10 +154,13 @@ static void report_wqe(uct_ep_h endpoint)
 
 int main(int argc, char **argv)
 {
-    if (argc != 4) fail("expected device, port and GID index");
+    if (argc != 4 && (argc != 5 || strcmp(argv[4], "--devx"))) fail("expected device, port, GID index and optional --devx");
+    use_devx = argc == 5;
     alarm(60);
-    if (setenv("UCX_IB_MLX5_DEVX", "no", 1) || setenv("UCX_IB_GID_INDEX", argv[3], 1) ||
+    if (setenv("UCX_IB_MLX5_DEVX", use_devx ? "yes" : "no", 1) || setenv("UCX_IB_GID_INDEX", argv[3], 1) ||
         setenv("UCX_LOG_LEVEL", "error", 1)) fail("environment");
+    /* The fixture does not need a shared hardware counter set. */
+    if (use_devx && setenv("UCX_IB_COUNTER_SET_ID", "0", 1)) fail("counter setting");
     char device[128];
     if (snprintf(device, sizeof(device), "%s:%s", argv[1], argv[2]) >= (int)sizeof(device)) fail("device argument");
     ucs_async_context_t *async;

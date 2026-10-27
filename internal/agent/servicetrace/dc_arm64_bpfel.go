@@ -59,29 +59,37 @@ type dcDcIdentity struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	dcMapDcCreating       = "dc_creating"
-	dcMapDcEpoch          = "dc_epoch"
-	dcMapDcEvents         = "dc_events"
-	dcMapDcModifying      = "dc_modifying"
-	dcMapDcPending        = "dc_pending"
-	dcMapDcQps            = "dc_qps"
-	dcMapDcScratch        = "dc_scratch"
-	dcMapDcSequence       = "dc_sequence"
-	dcMapDcSettings       = "dc_settings"
-	dcMapDcStats          = "dc_stats"
-	dcMapDcUcxLayout      = "dc_ucx_layout"
-	dcMapDcUcxPending     = "dc_ucx_pending"
-	dcProgDcCompleteEnter = "dc_complete_enter"
-	dcProgDcCompleteExit  = "dc_complete_exit"
-	dcProgDcCreateEnter   = "dc_create_enter"
-	dcProgDcCreateExit    = "dc_create_exit"
-	dcProgDcExec          = "dc_exec"
-	dcProgDcExit          = "dc_exit"
-	dcProgDcModifyEnter   = "dc_modify_enter"
-	dcProgDcModifyExit    = "dc_modify_exit"
-	dcProgDcRetire        = "dc_retire"
-	dcProgDcUcxEnter      = "dc_ucx_enter"
-	dcProgDcUcxExit       = "dc_ucx_exit"
+	dcMapDcCreating          = "dc_creating"
+	dcMapDcDevxConnecting    = "dc_devx_connecting"
+	dcMapDcDevxCreating      = "dc_devx_creating"
+	dcMapDcDevxQueues        = "dc_devx_queues"
+	dcMapDcEpoch             = "dc_epoch"
+	dcMapDcEvents            = "dc_events"
+	dcMapDcModifying         = "dc_modifying"
+	dcMapDcPending           = "dc_pending"
+	dcMapDcQps               = "dc_qps"
+	dcMapDcScratch           = "dc_scratch"
+	dcMapDcSequence          = "dc_sequence"
+	dcMapDcSettings          = "dc_settings"
+	dcMapDcStats             = "dc_stats"
+	dcMapDcUcxLayout         = "dc_ucx_layout"
+	dcMapDcUcxPending        = "dc_ucx_pending"
+	dcProgDcCompleteEnter    = "dc_complete_enter"
+	dcProgDcCompleteExit     = "dc_complete_exit"
+	dcProgDcCreateEnter      = "dc_create_enter"
+	dcProgDcCreateExit       = "dc_create_exit"
+	dcProgDcDevxConnectEnter = "dc_devx_connect_enter"
+	dcProgDcDevxConnectExit  = "dc_devx_connect_exit"
+	dcProgDcDevxCreateEnter  = "dc_devx_create_enter"
+	dcProgDcDevxCreateExit   = "dc_devx_create_exit"
+	dcProgDcDevxModify       = "dc_devx_modify"
+	dcProgDcExec             = "dc_exec"
+	dcProgDcExit             = "dc_exit"
+	dcProgDcModifyEnter      = "dc_modify_enter"
+	dcProgDcModifyExit       = "dc_modify_exit"
+	dcProgDcRetire           = "dc_retire"
+	dcProgDcUcxEnter         = "dc_ucx_enter"
+	dcProgDcUcxExit          = "dc_ucx_exit"
 )
 
 // loadDc returns the embedded CollectionSpec for dc.
@@ -126,35 +134,43 @@ type dcSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type dcProgramSpecs struct {
-	DcCompleteEnter *ebpf.ProgramSpec `ebpf:"dc_complete_enter"`
-	DcCompleteExit  *ebpf.ProgramSpec `ebpf:"dc_complete_exit"`
-	DcCreateEnter   *ebpf.ProgramSpec `ebpf:"dc_create_enter"`
-	DcCreateExit    *ebpf.ProgramSpec `ebpf:"dc_create_exit"`
-	DcExec          *ebpf.ProgramSpec `ebpf:"dc_exec"`
-	DcExit          *ebpf.ProgramSpec `ebpf:"dc_exit"`
-	DcModifyEnter   *ebpf.ProgramSpec `ebpf:"dc_modify_enter"`
-	DcModifyExit    *ebpf.ProgramSpec `ebpf:"dc_modify_exit"`
-	DcRetire        *ebpf.ProgramSpec `ebpf:"dc_retire"`
-	DcUcxEnter      *ebpf.ProgramSpec `ebpf:"dc_ucx_enter"`
-	DcUcxExit       *ebpf.ProgramSpec `ebpf:"dc_ucx_exit"`
+	DcCompleteEnter    *ebpf.ProgramSpec `ebpf:"dc_complete_enter"`
+	DcCompleteExit     *ebpf.ProgramSpec `ebpf:"dc_complete_exit"`
+	DcCreateEnter      *ebpf.ProgramSpec `ebpf:"dc_create_enter"`
+	DcCreateExit       *ebpf.ProgramSpec `ebpf:"dc_create_exit"`
+	DcDevxConnectEnter *ebpf.ProgramSpec `ebpf:"dc_devx_connect_enter"`
+	DcDevxConnectExit  *ebpf.ProgramSpec `ebpf:"dc_devx_connect_exit"`
+	DcDevxCreateEnter  *ebpf.ProgramSpec `ebpf:"dc_devx_create_enter"`
+	DcDevxCreateExit   *ebpf.ProgramSpec `ebpf:"dc_devx_create_exit"`
+	DcDevxModify       *ebpf.ProgramSpec `ebpf:"dc_devx_modify"`
+	DcExec             *ebpf.ProgramSpec `ebpf:"dc_exec"`
+	DcExit             *ebpf.ProgramSpec `ebpf:"dc_exit"`
+	DcModifyEnter      *ebpf.ProgramSpec `ebpf:"dc_modify_enter"`
+	DcModifyExit       *ebpf.ProgramSpec `ebpf:"dc_modify_exit"`
+	DcRetire           *ebpf.ProgramSpec `ebpf:"dc_retire"`
+	DcUcxEnter         *ebpf.ProgramSpec `ebpf:"dc_ucx_enter"`
+	DcUcxExit          *ebpf.ProgramSpec `ebpf:"dc_ucx_exit"`
 }
 
 // dcMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type dcMapSpecs struct {
-	DcCreating   *ebpf.MapSpec `ebpf:"dc_creating"`
-	DcEpoch      *ebpf.MapSpec `ebpf:"dc_epoch"`
-	DcEvents     *ebpf.MapSpec `ebpf:"dc_events"`
-	DcModifying  *ebpf.MapSpec `ebpf:"dc_modifying"`
-	DcPending    *ebpf.MapSpec `ebpf:"dc_pending"`
-	DcQps        *ebpf.MapSpec `ebpf:"dc_qps"`
-	DcScratch    *ebpf.MapSpec `ebpf:"dc_scratch"`
-	DcSequence   *ebpf.MapSpec `ebpf:"dc_sequence"`
-	DcSettings   *ebpf.MapSpec `ebpf:"dc_settings"`
-	DcStats      *ebpf.MapSpec `ebpf:"dc_stats"`
-	DcUcxLayout  *ebpf.MapSpec `ebpf:"dc_ucx_layout"`
-	DcUcxPending *ebpf.MapSpec `ebpf:"dc_ucx_pending"`
+	DcCreating       *ebpf.MapSpec `ebpf:"dc_creating"`
+	DcDevxConnecting *ebpf.MapSpec `ebpf:"dc_devx_connecting"`
+	DcDevxCreating   *ebpf.MapSpec `ebpf:"dc_devx_creating"`
+	DcDevxQueues     *ebpf.MapSpec `ebpf:"dc_devx_queues"`
+	DcEpoch          *ebpf.MapSpec `ebpf:"dc_epoch"`
+	DcEvents         *ebpf.MapSpec `ebpf:"dc_events"`
+	DcModifying      *ebpf.MapSpec `ebpf:"dc_modifying"`
+	DcPending        *ebpf.MapSpec `ebpf:"dc_pending"`
+	DcQps            *ebpf.MapSpec `ebpf:"dc_qps"`
+	DcScratch        *ebpf.MapSpec `ebpf:"dc_scratch"`
+	DcSequence       *ebpf.MapSpec `ebpf:"dc_sequence"`
+	DcSettings       *ebpf.MapSpec `ebpf:"dc_settings"`
+	DcStats          *ebpf.MapSpec `ebpf:"dc_stats"`
+	DcUcxLayout      *ebpf.MapSpec `ebpf:"dc_ucx_layout"`
+	DcUcxPending     *ebpf.MapSpec `ebpf:"dc_ucx_pending"`
 }
 
 // dcVariableSpecs contains global variables before they are loaded into the kernel.
@@ -183,23 +199,29 @@ func (o *dcObjects) Close() error {
 //
 // It can be passed to loadDcObjects or ebpf.CollectionSpec.LoadAndAssign.
 type dcMaps struct {
-	DcCreating   *ebpf.Map `ebpf:"dc_creating"`
-	DcEpoch      *ebpf.Map `ebpf:"dc_epoch"`
-	DcEvents     *ebpf.Map `ebpf:"dc_events"`
-	DcModifying  *ebpf.Map `ebpf:"dc_modifying"`
-	DcPending    *ebpf.Map `ebpf:"dc_pending"`
-	DcQps        *ebpf.Map `ebpf:"dc_qps"`
-	DcScratch    *ebpf.Map `ebpf:"dc_scratch"`
-	DcSequence   *ebpf.Map `ebpf:"dc_sequence"`
-	DcSettings   *ebpf.Map `ebpf:"dc_settings"`
-	DcStats      *ebpf.Map `ebpf:"dc_stats"`
-	DcUcxLayout  *ebpf.Map `ebpf:"dc_ucx_layout"`
-	DcUcxPending *ebpf.Map `ebpf:"dc_ucx_pending"`
+	DcCreating       *ebpf.Map `ebpf:"dc_creating"`
+	DcDevxConnecting *ebpf.Map `ebpf:"dc_devx_connecting"`
+	DcDevxCreating   *ebpf.Map `ebpf:"dc_devx_creating"`
+	DcDevxQueues     *ebpf.Map `ebpf:"dc_devx_queues"`
+	DcEpoch          *ebpf.Map `ebpf:"dc_epoch"`
+	DcEvents         *ebpf.Map `ebpf:"dc_events"`
+	DcModifying      *ebpf.Map `ebpf:"dc_modifying"`
+	DcPending        *ebpf.Map `ebpf:"dc_pending"`
+	DcQps            *ebpf.Map `ebpf:"dc_qps"`
+	DcScratch        *ebpf.Map `ebpf:"dc_scratch"`
+	DcSequence       *ebpf.Map `ebpf:"dc_sequence"`
+	DcSettings       *ebpf.Map `ebpf:"dc_settings"`
+	DcStats          *ebpf.Map `ebpf:"dc_stats"`
+	DcUcxLayout      *ebpf.Map `ebpf:"dc_ucx_layout"`
+	DcUcxPending     *ebpf.Map `ebpf:"dc_ucx_pending"`
 }
 
 func (m *dcMaps) Close() error {
 	return _DcClose(
 		m.DcCreating,
+		m.DcDevxConnecting,
+		m.DcDevxCreating,
+		m.DcDevxQueues,
 		m.DcEpoch,
 		m.DcEvents,
 		m.DcModifying,
@@ -224,17 +246,22 @@ type dcVariables struct {
 //
 // It can be passed to loadDcObjects or ebpf.CollectionSpec.LoadAndAssign.
 type dcPrograms struct {
-	DcCompleteEnter *ebpf.Program `ebpf:"dc_complete_enter"`
-	DcCompleteExit  *ebpf.Program `ebpf:"dc_complete_exit"`
-	DcCreateEnter   *ebpf.Program `ebpf:"dc_create_enter"`
-	DcCreateExit    *ebpf.Program `ebpf:"dc_create_exit"`
-	DcExec          *ebpf.Program `ebpf:"dc_exec"`
-	DcExit          *ebpf.Program `ebpf:"dc_exit"`
-	DcModifyEnter   *ebpf.Program `ebpf:"dc_modify_enter"`
-	DcModifyExit    *ebpf.Program `ebpf:"dc_modify_exit"`
-	DcRetire        *ebpf.Program `ebpf:"dc_retire"`
-	DcUcxEnter      *ebpf.Program `ebpf:"dc_ucx_enter"`
-	DcUcxExit       *ebpf.Program `ebpf:"dc_ucx_exit"`
+	DcCompleteEnter    *ebpf.Program `ebpf:"dc_complete_enter"`
+	DcCompleteExit     *ebpf.Program `ebpf:"dc_complete_exit"`
+	DcCreateEnter      *ebpf.Program `ebpf:"dc_create_enter"`
+	DcCreateExit       *ebpf.Program `ebpf:"dc_create_exit"`
+	DcDevxConnectEnter *ebpf.Program `ebpf:"dc_devx_connect_enter"`
+	DcDevxConnectExit  *ebpf.Program `ebpf:"dc_devx_connect_exit"`
+	DcDevxCreateEnter  *ebpf.Program `ebpf:"dc_devx_create_enter"`
+	DcDevxCreateExit   *ebpf.Program `ebpf:"dc_devx_create_exit"`
+	DcDevxModify       *ebpf.Program `ebpf:"dc_devx_modify"`
+	DcExec             *ebpf.Program `ebpf:"dc_exec"`
+	DcExit             *ebpf.Program `ebpf:"dc_exit"`
+	DcModifyEnter      *ebpf.Program `ebpf:"dc_modify_enter"`
+	DcModifyExit       *ebpf.Program `ebpf:"dc_modify_exit"`
+	DcRetire           *ebpf.Program `ebpf:"dc_retire"`
+	DcUcxEnter         *ebpf.Program `ebpf:"dc_ucx_enter"`
+	DcUcxExit          *ebpf.Program `ebpf:"dc_ucx_exit"`
 }
 
 func (p *dcPrograms) Close() error {
@@ -243,6 +270,11 @@ func (p *dcPrograms) Close() error {
 		p.DcCompleteExit,
 		p.DcCreateEnter,
 		p.DcCreateExit,
+		p.DcDevxConnectEnter,
+		p.DcDevxConnectExit,
+		p.DcDevxCreateEnter,
+		p.DcDevxCreateExit,
+		p.DcDevxModify,
 		p.DcExec,
 		p.DcExit,
 		p.DcModifyEnter,

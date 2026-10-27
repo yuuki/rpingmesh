@@ -29,10 +29,12 @@ import (
 
 // DCOptions selects one process and one RDMA port. Attach before it creates
 // DCIs. Library and DebugFile must describe the same ELF build, with complete
-// provider DWARF. Only the libmlx5 extended WR API is observed.
+// provider DWARF. UCXLibrary/UCXDebugFile optionally enable the experimental
+// dc_mlx5 AM-short adapter in addition to the libmlx5 extended WR API.
 type DCOptions struct {
 	PID                        int
 	Library, DebugFile, Device string
+	UCXLibrary, UCXDebugFile   string
 	Port                       uint8
 	Capacity                   int
 	IdleTimeout                time.Duration
@@ -49,6 +51,7 @@ type DCStats struct {
 	RingLost           uint64 `json:"ring_lost"`
 	Retired            uint64 `json:"retired"`
 	Created            uint64 `json:"created"`
+	UCXSubmissions     uint64 `json:"ucx_submissions"`
 	AcceptedSends      uint64 `json:"accepted_sends"`
 	RejectedRecords    uint64 `json:"rejected_records"`
 	ActiveFlows        int    `json:"active_flows"`
@@ -62,6 +65,7 @@ type DCCollector struct {
 	links              []link.Link
 	reader             *ringbuf.Reader
 	library            *os.File
+	ucxLibrary         *os.File
 	pidfd              int
 	table              *dcFlowTable
 	accepted, rejected atomic.Uint64
@@ -120,6 +124,28 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 	if err = dcLibraryMapped(options.PID, c.library); err != nil {
 		return nil, err
 	}
+	var ucx *ucxDCProvider
+	var ucxPinned string
+	if options.UCXLibrary != "" || options.UCXDebugFile != "" {
+		if options.UCXLibrary == "" || options.UCXDebugFile == "" {
+			return nil, fmt.Errorf("UCX library and matching debug ELF must both be supplied")
+		}
+		c.ucxLibrary, err = os.Open(options.UCXLibrary)
+		if err != nil {
+			return nil, err
+		}
+		ucxPinned = fmt.Sprintf("/proc/self/fd/%d", c.ucxLibrary.Fd())
+		ucx, err = inspectUCXDC(ucxPinned, options.UCXDebugFile)
+		if err != nil {
+			return nil, err
+		}
+		if ucx.machine != profile.machine {
+			return nil, fmt.Errorf("UCX/provider architectures differ")
+		}
+		if err = dcLibraryMapped(options.PID, c.ucxLibrary); err != nil {
+			return nil, err
+		}
+	}
 	if !c.alive() {
 		return nil, fmt.Errorf("target process exited")
 	}
@@ -132,6 +158,11 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 	_ = binary.Write(&config, binary.LittleEndian, profile.layout)
 	if err = c.objs.DcSettings.Put(uint32(0), config.Bytes()); err != nil {
 		return nil, err
+	}
+	if ucx != nil {
+		if err = c.objs.DcUcxLayout.Put(uint32(0), ucx.layout); err != nil {
+			return nil, err
+		}
 	}
 	if c.reader, err = ringbuf.NewReader(c.objs.DcEvents); err != nil {
 		return nil, err
@@ -176,6 +207,22 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 		return nil, fmt.Errorf("attach process-exec invalidation: %w", err)
 	}
 	c.links = append(c.links, execLink)
+	if ucx != nil {
+		ucxExe, err := link.OpenExecutable(ucxPinned)
+		if err != nil {
+			return nil, err
+		}
+		ret, err := ucxExe.Uretprobe("", c.objs.DcUcxExit, &link.UprobeOptions{Address: ucx.symbol})
+		if err != nil {
+			return nil, fmt.Errorf("attach UCX AM-short return: %w", err)
+		}
+		c.links = append(c.links, ret)
+		enter, err := ucxExe.Uprobe("", c.objs.DcUcxEnter, &link.UprobeOptions{Address: ucx.symbol})
+		if err != nil {
+			return nil, fmt.Errorf("attach UCX AM-short entry: %w", err)
+		}
+		c.links = append(c.links, enter)
+	}
 	probes = append(probes,
 		struct {
 			name string
@@ -414,7 +461,7 @@ func (c *DCCollector) prune(now time.Time) error {
 func (c *DCCollector) Stats() (DCStats, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var values [8]uint64
+	var values [9]uint64
 	for i := range values {
 		if err := c.objs.DcStats.Lookup(uint32(i), &values[i]); err != nil {
 			return DCStats{}, err
@@ -424,7 +471,7 @@ func (c *DCCollector) Stats() (DCStats, error) {
 		return DCStats{}, err
 	}
 	return DCStats{SubmittedBatches: values[0], FailedSubmissions: values[1], UnsupportedBatches: values[2],
-		ReadErrors: values[3], MapErrors: values[4], RingLost: values[5], Retired: values[6], Created: values[7],
+		ReadErrors: values[3], MapErrors: values[4], RingLost: values[5], Retired: values[6], Created: values[7], UCXSubmissions: values[8],
 		AcceptedSends: c.accepted.Load(), RejectedRecords: c.rejected.Load(), ActiveFlows: len(c.table.snapshot(time.Now()))}, nil
 }
 
@@ -439,6 +486,9 @@ func (c *DCCollector) Close() {
 		c.objs.Close()
 		if c.library != nil {
 			c.library.Close()
+		}
+		if c.ucxLibrary != nil {
+			c.ucxLibrary.Close()
 		}
 		if c.pidfd >= 0 {
 			unix.Close(c.pidfd)

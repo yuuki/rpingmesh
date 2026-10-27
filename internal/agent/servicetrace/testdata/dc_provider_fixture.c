@@ -25,6 +25,34 @@ static struct mlx5_qp storage;
 static unsigned char queue[64][64];
 static int failure;
 
+/* Deliberately synthetic UCX layouts; no copied production offsets. */
+struct uct_ib_mlx5_txwq {
+    struct { int type; uint32_t qp_num; struct { struct ibv_qp *qp; } verbs; } super;
+    uint16_t sw_pi, prev_sw_pi;
+    void *qstart, *qend, *curr;
+    uint32_t *dbrec;
+};
+struct uct_dc_dci { uint64_t padding; struct uct_ib_mlx5_txwq txwq; };
+struct uct_dc_mlx5_iface {
+    struct { struct { struct { struct { struct { uint64_t padding; } super; } super; } super; } super; } super;
+    struct { struct { struct uct_dc_dci **buffer; uint16_t length; } dcis; } tx;
+};
+struct uct_dc_mlx5_ep {
+    struct { struct { struct uct_dc_mlx5_iface *iface; } super; } super;
+    uint64_t padding;
+#ifdef TEST_UCX_BAD_DCI
+    uint32_t dci;
+#else
+    uint16_t dci;
+#endif
+};
+static struct uct_dc_dci ucx_dci;
+static struct uct_dc_dci *ucx_array[] = {&ucx_dci};
+static struct uct_dc_mlx5_iface ucx_iface;
+static struct uct_dc_mlx5_ep ucx_ep;
+static uint32_t ucx_db;
+static int ucx_mode;
+
 __attribute__((noinline)) struct ibv_qp *mlx5dv_create_qp(struct ibv_context *ctx, void *unused,
                                                        struct mlx5dv_qp_init_attr *attr)
 {
@@ -52,6 +80,31 @@ __attribute__((noinline)) int mlx5_send_wr_complete(struct ibv_qp_ex *qp)
 
 static void put32(unsigned char *p, uint32_t v)
 { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
+
+__attribute__((noinline)) int uct_dc_mlx5_ep_am_short(struct uct_dc_mlx5_ep *ep)
+{
+    if (ucx_mode == 1) return -2;
+    struct uct_ib_mlx5_txwq *wq = &ep->super.super.iface->tx.dcis.buffer[ep->dci]->txwq;
+    unsigned pos = storage.sq.cur_post++;
+    unsigned char *p = queue[pos % 64];
+    memset(p, 0, 64);
+    put32(p, ((pos & 0xffff) << 8) | 0x0a);
+    put32(p + 4, (0x12345 << 8) | 4);
+    memset(p + 16, 0xa5, 8);
+    put32(p + 24, 0x80000010);
+    p[30] = 0xc1; p[31] = 0x23; p[43] = 64;
+    p[58] = 0xff; p[59] = 0xff; p[60] = 192; p[62] = 2; p[63] = 1;
+    wq->super.type = ucx_mode == 2;
+    wq->super.qp_num = 0x12345 + (ucx_mode == 5);
+    wq->super.verbs.qp = &storage.verbs_qp.qp;
+    wq->prev_sw_pi = pos; wq->sw_pi = pos + 1;
+    wq->qstart = queue; wq->qend = queue + 64;
+    wq->curr = queue[(pos + 1) % 64];
+    wq->dbrec = &ucx_db;
+    put32((unsigned char *)&ucx_db, (uint16_t)(pos + 1 + (ucx_mode == 3)));
+    if (ucx_mode == 4) put32(p, (((pos + 1) & 0xffff) << 8) | 0x0a);
+    return 0;
+}
 
 static void submit(unsigned n, int invalid)
 {
@@ -93,6 +146,8 @@ int main(int argc, char **argv)
     alarm(60);
     puts("ready"); fflush(stdout);
     struct ibv_qp *qp = &storage.verbs_qp.qp;
+    ucx_iface.tx.dcis.buffer = ucx_array; ucx_iface.tx.dcis.length = 1;
+    ucx_ep.super.super.iface = &ucx_iface;
     int op;
     while ((op = getchar()) != EOF) {
         struct ibv_qp_attr attr = {.qp_state = 1, .port_num = 1, .ah_attr.port_num = 1};
@@ -112,6 +167,11 @@ int main(int argc, char **argv)
             break;
         }
         case 's': failure = 0; submit(2, 0); break;
+        case 'A': case 'F': case 'D': case 'B': case 'I': case 'Q': case 'W':
+            ucx_mode = op == 'F' ? 1 : op == 'D' ? 2 : op == 'B' ? 3 : op == 'I' ? 4 : op == 'Q' ? 5 : 0;
+            if (op == 'W') storage.sq.cur_post = 65535;
+            uct_dc_mlx5_ep_am_short(&ucx_ep);
+            break;
         case 'f': failure = EINVAL; submit(2, 0); failure = 0; break;
         case 'b': submit(17, 0); break;
         case 'v': submit(2, 1); break;

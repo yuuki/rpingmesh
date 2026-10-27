@@ -23,10 +23,20 @@ struct dc_batch {
 };
 struct dc_create_pending { __s32 fd; };
 struct dc_modify_pending { __u64 qp; struct dc_identity identity; };
+struct ucx_dc_layout {
+    __u32 ep_interface, ep_dci, interface_buffer, interface_length;
+    __u32 dci_wq, wq_type, wq_qp, wq_qpn;
+    __u32 wq_start, wq_end, wq_current, wq_db;
+    __u32 wq_previous, wq_producer;
+};
+struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
+    __type(key, __u32); __type(value, struct ucx_dc_layout); } dc_ucx_layout SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 256);
+    __type(key, __u64); __type(value, __u64); } dc_ucx_pending SEC(".maps");
 
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
     __type(key, __u32); __type(value, struct dc_config); } dc_settings SEC(".maps");
-struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 8);
+struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 9);
     __type(key, __u32); __type(value, __u64); } dc_stats SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
     __type(key, __u32); __type(value, __u64); } dc_epoch SEC(".maps");
@@ -89,6 +99,7 @@ static __always_inline void invalidate_process(void)
     bpf_for_each_map_elem(&dc_creating, clear_entry, 0, 0);
     bpf_for_each_map_elem(&dc_modifying, clear_entry, 0, 0);
     bpf_for_each_map_elem(&dc_pending, clear_entry, 0, 0);
+    bpf_for_each_map_elem(&dc_ucx_pending, clear_entry, 0, 0);
 }
 
 SEC("raw_tracepoint/sched_process_exit")
@@ -289,4 +300,82 @@ int dc_complete_exit(struct pt_regs *ctx)
     }
     bpf_map_delete_elem(&dc_pending, &task);
     return 0;
+}
+
+/* UCX dc_mlx5 AM-short returns UCS_OK only after ringing the doorbell. Its
+ * helpers are inlined, so inspect the last posted WQE at the public function's
+ * return. This deliberately excludes other UCT operations and DevX DCIs. */
+SEC("uprobe")
+int dc_ucx_enter(struct pt_regs *ctx)
+{
+    if (!layout()) return 0;
+    __u64 task = bpf_get_current_pid_tgid(), ep = PT_REGS_PARM1(ctx);
+    if (bpf_map_update_elem(&dc_ucx_pending, &task, &ep, BPF_ANY)) count(4);
+    return 0;
+}
+
+SEC("uretprobe")
+int dc_ucx_exit(struct pt_regs *ctx)
+{
+    struct dc_layout *l = layout();
+    if (!l) return 0;
+    __u64 task = bpf_get_current_pid_tgid();
+    __u64 *pending = bpf_map_lookup_elem(&dc_ucx_pending, &task);
+    if (!pending) return 0;
+    __u64 ep = *pending;
+    bpf_map_delete_elem(&dc_ucx_pending, &task);
+    if (PT_REGS_RC(ctx)) { count(1); return 0; }
+    __u32 zero = 0;
+    struct ucx_dc_layout *u = bpf_map_lookup_elem(&dc_ucx_layout, &zero);
+    if (!u) { count(4); return 0; }
+    __u64 iface = 0, array = 0, dci = 0, qp = 0;
+    __u16 index = 0, length = 0;
+    if (READ(iface, ep, u->ep_interface) || READ(index, ep, u->ep_dci) ||
+        READ(array, iface, u->interface_buffer) || READ(length, iface, u->interface_length)) goto read_failed;
+    if (!array || index >= length || index >= 4096) goto unsupported;
+    if (READ(dci, array, (__u64)index * 8)) goto read_failed;
+    if (!dci) goto unsupported;
+    __u64 wq = dci + u->dci_wq;
+    __u32 type = 0, qpn = 0;
+    if (READ(type, wq, u->wq_type)) goto read_failed;
+    if (type != 0) goto unsupported; /* UCT_IB_MLX5_OBJ_TYPE_VERBS */
+    if (READ(qp, wq, u->wq_qp) || READ(qpn, wq, u->wq_qpn)) goto read_failed;
+    struct dc_identity *id = bpf_map_lookup_elem(&dc_qps, &qp);
+    if (!current(id) || !id->port || id->state != 3 || id->qpn != qpn || qp < l->qp_base) goto unsupported;
+    __u64 start = 0, end = 0, curr = 0, db = 0, provider_start = 0;
+    __u32 db_value = 0, blocks = 0, shift = 0;
+    __u16 previous = 0, producer = 0;
+    if (READ(start, wq, u->wq_start) || READ(end, wq, u->wq_end) ||
+        READ(curr, wq, u->wq_current) || READ(db, wq, u->wq_db) ||
+        READ(previous, wq, u->wq_previous) || READ(producer, wq, u->wq_producer) ||
+        READ(db_value, db, 0) || READ(provider_start, qp - l->qp_base, l->sq_start) ||
+        READ(blocks, qp - l->qp_base, l->sq_count) || READ(shift, qp - l->qp_base, l->sq_shift)) goto read_failed;
+    __u16 posted = producer - previous;
+    if (!start || start != provider_start || !blocks || blocks > (1 << 16) ||
+        (blocks & (blocks - 1)) || shift != 6 || end - start != (__u64)blocks * 64 ||
+        !posted || posted > 4 || (__u16)__builtin_bswap32(db_value) != producer ||
+        curr != start + ((__u64)(producer & (blocks - 1)) << 6)) goto unsupported;
+    struct dc_batch *b = bpf_map_lookup_elem(&dc_scratch, &zero);
+    if (!b) { count(4); return 0; }
+    for (__u32 i = 0; i < sizeof(b->prefix) / 8; i++)
+        ((volatile __u64 *)b->prefix)[i] = 0;
+    b->qp = qp; b->identity = *id; b->count = 1; b->reserved = 0;
+    __u64 wqe = start + ((__u64)(previous & (blocks - 1)) << 6);
+    /* Never read the DC access key or message payload. */
+    if (bpf_probe_read_user(b->prefix[0], 16, (void *)wqe) ||
+        bpf_probe_read_user(b->prefix[0] + 24, 40, (void *)(wqe + 24))) goto read_failed;
+    __u32 ctrl, qpn_ds;
+    __builtin_memcpy(&ctrl, b->prefix[0], 4);
+    __builtin_memcpy(&qpn_ds, b->prefix[0] + 4, 4);
+    ctrl = __builtin_bswap32(ctrl); qpn_ds = __builtin_bswap32(qpn_ds);
+    if ((ctrl & 0xff0000ff) != 0x0a || ((ctrl >> 8) & 0xffff) != previous ||
+        (qpn_ds >> 8) != qpn || (qpn_ds & 192) || (qpn_ds & 63) < 4 ||
+        ((qpn_ds & 63) + 3) / 4 != posted) goto unsupported;
+    if (bpf_ringbuf_output(&dc_events, b, sizeof(*b), 0)) count(5);
+    else { count(0); count(8); }
+    return 0;
+read_failed:
+    count(3); return 0;
+unsupported:
+    count(2); return 0;
 }

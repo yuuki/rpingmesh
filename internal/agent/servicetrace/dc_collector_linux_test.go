@@ -16,17 +16,25 @@ import (
 	"time"
 )
 
-func buildDCFixture(t *testing.T) string {
+func buildDCFixture(t *testing.T, extra ...string) string {
 	t.Helper()
 	if _, err := exec.LookPath("cc"); err != nil {
 		t.Fatal("DC fixture requires a C compiler")
 	}
 	file := filepath.Join(t.TempDir(), "dc-provider")
 	cmd := exec.Command("cc", "-std=c11", "-pthread", "-g", "-O0", "-fno-inline", "-fPIE", "-pie", "-Wl,--build-id", "-Wall", "-Wextra", "-Werror", "testdata/dc_provider_fixture.c", "-o", file)
+	cmd.Args = append(cmd.Args, extra...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("compile synthetic provider: %v\n%s", err, out)
 	}
 	return file
+}
+
+func TestUCXDCRejectsUnsupportedLayout(t *testing.T) {
+	file := buildDCFixture(t, "-DTEST_UCX_BAD_DCI")
+	if _, err := inspectUCXDC(file, file); err == nil {
+		t.Fatal("accepted an unsupported DCI index width")
+	}
 }
 
 func TestDCProviderELF(t *testing.T) {
@@ -67,6 +75,12 @@ func TestDCProviderELF(t *testing.T) {
 	if _, err := inspectDCProvider(file, mismatch); err == nil {
 		t.Fatal("accepted mismatching debug build ID")
 	}
+	if _, err := inspectUCXDC(file, file); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inspectUCXDC(file, mismatch); err == nil {
+		t.Fatal("accepted mismatching UCX debug build ID")
+	}
 	copy[offset] ^= 1
 	// objcopy removes DWARF without changing the build ID: matching symbols
 	// and an ID alone must still be insufficient.
@@ -79,6 +93,9 @@ func TestDCProviderELF(t *testing.T) {
 	}
 	if _, err := inspectDCProvider(file, stripped); err == nil {
 		t.Fatal("accepted ELF without full DWARF")
+	}
+	if _, err := inspectUCXDC(file, stripped); err == nil {
+		t.Fatal("accepted UCX ELF without full DWARF")
 	}
 }
 
@@ -98,6 +115,7 @@ func TestDCBPFSpec(t *testing.T) {
 		t.Fatal(err)
 	}
 	if spec.Maps[dcMapDcSettings].ValueSize != uint32(4+binary.Size(dcLayout{})) ||
+		spec.Maps[dcMapDcUcxLayout].ValueSize != uint32(binary.Size(ucxDCLayout{})) ||
 		spec.Maps[dcMapDcPending].ValueSize != uint32(binary.Size(dcDcBatch{})) ||
 		binary.Size(dcDcBatch{}) != 1064 {
 		t.Fatal("DC BPF/Go ABI mismatch")
@@ -150,7 +168,8 @@ func testDCUprobeIntegration(t *testing.T, workerExec bool) {
 			t.Fatal(err)
 		}
 	}
-	c, err := OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: file, DebugFile: file, Device: "test-device", Port: 1, sysfsRoot: root})
+	c, err := OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: file, DebugFile: file,
+		UCXLibrary: file, UCXDebugFile: file, Device: "test-device", Port: 1, sysfsRoot: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,6 +265,35 @@ func testDCUprobeIntegration(t *testing.T, workerExec bool) {
 	await(func(s DCStats) bool { return s.AcceptedSends == final.AcceptedSends+2 && s.ActiveFlows == 2 })
 	command('y') // worker-thread destruction must retire its flows
 	await(func(s DCStats) bool { return s.ActiveFlows == 0 })
+	command('c')
+	before, err := c.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command('A')
+	await(func(s DCStats) bool {
+		return s.UCXSubmissions == 1 && s.AcceptedSends == before.AcceptedSends+1 && s.ActiveFlows == 1
+	})
+	command('F')
+	await(func(s DCStats) bool {
+		return s.FailedSubmissions == before.FailedSubmissions+1 && s.UCXSubmissions == 1
+	})
+	for i, op := range []byte{'D', 'B', 'I', 'Q'} {
+		command(op) // DevX, stale doorbell, mismatching WQE index, mismatching QPN
+		await(func(s DCStats) bool {
+			return s.UnsupportedBatches == before.UnsupportedBatches+uint64(i)+1 && s.UCXSubmissions == 1
+		})
+	}
+	command('W') // Both ring and 16-bit producer wrap.
+	await(func(s DCStats) bool {
+		return s.UCXSubmissions == 2 && s.AcceptedSends == before.AcceptedSends+2 && s.ActiveFlows == 1
+	})
+	command('d')
+	await(func(s DCStats) bool { return s.ActiveFlows == 0 })
+	command('A') // A retired DCI must not be revived by the UCX adapter.
+	await(func(s DCStats) bool {
+		return s.UnsupportedBatches == before.UnsupportedBatches+5 && s.UCXSubmissions == 2 && s.ActiveFlows == 0
+	})
 	final, err = c.Stats()
 	if err != nil {
 		t.Fatal(err)

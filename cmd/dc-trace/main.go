@@ -31,6 +31,8 @@ func run() error {
 	var duration time.Duration
 	flag.StringVar(&options.Library, "library", "", "target process's libmlx5 ELF")
 	flag.StringVar(&options.DebugFile, "debug", "", "matching full ELF/DWARF debug file")
+	flag.StringVar(&options.UCXLibrary, "ucx-library", "", "optional UCX dc_mlx5 provider ELF; AM-short only")
+	flag.StringVar(&options.UCXDebugFile, "ucx-debug", "", "matching full UCX ELF/DWARF debug file")
 	flag.IntVar(&options.PID, "pid", 0, "target process ID; attach before DCI creation")
 	flag.StringVar(&options.Device, "device", "", "RDMA device to observe")
 	flag.UintVar(&port, "port", 0, "RDMA port to observe")
@@ -45,6 +47,11 @@ func run() error {
 	if check {
 		if err := servicetrace.CheckDCProvider(options.Library, options.DebugFile); err != nil {
 			return err
+		}
+		if options.UCXLibrary != "" || options.UCXDebugFile != "" {
+			if err := servicetrace.CheckUCXDC(options.UCXLibrary, options.UCXDebugFile); err != nil {
+				return err
+			}
 		}
 		fmt.Println("Provider layout validated; BPF was not loaded.")
 		return nil

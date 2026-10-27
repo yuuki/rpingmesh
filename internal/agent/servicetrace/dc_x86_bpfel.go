@@ -69,6 +69,8 @@ const (
 	dcMapDcSequence       = "dc_sequence"
 	dcMapDcSettings       = "dc_settings"
 	dcMapDcStats          = "dc_stats"
+	dcMapDcUcxLayout      = "dc_ucx_layout"
+	dcMapDcUcxPending     = "dc_ucx_pending"
 	dcProgDcCompleteEnter = "dc_complete_enter"
 	dcProgDcCompleteExit  = "dc_complete_exit"
 	dcProgDcCreateEnter   = "dc_create_enter"
@@ -78,6 +80,8 @@ const (
 	dcProgDcModifyEnter   = "dc_modify_enter"
 	dcProgDcModifyExit    = "dc_modify_exit"
 	dcProgDcRetire        = "dc_retire"
+	dcProgDcUcxEnter      = "dc_ucx_enter"
+	dcProgDcUcxExit       = "dc_ucx_exit"
 )
 
 // loadDc returns the embedded CollectionSpec for dc.
@@ -131,22 +135,26 @@ type dcProgramSpecs struct {
 	DcModifyEnter   *ebpf.ProgramSpec `ebpf:"dc_modify_enter"`
 	DcModifyExit    *ebpf.ProgramSpec `ebpf:"dc_modify_exit"`
 	DcRetire        *ebpf.ProgramSpec `ebpf:"dc_retire"`
+	DcUcxEnter      *ebpf.ProgramSpec `ebpf:"dc_ucx_enter"`
+	DcUcxExit       *ebpf.ProgramSpec `ebpf:"dc_ucx_exit"`
 }
 
 // dcMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type dcMapSpecs struct {
-	DcCreating  *ebpf.MapSpec `ebpf:"dc_creating"`
-	DcEpoch     *ebpf.MapSpec `ebpf:"dc_epoch"`
-	DcEvents    *ebpf.MapSpec `ebpf:"dc_events"`
-	DcModifying *ebpf.MapSpec `ebpf:"dc_modifying"`
-	DcPending   *ebpf.MapSpec `ebpf:"dc_pending"`
-	DcQps       *ebpf.MapSpec `ebpf:"dc_qps"`
-	DcScratch   *ebpf.MapSpec `ebpf:"dc_scratch"`
-	DcSequence  *ebpf.MapSpec `ebpf:"dc_sequence"`
-	DcSettings  *ebpf.MapSpec `ebpf:"dc_settings"`
-	DcStats     *ebpf.MapSpec `ebpf:"dc_stats"`
+	DcCreating   *ebpf.MapSpec `ebpf:"dc_creating"`
+	DcEpoch      *ebpf.MapSpec `ebpf:"dc_epoch"`
+	DcEvents     *ebpf.MapSpec `ebpf:"dc_events"`
+	DcModifying  *ebpf.MapSpec `ebpf:"dc_modifying"`
+	DcPending    *ebpf.MapSpec `ebpf:"dc_pending"`
+	DcQps        *ebpf.MapSpec `ebpf:"dc_qps"`
+	DcScratch    *ebpf.MapSpec `ebpf:"dc_scratch"`
+	DcSequence   *ebpf.MapSpec `ebpf:"dc_sequence"`
+	DcSettings   *ebpf.MapSpec `ebpf:"dc_settings"`
+	DcStats      *ebpf.MapSpec `ebpf:"dc_stats"`
+	DcUcxLayout  *ebpf.MapSpec `ebpf:"dc_ucx_layout"`
+	DcUcxPending *ebpf.MapSpec `ebpf:"dc_ucx_pending"`
 }
 
 // dcVariableSpecs contains global variables before they are loaded into the kernel.
@@ -175,16 +183,18 @@ func (o *dcObjects) Close() error {
 //
 // It can be passed to loadDcObjects or ebpf.CollectionSpec.LoadAndAssign.
 type dcMaps struct {
-	DcCreating  *ebpf.Map `ebpf:"dc_creating"`
-	DcEpoch     *ebpf.Map `ebpf:"dc_epoch"`
-	DcEvents    *ebpf.Map `ebpf:"dc_events"`
-	DcModifying *ebpf.Map `ebpf:"dc_modifying"`
-	DcPending   *ebpf.Map `ebpf:"dc_pending"`
-	DcQps       *ebpf.Map `ebpf:"dc_qps"`
-	DcScratch   *ebpf.Map `ebpf:"dc_scratch"`
-	DcSequence  *ebpf.Map `ebpf:"dc_sequence"`
-	DcSettings  *ebpf.Map `ebpf:"dc_settings"`
-	DcStats     *ebpf.Map `ebpf:"dc_stats"`
+	DcCreating   *ebpf.Map `ebpf:"dc_creating"`
+	DcEpoch      *ebpf.Map `ebpf:"dc_epoch"`
+	DcEvents     *ebpf.Map `ebpf:"dc_events"`
+	DcModifying  *ebpf.Map `ebpf:"dc_modifying"`
+	DcPending    *ebpf.Map `ebpf:"dc_pending"`
+	DcQps        *ebpf.Map `ebpf:"dc_qps"`
+	DcScratch    *ebpf.Map `ebpf:"dc_scratch"`
+	DcSequence   *ebpf.Map `ebpf:"dc_sequence"`
+	DcSettings   *ebpf.Map `ebpf:"dc_settings"`
+	DcStats      *ebpf.Map `ebpf:"dc_stats"`
+	DcUcxLayout  *ebpf.Map `ebpf:"dc_ucx_layout"`
+	DcUcxPending *ebpf.Map `ebpf:"dc_ucx_pending"`
 }
 
 func (m *dcMaps) Close() error {
@@ -199,6 +209,8 @@ func (m *dcMaps) Close() error {
 		m.DcSequence,
 		m.DcSettings,
 		m.DcStats,
+		m.DcUcxLayout,
+		m.DcUcxPending,
 	)
 }
 
@@ -221,6 +233,8 @@ type dcPrograms struct {
 	DcModifyEnter   *ebpf.Program `ebpf:"dc_modify_enter"`
 	DcModifyExit    *ebpf.Program `ebpf:"dc_modify_exit"`
 	DcRetire        *ebpf.Program `ebpf:"dc_retire"`
+	DcUcxEnter      *ebpf.Program `ebpf:"dc_ucx_enter"`
+	DcUcxExit       *ebpf.Program `ebpf:"dc_ucx_exit"`
 }
 
 func (p *dcPrograms) Close() error {
@@ -234,6 +248,8 @@ func (p *dcPrograms) Close() error {
 		p.DcModifyEnter,
 		p.DcModifyExit,
 		p.DcRetire,
+		p.DcUcxEnter,
+		p.DcUcxExit,
 	)
 }
 

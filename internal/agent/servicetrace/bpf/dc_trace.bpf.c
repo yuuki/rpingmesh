@@ -123,9 +123,18 @@ int dc_exit(void *ctx)
     __u32 zero = 0;
     struct dc_config *c = bpf_map_lookup_elem(&dc_settings, &zero);
     __u64 task = bpf_get_current_pid_tgid();
+    if (!c || !c->pid || c->pid != task >> 32) return 0;
+    /* A worker can exit inside a callback without reaching any return probe.
+     * Drop its pending calls before TID reuse, but keep shared QP lifetimes. */
+    bpf_map_delete_elem(&dc_creating, &task);
+    bpf_map_delete_elem(&dc_modifying, &task);
+    bpf_map_delete_elem(&dc_pending, &task);
+    bpf_map_delete_elem(&dc_ucx_pending, &task);
+    bpf_map_delete_elem(&dc_devx_creating, &task);
+    bpf_map_delete_elem(&dc_devx_connecting, &task);
     /* Disable before the leader's PID can be reused. Leader-only exit while
      * workers survive conservatively ends tracking as well. */
-    if (c && c->pid && c->pid == task >> 32 && c->pid == (__u32)task) {
+    if (c->pid == (__u32)task) {
         c->pid = 0;
         invalidate_process();
     }

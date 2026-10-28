@@ -63,6 +63,47 @@ func TestKernelAndUverbsIdentitiesAreSeparate(t *testing.T) {
 	}
 }
 
+func TestKernelPointerReuseIgnoresOldDisconnect(t *testing.T) {
+	for name, replace := range map[string]func(*Event){
+		"qpn":    func(e *Event) { e.QPNum++ },
+		"device": func(e *Event) { e.Dev = devB },
+		"type":   func(e *Event) { e.QPType = QPTypeUC },
+	} {
+		for _, end := range []string{"destroy", "reset", "error"} {
+			t.Run(name+"/"+end, func(t *testing.T) {
+				table := NewTable()
+				old := kernelConnect()
+				table.Apply(old)
+				next := old
+				replace(&next)
+				table.Apply(next)
+				want := table.Connections()[0]
+				// A destroy return can arrive after the freed pointer was reused.
+				disconnect := func(e Event) Event {
+					switch end {
+					case "destroy":
+						e.Kind = KindQPDestroy
+					case "reset":
+						e.QPState = QPStateReset
+					case "error":
+						e.QPState = QPStateErr
+					}
+					return e
+				}
+				if table.Apply(disconnect(old)) {
+					t.Fatal("old disconnect changed the replacement connection")
+				}
+				if got := table.Connections(); len(got) != 1 || got[0] != want {
+					t.Fatalf("replacement connection was not preserved: %+v", got)
+				}
+				if !table.Apply(disconnect(next)) || len(table.Connections()) != 0 {
+					t.Fatal("matching disconnect did not remove the replacement")
+				}
+			})
+		}
+	}
+}
+
 func TestKernelRejectsIncompleteAndUnconnectedEvents(t *testing.T) {
 	for name, mutate := range map[string]func(*Event){
 		"driver":      func(e *Event) { e.QPType = QPTypeDriver },

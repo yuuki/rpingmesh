@@ -11,6 +11,12 @@ func (t *Table) applyKernel(ev Event) bool {
 	switch {
 	case ev.Kind == KindQPDestroy, ev.IsReset(),
 		ev.Kind == KindQPModify && ev.AttrMask&AttrMaskState != 0 && ev.QPState == QPStateErr:
+		// A destroy return can follow allocation of a new QP at this address.
+		// Do not apply the old lifetime's disconnect to its replacement.
+		if exists && (previous.Dev != ev.Dev || previous.LocalQPN != ev.QPNum || previous.QPType != ev.QPType) {
+			t.counters.Ignored++
+			return false
+		}
 		delete(t.kernelQPs, ev.Context)
 		if ev.Kind == KindQPDestroy {
 			t.counters.Destroys++

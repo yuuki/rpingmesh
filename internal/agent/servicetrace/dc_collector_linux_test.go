@@ -7,6 +7,7 @@ import (
 	"context"
 	"debug/elf"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"github.com/cilium/ebpf"
 	"os"
@@ -557,6 +558,27 @@ func testDCUprobeIntegration(t *testing.T, workerExec, devx bool, adapterOptions
 		}
 		command('X')
 		accepted(8, 0)
+		{ // Regression: worker exit must release pending state without retiring QPs.
+			command('c')
+			command('p')
+			accepted(9, 1)
+			// Exceed the pending map capacity without relying on OS TID reuse.
+			// Each worker exits inside bcopy, so its return probe cannot clean up.
+			for i := uint32(0); i <= c.objs.DcUcxPending.MaxEntries(); i++ {
+				command('+')
+				var task uint64
+				if err := c.objs.DcUcxPending.NextKey(nil, &task); !errors.Is(err, ebpf.ErrKeyNotExist) {
+					t.Fatalf("exited worker retained a pending UCX call or map read failed: %v", err)
+				}
+			}
+			accepted(9, 1) // Worker exit must not retire the shared DCI or its flows.
+			command('-')
+			accepted(10, 1) // A fresh worker still submits on the same DCI.
+			command('p')
+			accepted(11, 1) // The leader remains enabled too.
+			command('d')
+			accepted(11, 0)
+		}
 	}
 	if rma {
 		baseline, err := c.Stats()

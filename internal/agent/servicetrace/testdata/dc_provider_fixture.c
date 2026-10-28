@@ -171,6 +171,8 @@ __attribute__((noinline)) int uct_dc_mlx5_ep_am_short_iov(struct uct_dc_mlx5_ep 
 { return ucx_post(ep, 0x0a); }
 __attribute__((noinline)) ssize_t uct_dc_mlx5_ep_am_bcopy(struct uct_dc_mlx5_ep *ep)
 {
+    /* Model a pack callback terminating its worker before the return probe. */
+    if (ucx_mode == 16) pthread_exit(NULL);
     if (ucx_mode == 8) uct_dc_mlx5_ep_am_short(ep);
     int status = ucx_post(ep, 0x0a);
     return status ? status : ucx_mode == 9 ? 0 : 12;
@@ -293,6 +295,13 @@ static void *exec_worker(void *path)
     _exit(1);
 }
 
+static void *bcopy_worker(void *arg)
+{
+    (void)arg;
+    uct_dc_mlx5_ep_am_bcopy(&ucx_ep);
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -323,6 +332,14 @@ int main(int argc, char **argv)
             pthread_t thread;
             if (pthread_create(&thread, NULL, worker, op == 'y' ? &storage : NULL) ||
                 pthread_join(thread, NULL)) return 1;
+            break;
+        }
+        case '+': case '-': {
+            pthread_t thread;
+            ucx_mode = op == '+' ? 16 : 0;
+            if (pthread_create(&thread, NULL, bcopy_worker, NULL) ||
+                pthread_join(thread, NULL)) return 1;
+            ucx_mode = 0;
             break;
         }
         case 's': failure = 0; submit(2, 0); break;

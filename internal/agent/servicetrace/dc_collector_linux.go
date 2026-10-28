@@ -40,6 +40,7 @@ type DCOptions struct {
 	UCXAM                      bool
 	UCXRMA                     bool
 	UCXAtomic                  bool
+	UCXTag                     bool
 	Port                       uint8
 	Capacity                   int
 	IdleTimeout                time.Duration
@@ -136,7 +137,7 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 	}
 	var ucx *ucxDCProvider
 	var ucxPinned string
-	if options.UCXLibrary != "" || options.UCXDebugFile != "" || options.UCXDevX || options.UCXAM || options.UCXRMA || options.UCXAtomic {
+	if options.UCXLibrary != "" || options.UCXDebugFile != "" || options.UCXDevX || options.UCXAM || options.UCXRMA || options.UCXAtomic || options.UCXTag {
 		if options.UCXLibrary == "" || options.UCXDebugFile == "" {
 			return nil, fmt.Errorf("UCX library and matching debug ELF must both be supplied")
 		}
@@ -145,7 +146,7 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 			return nil, err
 		}
 		ucxPinned = fmt.Sprintf("/proc/self/fd/%d", c.ucxLibrary.Fd())
-		ucx, err = inspectUCXDCOperations(ucxPinned, options.UCXDebugFile, options.UCXDevX, options.UCXStreams, options.UCXAM, options.UCXRMA, options.UCXAtomic)
+		ucx, err = inspectUCXDCOperations(ucxPinned, options.UCXDebugFile, options.UCXDevX, options.UCXStreams, options.UCXAM, options.UCXRMA, options.UCXAtomic, options.UCXTag)
 		if err != nil {
 			return nil, err
 		}
@@ -285,6 +286,11 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 				hooks = append(hooks, ucxProbe{ucx.atomicSymbols[i], c.objs.DcUcxExit, true}, ucxProbe{ucx.atomicSymbols[i], enter, false})
 			}
 		}
+		if options.UCXTag {
+			for i, enter := range []*ebpf.Program{c.objs.DcUcxEnter, c.objs.DcUcxTagBcopyEnter, c.objs.DcUcxTagZcopyEnter, c.objs.DcUcxTagRequestEnter, c.objs.DcUcxTagRndvEnter} {
+				hooks = append(hooks, ucxProbe{ucx.tagSymbols[i], c.objs.DcUcxExit, true}, ucxProbe{ucx.tagSymbols[i], enter, false})
+			}
+		}
 		if options.UCXDevX {
 			hooks = append(hooks, ucxProbe{ucx.connectSymbol, c.objs.DcDevxConnectExit, true},
 				ucxProbe{ucx.connectSymbol, c.objs.DcDevxConnectEnter, false},
@@ -418,7 +424,8 @@ func (c *DCCollector) consume(raw []byte, now time.Time) {
 	}
 	// Validate the entire batch before admitting any of it.
 	for i := uint32(0); i < b.Count; i++ {
-		if b.Prefix[i][16]|b.Prefix[i][17]|b.Prefix[i][18]|b.Prefix[i][19]|
+		if b.Prefix[i][12]|b.Prefix[i][13]|b.Prefix[i][14]|b.Prefix[i][15]|
+			b.Prefix[i][16]|b.Prefix[i][17]|b.Prefix[i][18]|b.Prefix[i][19]|
 			b.Prefix[i][20]|b.Prefix[i][21]|b.Prefix[i][22]|b.Prefix[i][23] != 0 {
 			c.rejected.Add(1)
 			return

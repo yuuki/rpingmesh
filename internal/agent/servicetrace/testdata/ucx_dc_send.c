@@ -28,7 +28,7 @@ static void gate(const char *message, int command)
 }
 
 struct receiver { unsigned count; unsigned mask; };
-static int use_devx, use_streams;
+static int use_devx, use_streams, use_tag;
 static const char *operation = "short";
 static unsigned completed;
 static uct_component_h selected_component;
@@ -98,16 +98,72 @@ static uct_md_h open_md(const char *device)
     return NULL;
 }
 
+struct tag_receive {
+    uct_tag_context_t ctx;
+    unsigned done, consumed, request;
+    uct_tag_t tag;
+    uint64_t imm;
+    size_t length;
+    unsigned char buffer[512];
+};
+static void tag_consumed(uct_tag_context_t *ctx)
+{
+    struct tag_receive *r = (struct tag_receive *)ctx;
+    if (r->consumed++) fail("duplicate tag consumption");
+}
+static void tag_completed(uct_tag_context_t *ctx, uct_tag_t tag, uint64_t imm,
+                          size_t length, void *inline_data, ucs_status_t status)
+{
+    struct tag_receive *r = (struct tag_receive *)ctx;
+    if (status != UCS_OK || tag != r->tag || imm != r->imm || length != r->length || r->request || r->done++)
+        fail("tag receive completion");
+    if (inline_data) memcpy(r->buffer, inline_data, length);
+}
+static void tag_request_completed(uct_tag_context_t *ctx, uct_tag_t tag, const void *header,
+                                  unsigned length, ucs_status_t status, unsigned flags)
+{
+    struct tag_receive *r = (struct tag_receive *)ctx;
+    if (status != UCS_OK || tag != r->tag || length != r->length || !r->request || r->done++)
+        fail("tag request completion");
+    if (flags & UCT_TAG_RECV_CB_INLINE_DATA) memcpy(r->buffer, header, length);
+}
+static ucs_status_t tag_unexpected_eager(void *arg, void *data, size_t length,
+                                        unsigned flags, uct_tag_t tag, uint64_t imm, void **context)
+{
+    (void)arg; (void)data; (void)length; (void)flags; (void)tag; (void)imm; (void)context;
+    fail("unexpected tag eager message");
+    return UCS_ERR_IO_ERROR;
+}
+static ucs_status_t tag_unexpected_rndv(void *arg, unsigned flags, uint64_t tag,
+                                       const void *header, unsigned header_length,
+                                       uint64_t remote_addr, size_t length, const void *rkey)
+{
+    (void)arg; (void)flags; (void)tag; (void)header; (void)header_length;
+    (void)remote_addr; (void)length; (void)rkey;
+    fail("unexpected tag rendezvous message");
+    return UCS_ERR_IO_ERROR;
+}
+
 static uct_iface_h open_iface(uct_md_h md, uct_worker_h worker, const char *device)
 {
     uct_iface_config_t *config;
     CHECK(uct_md_iface_config_read(md, "dc_mlx5", NULL, NULL, &config));
+    if (use_tag) {
+        CHECK(uct_config_modify(config, "RC_TM_ENABLE", "y"));
+        CHECK(uct_config_modify(config, "RC_TM_MP_SRQ_ENABLE", "no"));
+    }
     CHECK(uct_config_modify(config, "DC_TX_POLICY", use_streams ? "hw_dcs" : "rand"));
     CHECK(uct_config_modify(config, "DC_NUM_DCI", "1"));
     if (use_streams) CHECK(uct_config_modify(config, "DC_NUM_DCI_CHANNELS", "4"));
     uct_iface_params_t p = {0};
     p.field_mask = UCT_IFACE_PARAM_FIELD_OPEN_MODE | UCT_IFACE_PARAM_FIELD_DEVICE |
                    UCT_IFACE_PARAM_FIELD_RX_HEADROOM;
+    if (use_tag) {
+        p.field_mask |= UCT_IFACE_PARAM_FIELD_HW_TM_EAGER_CB | UCT_IFACE_PARAM_FIELD_HW_TM_EAGER_ARG |
+                        UCT_IFACE_PARAM_FIELD_HW_TM_RNDV_CB | UCT_IFACE_PARAM_FIELD_HW_TM_RNDV_ARG;
+        p.eager_cb = tag_unexpected_eager;
+        p.rndv_cb = tag_unexpected_rndv;
+    }
     p.open_mode = UCT_IFACE_OPEN_MODE_DEVICE;
     p.mode.device.tl_name = "dc_mlx5";
     p.mode.device.dev_name = device;
@@ -166,7 +222,7 @@ static void report_wqe(uct_ep_h endpoint)
     unsigned char record[68] = {0};
     uint32_t qpn = htonl(wq->super.qp_num);
     memcpy(record, &qpn, 4);
-    memcpy(record + 4, prefix, 16);
+    memcpy(record + 4, prefix, 12);
     memcpy(record + 28, prefix + 24, 40);
     if (fwrite(record, sizeof(record), 1, stdout) != 1) fail("record output");
 }
@@ -269,6 +325,88 @@ static void run_rma(uct_md_h md, uct_worker_h worker, uct_ep_h *eps, unsigned ep
         CHECK(uct_rkey_release(selected_component, &keys[peer]));
         CHECK(uct_md_mem_dereg(md, remote_mem[peer]));
     }
+}
+
+static void run_tag(uct_md_h md, uct_worker_h worker, uct_ep_h *eps, unsigned ep_count,
+                    uct_iface_h *receivers)
+{
+    int short_send = !strcmp(operation, "tag-short");
+    int bcopy = !strcmp(operation, "tag-bcopy") || !strcmp(operation, "tag-bcopy-imm");
+    int zcopy = !strcmp(operation, "tag-zcopy") || !strcmp(operation, "tag-zcopy-imm");
+    int rndv = !strcmp(operation, "tag-rndv-zcopy");
+    int request = !strcmp(operation, "tag-rndv-request");
+    size_t length = short_send || request ? 16 : 256;
+    uint64_t imm = strstr(operation, "-imm") ? 0x1234567800000000ull : 0;
+    struct tag_receive receive[2] = {0};
+    uct_mem_h recv_mem[2], send_mem;
+    unsigned char payload[256];
+    uct_iface_attr_t attr;
+    CHECK(uct_iface_query(eps[0]->iface, &attr));
+    uint64_t capability = short_send ? UCT_IFACE_FLAG_TAG_EAGER_SHORT :
+                          bcopy ? UCT_IFACE_FLAG_TAG_EAGER_BCOPY :
+                          zcopy ? UCT_IFACE_FLAG_TAG_EAGER_ZCOPY : UCT_IFACE_FLAG_TAG_RNDV_ZCOPY;
+    if (!(attr.cap.flags & capability)) {
+        puts("tag-unavailable");
+        fflush(stdout);
+        exit(77);
+    }
+    puts("tag-supported");
+    fflush(stdout);
+    for (unsigned peer = 0; peer < 2; ++peer) {
+        CHECK(uct_iface_query(receivers[peer], &attr));
+        if (attr.cap.tag.recv.min_recv > sizeof(receive[peer].buffer)) fail("tag receive size");
+        CHECK(uct_md_mem_reg(md, receive[peer].buffer, sizeof(receive[peer].buffer),
+                            UCT_MD_MEM_ACCESS_LOCAL_WRITE, &recv_mem[peer]));
+    }
+    CHECK(uct_md_mem_reg(md, payload, sizeof(payload),
+                        UCT_MD_MEM_ACCESS_LOCAL_READ | UCT_MD_MEM_ACCESS_REMOTE_GET, &send_mem));
+    for (unsigned i = 0; i < 3; ++i) {
+        unsigned ep_index = i % ep_count;
+        unsigned peer = use_streams ? ep_index / 2 : ep_index;
+        struct tag_receive *r = &receive[peer];
+        r->done = r->consumed = 0;
+        r->request = request;
+        r->tag = 0x1020304000000000ull + i;
+        r->imm = imm;
+        r->length = length;
+        r->ctx.tag_consumed_cb = tag_consumed;
+        r->ctx.completed_cb = tag_completed;
+        r->ctx.rndv_cb = tag_request_completed;
+        memset(receive[0].buffer, 0xee, sizeof(receive[0].buffer));
+        memset(receive[1].buffer, 0xee, sizeof(receive[1].buffer));
+        for (unsigned j = 0; j < length; ++j) payload[j] = (unsigned char)(i * 71 + j);
+        uct_iov_t recv_iov = {.buffer = r->buffer, .length = sizeof(r->buffer), .memh = recv_mem[peer], .count = 1};
+        CHECK(uct_iface_tag_recv_zcopy(receivers[peer], r->tag, UINT64_MAX, &recv_iov, 1, &r->ctx));
+        /* Let the tag-list update reach the device before posting the send. */
+        for (unsigned n = 0; n < 1000; ++n) uct_worker_progress(worker);
+        uct_iov_t send_iov = {.buffer = payload, .length = length, .memh = send_mem, .count = 1};
+        struct rma_copy copy = {.buffer = payload, .length = length};
+        uct_completion_t comp = {.func = completion, .count = 1, .status = UCS_OK};
+        unsigned before = completed;
+        uct_ep_h ep = eps[ep_index];
+        if (short_send) CHECK(uct_ep_tag_eager_short(ep, r->tag, payload, length));
+        else if (bcopy) {
+            if (uct_ep_tag_eager_bcopy(ep, r->tag, imm, pack_rma, &copy, 0) != (ssize_t)length)
+                fail("tag bcopy submission");
+        } else if (zcopy) {
+            if (uct_ep_tag_eager_zcopy(ep, r->tag, imm, &send_iov, 1, 0, &comp) != UCS_INPROGRESS)
+                fail("tag zcopy submission");
+        } else if (request) CHECK(uct_ep_tag_rndv_request(ep, r->tag, payload, length, 0));
+        else {
+            void *handle = uct_ep_tag_rndv_zcopy(ep, r->tag, payload, 8, &send_iov, 1, 0, &comp);
+            if (UCS_PTR_IS_ERR(handle)) fail("tag rendezvous submission");
+        }
+        report_wqe(ep);
+        while (!r->done || !r->consumed || ((zcopy || rndv) && completed == before)) uct_worker_progress(worker);
+        flush_ep(ep, worker);
+        if (memcmp(r->buffer, payload, length)) fail("tag received contents");
+        for (unsigned j = length; j < sizeof(r->buffer); ++j)
+            if (r->buffer[j] != 0xee) fail("tag receive bounds");
+        for (unsigned j = 0; j < sizeof(r->buffer); ++j)
+            if (receive[peer ^ 1].buffer[j] != 0xee) fail("tag destination isolation");
+    }
+    CHECK(uct_md_mem_dereg(md, send_mem));
+    for (unsigned peer = 0; peer < 2; ++peer) CHECK(uct_md_mem_dereg(md, recv_mem[peer]));
 }
 
 static unsigned atomic_width;
@@ -377,8 +515,11 @@ int main(int argc, char **argv)
     if (argc == 6) operation = argv[5];
     int rma = !strcmp(operation, "put-short") || !strcmp(operation, "put-bcopy") ||
               !strcmp(operation, "put-zcopy") || !strcmp(operation, "get-bcopy") || !strcmp(operation, "get-zcopy");
+    use_tag = !strcmp(operation, "tag-short") || !strcmp(operation, "tag-bcopy") ||
+              !strcmp(operation, "tag-bcopy-imm") || !strcmp(operation, "tag-zcopy") ||
+              !strcmp(operation, "tag-zcopy-imm") || !strcmp(operation, "tag-rndv-request") || !strcmp(operation, "tag-rndv-zcopy");
     int atomic = parse_atomic();
-    if (!atomic && !rma && strcmp(operation, "short") && strcmp(operation, "short-iov") &&
+    if (!use_tag && !atomic && !rma && strcmp(operation, "short") && strcmp(operation, "short-iov") &&
         strcmp(operation, "bcopy") && strcmp(operation, "zcopy")) fail("invalid operation");
     alarm(60);
     if (setenv("UCX_IB_MLX5_DEVX", use_devx ? "yes" : "no", 1) || setenv("UCX_IB_GID_INDEX", argv[3], 1) ||
@@ -406,7 +547,9 @@ int main(int argc, char **argv)
     for (unsigned i = 0; i < ep_count; ++i) {
         eps[i] = connect_ep(sender, receivers[use_streams ? i / 2 : i]);
     }
-    if (atomic) {
+    if (use_tag) {
+        run_tag(md, worker, eps, ep_count, receivers);
+    } else if (atomic) {
         run_atomic(md, worker, eps, ep_count);
     } else if (rma) {
         run_rma(md, worker, eps, ep_count);

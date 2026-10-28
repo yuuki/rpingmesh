@@ -285,7 +285,7 @@ int dc_complete_enter(struct pt_regs *ctx)
         if (i >= nreq) break;
         __u64 wqe = start + ((__u64)(first & (count_wq - 1)) << 6);
         /* The extended AV fits in one WQEBB. Never read/export its DC key. */
-        if (bpf_probe_read_user(b->prefix[i], 16, (void *)wqe) ||
+        if (bpf_probe_read_user(b->prefix[i], 12, (void *)wqe) ||
             bpf_probe_read_user(b->prefix[i] + 24, 40, (void *)(wqe + 24))) { count(3); return 0; }
         __u32 ctrl, qpn_ds;
         __builtin_memcpy(&ctrl, b->prefix[i], 4);
@@ -351,6 +351,17 @@ int dc_ucx_put_zcopy_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2, 0x08)
 SEC("uprobe")
 int dc_ucx_get_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2, 0x10); }
 
+/* Tag eager sends use SEND_IMM only for a nonzero immediate value.
+ * Retain only that decision, never the immediate or tag itself. */
+SEC("uprobe")
+int dc_ucx_tag_bcopy_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 1, PT_REGS_PARM3(ctx) ? 0x0b : 0x0a); }
+SEC("uprobe")
+int dc_ucx_tag_zcopy_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2, PT_REGS_PARM3(ctx) ? 0x0b : 0x0a); }
+SEC("uprobe")
+int dc_ucx_tag_request_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 0, 0x0b); }
+SEC("uprobe")
+int dc_ucx_tag_rndv_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 3, 0x0a); }
+
 /* UCX atomic operation enum: ADD, AND, OR, XOR, SWAP. Compare-and-swap
  * has separate entry points. Only opcode/size metadata is retained. */
 static __always_inline __u32 ucx_atomic_opcode(struct pt_regs *ctx, int wide, int fetch)
@@ -387,14 +398,17 @@ int dc_ucx_exit(struct pt_regs *ctx)
     __u32 kind = pending->kind, invalid = pending->invalid, opcode = pending->opcode;
     bpf_map_delete_elem(&dc_ucx_pending, &task);
     if (invalid) { count(2); return 0; }
-    /* Atomic post returns UCS_OK; atomic fetch/cswap returns UCS_INPROGRESS.
+    /* Tag rendezvous returns a uint32 operation ID (zero is valid), or a
+     * sign-extended error pointer. This is submission, not transfer completion.
+     * Atomic post returns UCS_OK; atomic fetch/cswap returns UCS_INPROGRESS.
      * AM/put bcopy returns a signed ssize_t length (including zero);
      * zcopy and get-bcopy return
      * UCS_INPROGRESS after submission, not a completed operation. */
     __u64 result = PT_REGS_RC(ctx);
     if ((kind == 0 && (__s32)result != 0) ||
         (kind == 1 && (__s64)result < 0) ||
-        (kind == 2 && (__s32)result != 1)) { count(1); return 0; }
+        (kind == 2 && (__s32)result != 1) ||
+        (kind == 3 && result > 0xffffffffULL)) { count(1); return 0; }
     __u32 zero = 0;
     struct ucx_dc_layout *u = bpf_map_lookup_elem(&dc_ucx_layout, &zero);
     if (!u) { count(4); return 0; }
@@ -440,8 +454,9 @@ int dc_ucx_exit(struct pt_regs *ctx)
         ((volatile __u64 *)b->prefix)[i] = 0;
     b->qp = qp; b->identity = *id; b->count = 1; b->stream_channels = channels;
     __u64 wqe = start + ((__u64)(previous & (blocks - 1)) << 6);
-    /* Never read the DC access key, remote address/rkey or payload. */
-    if (bpf_probe_read_user(b->prefix[0], 16, (void *)wqe) ||
+    /* Never read immediate data, the DC access key, remote address/rkey,
+     * tag headers, atomic operands or payload. */
+    if (bpf_probe_read_user(b->prefix[0], 12, (void *)wqe) ||
         bpf_probe_read_user(b->prefix[0] + 24, 40, (void *)(wqe + 24))) goto read_failed;
     __u32 ctrl, qpn_ds;
     __builtin_memcpy(&ctrl, b->prefix[0], 4);
@@ -451,7 +466,7 @@ int dc_ucx_exit(struct pt_regs *ctx)
     __u32 atomic_ds = opcode == 0x09000014 ? 8 : 7;
     if (op >= 0x11 && (qpn_ds & 63) != atomic_ds) goto unsupported;
     if ((ctrl & 0xff0000ff) != opcode || ((ctrl >> 8) & 0xffff) != previous ||
-        (qpn_ds >> 8) != qpn || (qpn_ds & 192) || (qpn_ds & 63) < (opcode == 0x0a ? 4 : 5) ||
+        (qpn_ds >> 8) != qpn || (qpn_ds & 192) || (qpn_ds & 63) < ((opcode == 0x0a || opcode == 0x0b) ? 4 : 5) ||
         ((qpn_ds & 63) + 3) / 4 != posted) goto unsupported;
     __u16 channel = ((__u16)b->prefix[0][9] << 8) | b->prefix[0][10];
     if (channels) {

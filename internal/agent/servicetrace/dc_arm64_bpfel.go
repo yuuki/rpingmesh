@@ -111,6 +111,10 @@ const (
 	dcProgDcUcxPutBcopyEnter      = "dc_ucx_put_bcopy_enter"
 	dcProgDcUcxPutShortEnter      = "dc_ucx_put_short_enter"
 	dcProgDcUcxPutZcopyEnter      = "dc_ucx_put_zcopy_enter"
+	dcProgDcUcxTagBcopyEnter      = "dc_ucx_tag_bcopy_enter"
+	dcProgDcUcxTagRequestEnter    = "dc_ucx_tag_request_enter"
+	dcProgDcUcxTagRndvEnter       = "dc_ucx_tag_rndv_enter"
+	dcProgDcUcxTagZcopyEnter      = "dc_ucx_tag_zcopy_enter"
 	dcProgDcUcxZcopyEnter         = "dc_ucx_zcopy_enter"
 )
 
@@ -183,6 +187,10 @@ type dcProgramSpecs struct {
 	DcUcxPutBcopyEnter      *ebpf.ProgramSpec `ebpf:"dc_ucx_put_bcopy_enter"`
 	DcUcxPutShortEnter      *ebpf.ProgramSpec `ebpf:"dc_ucx_put_short_enter"`
 	DcUcxPutZcopyEnter      *ebpf.ProgramSpec `ebpf:"dc_ucx_put_zcopy_enter"`
+	DcUcxTagBcopyEnter      *ebpf.ProgramSpec `ebpf:"dc_ucx_tag_bcopy_enter"`
+	DcUcxTagRequestEnter    *ebpf.ProgramSpec `ebpf:"dc_ucx_tag_request_enter"`
+	DcUcxTagRndvEnter       *ebpf.ProgramSpec `ebpf:"dc_ucx_tag_rndv_enter"`
+	DcUcxTagZcopyEnter      *ebpf.ProgramSpec `ebpf:"dc_ucx_tag_zcopy_enter"`
 	DcUcxZcopyEnter         *ebpf.ProgramSpec `ebpf:"dc_ucx_zcopy_enter"`
 }
 
@@ -307,6 +315,10 @@ type dcPrograms struct {
 	DcUcxPutBcopyEnter      *ebpf.Program `ebpf:"dc_ucx_put_bcopy_enter"`
 	DcUcxPutShortEnter      *ebpf.Program `ebpf:"dc_ucx_put_short_enter"`
 	DcUcxPutZcopyEnter      *ebpf.Program `ebpf:"dc_ucx_put_zcopy_enter"`
+	DcUcxTagBcopyEnter      *ebpf.Program `ebpf:"dc_ucx_tag_bcopy_enter"`
+	DcUcxTagRequestEnter    *ebpf.Program `ebpf:"dc_ucx_tag_request_enter"`
+	DcUcxTagRndvEnter       *ebpf.Program `ebpf:"dc_ucx_tag_rndv_enter"`
+	DcUcxTagZcopyEnter      *ebpf.Program `ebpf:"dc_ucx_tag_zcopy_enter"`
 	DcUcxZcopyEnter         *ebpf.Program `ebpf:"dc_ucx_zcopy_enter"`
 }
 
@@ -339,6 +351,10 @@ func (p *dcPrograms) Close() error {
 		p.DcUcxPutBcopyEnter,
 		p.DcUcxPutShortEnter,
 		p.DcUcxPutZcopyEnter,
+		p.DcUcxTagBcopyEnter,
+		p.DcUcxTagRequestEnter,
+		p.DcUcxTagRndvEnter,
+		p.DcUcxTagZcopyEnter,
 		p.DcUcxZcopyEnter,
 	)
 }

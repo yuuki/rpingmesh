@@ -85,6 +85,9 @@ func TestDCProviderELF(t *testing.T) {
 	if _, err := inspectUCXDC(file, file); err != nil {
 		t.Fatal(err)
 	}
+	if err := CheckUCXDCTag(file, file); err != nil {
+		t.Fatal(err)
+	}
 	if err := CheckUCXDCAtomic(file, file); err != nil {
 		t.Fatal(err)
 	}
@@ -187,11 +190,19 @@ func TestUCXAtomicUprobeIntegration(t *testing.T) {
 	testDCUprobeIntegration(t, false, true, true, true, true, true)
 }
 
+func TestUCXTagUprobeIntegration(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_TAG_UPROBE_TEST") != "1" {
+		t.Skip("user-run privileged UCX tag submission test")
+	}
+	testDCUprobeIntegration(t, false, true, true, true, true, true, true)
+}
+
 func testDCUprobeIntegration(t *testing.T, workerExec, devx bool, adapterOptions ...bool) {
 	streams := len(adapterOptions) > 0 && adapterOptions[0]
 	am := len(adapterOptions) > 1 && adapterOptions[1]
 	rma := len(adapterOptions) > 2 && adapterOptions[2]
 	atomic := len(adapterOptions) > 3 && adapterOptions[3]
+	tag := len(adapterOptions) > 4 && adapterOptions[4]
 	file := buildDCFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -228,7 +239,7 @@ func testDCUprobeIntegration(t *testing.T, workerExec, devx bool, adapterOptions
 		}
 	}
 	c, err := OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: file, DebugFile: file,
-		UCXLibrary: file, UCXDebugFile: file, UCXDevX: devx, UCXStreams: streams, UCXAM: am, UCXRMA: rma, UCXAtomic: atomic, Device: "test-device", Port: 1, sysfsRoot: root})
+		UCXLibrary: file, UCXDebugFile: file, UCXDevX: devx, UCXStreams: streams, UCXAM: am, UCXRMA: rma, UCXAtomic: atomic, UCXTag: tag, Device: "test-device", Port: 1, sysfsRoot: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -684,6 +695,82 @@ func testDCUprobeIntegration(t *testing.T, workerExec, devx bool, adapterOptions
 		accepted(0)
 		command('h')
 		await(func(s DCStats) bool { return s.UnsupportedBatches == baseline.UnsupportedBatches+25 })
+		accepted(0)
+	}
+	if tag {
+		baseline, err := c.Stats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var sends uint64
+		accepted := func(active int) {
+			t.Helper()
+			await(func(s DCStats) bool {
+				return s.AcceptedSends == baseline.AcceptedSends+sends && s.UCXSubmissions == baseline.UCXSubmissions+sends && s.ActiveFlows == active && s.RejectedRecords == baseline.RejectedRecords
+			})
+		}
+		entries := []byte{'k', 'm', 'g', '{', '}'}
+		for _, backend := range []byte{'c', 'C', 'S'} {
+			command(backend)
+			if backend != 'c' {
+				command('N')
+			}
+			if backend == 'S' {
+				command('1')
+			}
+			command('=')
+			command('[')
+			for _, entry := range entries {
+				command(entry)
+				sends++
+				accepted(1)
+			}
+			command(']') // Nonzero upper half must still select SEND_IMM.
+			for _, entry := range []byte{'m', 'g'} {
+				command(entry)
+				sends++
+				accepted(1)
+			}
+			command('~')
+			for _, entry := range []byte{'m', '}'} {
+				command(entry)
+				sends++
+				accepted(1)
+			}
+			if backend == 'c' {
+				command('d')
+			} else {
+				command('X')
+			}
+			accepted(0)
+		}
+		command('c')
+		command('!')
+		for _, entry := range entries {
+			command(entry)
+		}
+		command(';')
+		command('g')
+		command('}')
+		await(func(s DCStats) bool { return s.FailedSubmissions == baseline.FailedSubmissions+7 })
+		for _, mode := range []byte{'/', ':'} {
+			command(mode)
+			for _, entry := range entries {
+				command(entry)
+			}
+		}
+		command('@')
+		command('m') // Reject reentrant pack callbacks as a group.
+		await(func(s DCStats) bool { return s.UnsupportedBatches == baseline.UnsupportedBatches+11 })
+		accepted(0)
+		command('=')
+		command('}')
+		sends++
+		accepted(1)
+		command('d')
+		accepted(0)
+		command('}')
+		await(func(s DCStats) bool { return s.UnsupportedBatches == baseline.UnsupportedBatches+12 })
 		accepted(0)
 	}
 	final, err = c.Stats()

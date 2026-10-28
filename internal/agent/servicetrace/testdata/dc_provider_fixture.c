@@ -143,11 +143,12 @@ static int ucx_post(struct uct_dc_mlx5_ep *ep, unsigned opcode)
     storage.sq.cur_post += posted;
     unsigned char *p = queue[pos % 64];
     memset(p, 0, 64);
-    put32(p, ((pos & 0xffff) << 8) | (ucx_mode == 11 ? 0x0a : opcode));
+    put32(p, ((pos & 0xffff) << 8) | (ucx_mode == 11 ? 0x0a : ucx_mode == 15 ? 0x08 : opcode));
     if (ucx_mode == 14) p[0] ^= 1;
     put32(p + 4, (0x12345 << 8) | (ucx_mode == 12 ? 4 : ds));
     p[9] = ucx_mode == 6;
     p[10] = ep->dci_channel_index + (ucx_mode == 7);
+    memset(p + 12, 0x5a, 4); /* Immediate data must never be captured. */
     memset(p + 16, 0xa5, 8);
     put32(p + 24, 0x80000010);
     p[30] = 0xc1; p[31] = 0x23; p[43] = 64;
@@ -208,6 +209,32 @@ __attribute__((noinline)) int uct_dc_mlx5_ep_get_zcopy(struct uct_dc_mlx5_ep *ep
     return status ? status : 1;
 }
 
+static uint64_t tag_immediate;
+__attribute__((noinline)) int uct_dc_mlx5_ep_tag_eager_short(struct uct_dc_mlx5_ep *ep)
+{ return ucx_post(ep, 0x0a); }
+__attribute__((noinline)) ssize_t uct_dc_mlx5_ep_tag_eager_bcopy(struct uct_dc_mlx5_ep *ep, uint64_t tag, uint64_t imm)
+{
+    (void)tag;
+    if (ucx_mode == 8) uct_dc_mlx5_ep_am_short(ep);
+    int status = ucx_post(ep, imm ? 0x0b : 0x0a);
+    return status ? status : ucx_mode == 9 ? 0 : 12;
+}
+__attribute__((noinline)) int uct_dc_mlx5_ep_tag_eager_zcopy(struct uct_dc_mlx5_ep *ep, uint64_t tag, uint64_t imm)
+{
+    (void)tag;
+    if (ucx_mode == 13) return 0;
+    int status = ucx_post(ep, imm ? 0x0b : 0x0a);
+    return status ? status : 1;
+}
+__attribute__((noinline)) int uct_dc_mlx5_ep_tag_rndv_request(struct uct_dc_mlx5_ep *ep)
+{ return ucx_post(ep, 0x0b); }
+__attribute__((noinline)) void *uct_dc_mlx5_ep_tag_rndv_zcopy(struct uct_dc_mlx5_ep *ep)
+{
+    if (ucx_mode == 13) return (void *)(uintptr_t)0x100000000ull;
+    int status = ucx_post(ep, 0x0a);
+    return status ? (void *)(intptr_t)status : (void *)(uintptr_t)(ucx_mode == 9 ? 0 : 7);
+}
+
 static unsigned atomic_operation;
 static int atomic_submit(struct uct_dc_mlx5_ep *ep, unsigned op, unsigned width, int fetch, int cswap)
 {
@@ -243,6 +270,7 @@ static void submit(unsigned n, int invalid)
         memset(p, 0, 64);
         put32(p, ((pos & 0xffff) << 8) | 0x0a);
         put32(p + 4, (0x12345 << 8) | 4);
+        memset(p + 12, 0x5a, 4); /* Immediate data must never be captured. */
         memset(p + 16, 0xa5, 8); /* Must be redacted by BPF, never exported. */
         put32(p + 24, 0x80000010 + i);
         p[30] = 0xc1; p[31] = 0x23; p[43] = 64;
@@ -325,6 +353,14 @@ int main(int argc, char **argv)
         case 'R': uct_dc_mlx5_ep_atomic64_fetch(&ucx_ep, atomic_operation); break;
         case 'U': uct_dc_mlx5_ep_atomic_cswap32(&ucx_ep); break;
         case 'h': uct_dc_mlx5_ep_atomic_cswap64(&ucx_ep); break;
+        case '[': tag_immediate = 0; break;
+        case ']': tag_immediate = 0x1234567800000000ull; break;
+        case '/': ucx_mode = 15; break;
+        case 'k': uct_dc_mlx5_ep_tag_eager_short(&ucx_ep); break;
+        case 'm': uct_dc_mlx5_ep_tag_eager_bcopy(&ucx_ep, 1, tag_immediate); break;
+        case 'g': uct_dc_mlx5_ep_tag_eager_zcopy(&ucx_ep, 1, tag_immediate); break;
+        case '{': uct_dc_mlx5_ep_tag_rndv_request(&ucx_ep); break;
+        case '}': uct_dc_mlx5_ep_tag_rndv_zcopy(&ucx_ep); break;
         case '!': ucx_mode = 1; break;
         case '=': ucx_mode = 0; break;
         case '?': ucx_mode = 11; break;

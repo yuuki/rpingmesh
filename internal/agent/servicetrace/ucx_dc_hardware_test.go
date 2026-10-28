@@ -129,6 +129,26 @@ func testUCXAtomicHardware(t *testing.T, attach bool) {
 	}
 }
 
+func TestUCXTagHardware(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_TAG_HARDWARE_TEST") != "1" {
+		t.Skip("opt-in UCX tag hardware test")
+	}
+	testUCXTagHardware(t, false)
+}
+func TestUCXTagUprobeHardware(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_TAG_UPROBE_TEST") != "1" {
+		t.Skip("user-run privileged UCX tag hardware test")
+	}
+	testUCXTagHardware(t, true)
+}
+func testUCXTagHardware(t *testing.T, attach bool) {
+	for _, backend := range []string{"verbs", "devx", "streams"} {
+		for _, operation := range []string{"tag-short", "tag-bcopy", "tag-bcopy-imm", "tag-zcopy", "tag-zcopy-imm", "tag-rndv-request", "tag-rndv-zcopy"} {
+			t.Run(backend+"/"+operation, func(t *testing.T) { testUCXDCHardware(t, attach, backend != "verbs", backend == "streams", operation) })
+		}
+	}
+}
+
 func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperation ...string) {
 	operation := "short"
 	if len(selectedOperation) > 0 {
@@ -136,7 +156,8 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperati
 	}
 	rma := strings.HasPrefix(operation, "put-") || strings.HasPrefix(operation, "get-")
 	atomic := strings.HasPrefix(operation, "atomic")
-	am := operation != "short" && !rma && !atomic
+	tag := strings.HasPrefix(operation, "tag-")
+	am := operation != "short" && !rma && !atomic && !tag
 	opcode, modifier := byte(0x0a), byte(0)
 	if strings.HasPrefix(operation, "put-") {
 		opcode = 0x08
@@ -160,6 +181,9 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperati
 		if wide && strings.HasSuffix(operation, "-cswap") {
 			opcode, modifier = 0x11, 0
 		}
+	}
+	if tag && (strings.HasSuffix(operation, "-imm") || operation == "tag-rndv-request") {
+		opcode = 0x0b
 	}
 	wantFlows := 2
 	var channels uint32
@@ -213,6 +237,11 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperati
 			t.Fatal(err)
 		}
 	}
+	if tag {
+		if err := CheckUCXDCTag(ucx, ucxDebug); err != nil {
+			t.Fatal(err)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	child := exec.CommandContext(ctx, get("RPINGMESH_UCX_DC_HELPER"), device, portText, gid)
@@ -221,7 +250,7 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperati
 	} else if devx {
 		child.Args = append(child.Args, "--devx")
 	}
-	if am || rma || atomic {
+	if am || rma || atomic || tag {
 		if !devx {
 			child.Args = append(child.Args, "--verbs")
 		}
@@ -274,7 +303,7 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperati
 	var c *DCCollector
 	if attach {
 		c, err = OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: library, DebugFile: debug,
-			UCXLibrary: ucx, UCXDebugFile: ucxDebug, UCXDevX: devx, UCXStreams: streams, UCXAM: am, UCXRMA: rma, UCXAtomic: atomic, Device: device, Port: uint8(port)})
+			UCXLibrary: ucx, UCXDebugFile: ucxDebug, UCXDevX: devx, UCXStreams: streams, UCXAM: am, UCXRMA: rma, UCXAtomic: atomic, UCXTag: tag, Device: device, Port: uint8(port)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -290,6 +319,25 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperati
 		}()
 	}
 	command('g')
+	if tag {
+		capability, err := r.ReadString('\n')
+		if err != nil {
+			t.Fatal("UCX tag capability handshake failed")
+		}
+		if capability == "tag-unavailable\n" {
+			err := child.Wait()
+			if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 77 {
+				t.Fatal("invalid unsupported-tag exit")
+			}
+			if attach {
+				t.Log("attached tag submission symbols; hardware sends unavailable")
+			}
+			t.Skip("selected UCX device/backend does not advertise the requested DC tag capability")
+		}
+		if capability != "tag-supported\n" {
+			t.Fatal("invalid tag capability handshake")
+		}
+	}
 	var records [3 * 68]byte
 	if _, err := io.ReadFull(r, records[:]); err != nil {
 		t.Fatal("UCX did not complete three sends")
@@ -301,8 +349,8 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperati
 	destinations := make(map[uint32]bool)
 	for i := 0; i < 3; i++ {
 		record := records[i*68 : (i+1)*68]
-		if !bytes.Equal(record[20:28], make([]byte, 8)) {
-			t.Fatal("helper exported an access key")
+		if !bytes.Equal(record[16:28], make([]byte, 12)) {
+			t.Fatal("helper exported immediate data or an access key")
 		}
 		if record[7] != opcode || record[4] != modifier {
 			t.Fatal("submitted WQE opcode differs from requested operation")

@@ -42,7 +42,7 @@ struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 256);
     __type(key, __u64); __type(value, struct dc_modify_pending); } dc_devx_connecting SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
     __type(key, __u32); __type(value, struct ucx_dc_layout); } dc_ucx_layout SEC(".maps");
-struct dc_ucx_call { __u64 ep; __u32 kind, depth, invalid, reserved; };
+struct dc_ucx_call { __u64 ep; __u32 kind, depth, invalid, opcode; };
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 256);
     __type(key, __u64); __type(value, struct dc_ucx_call); } dc_ucx_pending SEC(".maps");
 
@@ -318,10 +318,10 @@ int dc_complete_exit(struct pt_regs *ctx)
     return 0;
 }
 
-/* The supported AM entry points each submit one SEND before returning their
+/* The supported UCX entry points each submit one WQE before returning their
  * documented success value. A pack callback may reenter UCT: reject the whole
  * nested call group rather than attribute its last WQE to the wrong call. */
-static __always_inline int ucx_enter(struct pt_regs *ctx, __u32 kind)
+static __always_inline int ucx_enter(struct pt_regs *ctx, __u32 kind, __u32 opcode)
 {
     if (!layout()) return 0;
     __u64 task = bpf_get_current_pid_tgid();
@@ -331,16 +331,25 @@ static __always_inline int ucx_enter(struct pt_regs *ctx, __u32 kind)
         pending->invalid = 1;
         return 0;
     }
-    struct dc_ucx_call call = {.ep = PT_REGS_PARM1(ctx), .kind = kind, .depth = 1};
+    struct dc_ucx_call call = {.ep = PT_REGS_PARM1(ctx), .kind = kind, .depth = 1, .opcode = opcode};
     if (bpf_map_update_elem(&dc_ucx_pending, &task, &call, BPF_ANY)) count(4);
     return 0;
 }
 SEC("uprobe")
-int dc_ucx_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 0); }
+int dc_ucx_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 0, 0x0a); }
 SEC("uprobe")
-int dc_ucx_bcopy_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 1); }
+int dc_ucx_bcopy_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 1, 0x0a); }
 SEC("uprobe")
-int dc_ucx_zcopy_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2); }
+int dc_ucx_zcopy_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2, 0x0a); }
+
+SEC("uprobe")
+int dc_ucx_put_short_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 0, 0x08); }
+SEC("uprobe")
+int dc_ucx_put_bcopy_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 1, 0x08); }
+SEC("uprobe")
+int dc_ucx_put_zcopy_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2, 0x08); }
+SEC("uprobe")
+int dc_ucx_get_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2, 0x10); }
 
 SEC("uretprobe")
 int dc_ucx_exit(struct pt_regs *ctx)
@@ -352,10 +361,11 @@ int dc_ucx_exit(struct pt_regs *ctx)
     if (!pending) return 0;
     if (pending->depth > 1) { pending->depth--; return 0; }
     __u64 ep = pending->ep;
-    __u32 kind = pending->kind, invalid = pending->invalid;
+    __u32 kind = pending->kind, invalid = pending->invalid, opcode = pending->opcode;
     bpf_map_delete_elem(&dc_ucx_pending, &task);
     if (invalid) { count(2); return 0; }
-    /* bcopy returns a signed ssize_t length (including zero); zcopy returns
+    /* AM/put bcopy returns a signed ssize_t length (including zero);
+     * zcopy and get-bcopy return
      * UCS_INPROGRESS after submission, not a completed operation. */
     __u64 result = PT_REGS_RC(ctx);
     if ((kind == 0 && (__s32)result != 0) ||
@@ -406,15 +416,15 @@ int dc_ucx_exit(struct pt_regs *ctx)
         ((volatile __u64 *)b->prefix)[i] = 0;
     b->qp = qp; b->identity = *id; b->count = 1; b->stream_channels = channels;
     __u64 wqe = start + ((__u64)(previous & (blocks - 1)) << 6);
-    /* Never read the DC access key or message payload. */
+    /* Never read the DC access key, remote address/rkey or payload. */
     if (bpf_probe_read_user(b->prefix[0], 16, (void *)wqe) ||
         bpf_probe_read_user(b->prefix[0] + 24, 40, (void *)(wqe + 24))) goto read_failed;
     __u32 ctrl, qpn_ds;
     __builtin_memcpy(&ctrl, b->prefix[0], 4);
     __builtin_memcpy(&qpn_ds, b->prefix[0] + 4, 4);
     ctrl = __builtin_bswap32(ctrl); qpn_ds = __builtin_bswap32(qpn_ds);
-    if ((ctrl & 0xff0000ff) != 0x0a || ((ctrl >> 8) & 0xffff) != previous ||
-        (qpn_ds >> 8) != qpn || (qpn_ds & 192) || (qpn_ds & 63) < 4 ||
+    if ((ctrl & 0xff0000ff) != opcode || ((ctrl >> 8) & 0xffff) != previous ||
+        (qpn_ds >> 8) != qpn || (qpn_ds & 192) || (qpn_ds & 63) < (opcode == 0x0a ? 4 : 5) ||
         ((qpn_ds & 63) + 3) / 4 != posted) goto unsupported;
     __u16 channel = ((__u16)b->prefix[0][9] << 8) | b->prefix[0][10];
     if (channels) {

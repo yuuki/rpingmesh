@@ -80,11 +80,39 @@ func testUCXAMHardware(t *testing.T, attach bool) {
 	}
 }
 
-func testUCXDCHardware(t *testing.T, attach, devx, streams bool, amOperation ...string) {
-	am := len(amOperation) > 0
+func TestUCXRMAHardware(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_RMA_HARDWARE_TEST") != "1" {
+		t.Skip("opt-in UCX RMA hardware test")
+	}
+	testUCXRMAHardware(t, false)
+}
+func TestUCXRMAUprobeHardware(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_RMA_UPROBE_TEST") != "1" {
+		t.Skip("user-run privileged UCX RMA hardware test")
+	}
+	testUCXRMAHardware(t, true)
+}
+func testUCXRMAHardware(t *testing.T, attach bool) {
+	for _, backend := range []string{"verbs", "devx", "streams"} {
+		for _, operation := range []string{"put-short", "put-bcopy", "put-zcopy", "get-bcopy", "get-zcopy"} {
+			t.Run(backend+"/"+operation, func(t *testing.T) { testUCXDCHardware(t, attach, backend != "verbs", backend == "streams", operation) })
+		}
+	}
+}
+
+func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperation ...string) {
 	operation := "short"
-	if am {
-		operation = amOperation[0]
+	if len(selectedOperation) > 0 {
+		operation = selectedOperation[0]
+	}
+	rma := strings.HasPrefix(operation, "put-") || strings.HasPrefix(operation, "get-")
+	am := operation != "short" && !rma
+	opcode := byte(0x0a)
+	if strings.HasPrefix(operation, "put-") {
+		opcode = 0x08
+	}
+	if strings.HasPrefix(operation, "get-") {
+		opcode = 0x10
 	}
 	wantFlows := 2
 	var channels uint32
@@ -128,6 +156,11 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, amOperation ...
 			t.Fatal(err)
 		}
 	}
+	if rma {
+		if err := CheckUCXDCRMA(ucx, ucxDebug); err != nil {
+			t.Fatal(err)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	child := exec.CommandContext(ctx, get("RPINGMESH_UCX_DC_HELPER"), device, portText, gid)
@@ -136,7 +169,7 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, amOperation ...
 	} else if devx {
 		child.Args = append(child.Args, "--devx")
 	}
-	if am {
+	if am || rma {
 		if !devx {
 			child.Args = append(child.Args, "--verbs")
 		}
@@ -189,7 +222,7 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, amOperation ...
 	var c *DCCollector
 	if attach {
 		c, err = OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: library, DebugFile: debug,
-			UCXLibrary: ucx, UCXDebugFile: ucxDebug, UCXDevX: devx, UCXStreams: streams, UCXAM: am, Device: device, Port: uint8(port)})
+			UCXLibrary: ucx, UCXDebugFile: ucxDebug, UCXDevX: devx, UCXStreams: streams, UCXAM: am, UCXRMA: rma, Device: device, Port: uint8(port)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -218,6 +251,9 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, amOperation ...
 		record := records[i*68 : (i+1)*68]
 		if !bytes.Equal(record[20:28], make([]byte, 8)) {
 			t.Fatal("helper exported an access key")
+		}
+		if record[7] != opcode {
+			t.Fatal("submitted WQE opcode differs from requested operation")
 		}
 		n := binary.BigEndian.Uint32(record)
 		if i > 0 && n != qpn {
@@ -295,8 +331,8 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, amOperation ...
 		t.Fatal("UCX helper teardown failed")
 	}
 	if attach {
-		t.Logf("verified 3 UCX direct sends, %d destination/stream flows, and DCI retirement (DevX=%t, streams=%t, AM=%s)", wantFlows, devx, streams, operation)
+		t.Logf("verified 3 UCX direct sends, %d destination/stream flows, and DCI retirement (DevX=%t, streams=%t, operation=%s)", wantFlows, devx, streams, operation)
 	} else {
-		t.Logf("verified selected libraries and 3 UCX direct sends with receive and flush completion (DevX=%t, streams=%t, AM=%s); BPF was not loaded", devx, streams, operation)
+		t.Logf("verified selected libraries and 3 UCX direct sends with data and completion verification (DevX=%t, streams=%t, operation=%s); BPF was not loaded", devx, streams, operation)
 	}
 }

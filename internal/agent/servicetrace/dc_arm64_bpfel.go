@@ -101,6 +101,10 @@ const (
 	dcProgDcUcxBcopyEnter    = "dc_ucx_bcopy_enter"
 	dcProgDcUcxEnter         = "dc_ucx_enter"
 	dcProgDcUcxExit          = "dc_ucx_exit"
+	dcProgDcUcxGetEnter      = "dc_ucx_get_enter"
+	dcProgDcUcxPutBcopyEnter = "dc_ucx_put_bcopy_enter"
+	dcProgDcUcxPutShortEnter = "dc_ucx_put_short_enter"
+	dcProgDcUcxPutZcopyEnter = "dc_ucx_put_zcopy_enter"
 	dcProgDcUcxZcopyEnter    = "dc_ucx_zcopy_enter"
 )
 
@@ -163,6 +167,10 @@ type dcProgramSpecs struct {
 	DcUcxBcopyEnter    *ebpf.ProgramSpec `ebpf:"dc_ucx_bcopy_enter"`
 	DcUcxEnter         *ebpf.ProgramSpec `ebpf:"dc_ucx_enter"`
 	DcUcxExit          *ebpf.ProgramSpec `ebpf:"dc_ucx_exit"`
+	DcUcxGetEnter      *ebpf.ProgramSpec `ebpf:"dc_ucx_get_enter"`
+	DcUcxPutBcopyEnter *ebpf.ProgramSpec `ebpf:"dc_ucx_put_bcopy_enter"`
+	DcUcxPutShortEnter *ebpf.ProgramSpec `ebpf:"dc_ucx_put_short_enter"`
+	DcUcxPutZcopyEnter *ebpf.ProgramSpec `ebpf:"dc_ucx_put_zcopy_enter"`
 	DcUcxZcopyEnter    *ebpf.ProgramSpec `ebpf:"dc_ucx_zcopy_enter"`
 }
 
@@ -277,6 +285,10 @@ type dcPrograms struct {
 	DcUcxBcopyEnter    *ebpf.Program `ebpf:"dc_ucx_bcopy_enter"`
 	DcUcxEnter         *ebpf.Program `ebpf:"dc_ucx_enter"`
 	DcUcxExit          *ebpf.Program `ebpf:"dc_ucx_exit"`
+	DcUcxGetEnter      *ebpf.Program `ebpf:"dc_ucx_get_enter"`
+	DcUcxPutBcopyEnter *ebpf.Program `ebpf:"dc_ucx_put_bcopy_enter"`
+	DcUcxPutShortEnter *ebpf.Program `ebpf:"dc_ucx_put_short_enter"`
+	DcUcxPutZcopyEnter *ebpf.Program `ebpf:"dc_ucx_put_zcopy_enter"`
 	DcUcxZcopyEnter    *ebpf.Program `ebpf:"dc_ucx_zcopy_enter"`
 }
 
@@ -299,6 +311,10 @@ func (p *dcPrograms) Close() error {
 		p.DcUcxBcopyEnter,
 		p.DcUcxEnter,
 		p.DcUcxExit,
+		p.DcUcxGetEnter,
+		p.DcUcxPutBcopyEnter,
+		p.DcUcxPutShortEnter,
+		p.DcUcxPutZcopyEnter,
 		p.DcUcxZcopyEnter,
 	)
 }

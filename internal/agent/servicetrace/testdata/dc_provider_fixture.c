@@ -132,15 +132,17 @@ __attribute__((noinline)) int mlx5_send_wr_complete(struct ibv_qp_ex *qp)
 static void put32(unsigned char *p, uint32_t v)
 { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
 
-static int ucx_post(struct uct_dc_mlx5_ep *ep)
+static int ucx_post(struct uct_dc_mlx5_ep *ep, unsigned opcode)
 {
     if (ucx_mode == 1) return -2;
     struct uct_ib_mlx5_txwq *wq = &ep->super.super.iface->tx.dcis.buffer[ep->dci]->txwq;
-    unsigned pos = storage.sq.cur_post++;
+    unsigned posted = opcode == 0x0a ? 1 : 2;
+    unsigned pos = storage.sq.cur_post;
+    storage.sq.cur_post += posted;
     unsigned char *p = queue[pos % 64];
     memset(p, 0, 64);
-    put32(p, ((pos & 0xffff) << 8) | 0x0a);
-    put32(p + 4, (0x12345 << 8) | 4);
+    put32(p, ((pos & 0xffff) << 8) | (ucx_mode == 11 ? 0x0a : opcode));
+    put32(p + 4, (0x12345 << 8) | (opcode == 0x0a || ucx_mode == 12 ? 4 : 5));
     p[9] = ucx_mode == 6;
     p[10] = ep->dci_channel_index + (ucx_mode == 7);
     memset(p + 16, 0xa5, 8);
@@ -150,29 +152,56 @@ static int ucx_post(struct uct_dc_mlx5_ep *ep)
     wq->super.type = ucx_devx_active || ucx_mode == 2;
     wq->super.qp_num = 0x12345 + (ucx_mode == 5);
     if (!ucx_devx_active) wq->super.verbs.qp = &storage.verbs_qp.qp;
-    wq->prev_sw_pi = pos; wq->sw_pi = pos + 1;
+    wq->prev_sw_pi = pos; wq->sw_pi = pos + posted;
     wq->qstart = queue; wq->qend = queue + 64;
-    wq->curr = queue[(pos + 1) % 64];
+    wq->curr = queue[(pos + posted) % 64];
     wq->dbrec = &ucx_db;
-    put32((unsigned char *)&ucx_db, (uint16_t)(pos + 1 + (ucx_mode == 3)));
+    put32((unsigned char *)&ucx_db, (uint16_t)(pos + posted + (ucx_mode == 3)));
     if (ucx_mode == 4) put32(p, (((pos + 1) & 0xffff) << 8) | 0x0a);
     return 0;
 }
 
 __attribute__((noinline)) int uct_dc_mlx5_ep_am_short(struct uct_dc_mlx5_ep *ep)
-{ return ucx_post(ep); }
+{ return ucx_post(ep, 0x0a); }
 __attribute__((noinline)) int uct_dc_mlx5_ep_am_short_iov(struct uct_dc_mlx5_ep *ep)
-{ return ucx_post(ep); }
+{ return ucx_post(ep, 0x0a); }
 __attribute__((noinline)) ssize_t uct_dc_mlx5_ep_am_bcopy(struct uct_dc_mlx5_ep *ep)
 {
     if (ucx_mode == 8) uct_dc_mlx5_ep_am_short(ep);
-    int status = ucx_post(ep);
+    int status = ucx_post(ep, 0x0a);
     return status ? status : ucx_mode == 9 ? 0 : 12;
 }
 __attribute__((noinline)) int uct_dc_mlx5_ep_am_zcopy(struct uct_dc_mlx5_ep *ep)
 {
     if (ucx_mode == 10) return 0; /* No submission: must not replay old data. */
-    int status = ucx_post(ep);
+    int status = ucx_post(ep, 0x0a);
+    return status ? status : 1;
+}
+
+__attribute__((noinline)) int uct_dc_mlx5_ep_put_short(struct uct_dc_mlx5_ep *ep)
+{ return ucx_post(ep, 0x08); }
+__attribute__((noinline)) ssize_t uct_dc_mlx5_ep_put_bcopy(struct uct_dc_mlx5_ep *ep)
+{
+    if (ucx_mode == 8) uct_dc_mlx5_ep_am_short(ep);
+    int status = ucx_post(ep, 0x08);
+    return status ? status : ucx_mode == 9 ? 0 : 12;
+}
+__attribute__((noinline)) int uct_dc_mlx5_ep_put_zcopy(struct uct_dc_mlx5_ep *ep)
+{
+    if (ucx_mode == 13) return 0;
+    int status = ucx_post(ep, 0x08);
+    return status ? status : 1;
+}
+__attribute__((noinline)) int uct_dc_mlx5_ep_get_bcopy(struct uct_dc_mlx5_ep *ep)
+{
+    if (ucx_mode == 13) return 0;
+    int status = ucx_post(ep, 0x10);
+    return status ? status : 1;
+}
+__attribute__((noinline)) int uct_dc_mlx5_ep_get_zcopy(struct uct_dc_mlx5_ep *ep)
+{
+    if (ucx_mode == 13) return 0;
+    int status = ucx_post(ep, 0x10);
     return status ? status : 1;
 }
 
@@ -258,6 +287,18 @@ int main(int argc, char **argv)
             devx_failure = 0;
             break;
         case 'X': mlx5dv_devx_obj_destroy(&devx_object); break;
+        case '!': ucx_mode = 1; break;
+        case '=': ucx_mode = 0; break;
+        case '?': ucx_mode = 11; break;
+        case '#': ucx_mode = 12; break;
+        case ';': ucx_mode = 13; break;
+        case '~': ucx_mode = 9; break;
+        case '@': ucx_mode = 8; break;
+        case '$': uct_dc_mlx5_ep_put_short(&ucx_ep); break;
+        case '%': uct_dc_mlx5_ep_put_bcopy(&ucx_ep); break;
+        case '&': uct_dc_mlx5_ep_put_zcopy(&ucx_ep); break;
+        case '(': uct_dc_mlx5_ep_get_bcopy(&ucx_ep); break;
+        case ')': uct_dc_mlx5_ep_get_zcopy(&ucx_ep); break;
         case 'i': case 'j':
             ucx_mode = op == 'j' ? 1 : 0;
             uct_dc_mlx5_ep_am_short_iov(&ucx_ep); break;

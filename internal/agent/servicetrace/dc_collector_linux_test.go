@@ -85,6 +85,9 @@ func TestDCProviderELF(t *testing.T) {
 	if _, err := inspectUCXDC(file, file); err != nil {
 		t.Fatal(err)
 	}
+	if err := CheckUCXDCRMA(file, file); err != nil {
+		t.Fatal(err)
+	}
 	if err := CheckUCXDCAM(file, file); err != nil {
 		t.Fatal(err)
 	}
@@ -167,9 +170,17 @@ func TestUCXAMUprobeIntegration(t *testing.T) {
 	testDCUprobeIntegration(t, false, true, true, true)
 }
 
+func TestUCXRMAUprobeIntegration(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_RMA_UPROBE_TEST") != "1" {
+		t.Skip("user-run privileged UCX RMA submission test")
+	}
+	testDCUprobeIntegration(t, false, true, true, true, true)
+}
+
 func testDCUprobeIntegration(t *testing.T, workerExec, devx bool, adapterOptions ...bool) {
 	streams := len(adapterOptions) > 0 && adapterOptions[0]
 	am := len(adapterOptions) > 1 && adapterOptions[1]
+	rma := len(adapterOptions) > 2 && adapterOptions[2]
 	file := buildDCFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -206,7 +217,7 @@ func testDCUprobeIntegration(t *testing.T, workerExec, devx bool, adapterOptions
 		}
 	}
 	c, err := OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: file, DebugFile: file,
-		UCXLibrary: file, UCXDebugFile: file, UCXDevX: devx, UCXStreams: streams, UCXAM: am, Device: "test-device", Port: 1, sysfsRoot: root})
+		UCXLibrary: file, UCXDebugFile: file, UCXDevX: devx, UCXStreams: streams, UCXAM: am, UCXRMA: rma, Device: "test-device", Port: 1, sysfsRoot: root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,6 +535,65 @@ func testDCUprobeIntegration(t *testing.T, workerExec, devx bool, adapterOptions
 		}
 		command('X')
 		accepted(8, 0)
+	}
+	if rma {
+		baseline, err := c.Stats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		accepted := func(n uint64, active int) {
+			t.Helper()
+			await(func(s DCStats) bool {
+				return s.AcceptedSends == baseline.AcceptedSends+n && s.UCXSubmissions == baseline.UCXSubmissions+n && s.ActiveFlows == active
+			})
+		}
+		operations := []byte{'$', '%', '&', '(', ')'}
+		command('c')
+		command('=')
+		for i, op := range operations {
+			command(op)
+			accepted(uint64(i+1), 1)
+		}
+		command('~')
+		command('%')
+		accepted(6, 1) // Zero-length bcopy still submits.
+		command('!')
+		for _, op := range operations {
+			command(op)
+		}
+		command(';')
+		for _, op := range []byte{'&', '(', ')'} {
+			command(op)
+		}
+		await(func(s DCStats) bool { return s.FailedSubmissions == baseline.FailedSubmissions+8 })
+		accepted(6, 1)
+		for _, mode := range []byte{'?', '#'} {
+			command(mode)
+			for _, op := range operations {
+				command(op)
+			}
+		}
+		command('@')
+		command('%') // Nested AM send in a put pack callback.
+		await(func(s DCStats) bool { return s.UnsupportedBatches == baseline.UnsupportedBatches+11 })
+		accepted(6, 1)
+		command('=')
+		command(')')
+		accepted(7, 1)
+		command('d')
+		accepted(7, 0)
+		command('S')
+		command('N')
+		command('1')
+		for i, op := range operations {
+			command(op)
+			accepted(uint64(i+8), 1)
+		}
+		command('X')
+		accepted(12, 0)
+		command(')')
+		await(func(s DCStats) bool { return s.UnsupportedBatches == baseline.UnsupportedBatches+12 })
+		accepted(12, 0)
 	}
 	final, err = c.Stats()
 	if err != nil {

@@ -31,9 +31,10 @@ struct receiver { unsigned count; unsigned mask; };
 static int use_devx, use_streams;
 static const char *operation = "short";
 static unsigned completed;
+static uct_component_h selected_component;
 static void completion(uct_completion_t *comp)
 {
-    if (comp->status != UCS_OK) fail("zcopy completion");
+    if (comp->status != UCS_OK) fail("asynchronous completion");
     ++completed;
 }
 static size_t pack_message(void *dest, void *arg)
@@ -83,6 +84,7 @@ static uct_md_h open_md(const char *device)
                 if (!strcmp(resources[k].tl_name, "dc_mlx5") && !strcmp(resources[k].dev_name, device)) found = 1;
             uct_release_tl_resource_list(resources);
             if (found) {
+                selected_component = components[i];
                 free(a.md_resources);
                 uct_release_component_list(components);
                 return md;
@@ -169,6 +171,106 @@ static void report_wqe(uct_ep_h endpoint)
     if (fwrite(record, sizeof(record), 1, stdout) != 1) fail("record output");
 }
 
+struct rma_copy { void *buffer; size_t length; };
+static size_t pack_rma(void *dest, void *arg)
+{
+    struct rma_copy *copy = arg;
+    memcpy(dest, copy->buffer, copy->length);
+    return copy->length;
+}
+static void unpack_rma(void *arg, const void *data, size_t length)
+{
+    struct rma_copy *copy = arg;
+    if (length != copy->length) fail("get bcopy length");
+    memcpy(copy->buffer, data, length);
+}
+static void flush_ep(uct_ep_h ep, uct_worker_h worker)
+{
+    ucs_status_t status;
+    do {
+        status = uct_ep_flush(ep, 0, NULL);
+        uct_worker_progress(worker);
+    } while (status == UCS_INPROGRESS || status == UCS_ERR_NO_RESOURCE);
+    if (status != UCS_OK) fail("RMA completion");
+}
+
+static void run_rma(uct_md_h md, uct_worker_h worker, uct_ep_h *eps, unsigned ep_count)
+{
+    unsigned char remote[2][256] __attribute__((aligned(64)));
+    unsigned char local[256] __attribute__((aligned(64)));
+    unsigned char expected[256];
+    uct_mem_h remote_mem[2], local_mem;
+    uct_rkey_bundle_t keys[2];
+    uct_md_attr_t md_attr;
+    CHECK(uct_md_query(md, &md_attr));
+    void *packed = malloc(md_attr.rkey_packed_size);
+    if (!packed) fail("key buffer allocation");
+    unsigned access = UCT_MD_MEM_ACCESS_LOCAL_READ | UCT_MD_MEM_ACCESS_LOCAL_WRITE |
+                      UCT_MD_MEM_ACCESS_REMOTE_GET | UCT_MD_MEM_ACCESS_REMOTE_PUT;
+    for (unsigned peer = 0; peer < 2; ++peer) {
+        CHECK(uct_md_mem_reg(md, remote[peer], sizeof(remote[peer]), access, &remote_mem[peer]));
+        CHECK(uct_md_mkey_pack(md, remote_mem[peer], packed));
+        CHECK(uct_rkey_unpack(selected_component, packed, &keys[peer]));
+    }
+    free(packed);
+    CHECK(uct_md_mem_reg(md, local, sizeof(local),
+                        UCT_MD_MEM_ACCESS_LOCAL_READ | UCT_MD_MEM_ACCESS_LOCAL_WRITE, &local_mem));
+    int get = !strncmp(operation, "get-", 4);
+    int put_short = !strcmp(operation, "put-short");
+    int put_bcopy = !strcmp(operation, "put-bcopy");
+    int put_zcopy = !strcmp(operation, "put-zcopy");
+    int get_bcopy = !strcmp(operation, "get-bcopy");
+    size_t length = put_short ? 16 : sizeof(local);
+    uct_iface_attr_t attr;
+    CHECK(uct_iface_query(eps[0]->iface, &attr));
+    uint64_t capability = put_short ? UCT_IFACE_FLAG_PUT_SHORT :
+                          put_bcopy ? UCT_IFACE_FLAG_PUT_BCOPY :
+                          put_zcopy ? UCT_IFACE_FLAG_PUT_ZCOPY :
+                          get_bcopy ? UCT_IFACE_FLAG_GET_BCOPY : UCT_IFACE_FLAG_GET_ZCOPY;
+    if (!(attr.cap.flags & capability) ||
+        (!strcmp(operation, "get-zcopy") &&
+         (length < attr.cap.get.min_zcopy || length > attr.cap.get.max_zcopy))) fail("RMA capability");
+    for (unsigned i = 0; i < 3; ++i) {
+        unsigned ep_index = i % ep_count;
+        unsigned peer = use_streams ? ep_index / 2 : ep_index;
+        for (unsigned j = 0; j < sizeof(expected); ++j) expected[j] = (unsigned char)(i * 71 + j);
+        memset(remote, 0xee, sizeof(remote));
+        memset(local, 0xcc, sizeof(local));
+        if (get) memcpy(remote[peer], expected, length);
+        else memcpy(local, expected, length);
+        uint64_t address = (uintptr_t)remote[peer];
+        uct_ep_h ep = eps[ep_index];
+        uct_iov_t iov = {.buffer = local, .length = length, .memh = local_mem, .count = 1};
+        struct rma_copy copy = {.buffer = local, .length = length};
+        uct_completion_t comp = {.func = completion, .count = 1, .status = UCS_OK};
+        unsigned before = completed;
+        if (put_short) {
+            CHECK(uct_ep_put_short(ep, local, length, address, keys[peer].rkey));
+        } else if (put_bcopy) {
+            if (uct_ep_put_bcopy(ep, pack_rma, &copy, address, keys[peer].rkey) != (ssize_t)length)
+                fail("put bcopy submission");
+        } else {
+            ucs_status_t status;
+            if (put_zcopy) status = uct_ep_put_zcopy(ep, &iov, 1, address, keys[peer].rkey, &comp);
+            else if (get_bcopy) status = uct_ep_get_bcopy(ep, unpack_rma, &copy, length, address, keys[peer].rkey, &comp);
+            else status = uct_ep_get_zcopy(ep, &iov, 1, address, keys[peer].rkey, &comp);
+            if (status != UCS_INPROGRESS) fail("asynchronous RMA submission");
+        }
+        report_wqe(ep);
+        if (!put_short && !put_bcopy)
+            while (completed == before) uct_worker_progress(worker);
+        flush_ep(ep, worker);
+        if (memcmp(get ? local : remote[peer], expected, length)) fail("RMA contents");
+        for (unsigned j = 0; j < sizeof(remote[0]); ++j)
+            if (remote[peer ^ 1][j] != 0xee) fail("RMA destination isolation");
+    }
+    CHECK(uct_md_mem_dereg(md, local_mem));
+    for (unsigned peer = 0; peer < 2; ++peer) {
+        CHECK(uct_rkey_release(selected_component, &keys[peer]));
+        CHECK(uct_md_mem_dereg(md, remote_mem[peer]));
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 4 || argc > 6 || (argc >= 5 && strcmp(argv[4], "--verbs") &&
@@ -176,8 +278,10 @@ int main(int argc, char **argv)
     use_devx = argc >= 5 && strcmp(argv[4], "--verbs");
     use_streams = argc >= 5 && !strcmp(argv[4], "--streams");
     if (argc == 6) operation = argv[5];
-    if (strcmp(operation, "short") && strcmp(operation, "short-iov") &&
-        strcmp(operation, "bcopy") && strcmp(operation, "zcopy")) fail("invalid AM operation");
+    int rma = !strcmp(operation, "put-short") || !strcmp(operation, "put-bcopy") ||
+              !strcmp(operation, "put-zcopy") || !strcmp(operation, "get-bcopy") || !strcmp(operation, "get-zcopy");
+    if (!rma && strcmp(operation, "short") && strcmp(operation, "short-iov") &&
+        strcmp(operation, "bcopy") && strcmp(operation, "zcopy")) fail("invalid operation");
     alarm(60);
     if (setenv("UCX_IB_MLX5_DEVX", use_devx ? "yes" : "no", 1) || setenv("UCX_IB_GID_INDEX", argv[3], 1) ||
         setenv("UCX_LOG_LEVEL", "error", 1)) fail("environment");
@@ -204,38 +308,42 @@ int main(int argc, char **argv)
     for (unsigned i = 0; i < ep_count; ++i) {
         eps[i] = connect_ep(sender, receivers[use_streams ? i / 2 : i]);
     }
-    char payload[4] = {'t', 'e', 's', 't'};
-    uct_mem_h memh = UCT_MEM_HANDLE_NULL;
-    int zcopy = !strcmp(operation, "zcopy");
-    if (zcopy) CHECK(uct_md_mem_reg(md, payload, sizeof(payload), UCT_MD_MEM_ACCESS_LOCAL_READ, &memh));
-    for (uint64_t i = 0; i < 3; ++i) {
-        uct_ep_h ep = eps[i % ep_count];
-        uct_iov_t iov[2] = {{.buffer = &i, .length = 8, .memh = UCT_MEM_HANDLE_NULL, .count = 1},
-                            {.buffer = payload, .length = 4, .memh = memh, .count = 1}};
-        uct_completion_t comp = {.func = completion, .count = 1, .status = UCS_OK};
-        if (!strcmp(operation, "short-iov")) {
-            CHECK(uct_ep_am_short_iov(ep, 1, iov, 2));
-        } else if (!strcmp(operation, "bcopy")) {
-            if (uct_ep_am_bcopy(ep, 1, pack_message, &i, 0) != 12) fail("bcopy submission");
-        } else if (zcopy) {
-            if (uct_ep_am_zcopy(ep, 1, &i, 8, &iov[1], 1, 0, &comp) != UCS_INPROGRESS) fail("zcopy submission");
-        } else {
-            CHECK(uct_ep_am_short(ep, 1, i, payload, 4));
+    if (rma) {
+        run_rma(md, worker, eps, ep_count);
+    } else {
+        char payload[4] = {'t', 'e', 's', 't'};
+        uct_mem_h memh = UCT_MEM_HANDLE_NULL;
+        int zcopy = !strcmp(operation, "zcopy");
+        if (zcopy) CHECK(uct_md_mem_reg(md, payload, sizeof(payload), UCT_MD_MEM_ACCESS_LOCAL_READ, &memh));
+        for (uint64_t i = 0; i < 3; ++i) {
+            uct_ep_h ep = eps[i % ep_count];
+            uct_iov_t iov[2] = {{.buffer = &i, .length = 8, .memh = UCT_MEM_HANDLE_NULL, .count = 1},
+                                {.buffer = payload, .length = 4, .memh = memh, .count = 1}};
+            uct_completion_t comp = {.func = completion, .count = 1, .status = UCS_OK};
+            if (!strcmp(operation, "short-iov")) {
+                CHECK(uct_ep_am_short_iov(ep, 1, iov, 2));
+            } else if (!strcmp(operation, "bcopy")) {
+                if (uct_ep_am_bcopy(ep, 1, pack_message, &i, 0) != 12) fail("bcopy submission");
+            } else if (zcopy) {
+                if (uct_ep_am_zcopy(ep, 1, &i, 8, &iov[1], 1, 0, &comp) != UCS_INPROGRESS) fail("zcopy submission");
+            } else {
+                CHECK(uct_ep_am_short(ep, 1, i, payload, 4));
+            }
+            report_wqe(eps[i % ep_count]);
+            while (state[0].count + state[1].count != i + 1 || (zcopy && completed != i + 1))
+                uct_worker_progress(worker);
         }
-        report_wqe(eps[i % ep_count]);
-        while (state[0].count + state[1].count != i + 1 || (zcopy && completed != i + 1))
-            uct_worker_progress(worker);
+        for (unsigned i = 0; i < ep_count; ++i) {
+            ucs_status_t status;
+            do {
+                status = uct_ep_flush(eps[i], 0, NULL);
+                uct_worker_progress(worker);
+            } while (status == UCS_INPROGRESS || status == UCS_ERR_NO_RESOURCE);
+            if (status != UCS_OK) fail("send completion");
+        }
+        if (zcopy) CHECK(uct_md_mem_dereg(md, memh));
+        if (state[0].mask != (use_streams ? 3u : 5u) || state[1].mask != (use_streams ? 4u : 2u)) fail("receive destinations");
     }
-    for (unsigned i = 0; i < ep_count; ++i) {
-        ucs_status_t status;
-        do {
-            status = uct_ep_flush(eps[i], 0, NULL);
-            uct_worker_progress(worker);
-        } while (status == UCS_INPROGRESS || status == UCS_ERR_NO_RESOURCE);
-        if (status != UCS_OK) fail("send completion");
-    }
-    if (zcopy) CHECK(uct_md_mem_dereg(md, memh));
-    if (state[0].mask != (use_streams ? 3u : 5u) || state[1].mask != (use_streams ? 4u : 2u)) fail("receive destinations");
     gate("delivered", 'd');
     for (unsigned i = 0; i < ep_count; ++i) uct_ep_destroy(eps[i]);
     uct_iface_close(sender);

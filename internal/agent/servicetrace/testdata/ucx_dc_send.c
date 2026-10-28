@@ -271,6 +271,103 @@ static void run_rma(uct_md_h md, uct_worker_h worker, uct_ep_h *eps, unsigned ep
     }
 }
 
+static unsigned atomic_width;
+static int atomic_fetch;
+static uct_atomic_op_t atomic_op;
+static int parse_atomic(void)
+{
+    const char *p;
+    if (!strncmp(operation, "atomic32-", 9)) atomic_width = 32;
+    else if (!strncmp(operation, "atomic64-", 9)) atomic_width = 64;
+    else return 0;
+    p = operation + 9;
+    atomic_fetch = 1;
+    if (!strcmp(p, "cswap")) { atomic_op = UCT_ATOMIC_OP_CSWAP; return 1; }
+    if (!strncmp(p, "post-", 5)) { atomic_fetch = 0; p += 5; }
+    else if (!strncmp(p, "fetch-", 6)) p += 6;
+    else fail("invalid atomic form");
+    if (!strcmp(p, "add")) atomic_op = UCT_ATOMIC_OP_ADD;
+    else if (!strcmp(p, "and")) atomic_op = UCT_ATOMIC_OP_AND;
+    else if (!strcmp(p, "or")) atomic_op = UCT_ATOMIC_OP_OR;
+    else if (!strcmp(p, "xor")) atomic_op = UCT_ATOMIC_OP_XOR;
+    else if (atomic_fetch && !strcmp(p, "swap")) atomic_op = UCT_ATOMIC_OP_SWAP;
+    else fail("invalid atomic operation");
+    return 1;
+}
+
+static void run_atomic(uct_md_h md, uct_worker_h worker, uct_ep_h *eps, unsigned ep_count)
+{
+    uint64_t remote[2] __attribute__((aligned(64)));
+    uct_mem_h mem[2];
+    uct_rkey_bundle_t keys[2];
+    uct_md_attr_t md_attr;
+    uct_iface_attr_t attr;
+    CHECK(uct_md_query(md, &md_attr));
+    CHECK(uct_iface_query(eps[0]->iface, &attr));
+    uint64_t ops = atomic_width == 32 ?
+        (atomic_fetch ? attr.cap.atomic32.fop_flags : attr.cap.atomic32.op_flags) :
+        (atomic_fetch ? attr.cap.atomic64.fop_flags : attr.cap.atomic64.op_flags);
+    if (!(ops & (1ull << atomic_op))) fail("atomic capability");
+    void *packed = malloc(md_attr.rkey_packed_size);
+    if (!packed) fail("atomic key buffer allocation");
+    for (unsigned peer = 0; peer < 2; ++peer) {
+        CHECK(uct_md_mem_reg(md, &remote[peer], sizeof(remote[peer]),
+                            UCT_MD_MEM_ACCESS_LOCAL_READ | UCT_MD_MEM_ACCESS_LOCAL_WRITE |
+                            UCT_MD_MEM_ACCESS_REMOTE_ATOMIC, &mem[peer]));
+        CHECK(uct_md_mkey_pack(md, mem[peer], packed));
+        CHECK(uct_rkey_unpack(selected_component, packed, &keys[peer]));
+    }
+    free(packed);
+    for (unsigned i = 0; i < 3; ++i) {
+        unsigned ep_index = i % ep_count;
+        unsigned peer = use_streams ? ep_index / 2 : ep_index;
+        uint64_t initial = 0x1234567855aa55a0ull + i;
+        uint64_t value = 0x010203040f0f0f0full;
+        uint64_t mask = atomic_width == 32 ? UINT32_MAX : UINT64_MAX;
+        uint64_t old = initial & mask, operand = value & mask, expected;
+        uint64_t compare = old + (i == 1); /* Exercise failed comparison too. */
+        switch (atomic_op) {
+        case UCT_ATOMIC_OP_ADD: expected = old + operand; break;
+        case UCT_ATOMIC_OP_AND: expected = old & operand; break;
+        case UCT_ATOMIC_OP_OR: expected = old | operand; break;
+        case UCT_ATOMIC_OP_XOR: expected = old ^ operand; break;
+        case UCT_ATOMIC_OP_SWAP: expected = operand; break;
+        case UCT_ATOMIC_OP_CSWAP: expected = compare == old ? operand : old; break;
+        default: fail("atomic expectation"); expected = 0;
+        }
+        remote[0] = remote[1] = initial;
+        uint64_t result64 = 0;
+        uint32_t result32 = 0;
+        uct_completion_t comp = {.func = completion, .count = 1, .status = UCS_OK};
+        unsigned before = completed;
+        uct_ep_h ep = eps[ep_index];
+        uint64_t address = (uintptr_t)&remote[peer];
+        ucs_status_t status;
+        if (atomic_width == 32) {
+            if (!atomic_fetch) status = uct_ep_atomic32_post(ep, atomic_op, operand, address, keys[peer].rkey);
+            else if (atomic_op == UCT_ATOMIC_OP_CSWAP)
+                status = uct_ep_atomic_cswap32(ep, compare, operand, address, keys[peer].rkey, &result32, &comp);
+            else status = uct_ep_atomic32_fetch(ep, atomic_op, operand, &result32, address, keys[peer].rkey, &comp);
+        } else {
+            if (!atomic_fetch) status = uct_ep_atomic64_post(ep, atomic_op, operand, address, keys[peer].rkey);
+            else if (atomic_op == UCT_ATOMIC_OP_CSWAP)
+                status = uct_ep_atomic_cswap64(ep, compare, operand, address, keys[peer].rkey, &result64, &comp);
+            else status = uct_ep_atomic64_fetch(ep, atomic_op, operand, &result64, address, keys[peer].rkey, &comp);
+        }
+        if (status != (atomic_fetch ? UCS_INPROGRESS : UCS_OK)) fail("atomic submission");
+        report_wqe(ep);
+        if (atomic_fetch) while (completed == before) uct_worker_progress(worker);
+        flush_ep(ep, worker);
+        if (atomic_fetch && (atomic_width == 32 ? result32 : result64) != old) fail("atomic fetch result");
+        if (remote[peer] != ((initial & ~mask) | (expected & mask))) fail("atomic remote value");
+        if (remote[peer ^ 1] != initial) fail("atomic destination isolation");
+    }
+    for (unsigned peer = 0; peer < 2; ++peer) {
+        CHECK(uct_rkey_release(selected_component, &keys[peer]));
+        CHECK(uct_md_mem_dereg(md, mem[peer]));
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 4 || argc > 6 || (argc >= 5 && strcmp(argv[4], "--verbs") &&
@@ -280,7 +377,8 @@ int main(int argc, char **argv)
     if (argc == 6) operation = argv[5];
     int rma = !strcmp(operation, "put-short") || !strcmp(operation, "put-bcopy") ||
               !strcmp(operation, "put-zcopy") || !strcmp(operation, "get-bcopy") || !strcmp(operation, "get-zcopy");
-    if (!rma && strcmp(operation, "short") && strcmp(operation, "short-iov") &&
+    int atomic = parse_atomic();
+    if (!atomic && !rma && strcmp(operation, "short") && strcmp(operation, "short-iov") &&
         strcmp(operation, "bcopy") && strcmp(operation, "zcopy")) fail("invalid operation");
     alarm(60);
     if (setenv("UCX_IB_MLX5_DEVX", use_devx ? "yes" : "no", 1) || setenv("UCX_IB_GID_INDEX", argv[3], 1) ||
@@ -308,7 +406,9 @@ int main(int argc, char **argv)
     for (unsigned i = 0; i < ep_count; ++i) {
         eps[i] = connect_ep(sender, receivers[use_streams ? i / 2 : i]);
     }
-    if (rma) {
+    if (atomic) {
+        run_atomic(md, worker, eps, ep_count);
+    } else if (rma) {
         run_rma(md, worker, eps, ep_count);
     } else {
         char payload[4] = {'t', 'e', 's', 't'};

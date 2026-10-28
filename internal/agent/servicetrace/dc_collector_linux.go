@@ -39,6 +39,7 @@ type DCOptions struct {
 	UCXStreams                 bool
 	UCXAM                      bool
 	UCXRMA                     bool
+	UCXAtomic                  bool
 	Port                       uint8
 	Capacity                   int
 	IdleTimeout                time.Duration
@@ -135,7 +136,7 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 	}
 	var ucx *ucxDCProvider
 	var ucxPinned string
-	if options.UCXLibrary != "" || options.UCXDebugFile != "" || options.UCXDevX || options.UCXAM || options.UCXRMA {
+	if options.UCXLibrary != "" || options.UCXDebugFile != "" || options.UCXDevX || options.UCXAM || options.UCXRMA || options.UCXAtomic {
 		if options.UCXLibrary == "" || options.UCXDebugFile == "" {
 			return nil, fmt.Errorf("UCX library and matching debug ELF must both be supplied")
 		}
@@ -144,7 +145,7 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 			return nil, err
 		}
 		ucxPinned = fmt.Sprintf("/proc/self/fd/%d", c.ucxLibrary.Fd())
-		ucx, err = inspectUCXDCOperations(ucxPinned, options.UCXDebugFile, options.UCXDevX, options.UCXStreams, options.UCXAM, options.UCXRMA)
+		ucx, err = inspectUCXDCOperations(ucxPinned, options.UCXDebugFile, options.UCXDevX, options.UCXStreams, options.UCXAM, options.UCXRMA, options.UCXAtomic)
 		if err != nil {
 			return nil, err
 		}
@@ -277,6 +278,11 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 		if options.UCXRMA {
 			for i, enter := range []*ebpf.Program{c.objs.DcUcxPutShortEnter, c.objs.DcUcxPutBcopyEnter, c.objs.DcUcxPutZcopyEnter, c.objs.DcUcxGetEnter, c.objs.DcUcxGetEnter} {
 				hooks = append(hooks, ucxProbe{ucx.rmaSymbols[i], c.objs.DcUcxExit, true}, ucxProbe{ucx.rmaSymbols[i], enter, false})
+			}
+		}
+		if options.UCXAtomic {
+			for i, enter := range []*ebpf.Program{c.objs.DcUcxAtomic32PostEnter, c.objs.DcUcxAtomic64PostEnter, c.objs.DcUcxAtomic32FetchEnter, c.objs.DcUcxAtomic64FetchEnter, c.objs.DcUcxAtomicCswap32Enter, c.objs.DcUcxAtomicCswap64Enter} {
+				hooks = append(hooks, ucxProbe{ucx.atomicSymbols[i], c.objs.DcUcxExit, true}, ucxProbe{ucx.atomicSymbols[i], enter, false})
 			}
 		}
 		if options.UCXDevX {

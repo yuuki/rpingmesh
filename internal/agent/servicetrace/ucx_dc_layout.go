@@ -7,10 +7,10 @@ import (
 	"fmt"
 )
 
-// ucxDCLayout describes the experimental UCX dc_mlx5 active-message adapter. It
+// ucxDCLayout describes the experimental UCX dc_mlx5 submission adapter. It
 // supports verbs DCIs and explicitly enabled DevX DCIs and streams through the
 // lifecycle adapter. AM short-iov, bcopy and zcopy require separate opt-in.
-// RMA put/get require separate opt-in; atomics and tag operations are not observed.
+// RMA put/get and atomics require separate opt-in; tag operations are not observed.
 // Keep this order identical to struct ucx_dc_layout in the BPF program.
 type ucxDCLayout struct {
 	EPInterface, EPDCI, InterfaceBuffer, InterfaceLength uint32
@@ -27,6 +27,7 @@ type ucxDCProvider struct {
 	symbol                      uint64
 	amSymbols                   [3]uint64
 	rmaSymbols                  [5]uint64
+	atomicSymbols               [6]uint64
 	createSymbol, connectSymbol uint64
 	machine                     elf.Machine
 }
@@ -42,10 +43,10 @@ func inspectUCXDCMode(library, debugFile string, devx bool) (*ucxDCProvider, err
 }
 
 func inspectUCXDCStreams(library, debugFile string, devx, streams bool) (*ucxDCProvider, error) {
-	return inspectUCXDCOperations(library, debugFile, devx, streams, false, false)
+	return inspectUCXDCOperations(library, debugFile, devx, streams, false, false, false)
 }
 
-func inspectUCXDCOperations(library, debugFile string, devx, streams, am, rma bool) (*ucxDCProvider, error) {
+func inspectUCXDCOperations(library, debugFile string, devx, streams, am, rma, atomic bool) (*ucxDCProvider, error) {
 	if streams && !devx {
 		return nil, fmt.Errorf("UCX streams require the DevX lifecycle adapter")
 	}
@@ -182,6 +183,11 @@ func inspectUCXDCOperations(library, debugFile string, devx, streams, am, rma bo
 			wanted[name] = &p.rmaSymbols[i]
 		}
 	}
+	if atomic {
+		for i, name := range []string{"uct_dc_mlx5_ep_atomic32_post", "uct_dc_mlx5_ep_atomic64_post", "uct_dc_mlx5_ep_atomic32_fetch", "uct_dc_mlx5_ep_atomic64_fetch", "uct_dc_mlx5_ep_atomic_cswap32", "uct_dc_mlx5_ep_atomic_cswap64"} {
+			wanted[name] = &p.atomicSymbols[i]
+		}
+	}
 	if devx {
 		wanted["uct_dc_mlx5_iface_create_dci"] = &p.createSymbol
 		wanted["uct_dc_mlx5_iface_dci_connect"] = &p.connectSymbol
@@ -241,12 +247,18 @@ func CheckUCXDCStreams(provider, providerDebug, ucx, ucxDebug string) error {
 
 // CheckUCXDCAM validates the additional active-message submission symbols.
 func CheckUCXDCAM(library, debugFile string) error {
-	_, err := inspectUCXDCOperations(library, debugFile, false, false, true, false)
+	_, err := inspectUCXDCOperations(library, debugFile, false, false, true, false, false)
 	return err
 }
 
 // CheckUCXDCRMA validates the optional put/get submission symbols.
 func CheckUCXDCRMA(library, debugFile string) error {
-	_, err := inspectUCXDCOperations(library, debugFile, false, false, false, true)
+	_, err := inspectUCXDCOperations(library, debugFile, false, false, false, true, false)
+	return err
+}
+
+// CheckUCXDCAtomic validates the optional 32/64-bit atomic submission symbols.
+func CheckUCXDCAtomic(library, debugFile string) error {
+	_, err := inspectUCXDCOperations(library, debugFile, false, false, false, false, true)
 	return err
 }

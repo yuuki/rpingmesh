@@ -100,19 +100,66 @@ func testUCXRMAHardware(t *testing.T, attach bool) {
 	}
 }
 
+func TestUCXAtomicHardware(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_ATOMIC_HARDWARE_TEST") != "1" {
+		t.Skip("opt-in UCX atomic hardware test")
+	}
+	testUCXAtomicHardware(t, false)
+}
+func TestUCXAtomicUprobeHardware(t *testing.T) {
+	if os.Getenv("RPINGMESH_UCX_ATOMIC_UPROBE_TEST") != "1" {
+		t.Skip("user-run privileged UCX atomic hardware test")
+	}
+	testUCXAtomicHardware(t, true)
+}
+func testUCXAtomicHardware(t *testing.T, attach bool) {
+	for _, backend := range []string{"verbs", "devx", "streams"} {
+		// Verbs-only providers can lack extended atomics or reject advertised
+		// DC atomics. Exercise that backend only when explicitly requested.
+		if backend == "verbs" && os.Getenv("RPINGMESH_UCX_ATOMIC_VERBS_TEST") != "1" {
+			t.Run(backend, func(t *testing.T) { t.Skip("set RPINGMESH_UCX_ATOMIC_VERBS_TEST=1 to test verbs DC atomics") })
+			continue
+		}
+		for _, width := range []string{"32", "64"} {
+			for _, op := range []string{"post-add", "post-and", "post-or", "post-xor", "fetch-add", "fetch-and", "fetch-or", "fetch-xor", "fetch-swap", "cswap"} {
+				operation := "atomic" + width + "-" + op
+				t.Run(backend+"/"+operation, func(t *testing.T) { testUCXDCHardware(t, attach, backend != "verbs", backend == "streams", operation) })
+			}
+		}
+	}
+}
+
 func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperation ...string) {
 	operation := "short"
 	if len(selectedOperation) > 0 {
 		operation = selectedOperation[0]
 	}
 	rma := strings.HasPrefix(operation, "put-") || strings.HasPrefix(operation, "get-")
-	am := operation != "short" && !rma
-	opcode := byte(0x0a)
+	atomic := strings.HasPrefix(operation, "atomic")
+	am := operation != "short" && !rma && !atomic
+	opcode, modifier := byte(0x0a), byte(0)
 	if strings.HasPrefix(operation, "put-") {
 		opcode = 0x08
 	}
 	if strings.HasPrefix(operation, "get-") {
 		opcode = 0x10
+	}
+	if atomic {
+		wide := strings.HasPrefix(operation, "atomic64-")
+		modifier = 8
+		if wide {
+			modifier = 9
+		}
+		opcode = 0x14
+		if strings.HasSuffix(operation, "-add") || strings.HasSuffix(operation, "-xor") {
+			opcode = 0x15
+		}
+		if wide && strings.HasSuffix(operation, "-add") {
+			opcode, modifier = 0x12, 0
+		}
+		if wide && strings.HasSuffix(operation, "-cswap") {
+			opcode, modifier = 0x11, 0
+		}
 	}
 	wantFlows := 2
 	var channels uint32
@@ -161,6 +208,11 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperati
 			t.Fatal(err)
 		}
 	}
+	if atomic {
+		if err := CheckUCXDCAtomic(ucx, ucxDebug); err != nil {
+			t.Fatal(err)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	child := exec.CommandContext(ctx, get("RPINGMESH_UCX_DC_HELPER"), device, portText, gid)
@@ -169,7 +221,7 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperati
 	} else if devx {
 		child.Args = append(child.Args, "--devx")
 	}
-	if am || rma {
+	if am || rma || atomic {
 		if !devx {
 			child.Args = append(child.Args, "--verbs")
 		}
@@ -222,7 +274,7 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperati
 	var c *DCCollector
 	if attach {
 		c, err = OpenDCCollector(DCOptions{PID: child.Process.Pid, Library: library, DebugFile: debug,
-			UCXLibrary: ucx, UCXDebugFile: ucxDebug, UCXDevX: devx, UCXStreams: streams, UCXAM: am, UCXRMA: rma, Device: device, Port: uint8(port)})
+			UCXLibrary: ucx, UCXDebugFile: ucxDebug, UCXDevX: devx, UCXStreams: streams, UCXAM: am, UCXRMA: rma, UCXAtomic: atomic, Device: device, Port: uint8(port)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -252,7 +304,7 @@ func testUCXDCHardware(t *testing.T, attach, devx, streams bool, selectedOperati
 		if !bytes.Equal(record[20:28], make([]byte, 8)) {
 			t.Fatal("helper exported an access key")
 		}
-		if record[7] != opcode {
+		if record[7] != opcode || record[4] != modifier {
 			t.Fatal("submitted WQE opcode differs from requested operation")
 		}
 		n := binary.BigEndian.Uint32(record)

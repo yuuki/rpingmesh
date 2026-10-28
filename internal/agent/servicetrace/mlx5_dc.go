@@ -55,18 +55,31 @@ func decodeMLX5DCStreamAddress(prefix []byte, expectedQPN uint32, channels uint3
 	if channels != 0 && (channels < 2 || channels > 128 || channels&(channels-1) != 0) {
 		return a, fmt.Errorf("invalid DCI stream channel count")
 	}
-	if ctrl>>24 != 0 || (channels == 0 && channel != 0) || (channels != 0 && uint32(channel) >= channels) {
-		return a, fmt.Errorf("mlx5 DC WQE opcode modifier or stream is unsupported")
+	if (channels == 0 && channel != 0) || (channels != 0 && uint32(channel) >= channels) {
+		return a, fmt.Errorf("mlx5 DC WQE stream is unsupported")
 	}
 	minDS := uint32(4)
+	modifier := uint32(0)
+	atomic := false
 	switch byte(ctrl) {
 	case 0x0a, 0x0b: // SEND, SEND_IMM
 	case 0x08, 0x09, 0x10: // RDMA_WRITE, RDMA_WRITE_IMM, RDMA_READ
 		minDS = 5 // remote address segment follows the AV
+	case 0x11, 0x12: // ATOMIC_CS, ATOMIC_FA (64-bit)
+		minDS, atomic = 7, true
+	case 0x14, 0x15: // MASKED_CS, MASKED_FA (32/64-bit)
+		modifier = ctrl >> 24
+		if modifier != 8 && modifier != 9 {
+			return a, fmt.Errorf("unsupported mlx5 DC atomic size modifier")
+		}
+		minDS, atomic = 7, true
+		if byte(ctrl) == 0x14 && modifier == 9 {
+			minDS = 8
+		}
 	default:
 		return a, fmt.Errorf("mlx5 DC WQE opcode %#x is unsupported", byte(ctrl))
 	}
-	if qpnDS&0xc0 != 0 || qpnDS&0x3f < minDS {
+	if ctrl>>24 != modifier || qpnDS&0xc0 != 0 || qpnDS&0x3f < minDS || (atomic && qpnDS&0x3f != minDS) {
 		return a, fmt.Errorf("mlx5 DC WQE segment count is invalid")
 	}
 	dct := be.Uint32(prefix[24:28])

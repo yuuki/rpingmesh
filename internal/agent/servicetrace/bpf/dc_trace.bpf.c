@@ -351,6 +351,29 @@ int dc_ucx_put_zcopy_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2, 0x08)
 SEC("uprobe")
 int dc_ucx_get_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2, 0x10); }
 
+/* UCX atomic operation enum: ADD, AND, OR, XOR, SWAP. Compare-and-swap
+ * has separate entry points. Only opcode/size metadata is retained. */
+static __always_inline __u32 ucx_atomic_opcode(struct pt_regs *ctx, int wide, int fetch)
+{
+    __u32 op = PT_REGS_PARM2(ctx);
+    if (op > (fetch ? 4 : 3)) return 0xffffffff;
+    if (op == 0 && wide) return 0x12;
+    __u32 mod = wide ? 9 : 8;
+    return (mod << 24) | ((op == 0 || op == 3) ? 0x15 : 0x14);
+}
+SEC("uprobe")
+int dc_ucx_atomic32_post_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 0, ucx_atomic_opcode(ctx, 0, 0)); }
+SEC("uprobe")
+int dc_ucx_atomic64_post_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 0, ucx_atomic_opcode(ctx, 1, 0)); }
+SEC("uprobe")
+int dc_ucx_atomic32_fetch_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2, ucx_atomic_opcode(ctx, 0, 1)); }
+SEC("uprobe")
+int dc_ucx_atomic64_fetch_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2, ucx_atomic_opcode(ctx, 1, 1)); }
+SEC("uprobe")
+int dc_ucx_atomic_cswap32_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2, 0x08000014); }
+SEC("uprobe")
+int dc_ucx_atomic_cswap64_enter(struct pt_regs *ctx) { return ucx_enter(ctx, 2, 0x11); }
+
 SEC("uretprobe")
 int dc_ucx_exit(struct pt_regs *ctx)
 {
@@ -364,7 +387,8 @@ int dc_ucx_exit(struct pt_regs *ctx)
     __u32 kind = pending->kind, invalid = pending->invalid, opcode = pending->opcode;
     bpf_map_delete_elem(&dc_ucx_pending, &task);
     if (invalid) { count(2); return 0; }
-    /* AM/put bcopy returns a signed ssize_t length (including zero);
+    /* Atomic post returns UCS_OK; atomic fetch/cswap returns UCS_INPROGRESS.
+     * AM/put bcopy returns a signed ssize_t length (including zero);
      * zcopy and get-bcopy return
      * UCS_INPROGRESS after submission, not a completed operation. */
     __u64 result = PT_REGS_RC(ctx);
@@ -423,6 +447,9 @@ int dc_ucx_exit(struct pt_regs *ctx)
     __builtin_memcpy(&ctrl, b->prefix[0], 4);
     __builtin_memcpy(&qpn_ds, b->prefix[0] + 4, 4);
     ctrl = __builtin_bswap32(ctrl); qpn_ds = __builtin_bswap32(qpn_ds);
+    __u32 op = opcode & 255;
+    __u32 atomic_ds = opcode == 0x09000014 ? 8 : 7;
+    if (op >= 0x11 && (qpn_ds & 63) != atomic_ds) goto unsupported;
     if ((ctrl & 0xff0000ff) != opcode || ((ctrl >> 8) & 0xffff) != previous ||
         (qpn_ds >> 8) != qpn || (qpn_ds & 192) || (qpn_ds & 63) < (opcode == 0x0a ? 4 : 5) ||
         ((qpn_ds & 63) + 3) / 4 != posted) goto unsupported;

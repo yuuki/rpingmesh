@@ -69,43 +69,49 @@ type dcDcIdentity struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	dcMapDcCreating          = "dc_creating"
-	dcMapDcDevxConnecting    = "dc_devx_connecting"
-	dcMapDcDevxCreating      = "dc_devx_creating"
-	dcMapDcDevxQueues        = "dc_devx_queues"
-	dcMapDcEpoch             = "dc_epoch"
-	dcMapDcEvents            = "dc_events"
-	dcMapDcModifying         = "dc_modifying"
-	dcMapDcPending           = "dc_pending"
-	dcMapDcQps               = "dc_qps"
-	dcMapDcScratch           = "dc_scratch"
-	dcMapDcSequence          = "dc_sequence"
-	dcMapDcSettings          = "dc_settings"
-	dcMapDcStats             = "dc_stats"
-	dcMapDcUcxLayout         = "dc_ucx_layout"
-	dcMapDcUcxPending        = "dc_ucx_pending"
-	dcProgDcCompleteEnter    = "dc_complete_enter"
-	dcProgDcCompleteExit     = "dc_complete_exit"
-	dcProgDcCreateEnter      = "dc_create_enter"
-	dcProgDcCreateExit       = "dc_create_exit"
-	dcProgDcDevxConnectEnter = "dc_devx_connect_enter"
-	dcProgDcDevxConnectExit  = "dc_devx_connect_exit"
-	dcProgDcDevxCreateEnter  = "dc_devx_create_enter"
-	dcProgDcDevxCreateExit   = "dc_devx_create_exit"
-	dcProgDcDevxModify       = "dc_devx_modify"
-	dcProgDcExec             = "dc_exec"
-	dcProgDcExit             = "dc_exit"
-	dcProgDcModifyEnter      = "dc_modify_enter"
-	dcProgDcModifyExit       = "dc_modify_exit"
-	dcProgDcRetire           = "dc_retire"
-	dcProgDcUcxBcopyEnter    = "dc_ucx_bcopy_enter"
-	dcProgDcUcxEnter         = "dc_ucx_enter"
-	dcProgDcUcxExit          = "dc_ucx_exit"
-	dcProgDcUcxGetEnter      = "dc_ucx_get_enter"
-	dcProgDcUcxPutBcopyEnter = "dc_ucx_put_bcopy_enter"
-	dcProgDcUcxPutShortEnter = "dc_ucx_put_short_enter"
-	dcProgDcUcxPutZcopyEnter = "dc_ucx_put_zcopy_enter"
-	dcProgDcUcxZcopyEnter    = "dc_ucx_zcopy_enter"
+	dcMapDcCreating               = "dc_creating"
+	dcMapDcDevxConnecting         = "dc_devx_connecting"
+	dcMapDcDevxCreating           = "dc_devx_creating"
+	dcMapDcDevxQueues             = "dc_devx_queues"
+	dcMapDcEpoch                  = "dc_epoch"
+	dcMapDcEvents                 = "dc_events"
+	dcMapDcModifying              = "dc_modifying"
+	dcMapDcPending                = "dc_pending"
+	dcMapDcQps                    = "dc_qps"
+	dcMapDcScratch                = "dc_scratch"
+	dcMapDcSequence               = "dc_sequence"
+	dcMapDcSettings               = "dc_settings"
+	dcMapDcStats                  = "dc_stats"
+	dcMapDcUcxLayout              = "dc_ucx_layout"
+	dcMapDcUcxPending             = "dc_ucx_pending"
+	dcProgDcCompleteEnter         = "dc_complete_enter"
+	dcProgDcCompleteExit          = "dc_complete_exit"
+	dcProgDcCreateEnter           = "dc_create_enter"
+	dcProgDcCreateExit            = "dc_create_exit"
+	dcProgDcDevxConnectEnter      = "dc_devx_connect_enter"
+	dcProgDcDevxConnectExit       = "dc_devx_connect_exit"
+	dcProgDcDevxCreateEnter       = "dc_devx_create_enter"
+	dcProgDcDevxCreateExit        = "dc_devx_create_exit"
+	dcProgDcDevxModify            = "dc_devx_modify"
+	dcProgDcExec                  = "dc_exec"
+	dcProgDcExit                  = "dc_exit"
+	dcProgDcModifyEnter           = "dc_modify_enter"
+	dcProgDcModifyExit            = "dc_modify_exit"
+	dcProgDcRetire                = "dc_retire"
+	dcProgDcUcxAtomic32FetchEnter = "dc_ucx_atomic32_fetch_enter"
+	dcProgDcUcxAtomic32PostEnter  = "dc_ucx_atomic32_post_enter"
+	dcProgDcUcxAtomic64FetchEnter = "dc_ucx_atomic64_fetch_enter"
+	dcProgDcUcxAtomic64PostEnter  = "dc_ucx_atomic64_post_enter"
+	dcProgDcUcxAtomicCswap32Enter = "dc_ucx_atomic_cswap32_enter"
+	dcProgDcUcxAtomicCswap64Enter = "dc_ucx_atomic_cswap64_enter"
+	dcProgDcUcxBcopyEnter         = "dc_ucx_bcopy_enter"
+	dcProgDcUcxEnter              = "dc_ucx_enter"
+	dcProgDcUcxExit               = "dc_ucx_exit"
+	dcProgDcUcxGetEnter           = "dc_ucx_get_enter"
+	dcProgDcUcxPutBcopyEnter      = "dc_ucx_put_bcopy_enter"
+	dcProgDcUcxPutShortEnter      = "dc_ucx_put_short_enter"
+	dcProgDcUcxPutZcopyEnter      = "dc_ucx_put_zcopy_enter"
+	dcProgDcUcxZcopyEnter         = "dc_ucx_zcopy_enter"
 )
 
 // loadDc returns the embedded CollectionSpec for dc.
@@ -150,28 +156,34 @@ type dcSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type dcProgramSpecs struct {
-	DcCompleteEnter    *ebpf.ProgramSpec `ebpf:"dc_complete_enter"`
-	DcCompleteExit     *ebpf.ProgramSpec `ebpf:"dc_complete_exit"`
-	DcCreateEnter      *ebpf.ProgramSpec `ebpf:"dc_create_enter"`
-	DcCreateExit       *ebpf.ProgramSpec `ebpf:"dc_create_exit"`
-	DcDevxConnectEnter *ebpf.ProgramSpec `ebpf:"dc_devx_connect_enter"`
-	DcDevxConnectExit  *ebpf.ProgramSpec `ebpf:"dc_devx_connect_exit"`
-	DcDevxCreateEnter  *ebpf.ProgramSpec `ebpf:"dc_devx_create_enter"`
-	DcDevxCreateExit   *ebpf.ProgramSpec `ebpf:"dc_devx_create_exit"`
-	DcDevxModify       *ebpf.ProgramSpec `ebpf:"dc_devx_modify"`
-	DcExec             *ebpf.ProgramSpec `ebpf:"dc_exec"`
-	DcExit             *ebpf.ProgramSpec `ebpf:"dc_exit"`
-	DcModifyEnter      *ebpf.ProgramSpec `ebpf:"dc_modify_enter"`
-	DcModifyExit       *ebpf.ProgramSpec `ebpf:"dc_modify_exit"`
-	DcRetire           *ebpf.ProgramSpec `ebpf:"dc_retire"`
-	DcUcxBcopyEnter    *ebpf.ProgramSpec `ebpf:"dc_ucx_bcopy_enter"`
-	DcUcxEnter         *ebpf.ProgramSpec `ebpf:"dc_ucx_enter"`
-	DcUcxExit          *ebpf.ProgramSpec `ebpf:"dc_ucx_exit"`
-	DcUcxGetEnter      *ebpf.ProgramSpec `ebpf:"dc_ucx_get_enter"`
-	DcUcxPutBcopyEnter *ebpf.ProgramSpec `ebpf:"dc_ucx_put_bcopy_enter"`
-	DcUcxPutShortEnter *ebpf.ProgramSpec `ebpf:"dc_ucx_put_short_enter"`
-	DcUcxPutZcopyEnter *ebpf.ProgramSpec `ebpf:"dc_ucx_put_zcopy_enter"`
-	DcUcxZcopyEnter    *ebpf.ProgramSpec `ebpf:"dc_ucx_zcopy_enter"`
+	DcCompleteEnter         *ebpf.ProgramSpec `ebpf:"dc_complete_enter"`
+	DcCompleteExit          *ebpf.ProgramSpec `ebpf:"dc_complete_exit"`
+	DcCreateEnter           *ebpf.ProgramSpec `ebpf:"dc_create_enter"`
+	DcCreateExit            *ebpf.ProgramSpec `ebpf:"dc_create_exit"`
+	DcDevxConnectEnter      *ebpf.ProgramSpec `ebpf:"dc_devx_connect_enter"`
+	DcDevxConnectExit       *ebpf.ProgramSpec `ebpf:"dc_devx_connect_exit"`
+	DcDevxCreateEnter       *ebpf.ProgramSpec `ebpf:"dc_devx_create_enter"`
+	DcDevxCreateExit        *ebpf.ProgramSpec `ebpf:"dc_devx_create_exit"`
+	DcDevxModify            *ebpf.ProgramSpec `ebpf:"dc_devx_modify"`
+	DcExec                  *ebpf.ProgramSpec `ebpf:"dc_exec"`
+	DcExit                  *ebpf.ProgramSpec `ebpf:"dc_exit"`
+	DcModifyEnter           *ebpf.ProgramSpec `ebpf:"dc_modify_enter"`
+	DcModifyExit            *ebpf.ProgramSpec `ebpf:"dc_modify_exit"`
+	DcRetire                *ebpf.ProgramSpec `ebpf:"dc_retire"`
+	DcUcxAtomic32FetchEnter *ebpf.ProgramSpec `ebpf:"dc_ucx_atomic32_fetch_enter"`
+	DcUcxAtomic32PostEnter  *ebpf.ProgramSpec `ebpf:"dc_ucx_atomic32_post_enter"`
+	DcUcxAtomic64FetchEnter *ebpf.ProgramSpec `ebpf:"dc_ucx_atomic64_fetch_enter"`
+	DcUcxAtomic64PostEnter  *ebpf.ProgramSpec `ebpf:"dc_ucx_atomic64_post_enter"`
+	DcUcxAtomicCswap32Enter *ebpf.ProgramSpec `ebpf:"dc_ucx_atomic_cswap32_enter"`
+	DcUcxAtomicCswap64Enter *ebpf.ProgramSpec `ebpf:"dc_ucx_atomic_cswap64_enter"`
+	DcUcxBcopyEnter         *ebpf.ProgramSpec `ebpf:"dc_ucx_bcopy_enter"`
+	DcUcxEnter              *ebpf.ProgramSpec `ebpf:"dc_ucx_enter"`
+	DcUcxExit               *ebpf.ProgramSpec `ebpf:"dc_ucx_exit"`
+	DcUcxGetEnter           *ebpf.ProgramSpec `ebpf:"dc_ucx_get_enter"`
+	DcUcxPutBcopyEnter      *ebpf.ProgramSpec `ebpf:"dc_ucx_put_bcopy_enter"`
+	DcUcxPutShortEnter      *ebpf.ProgramSpec `ebpf:"dc_ucx_put_short_enter"`
+	DcUcxPutZcopyEnter      *ebpf.ProgramSpec `ebpf:"dc_ucx_put_zcopy_enter"`
+	DcUcxZcopyEnter         *ebpf.ProgramSpec `ebpf:"dc_ucx_zcopy_enter"`
 }
 
 // dcMapSpecs contains maps before they are loaded into the kernel.
@@ -268,28 +280,34 @@ type dcVariables struct {
 //
 // It can be passed to loadDcObjects or ebpf.CollectionSpec.LoadAndAssign.
 type dcPrograms struct {
-	DcCompleteEnter    *ebpf.Program `ebpf:"dc_complete_enter"`
-	DcCompleteExit     *ebpf.Program `ebpf:"dc_complete_exit"`
-	DcCreateEnter      *ebpf.Program `ebpf:"dc_create_enter"`
-	DcCreateExit       *ebpf.Program `ebpf:"dc_create_exit"`
-	DcDevxConnectEnter *ebpf.Program `ebpf:"dc_devx_connect_enter"`
-	DcDevxConnectExit  *ebpf.Program `ebpf:"dc_devx_connect_exit"`
-	DcDevxCreateEnter  *ebpf.Program `ebpf:"dc_devx_create_enter"`
-	DcDevxCreateExit   *ebpf.Program `ebpf:"dc_devx_create_exit"`
-	DcDevxModify       *ebpf.Program `ebpf:"dc_devx_modify"`
-	DcExec             *ebpf.Program `ebpf:"dc_exec"`
-	DcExit             *ebpf.Program `ebpf:"dc_exit"`
-	DcModifyEnter      *ebpf.Program `ebpf:"dc_modify_enter"`
-	DcModifyExit       *ebpf.Program `ebpf:"dc_modify_exit"`
-	DcRetire           *ebpf.Program `ebpf:"dc_retire"`
-	DcUcxBcopyEnter    *ebpf.Program `ebpf:"dc_ucx_bcopy_enter"`
-	DcUcxEnter         *ebpf.Program `ebpf:"dc_ucx_enter"`
-	DcUcxExit          *ebpf.Program `ebpf:"dc_ucx_exit"`
-	DcUcxGetEnter      *ebpf.Program `ebpf:"dc_ucx_get_enter"`
-	DcUcxPutBcopyEnter *ebpf.Program `ebpf:"dc_ucx_put_bcopy_enter"`
-	DcUcxPutShortEnter *ebpf.Program `ebpf:"dc_ucx_put_short_enter"`
-	DcUcxPutZcopyEnter *ebpf.Program `ebpf:"dc_ucx_put_zcopy_enter"`
-	DcUcxZcopyEnter    *ebpf.Program `ebpf:"dc_ucx_zcopy_enter"`
+	DcCompleteEnter         *ebpf.Program `ebpf:"dc_complete_enter"`
+	DcCompleteExit          *ebpf.Program `ebpf:"dc_complete_exit"`
+	DcCreateEnter           *ebpf.Program `ebpf:"dc_create_enter"`
+	DcCreateExit            *ebpf.Program `ebpf:"dc_create_exit"`
+	DcDevxConnectEnter      *ebpf.Program `ebpf:"dc_devx_connect_enter"`
+	DcDevxConnectExit       *ebpf.Program `ebpf:"dc_devx_connect_exit"`
+	DcDevxCreateEnter       *ebpf.Program `ebpf:"dc_devx_create_enter"`
+	DcDevxCreateExit        *ebpf.Program `ebpf:"dc_devx_create_exit"`
+	DcDevxModify            *ebpf.Program `ebpf:"dc_devx_modify"`
+	DcExec                  *ebpf.Program `ebpf:"dc_exec"`
+	DcExit                  *ebpf.Program `ebpf:"dc_exit"`
+	DcModifyEnter           *ebpf.Program `ebpf:"dc_modify_enter"`
+	DcModifyExit            *ebpf.Program `ebpf:"dc_modify_exit"`
+	DcRetire                *ebpf.Program `ebpf:"dc_retire"`
+	DcUcxAtomic32FetchEnter *ebpf.Program `ebpf:"dc_ucx_atomic32_fetch_enter"`
+	DcUcxAtomic32PostEnter  *ebpf.Program `ebpf:"dc_ucx_atomic32_post_enter"`
+	DcUcxAtomic64FetchEnter *ebpf.Program `ebpf:"dc_ucx_atomic64_fetch_enter"`
+	DcUcxAtomic64PostEnter  *ebpf.Program `ebpf:"dc_ucx_atomic64_post_enter"`
+	DcUcxAtomicCswap32Enter *ebpf.Program `ebpf:"dc_ucx_atomic_cswap32_enter"`
+	DcUcxAtomicCswap64Enter *ebpf.Program `ebpf:"dc_ucx_atomic_cswap64_enter"`
+	DcUcxBcopyEnter         *ebpf.Program `ebpf:"dc_ucx_bcopy_enter"`
+	DcUcxEnter              *ebpf.Program `ebpf:"dc_ucx_enter"`
+	DcUcxExit               *ebpf.Program `ebpf:"dc_ucx_exit"`
+	DcUcxGetEnter           *ebpf.Program `ebpf:"dc_ucx_get_enter"`
+	DcUcxPutBcopyEnter      *ebpf.Program `ebpf:"dc_ucx_put_bcopy_enter"`
+	DcUcxPutShortEnter      *ebpf.Program `ebpf:"dc_ucx_put_short_enter"`
+	DcUcxPutZcopyEnter      *ebpf.Program `ebpf:"dc_ucx_put_zcopy_enter"`
+	DcUcxZcopyEnter         *ebpf.Program `ebpf:"dc_ucx_zcopy_enter"`
 }
 
 func (p *dcPrograms) Close() error {
@@ -308,6 +326,12 @@ func (p *dcPrograms) Close() error {
 		p.DcModifyEnter,
 		p.DcModifyExit,
 		p.DcRetire,
+		p.DcUcxAtomic32FetchEnter,
+		p.DcUcxAtomic32PostEnter,
+		p.DcUcxAtomic64FetchEnter,
+		p.DcUcxAtomic64PostEnter,
+		p.DcUcxAtomicCswap32Enter,
+		p.DcUcxAtomicCswap64Enter,
 		p.DcUcxBcopyEnter,
 		p.DcUcxEnter,
 		p.DcUcxExit,

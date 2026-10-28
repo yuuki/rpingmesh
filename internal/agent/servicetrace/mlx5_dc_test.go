@@ -140,3 +140,51 @@ func TestDecodeMLX5DCStreamAddress(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeMLX5DCAtomicAddress(t *testing.T) {
+	for _, tc := range []struct{ opcode, modifier, ds byte }{
+		{0x11, 0, 7}, {0x12, 0, 7},
+		{0x14, 8, 7}, {0x14, 9, 8}, {0x15, 8, 7}, {0x15, 9, 7},
+	} {
+		prefix := dcPrefix(t)
+		prefix[0], prefix[3], prefix[7] = tc.modifier, tc.opcode, tc.ds
+		want, err := decodeMLX5DCAddress(dcPrefix(t), 0x12345)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := decodeMLX5DCAddress(prefix, 0x12345)
+		if err != nil || got != want {
+			t.Fatalf("atomic %#x/%d: %+v, %v", tc.opcode, tc.modifier, got, err)
+		}
+		// Operands, remote address, keys and result buffers are outside the prefix.
+		prefix = append(prefix, make([]byte, 64)...)
+		for i := 64; i < len(prefix); i++ {
+			prefix[i] = 0xa5
+		}
+		got, err = decodeMLX5DCAddress(prefix, 0x12345)
+		if err != nil || got != want {
+			t.Fatal("atomic operands affected address")
+		}
+		prefix[10] = 1
+		if _, err := decodeMLX5DCStreamAddress(prefix, 0x12345, 2); err != nil {
+			t.Fatal(err)
+		}
+		prefix[10] = 0
+		for ds := byte(0); ds < 64; ds++ {
+			if ds == tc.ds {
+				continue
+			}
+			prefix[7] = ds
+			if _, err := decodeMLX5DCAddress(prefix, 0x12345); err == nil {
+				t.Fatalf("accepted atomic segment count %d", ds)
+			}
+		}
+		prefix[7] = tc.ds
+		for _, mod := range []byte{1, 7, 10, 255} {
+			prefix[0] = mod
+			if _, err := decodeMLX5DCAddress(prefix, 0x12345); err == nil {
+				t.Fatalf("accepted atomic modifier %d", mod)
+			}
+		}
+	}
+}

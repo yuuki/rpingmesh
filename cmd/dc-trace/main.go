@@ -32,6 +32,7 @@ func run() error {
 	flag.StringVar(&options.Library, "library", "", "target process's libmlx5 ELF")
 	flag.StringVar(&options.DebugFile, "debug", "", "matching full ELF/DWARF debug file")
 	flag.BoolVar(&options.UCXDevX, "ucx-devx", false, "also track non-stream UCX DevX DCIs; requires matching lifecycle symbols")
+	flag.BoolVar(&options.UCXAtomic, "ucx-atomic", false, "also track UCX 32/64-bit atomic post, fetch and compare-and-swap submissions")
 	flag.BoolVar(&options.UCXRMA, "ucx-rma", false, "also track UCX put short/bcopy/zcopy and get bcopy/zcopy submissions")
 	flag.BoolVar(&options.UCXAM, "ucx-am", false, "also track UCX AM short-iov, bcopy and zcopy submissions")
 	flag.BoolVar(&options.UCXStreams, "ucx-streams", false, "also track UCX DevX DCI streams; requires -ucx-devx")
@@ -77,6 +78,11 @@ func run() error {
 		}
 		if options.UCXRMA {
 			if err := servicetrace.CheckUCXDCRMA(options.UCXLibrary, options.UCXDebugFile); err != nil {
+				return err
+			}
+		}
+		if options.UCXAtomic {
+			if err := servicetrace.CheckUCXDCAtomic(options.UCXLibrary, options.UCXDebugFile); err != nil {
 				return err
 			}
 		}

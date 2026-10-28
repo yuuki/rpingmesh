@@ -136,13 +136,16 @@ static int ucx_post(struct uct_dc_mlx5_ep *ep, unsigned opcode)
 {
     if (ucx_mode == 1) return -2;
     struct uct_ib_mlx5_txwq *wq = &ep->super.super.iface->tx.dcis.buffer[ep->dci]->txwq;
-    unsigned posted = opcode == 0x0a ? 1 : 2;
+    unsigned op = opcode & 255;
+    unsigned ds = op == 0x0a ? 4 : op <= 0x10 ? 5 : opcode == 0x09000014 ? 8 : 7;
+    unsigned posted = (ds + 3) / 4;
     unsigned pos = storage.sq.cur_post;
     storage.sq.cur_post += posted;
     unsigned char *p = queue[pos % 64];
     memset(p, 0, 64);
     put32(p, ((pos & 0xffff) << 8) | (ucx_mode == 11 ? 0x0a : opcode));
-    put32(p + 4, (0x12345 << 8) | (opcode == 0x0a || ucx_mode == 12 ? 4 : 5));
+    if (ucx_mode == 14) p[0] ^= 1;
+    put32(p + 4, (0x12345 << 8) | (ucx_mode == 12 ? 4 : ds));
     p[9] = ucx_mode == 6;
     p[10] = ep->dci_channel_index + (ucx_mode == 7);
     memset(p + 16, 0xa5, 8);
@@ -204,6 +207,31 @@ __attribute__((noinline)) int uct_dc_mlx5_ep_get_zcopy(struct uct_dc_mlx5_ep *ep
     int status = ucx_post(ep, 0x10);
     return status ? status : 1;
 }
+
+static unsigned atomic_operation;
+static int atomic_submit(struct uct_dc_mlx5_ep *ep, unsigned op, unsigned width, int fetch, int cswap)
+{
+    if (ucx_mode == 13 && fetch) return 0;
+    unsigned code;
+    if (cswap) code = width == 64 ? 0x11 : 0x08000014;
+    else if (op == 0 && width == 64) code = 0x12;
+    else code = ((width == 64 ? 9u : 8u) << 24) | ((op == 0 || op == 3) ? 0x15 : 0x14);
+    /* Even a successful call with an invalid operation must be rejected. */
+    int status = ucx_post(ep, code);
+    return status ? status : fetch ? 1 : 0;
+}
+__attribute__((noinline)) int uct_dc_mlx5_ep_atomic32_post(struct uct_dc_mlx5_ep *ep, unsigned op)
+{ return atomic_submit(ep, op, 32, 0, 0); }
+__attribute__((noinline)) int uct_dc_mlx5_ep_atomic64_post(struct uct_dc_mlx5_ep *ep, unsigned op)
+{ return atomic_submit(ep, op, 64, 0, 0); }
+__attribute__((noinline)) int uct_dc_mlx5_ep_atomic32_fetch(struct uct_dc_mlx5_ep *ep, unsigned op)
+{ return atomic_submit(ep, op, 32, 1, 0); }
+__attribute__((noinline)) int uct_dc_mlx5_ep_atomic64_fetch(struct uct_dc_mlx5_ep *ep, unsigned op)
+{ return atomic_submit(ep, op, 64, 1, 0); }
+__attribute__((noinline)) int uct_dc_mlx5_ep_atomic_cswap32(struct uct_dc_mlx5_ep *ep)
+{ return atomic_submit(ep, 0, 32, 1, 1); }
+__attribute__((noinline)) int uct_dc_mlx5_ep_atomic_cswap64(struct uct_dc_mlx5_ep *ep)
+{ return atomic_submit(ep, 0, 64, 1, 1); }
 
 static void submit(unsigned n, int invalid)
 {
@@ -288,6 +316,15 @@ int main(int argc, char **argv)
             devx_failure = 0;
             break;
         case 'X': mlx5dv_devx_obj_destroy(&devx_object); break;
+        case '3': case '4': case '5': case '6': case '7': case '8':
+            atomic_operation = op - '3'; break;
+        case ':': ucx_mode = 14; break;
+        case 'E': uct_dc_mlx5_ep_atomic32_post(&ucx_ep, atomic_operation); break;
+        case 'G': uct_dc_mlx5_ep_atomic64_post(&ucx_ep, atomic_operation); break;
+        case 'P': uct_dc_mlx5_ep_atomic32_fetch(&ucx_ep, atomic_operation); break;
+        case 'R': uct_dc_mlx5_ep_atomic64_fetch(&ucx_ep, atomic_operation); break;
+        case 'U': uct_dc_mlx5_ep_atomic_cswap32(&ucx_ep); break;
+        case 'h': uct_dc_mlx5_ep_atomic_cswap64(&ucx_ep); break;
         case '!': ucx_mode = 1; break;
         case '=': ucx_mode = 0; break;
         case '?': ucx_mode = 11; break;

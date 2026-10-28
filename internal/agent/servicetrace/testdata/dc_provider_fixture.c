@@ -255,6 +255,7 @@ int main(int argc, char **argv)
         switch (op) {
         case 'c': case 't': {
             ucx_devx_active = 0;
+            ucx_ep.dci_channel_index = 0;
             struct mlx5dv_qp_init_attr init = {.comp_mask = op == 't' ? 10 : 2, .dc_init_attr.dc_type = 2};
             qp = mlx5dv_create_qp(&ctx, NULL, &init);
             mlx5_modify_qp(qp, &attr, 1 | 32);

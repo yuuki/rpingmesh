@@ -416,8 +416,9 @@ agent package ships it as an example rather than installing it.
 
 ## DC transport investigation (#111)
 
-DC remains unsupported: no new option claims that a QP or an allocated
-address handle is an observed service flow. The existing raw decoder
+DC is not integrated into the normal service-probe source. The opt-in
+`cmd/dc-trace` collector observes supported send submissions separately;
+a QP or an allocated address handle alone is not an observed service flow. The existing raw decoder
 explicitly rejects driver/DC transports, including synthetic DCI/DCT
 contexts with plausible-looking remote address fields.
 
@@ -434,79 +435,50 @@ Sources: [rdma-core mlx5 send implementation](https://github.com/linux-rdma/rdma
 [UCX direct DC WQE construction](https://github.com/openucx/ucx/blob/master/src/uct/ib/mlx5/dc/dc_mlx5_ep.c),
 and [Linux mlx5 resource dump implementation](https://github.com/torvalds/linux/blob/v6.12/drivers/infiniband/hw/mlx5/restrack.c).
 
-A future implementation must be explicitly mlx5-only and opt-in, pin and
-validate supported provider/UCX layouts, observe successful submission,
-and preserve multiple simultaneous remotes per DCI. It also needs bounded
-flow expiry and QP/process teardown, the actual RoCEv2 UDP source port
-(including DC stream behavior), and hardware packet-capture tests proving
-that probes select the same ECMP path. An unsupported binary/layout must
-leave DC disabled while connected-QP tracing continues.
+### Experimental DC submission collector
 
-### DC tracking core (not enabled at runtime)
+`cmd/dc-trace` is a Linux-only, opt-in diagnostic collector for libmlx5
+submissions and UCX direct DC sends. It validates the provider and optional
+UCX ELF/DWARF layouts and build IDs, pins the target process and library
+identities, and attaches before DCI creation. Unsupported layouts fail
+closed. It requires BPF/uprobe privileges, readable matching debug data,
+RDMA device access and a supported mlx5 RoCEv2 path. The normal connected-QP
+tracer is independent of this collector.
 
-`servicetrace/mlx5_dc.go` now decodes the 64-byte mlx5 control/extended-AV
-prefix for SEND, SEND_IMM, RDMA_WRITE, RDMA_WRITE_IMM, and RDMA_READ. The
-layout reference is [rdma-core's public mlx5 header at a fixed revision](https://github.com/linux-rdma/rdma-core/blob/fdd5dbfb71a1f5c80b90f4e1d6340ce21338bf6c/providers/mlx5/mlx5dv.h).
-It checks the expected DCI QPN, segment count, extended AV, DCT, supported
-flags, and remote GID. Atomics, compact AVs, opcode modifiers and nonzero
-stream IDs are rejected. DC keys and payloads are not retained.
+The libmlx5 adapter observes completed submission batches. The UCX adapter
+supports AM short, short-iov, bcopy and zcopy; RMA put/get; 32/64-bit atomic
+post, fetch and compare-and-swap; and tag eager/rendezvous submission entry
+points. UCX DevX and DCI streams are separate opt-ins. Each adapter validates
+successful return semantics, the published WQE and the live DCI lifecycle;
+nested or unsupported submissions are rejected conservatively.
+
+`servicetrace/mlx5_dc.go` decodes the mlx5 control/extended-AV prefix for
+supported send, RMA and atomic layouts. It checks the DCI QPN, segment count,
+extended AV, DCT, opcode/modifier, stream channel and remote GID. Capture
+excludes immediate values, DC keys, remote virtual addresses/keys, atomic operands,
+tag headers and payloads. The CLI emits aggregate statistics rather than
+flow or process/device identities.
 
 The AV UDP source port and application flow label are separate fields. A
 zero flow label does **not** invoke the RC/UC/XRC QPN-derived fallback:
 libmlx5 may have selected a random AV source port when creating the AH.
-The decoder does not assert that this candidate is the actual wire port,
-or that a probe using it selects the same ECMP path.
+This candidate port is not proof of the actual wire port or probe ECMP
+path equivalence.
 
-`servicetrace/dc_flows.go` retains multiple distinct AVs per DCI, with
-inactivity expiry, a total LRU capacity limit, DCI teardown and capture-loss
-reset. Its caller supplies a unique DCI lifetime token and orders observations
-using one monotonic clock. The caller must invalidate tokens before teardown
-and discard buffered events after capture loss; PID/QPN/pointer values alone
-are not lifetime identities. Observations older than the table clock are
-rejected. This core accepts only caller-confirmed submissions; staging,
-aborted/failed-batch filtering, ownership mapping and process-exit detection
-belong to the adapter and are not implemented yet.
+`servicetrace/dc_flows.go` retains multiple destinations/streams per DCI,
+with inactivity expiry, bounded LRU capacity, lifecycle retirement and
+capture-loss reset. Lifetime tokens prevent PID/QPN/pointer reuse from
+preserving stale flows. Process exit/exec and DCI teardown invalidate the
+corresponding observations.
 
-The WQE cannot establish that the QP is DC or RoCEv2 (UD shares its layout).
-An adapter must validate the actual provider/UCX build, establish the QP type,
-RoCEv2 GID, absence of stream mode (including stream zero) and QP-level UDP
-overrides, copy the prefix before slot reuse, and confirm submission. None of
-these prerequisites are inferred from plausible WQE bytes. There is currently
-no runtime adapter, enable option, monitor integration or hardware ECMP
-validation. Portable synthetic fixtures exercise parsing and flow lifetime
-only; this increment does not complete the DC part of #111.
-
-### Opt-in DC hardware test
-
-`TestMLX5DCHardware` uses public libmlx5 APIs to create one non-stream DCI
-and two local DCTs. It submits three tiny messages with different address
-vectors, including one zero application flow label. Only after successful
-send and receive completions does the helper send a copied WQE prefix to the
-Go decoder through a private pipe. The test checks address fields against
-the requested AV, explicit-label UDP-port mapping, preservation of all three
-flows, and DCI teardown. The same port is used at both ends; this is a local
-hardware loopback test, not a network path test.
-
-Run it on authorized mlx5 hardware with DC support, an active Ethernet port,
-a configured RoCEv2 GID, a C compiler, and the libibverbs/libmlx5 development
-headers. RDMA device access and sufficient locked-memory allowance are
-required; BPF privileges are not. Set `RPINGMESH_DC_HARDWARE_TEST=1` and provide
-`RPINGMESH_DC_TEST_DEVICE`, `RPINGMESH_DC_TEST_PORT`, and
-`RPINGMESH_DC_TEST_GID_INDEX` through the local environment, then run:
-
-```sh
-go test ./internal/agent/servicetrace -run '^TestMLX5DCHardware$' -count=1 -v
-```
-
-Keep `-count=1` to execute hardware operations on every run instead of reusing
-Go's test-result cache. This also matters after changing the helper C source,
-which is compiled by a child process rather than the Go build system.
-
-Do not commit the environment values or raw capture data. The helper redacts
-its test DC access key; live addresses stay in memory and are not printed or
-stored as fixtures. A successful hardware run validates the decoder against
-actual provider-generated WQEs. It does **not** validate a production capture
-adapter, UCX's direct send path, actual wire UDP ports, or ECMP equivalence.
+Synthetic integration tests cover the adapters and lifecycle/error paths.
+Hardware loopback tests have verified libmlx5 submissions and UCX AM/RMA
+submissions, plus atomic submissions through DevX and streams. Verbs atomic
+hardware coverage remains incomplete. Tag synthetic tracking and attachment
+to the real UCX library have passed, but tag hardware sends remain unverified:
+the tested interfaces did not advertise the required capability, and all
+hardware tag cases skipped. Successful loopback validation does not establish
+wire UDP ports, network path coverage or ECMP equivalence.
 
 ## Follow-ups
 
@@ -514,6 +486,6 @@ adapter, UCX's direct send path, actual wire UDP ports, or ECMP equivalence.
   implemented with strict layout checks; other drivers/formats remain
   unbound. No supported snapshot supplies a uverbs context/handle, so
   unknown-event correlation remains conservative and snapshot-based.
-- **DC transport.** mlx5's dynamically connected transport binds the remote
-  per work request, not at RTR. Implement and hardware-validate a bounded
-  send-path adapter after the prerequisites in the investigation above.
+- **DC transport.** Validate wire UDP ports and ECMP equivalence before
+  integrating the experimental collector into the service-probe source.
+  Complete tag and verbs atomic hardware coverage on capable interfaces.

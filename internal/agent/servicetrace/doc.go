@@ -14,7 +14,8 @@
 //
 // EnableKernelULP optionally adds ib_core probes for kernel-owned connected
 // QPs. Its separate object requires module BTF; failure does not disable the
-// uverbs tracer. DC per-send destinations are not supported.
+// uverbs tracer. The separate opt-in DC collector observes supported mlx5/UCX
+// submissions for diagnostics; DC flows are not integrated into service probes.
 //
 // The eBPF program is loaded on Linux only; on other platforms Open returns
 // ErrUnsupported. Everything else in the package (event decoding, the

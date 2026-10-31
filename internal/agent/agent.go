@@ -844,6 +844,14 @@ func (a *Agent) createServiceTracing() {
 		return
 	}
 
+	if a.cfg.ServiceTracingKernelULPEnabled {
+		if err := tracer.EnableKernelULP(); err != nil {
+			a.logger.Warn().Err(err).Msg("Kernel ULP tracing could not start; uverbs service tracing continues")
+		} else {
+			a.logger.Info().Msg("Kernel ULP service tracing enabled")
+		}
+	}
+
 	devices := make([]ServiceDevice, 0, len(a.rnics))
 	for _, r := range a.rnics {
 		r.prober.SetServiceTracingRate(float64(a.cfg.ServiceTracingProbeRatePerSecond), a.cfg.ServiceTracingProbeIntervalMS)

@@ -34,6 +34,7 @@ const (
 // Close.
 type Tracer struct {
 	objs   uverbsObjects
+	kernel *kernelObjects
 	links  []link.Link
 	reader *ringbuf.Reader
 	logger zerolog.Logger
@@ -212,6 +213,11 @@ func (t *Tracer) Close() error {
 			}
 		}
 		t.links = nil
+		if t.kernel != nil {
+			if e := t.kernel.Close(); e != nil && err == nil {
+				err = e
+			}
+		}
 		if e := t.objs.Close(); e != nil && err == nil {
 			err = e
 		}

@@ -85,3 +85,15 @@ func TestDecodeMlx5QPContextExtension(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestMlx5DCDoesNotBecomeConnectedFlow(t *testing.T) {
+	qp := QPResource{Dev: devA, LocalQPN: 0x100, RemoteQPN: 0x200,
+		QPType: QPTypeDriver, QPState: QPStateRTS, Port: 1}
+	for _, transport := range []byte{5, 6} { // MLX5_QP_ST_DCI, MLX5_QP_ST_DCT
+		raw := mlx5QPFixture(qp, 1)
+		raw[77] = transport
+		if _, err := decodeMlx5QP(raw, qp); err == nil {
+			t.Fatal("DC QP context was incorrectly treated as a per-send flow")
+		}
+	}
+}

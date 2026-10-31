@@ -238,6 +238,20 @@ func (m *ServiceMonitor) Stop() {
 
 // handleEvent runs on the tracer's reader goroutine: it must stay cheap.
 func (m *ServiceMonitor) handleEvent(ev servicetrace.Event) {
+	if ev.Source == servicetrace.SourceKernel {
+		// Kernel QPs have no uverbs file. Resolve the ib_device name using
+		// the published sysfs map; do not do filesystem I/O on the reader.
+		found := false
+		for dev, name := range m.deviceNumberSnapshot() {
+			if name == ev.DeviceName {
+				ev.Dev, found = dev, true
+				break
+			}
+		}
+		if !found {
+			return
+		}
+	}
 	if m.table.Apply(ev) {
 		m.signalChanged()
 	}
@@ -368,7 +382,7 @@ func (m *ServiceMonitor) reconcile() {
 			Uint64("dropped_total", dropped).
 			Uint64("dropped_since_last_rebuild", dropped-m.lastDropped).
 			Msg("The service tracer dropped events (ring buffer full); connections of exited processes are reaped, " +
-				"but a lost create or destroy stays uncorrected until its process exits")
+				"kernel removals are reconciled with netlink, but lost user lifecycle events may persist until process exit")
 		m.lastDropped = dropped
 	}
 	if removed, _ := m.table.ReapContexts(m.processAlive); removed > 0 {
@@ -429,7 +443,7 @@ func (m *ServiceMonitor) refreshQPs(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-	changed, accepted := m.table.ReconcileQPsIfCurrent(qps, generation)
+	changed, accepted := m.table.ReconcileQPsIfCurrent(qps, generation, devices)
 	if changed || !accepted {
 		m.signalChanged()
 	}

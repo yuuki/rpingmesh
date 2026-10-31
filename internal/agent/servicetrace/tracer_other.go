@@ -12,6 +12,9 @@ func Open() (*Tracer, error) {
 	return nil, ErrUnsupported
 }
 
+// EnableKernelULP is unavailable on non-Linux platforms.
+func (t *Tracer) EnableKernelULP() error { return ErrUnsupported }
+
 // Start is never reached: Open returns no Tracer on this platform.
 func (t *Tracer) Start(ctx context.Context, handle func(Event)) {}
 

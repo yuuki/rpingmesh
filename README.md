@@ -1174,6 +1174,18 @@ vector; a destroy, or the release of the context (process exit), ends the
 connection. The program is compiled ahead of time with `bpf2go` and
 committed, so building the agent needs no clang.
 
+**Kernel ULPs (optional).** With service tracing enabled, set
+`service_tracing_kernel_ulp_enabled: true` (or
+`--service-tracing-kernel-ulp-enabled`) to observe new kernel-owned
+connected QPs, such as NVMe-oF, NFS/RDMA and Lustre connections.
+This separately loaded CO-RE extension requires `/sys/kernel/btf/ib_core`.
+If unavailable or incompatible, the agent warns and continues uverbs
+tracing. It tracks successful RTR/reset/error/destroy operations and
+reconciles missed removals against RDMA netlink. Kernel workers are not
+service owners, so these flows have no PID/cgroup attribution. Pre-existing
+kernel connections and DC sends are not discovered by this option; see
+[coverage and the DC investigation](docs/design/ebpf-service-tracing.md#optional-kernel-ulp-tracing).
+
 **Flow labels.** A RoCEv2 driver derives a connected QP's UDP source port
 from its flow label, or, when the application set none, from a symmetric hash
 of the two QPNs (`rdma_calc_flow_label` in the kernel), and then folds the
@@ -1339,10 +1351,12 @@ acceptable; GIDs and other destination-RNIC identities are not.
   does not locate the faulty switch or link (the paper's Phase 2). It keeps
   summaries only in a bounded in-memory window. See
   [the Phase 2 design](docs/design/analyzer-phase2-localization.md).
-- **Service tracing covers user-space connected QPs on Linux.** The tracer
-  sees RC, UC and XRC queue pairs created through libibverbs. It does not see
-  kernel ULPs (NVMe-oF, NFS over RDMA, Lustre), driver-specific transports
-  such as DC, or connections that existed before the agent started. It
+- **Service tracing covers connected QPs on Linux.** The default tracer
+  sees RC, UC and XRC queue pairs created through libibverbs and can recover
+  existing user connections from supported mlx5 snapshots. The optional
+  kernel ULP extension requires `ib_core` BTF and observes new kernel
+  connections without service-owner attribution. Driver-specific transports
+  such as DC and pre-existing kernel connections remain unsupported. It
   needs a kernel with BTF (`/sys/kernel/btf/vmlinux`), BPF ring buffers
   (Linux 5.8) and `CAP_BPF`/`CAP_PERFMON`; otherwise the agent runs without
   it. See [the design](docs/design/ebpf-service-tracing.md).

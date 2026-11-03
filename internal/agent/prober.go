@@ -62,6 +62,18 @@ type pendingProbe struct {
 	// target's rotating set), so the result reports the path exercised.
 	flowLabel uint32
 	services  []string
+	// targetGID and targetQPN identify the responder this probe was sent
+	// to. An ACK is accepted only when its GRH source GID and source QPN
+	// match, so a host that learned the (predictable) sequence number cannot
+	// complete another target's probe with forged timestamps.
+	targetGID [16]byte
+	targetQPN uint32
+}
+
+// ackFromTarget reports whether an ACK completion came from the responder
+// the pending probe was sent to.
+func (pp *pendingProbe) ackFromTarget(event *rdmabridge.CompletionEvent) bool {
+	return event.SourceGID == pp.targetGID && event.SourceQPN == pp.targetQPN
 }
 
 // Prober sends probe packets to its targets, matches the ACK completions
@@ -814,6 +826,8 @@ func (p *Prober) sendProbe(target *controller_agent.PingTarget, rotationEpoch ui
 		createdAt: time.Now(),
 		flowLabel: flowLabel,
 		services:  services,
+		targetGID: targetGID,
+		targetQPN: target.GetTargetQpn(),
 	}
 	p.pendingMu.Lock()
 	p.pending[seqNum] = pp
@@ -967,7 +981,7 @@ func (p *Prober) handleACKEvent(event *rdmabridge.CompletionEvent) {
 	case rdmabridge.AckTypeFirst:
 		// T5 is this completion's timestamp (prober NIC recv of the first
 		// ACK); T3 is the responder recv timestamp carried in the payload.
-		p.applyAck(event.SequenceNum, "first", func(m *probe.PendingMeasurement) {
+		p.applyAck(event, "first", func(m *probe.PendingMeasurement) {
 			m.ApplyFirstAck(event.T3, event.TimestampNS)
 		}, func(e *zerolog.Event) *zerolog.Event {
 			return e.Uint64("t3_ns", event.T3).Uint64("t5_ns", event.TimestampNS)
@@ -977,7 +991,7 @@ func (p *Prober) handleACKEvent(event *rdmabridge.CompletionEvent) {
 		// T1, as soon as the second ACK is processed; the ring event carries
 		// no host-side timestamp for it.
 		t6 := nowMonotonicNS()
-		p.applyAck(event.SequenceNum, "second", func(m *probe.PendingMeasurement) {
+		p.applyAck(event, "second", func(m *probe.PendingMeasurement) {
 			m.ApplySecondAck(event.T3, event.T4, t6)
 		}, func(e *zerolog.Event) *zerolog.Event {
 			return e.Uint64("t4_ns", event.T4).Uint64("t6_ns", t6)
@@ -990,10 +1004,14 @@ func (p *Prober) handleACKEvent(event *rdmabridge.CompletionEvent) {
 	}
 }
 
-// applyAck records one ACK on the pending probe seqNum via apply and, when
-// the measurement is then complete, delivers the result. ACKs may arrive in
-// either order. fields adds the ACK's timestamps to the debug log.
-func (p *Prober) applyAck(seqNum uint64, which string, apply func(*probe.PendingMeasurement), fields func(*zerolog.Event) *zerolog.Event) {
+// applyAck records one ACK on the pending probe matching event's sequence
+// number via apply and, when the measurement is then complete, delivers the
+// result. ACKs may arrive in either order. An ACK whose source GID/QPN is not
+// the probed responder is dropped without touching the pending entry, so the
+// genuine ACKs can still complete it. fields adds the ACK's timestamps to the
+// debug log.
+func (p *Prober) applyAck(event *rdmabridge.CompletionEvent, which string, apply func(*probe.PendingMeasurement), fields func(*zerolog.Event) *zerolog.Event) {
+	seqNum := event.SequenceNum
 	p.pendingMu.Lock()
 	pp, ok := p.pending[seqNum]
 	if !ok {
@@ -1001,6 +1019,19 @@ func (p *Prober) applyAck(seqNum uint64, which string, apply func(*probe.Pending
 		p.logger.Warn().
 			Uint64("seq", seqNum).
 			Msgf("Received %s ACK for unknown sequence number", which)
+		return
+	}
+	if !pp.ackFromTarget(event) {
+		p.pendingMu.Unlock()
+		// Debug, not Warn: GID-level detail stays out of the default log
+		// level, and spoofed packets must not be able to flood the log.
+		p.logger.Debug().
+			Uint64("seq", seqNum).
+			Str("source_gid", probe.FormatGID(event.SourceGID)).
+			Uint32("source_qpn", event.SourceQPN).
+			Str("target_gid", pp.target.GetTargetGid()).
+			Uint32("target_qpn", pp.targetQPN).
+			Msgf("Dropping %s ACK from unexpected source", which)
 		return
 	}
 	apply(pp.meas)

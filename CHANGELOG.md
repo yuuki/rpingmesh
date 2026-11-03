@@ -22,6 +22,16 @@ All notable changes to this project are documented in this file.
   of one rqlite query per GID.
 - The agent keeps at most 4096 targets from one pinglist response.
 
+### Fixed
+
+- Each queue posts 256 receive buffers instead of 32, and its CQ holds 512
+  completions instead of 256. A UD datagram that finds no posted receive is
+  dropped silently, so a burst that arrived while the CQ poller slept (ACK
+  pairs from many targets, or probes from many probers) was counted as
+  probe loss. This made `TestResponderAckPairBurst` flaky on soft-RoCE.
+
+## [0.9.0] - 2026-11-03
+
 ### Added
 
 - Service tracing (the paper's section 4.2.2), opt-in with
@@ -66,11 +76,6 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
-- Each queue posts 256 receive buffers instead of 32, and its CQ holds 512
-  completions instead of 256. A UD datagram that finds no posted receive is
-  dropped silently, so a burst that arrived while the CQ poller slept (ACK
-  pairs from many targets, or probes from many probers) was counted as
-  probe loss. This made `TestResponderAckPairBurst` flaky on soft-RoCE.
 - The agent's analysis reporter sends its periodic reports on a goroutine
   of their own. A send is a synchronous RPC; on the drain loop it stopped
   the reporter from reading results for its duration, and the fan-in's

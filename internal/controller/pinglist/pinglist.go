@@ -34,6 +34,10 @@ type RnicSource interface {
 	// falls back to GID self-exclusion) and its plane_id the plane
 	// restriction (see resolveRequester).
 	GetRNICByGID(ctx context.Context, gid string) (*controller_agent.RnicInfo, error)
+	// GetRNICsByGIDs returns the active rows of the given GIDs keyed by GID;
+	// unregistered GIDs are absent. Service-target resolution uses it to look
+	// up a whole batch in a bounded number of queries.
+	GetRNICsByGIDs(ctx context.Context, gids []string) (map[string]*controller_agent.RnicInfo, error)
 }
 
 // DefaultUnspecifiedMeshMaxTargets is the fallback cap on ToR-mesh targets
@@ -292,7 +296,7 @@ func (g *PinglistGenerator) GenerateInterTorPinglist(
 
 // GenerateServiceTargets resolves the destination GIDs of the service flows
 // the requester traced (R-Pingmesh service tracing) into PingTargets of type
-// SERVICE_TRACING. Each GID is looked up in the registry; GIDs that are not
+// SERVICE_TRACING. The GIDs are looked up in the registry in one batch; GIDs that are not
 // registered (an RNIC without a running agent, or a stale registration) and
 // targets the requester must not probe (its own RNIC, other RNICs of its
 // host, a cross-address-family GID; see shouldProbe) are left out, so the
@@ -309,8 +313,7 @@ func (g *PinglistGenerator) GenerateServiceTargets(
 	rc := g.resolveRequester(ctx, requesterGID, "")
 
 	seen := make(map[string]struct{}, len(targetGIDs))
-	targets := make([]*controller_agent.PingTarget, 0, len(targetGIDs))
-	unregistered := 0
+	gids := make([]string, 0, len(targetGIDs))
 	for _, gid := range targetGIDs {
 		gid = strings.TrimSpace(gid)
 		if gid == "" {
@@ -320,11 +323,18 @@ func (g *PinglistGenerator) GenerateServiceTargets(
 			continue
 		}
 		seen[gid] = struct{}{}
+		gids = append(gids, gid)
+	}
 
-		rnic, err := g.registry.GetRNICByGID(ctx, gid)
-		if err != nil {
-			return nil, err
-		}
+	rows, err := g.registry.GetRNICsByGIDs(ctx, gids)
+	if err != nil {
+		return nil, err
+	}
+
+	targets := make([]*controller_agent.PingTarget, 0, len(gids))
+	unregistered := 0
+	for _, gid := range gids {
+		rnic := rows[gid]
 		if rnic == nil {
 			unregistered++
 			continue

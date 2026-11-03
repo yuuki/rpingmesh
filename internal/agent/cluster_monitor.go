@@ -273,6 +273,7 @@ func (m *ClusterMonitor) fetchPinglists(ctx context.Context) []*controller_agent
 			Msg("Failed to fetch TOR_MESH pinglist, reusing cached targets")
 		torMeshTargets = m.lastTorMeshTargets
 	} else {
+		torMeshTargets = m.capTargets(torMeshTargets, controller_agent.PinglistType_TOR_MESH)
 		m.lastTorMeshTargets = torMeshTargets
 	}
 
@@ -291,6 +292,7 @@ func (m *ClusterMonitor) fetchPinglists(ctx context.Context) []*controller_agent
 		// rate-limited as ToR-mesh. The agent knows they came from an
 		// INTER_TOR request, so stamp the type where it is unset.
 		stampUnsetPinglistType(interTorTargets, controller_agent.PinglistType_INTER_TOR)
+		interTorTargets = m.capTargets(interTorTargets, controller_agent.PinglistType_INTER_TOR)
 		m.lastInterTorTargets = interTorTargets
 	}
 
@@ -309,6 +311,28 @@ func (m *ClusterMonitor) fetchPinglists(ctx context.Context) []*controller_agent
 		Msg("Fetched pinglists from controller")
 
 	return combined
+}
+
+// MaxPinglistTargets caps the targets the agent accepts from one pinglist
+// response. The prober's rate limits are per target, so the agent's total
+// probe rate grows with the pinglist; without a cap, a misbehaving controller
+// (or anyone able to tamper with a plaintext controller connection) could make
+// every agent probe thousands of arbitrary GIDs. A ToR mesh, the largest
+// legitimate pinglist, is one ToR's RNICs, far below this.
+const MaxPinglistTargets = 4096
+
+// capTargets truncates a pinglist response to MaxPinglistTargets, logging when
+// it does.
+func (m *ClusterMonitor) capTargets(targets []*controller_agent.PingTarget, ptype controller_agent.PinglistType) []*controller_agent.PingTarget {
+	if len(targets) <= MaxPinglistTargets {
+		return targets
+	}
+	m.logger.Warn().
+		Str("type", ptype.String()).
+		Int("received", len(targets)).
+		Int("kept", MaxPinglistTargets).
+		Msg("Pinglist exceeds the per-response target cap; truncating")
+	return targets[:MaxPinglistTargets]
 }
 
 // stampUnsetPinglistType sets ptype on every target whose pinglist_type is

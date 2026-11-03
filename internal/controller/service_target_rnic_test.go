@@ -18,6 +18,19 @@ type gidRegistry struct {
 	err   error
 }
 
+func (g *gidRegistry) GetRNICsByGIDs(_ context.Context, gids []string) (map[string]*controller_agent.RnicInfo, error) {
+	if g.err != nil {
+		return nil, g.err
+	}
+	out := map[string]*controller_agent.RnicInfo{}
+	for _, gid := range gids {
+		if r := g.byGID[gid]; r != nil {
+			out[gid] = r
+		}
+	}
+	return out, nil
+}
+
 func (g *gidRegistry) GetRNICByGID(_ context.Context, gid string) (*controller_agent.RnicInfo, error) {
 	if g.err != nil {
 		return nil, g.err

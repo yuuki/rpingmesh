@@ -632,6 +632,25 @@ certificates. Missing or unreadable files fail validation at startup. Server
 certificate verification cannot be disabled, and certificates are loaded once,
 so rotating them requires a restart.
 
+Without `mtls` the controller cannot tell agents apart, so it bounds what any
+client can do instead:
+
+- Requests over 1 MiB, registrations of more than 256 RNICs, and reports of
+  more than 1024 path summaries are rejected. GIDs and IP addresses must
+  parse, and string fields are limited to 255 bytes. Summaries with oversized
+  fields or a window starting more than 10 minutes in the future are dropped.
+- A GID registered by another `agent_id` is not taken over while that row is
+  active (updated within `active_threshold_sec`). The registration succeeds
+  for the agent's other RNICs, and the controller logs the skipped GIDs. A
+  genuine move, such as a renamed host or an RNIC moved to another host, takes
+  effect on a heartbeat once the old row is inactive.
+- The agent accepts a probe ACK only from the GID and QPN of the responder it
+  probed, and keeps at most 4096 targets from one pinglist response.
+
+These limits do not authenticate anyone. A client that can reach the
+controller can still read the registered topology and register GIDs that no
+active agent holds.
+
 ### Self-protection
 
 With `self_protection_enabled: true`, a watchdog samples the agent's memory

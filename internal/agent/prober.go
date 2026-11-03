@@ -114,6 +114,8 @@ type Prober struct {
 
 	pending   map[uint64]*pendingProbe // sequence_num -> pending probe
 	pendingMu sync.Mutex
+	// ackDrops summarises discarded ACKs in a rate-limited Warn.
+	ackDrops ackDropLog
 
 	// Sequence numbers are high 32 bits = agentEpoch (random per process, so
 	// ACKs from a previous agent lifetime cannot match) | low 32 bits =
@@ -1016,15 +1018,17 @@ func (p *Prober) applyAck(event *rdmabridge.CompletionEvent, which string, apply
 	pp, ok := p.pending[seqNum]
 	if !ok {
 		p.pendingMu.Unlock()
-		p.logger.Warn().
+		p.logger.Debug().
 			Uint64("seq", seqNum).
 			Msgf("Received %s ACK for unknown sequence number", which)
+		p.ackDrops.record(p.logger, false)
 		return
 	}
 	if !pp.ackFromTarget(event) {
 		p.pendingMu.Unlock()
-		// Debug, not Warn: GID-level detail stays out of the default log
-		// level, and spoofed packets must not be able to flood the log.
+		p.ackDrops.record(p.logger, true)
+		// Per-ACK detail at Debug only: GIDs stay out of the default log
+		// level, and the rate-limited summary above is what operators see.
 		p.logger.Debug().
 			Uint64("seq", seqNum).
 			Str("source_gid", probe.FormatGID(event.SourceGID)).

@@ -317,12 +317,12 @@ func TestFullTopology(t *testing.T) {
 	}
 
 	agents := []agentDef{
-		{"topo-a1", "192.168.10.1", "topo-host-a1", "tor-X", "fe80::xa1", "10.10.0.1", "mlx5_0", 400},
-		{"topo-a2", "192.168.10.2", "topo-host-a2", "tor-X", "fe80::xa2", "10.10.0.2", "mlx5_0", 401},
-		{"topo-b1", "192.168.10.3", "topo-host-b1", "tor-Y", "fe80::yb1", "10.10.0.3", "mlx5_0", 402},
-		{"topo-b2", "192.168.10.4", "topo-host-b2", "tor-Y", "fe80::yb2", "10.10.0.4", "mlx5_0", 403},
-		{"topo-c1", "192.168.10.5", "topo-host-c1", "tor-Z", "fe80::zc1", "10.10.0.5", "mlx5_0", 404},
-		{"topo-c2", "192.168.10.6", "topo-host-c2", "tor-Z", "fe80::zc2", "10.10.0.6", "mlx5_0", 405},
+		{"topo-a1", "192.168.10.1", "topo-host-a1", "tor-X", "fe80::aa1", "10.10.0.1", "mlx5_0", 400},
+		{"topo-a2", "192.168.10.2", "topo-host-a2", "tor-X", "fe80::aa2", "10.10.0.2", "mlx5_0", 401},
+		{"topo-b1", "192.168.10.3", "topo-host-b1", "tor-Y", "fe80::bb1", "10.10.0.3", "mlx5_0", 402},
+		{"topo-b2", "192.168.10.4", "topo-host-b2", "tor-Y", "fe80::bb2", "10.10.0.4", "mlx5_0", 403},
+		{"topo-c1", "192.168.10.5", "topo-host-c1", "tor-Z", "fe80::cc1", "10.10.0.5", "mlx5_0", 404},
+		{"topo-c2", "192.168.10.6", "topo-host-c2", "tor-Z", "fe80::cc2", "10.10.0.6", "mlx5_0", 405},
 	}
 
 	for _, a := range agents {
@@ -331,7 +331,7 @@ func TestFullTopology(t *testing.T) {
 	}
 
 	// topo-a1 (tor-X) fetches both pinglist types — mimics ClusterMonitor.
-	requesterGID := "fe80::xa1"
+	requesterGID := "fe80::aa1"
 	torMesh := getPinglist(t, client, "topo-a1", "tor-X", requesterGID, "", controller_agent.PinglistType_TOR_MESH)
 	interTor := getPinglist(t, client, "topo-a1", "tor-X", requesterGID, "", controller_agent.PinglistType_INTER_TOR)
 
@@ -339,8 +339,8 @@ func TestFullTopology(t *testing.T) {
 	if len(torMesh) != 1 {
 		t.Fatalf("expected 1 TOR_MESH target (topo-a2), got %d", len(torMesh))
 	}
-	if !containsGID(torMesh, "fe80::xa2") {
-		t.Errorf("expected fe80::xa2 in TOR_MESH results")
+	if !containsGID(torMesh, "fe80::aa2") {
+		t.Errorf("expected fe80::aa2 in TOR_MESH results")
 	}
 	if containsGID(torMesh, requesterGID) {
 		t.Errorf("requester %s should be excluded from TOR_MESH", requesterGID)
@@ -442,7 +442,7 @@ func TestPinglistEmptyToR(t *testing.T) {
 	client := newClient(t)
 
 	// Register a single agent in an isolated ToR.
-	gid := fmt.Sprintf("fe80::empty-%d", time.Now().UnixNano()%10000)
+	gid := fmt.Sprintf("fe80::e:%04x", time.Now().UnixNano()%10000)
 	torID := fmt.Sprintf("tor-empty-%d", time.Now().UnixNano()%10000)
 	registerAgent(t, client, "lonely-agent", "192.168.99.1", "lonely-host", torID,
 		makeRNIC(gid, 500, "10.99.0.1", "lonely-host", torID, "mlx5_0"))

@@ -38,8 +38,15 @@ extern "C" {
 /* Memory and buffer sizing */
 #define RDMA_MR_SIZE              4096
 #define RDMA_GRH_SIZE             40
-#define RDMA_CQ_SIZE              256
-#define RDMA_INITIAL_RECV_BUFFERS 32
+/* The CQ holds every send and recv completion a queue can have outstanding
+ * (32 send slots + RDMA_INITIAL_RECV_BUFFERS recv slots); overrunning it
+ * moves the QP to the error state. */
+#define RDMA_CQ_SIZE              512
+/* Recv slots posted per queue. A UD datagram that finds no posted recv is
+ * dropped silently, so this absorbs bursts while the CQ poller is asleep:
+ * a responder answering many probers at once, or a prober receiving the
+ * ACK pairs of many targets. */
+#define RDMA_INITIAL_RECV_BUFFERS 256
 
 /* Protocol constants */
 #define RDMA_QKEY              0x11111111

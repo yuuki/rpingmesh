@@ -112,6 +112,10 @@ func filterRnicsByToR(rnics []*controller_agent.RnicInfo, torID string, match bo
 	return out
 }
 
+func (f *fakeRnicSource) GetRNICsByGIDs(ctx context.Context, gids []string) (map[string]*controller_agent.RnicInfo, error) {
+	return rowsByGID(ctx, f.GetRNICByGID, gids)
+}
+
 func (f *fakeRnicSource) GetRNICByGID(_ context.Context, gid string) (*controller_agent.RnicInfo, error) {
 	if f.resolveErr != nil {
 		return nil, f.resolveErr

@@ -304,12 +304,21 @@ func isDuplicateColumnErr(errs ...error) bool {
 // instead of after the stale-threshold window; the DELETE still runs when
 // rnics is empty. The agent always sends its complete RNIC set (see
 // buildRegistrationRequest in internal/agent/agent.go), never a delta.
+//
+// A GID whose row belongs to a different agent_id and is still active
+// (updated within the active-threshold window) is not taken over: the insert
+// leaves that row untouched and the GID is returned in skipped. Without this,
+// any client able to reach the controller could re-register a victim's GID
+// with its own QPN/IP and make every prober's traffic for that RNIC fail. A
+// row whose agent stopped heartbeating is replaced as before, so a genuine
+// move (a renamed host, an RNIC moved to another host) completes once the old
+// row leaves the active window.
 func (r *RnicRegistry) RegisterRNICs(
 	ctx context.Context,
 	agentID string,
 	agentIP string,
 	rnics []*controller_agent.RnicInfo,
-) error {
+) (skipped []string, err error) {
 	log.Info().
 		Str("agentID", agentID).
 		Int("rnicCount", len(rnics)).
@@ -327,12 +336,27 @@ func (r *RnicRegistry) RegisterRNICs(
 
 	deleteSQL := `DELETE FROM rnics WHERE agent_id = ?;`
 
+	// The DELETE above already removed this agent's own rows, so a conflict
+	// here is always another agent's row; it is replaced only once inactive.
 	insertSQL := `
-	INSERT OR REPLACE INTO rnics
+	INSERT INTO rnics
 	(rnic_gid, qpn, agent_id, agent_ip, rnic_ip, tor_id, hostname, device_name, plane_id, netdev, last_updated_epoch)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(rnic_gid) DO UPDATE SET
+		qpn = excluded.qpn,
+		agent_id = excluded.agent_id,
+		agent_ip = excluded.agent_ip,
+		rnic_ip = excluded.rnic_ip,
+		tor_id = excluded.tor_id,
+		hostname = excluded.hostname,
+		device_name = excluded.device_name,
+		plane_id = excluded.plane_id,
+		netdev = excluded.netdev,
+		last_updated_epoch = excluded.last_updated_epoch
+	WHERE rnics.last_updated_epoch <= ?;`
 
 	now := r.now().Unix()
+	activeCutoff := r.cutoff(r.activeThresholdSec)
 
 	statements := make([]gorqlite.ParameterizedStatement, 0, len(rnics)+1)
 	statements = append(statements, gorqlite.ParameterizedStatement{
@@ -354,31 +378,36 @@ func (r *RnicRegistry) RegisterRNICs(
 				rnic.GetPlaneId(),
 				rnic.GetNetdev(),
 				now,
+				activeCutoff,
 			},
 		})
 	}
 
 	results, err := r.conn.WriteParameterizedContext(ctx, statements)
 	if err != nil {
-		return fmt.Errorf("failed to replace RNICs: %w", err)
+		return nil, fmt.Errorf("failed to replace RNICs: %w", err)
 	}
 	// gorqlite returns one result per statement; anything else means the
 	// response cannot be matched to the statements, so do not index into it.
 	if len(results) != len(statements) {
-		return fmt.Errorf("failed to replace RNICs: got %d results for %d statements", len(results), len(statements))
+		return nil, fmt.Errorf("failed to replace RNICs: got %d results for %d statements", len(results), len(statements))
 	}
 
 	if results[0].Err != nil {
-		return fmt.Errorf("failed to delete stale RNICs for agent %s: %w", agentID, results[0].Err)
+		return nil, fmt.Errorf("failed to delete stale RNICs for agent %s: %w", agentID, results[0].Err)
 	}
 
 	for i, res := range results[1:] {
 		if res.Err != nil {
-			return fmt.Errorf("failed to register RNIC %s: %w", rnics[i].GetGid(), res.Err)
+			return nil, fmt.Errorf("failed to register RNIC %s: %w", rnics[i].GetGid(), res.Err)
+		}
+		// An upsert whose WHERE rejected the update changes no row.
+		if res.RowsAffected == 0 {
+			skipped = append(skipped, rnics[i].GetGid())
 		}
 	}
 
-	return nil
+	return skipped, nil
 }
 
 // rnicColumns is the column list selected by every RNIC read; scanRnicInfo
@@ -473,6 +502,41 @@ func (r *RnicRegistry) GetRNICByGID(
 		return nil, nil
 	}
 	return rnics[0], nil
+}
+
+// gidLookupChunk bounds the bound parameters of one GetRNICsByGIDs query,
+// below SQLite's historical 999-variable limit.
+const gidLookupChunk = 500
+
+// GetRNICsByGIDs returns the active registry rows (updated within the
+// configured active-threshold window) of the given GIDs, keyed by GID. GIDs
+// that are not registered are absent from the map. The lookup costs one query
+// per gidLookupChunk GIDs rather than one per GID, so a large
+// GetTargetRnicInfo request cannot turn into thousands of rqlite round trips.
+func (r *RnicRegistry) GetRNICsByGIDs(
+	ctx context.Context,
+	gids []string,
+) (map[string]*controller_agent.RnicInfo, error) {
+	out := make(map[string]*controller_agent.RnicInfo, len(gids))
+	cutoff := r.cutoff(r.activeThresholdSec)
+	for start := 0; start < len(gids); start += gidLookupChunk {
+		chunk := gids[start:min(start+gidLookupChunk, len(gids))]
+		args := make([]interface{}, 0, len(chunk)+1)
+		for _, gid := range chunk {
+			args = append(args, gid)
+		}
+		args = append(args, cutoff)
+		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(chunk)), ", ")
+		rnics, err := r.queryRnics(ctx, `WHERE rnic_gid IN (`+placeholders+`)
+	AND last_updated_epoch > ?;`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query RNIC info: %w", err)
+		}
+		for _, rnic := range rnics {
+			out[rnic.GetGid()] = rnic
+		}
+	}
+	return out, nil
 }
 
 // CleanupStaleEntries removes RNIC entries that have not been updated

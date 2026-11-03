@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- The agent accepts a probe ACK only when its source GID and QPN are those of
+  the responder it probed, so a host that guesses a sequence number cannot
+  complete another target's probe with forged timestamps. Dropped ACKs
+  (unknown sequence number or unexpected source) are reported as one
+  rate-limited Warn summary instead of one log line each.
+- The controller validates registrations: at most 256 RNICs, parseable GIDs
+  and IP addresses, and string fields of at most 255 bytes. It no longer lets
+  one `agent_id` take over a GID whose row another agent refreshed within
+  `active_threshold_sec`.
+- The controller caps inbound gRPC messages at 1 MiB and probe analysis
+  reports at 1024 summaries. It drops summaries with oversized fields or a
+  window starting more than 10 minutes in the future.
+- `GetTargetRnicInfo` looks up its GIDs in batched `IN (...)` queries instead
+  of one rqlite query per GID.
+- The agent keeps at most 4096 targets from one pinglist response.
+
 ### Added
 
 - Service tracing (the paper's section 4.2.2), opt-in with

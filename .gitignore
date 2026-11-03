@@ -26,3 +26,5 @@ __pycache__/
 # internal/agent/servicetrace/generate.go), so a global *.o ignore must not
 # hide them.
 !/internal/agent/servicetrace/*.o
+/controller
+/agent

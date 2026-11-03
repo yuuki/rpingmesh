@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -25,8 +26,8 @@ type fakeConn struct {
 	writeParameterizedErr error
 	// writeParameterizedResults, if set, is returned verbatim as the
 	// per-statement results from WriteParameterizedContext. If nil, a
-	// slice of zero-value (no-error) results matching the statement count
-	// is returned instead.
+	// slice of no-error, one-row-affected results matching the statement
+	// count is returned instead.
 	writeParameterizedResults []gorqlite.WriteResult
 
 	// queryOneParameterizedCalls captures every statement passed to
@@ -90,7 +91,12 @@ func (f *fakeConn) WriteParameterizedContext(_ context.Context, statements []gor
 	if f.writeParameterizedResults != nil {
 		return f.writeParameterizedResults, nil
 	}
-	return make([]gorqlite.WriteResult, len(statements)), nil
+	// Each statement changed one row, as a successful DELETE/INSERT would.
+	results := make([]gorqlite.WriteResult, len(statements))
+	for i := range results {
+		results[i].RowsAffected = 1
+	}
+	return results, nil
 }
 
 // newTestRegistry builds an RnicRegistry backed by conn, with the same
@@ -131,7 +137,7 @@ func TestRegisterRNICs_FreshRegistrationInsertsAll(t *testing.T) {
 	reg := newTestRegistry(fake)
 
 	rnics := []*controller_agent.RnicInfo{testRnic("gid-1"), testRnic("gid-2")}
-	if err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", rnics); err != nil {
+	if _, err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", rnics); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -180,14 +186,14 @@ func TestRegisterRNICs_ReRegistrationWithSmallerSetReplacesRows(t *testing.T) {
 
 	// Initial registration reports three RNICs for the agent.
 	first := []*controller_agent.RnicInfo{testRnic("gid-1"), testRnic("gid-2"), testRnic("gid-3")}
-	if err := reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", first); err != nil {
+	if _, err := reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", first); err != nil {
 		t.Fatalf("first registration: unexpected error: %v", err)
 	}
 
 	// Re-registration (e.g. a heartbeat after a NIC was removed) reports
 	// only one of those RNICs.
 	second := []*controller_agent.RnicInfo{testRnic("gid-1")}
-	if err := reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", second); err != nil {
+	if _, err := reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", second); err != nil {
 		t.Fatalf("second registration: unexpected error: %v", err)
 	}
 
@@ -223,7 +229,7 @@ func TestRegisterRNICs_DeleteStatementErrorPropagates(t *testing.T) {
 	}
 	reg := newTestRegistry(fake)
 
-	err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
+	_, err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
 	if err == nil || !errors.Is(err, wantErr) {
 		t.Fatalf("got error %v, want wrapping %v", err, wantErr)
 	}
@@ -239,7 +245,7 @@ func TestRegisterRNICs_InsertStatementErrorPropagates(t *testing.T) {
 	}
 	reg := newTestRegistry(fake)
 
-	err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
+	_, err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
 	if err == nil || !errors.Is(err, wantErr) {
 		t.Fatalf("got error %v, want wrapping %v", err, wantErr)
 	}
@@ -253,7 +259,7 @@ func TestRegisterRNICs_TransactionErrorPropagates(t *testing.T) {
 	fake := &fakeConn{writeParameterizedErr: wantErr}
 	reg := newTestRegistry(fake)
 
-	err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
+	_, err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
 	if err == nil || !errors.Is(err, wantErr) {
 		t.Fatalf("got error %v, want wrapping %v", err, wantErr)
 	}
@@ -266,7 +272,7 @@ func TestRegisterRNICs_ResultCountMismatchIsError(t *testing.T) {
 	fake := &fakeConn{writeParameterizedResults: []gorqlite.WriteResult{}}
 	reg := newTestRegistry(fake)
 
-	err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
+	_, err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
 	if err == nil {
 		t.Fatal("expected an error for a result count that does not match the statement count")
 	}
@@ -284,7 +290,7 @@ func TestRegisterRNICs_EmptyRNICsStillDeletesAgentRows(t *testing.T) {
 	// registered rows deleted - the empty set is itself the agent's current
 	// state, and set-replacement semantics apply just as much as when the
 	// set shrinks but isn't empty.
-	if err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", nil); err != nil {
+	if _, err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1", nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -309,10 +315,10 @@ func TestRegisterRNICs_ReRegistrationWithEmptySetRemovesAllPreviousRows(t *testi
 	ctx := context.Background()
 
 	// Register two different agents, each with their own RNICs.
-	if err := reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1"), testRnic("gid-2")}); err != nil {
+	if _, err := reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1"), testRnic("gid-2")}); err != nil {
 		t.Fatalf("agent-1 registration: unexpected error: %v", err)
 	}
-	if err := reg.RegisterRNICs(ctx, "agent-2", "10.0.0.2", []*controller_agent.RnicInfo{testRnic("gid-3")}); err != nil {
+	if _, err := reg.RegisterRNICs(ctx, "agent-2", "10.0.0.2", []*controller_agent.RnicInfo{testRnic("gid-3")}); err != nil {
 		t.Fatalf("agent-2 registration: unexpected error: %v", err)
 	}
 
@@ -320,7 +326,7 @@ func TestRegisterRNICs_ReRegistrationWithEmptySetRemovesAllPreviousRows(t *testi
 	// lost or removed from the allowlist). This must still delete agent-1's
 	// rows so they don't linger, scoped only to agent-1 - agent-2's rows
 	// must be untouched.
-	if err := reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", nil); err != nil {
+	if _, err := reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", nil); err != nil {
 		t.Fatalf("agent-1 empty re-registration: unexpected error: %v", err)
 	}
 
@@ -499,7 +505,7 @@ func TestNoStatementUsesSQLiteNow(t *testing.T) {
 	reg := newTestRegistry(fake)
 	ctx := context.Background()
 
-	_ = reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
+	_, _ = reg.RegisterRNICs(ctx, "agent-1", "10.0.0.1", []*controller_agent.RnicInfo{testRnic("gid-1")})
 	_, _ = reg.GetRNICsByToR(ctx, "tor-1")
 	_, _ = reg.GetActiveRNICsInOtherToRs(ctx, "tor-1")
 	_, _ = reg.GetRNICByGID(ctx, "gid-1")
@@ -522,7 +528,7 @@ func TestNoStatementUsesSQLiteNow(t *testing.T) {
 
 	// RegisterRNICs stamps rows with the same clock the cutoffs use.
 	ins := fake.writeParameterizedCalls[0][1]
-	if got := ins.Arguments[len(ins.Arguments)-1]; got != testNowUnix {
+	if got := ins.Arguments[len(ins.Arguments)-2]; got != testNowUnix {
 		t.Errorf("last_updated_epoch = %v, want %d", got, testNowUnix)
 	}
 }
@@ -535,7 +541,7 @@ func TestRegisterRNICs_StoresPlaneID(t *testing.T) {
 
 	untagged := testRnic("gid-2")
 	untagged.PlaneId = ""
-	if err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1",
+	if _, err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1",
 		[]*controller_agent.RnicInfo{testRnic("gid-1"), untagged}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -546,7 +552,7 @@ func TestRegisterRNICs_StoresPlaneID(t *testing.T) {
 			t.Fatalf("insert query lacks plane_id: %s", ins.Query)
 		}
 		// plane_id is bound right before netdev and last_updated_epoch.
-		if got := ins.Arguments[len(ins.Arguments)-3]; got != want {
+		if got := ins.Arguments[len(ins.Arguments)-4]; got != want {
 			t.Errorf("insert %d plane_id = %v, want %q", i, got, want)
 		}
 	}
@@ -560,7 +566,7 @@ func TestRegisterRNICs_StoresNetdev(t *testing.T) {
 
 	resolved := testRnic("gid-1")
 	resolved.Netdev = "ens1f0"
-	if err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1",
+	if _, err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1",
 		[]*controller_agent.RnicInfo{resolved, testRnic("gid-2")}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -571,7 +577,7 @@ func TestRegisterRNICs_StoresNetdev(t *testing.T) {
 			t.Fatalf("insert query lacks netdev: %s", ins.Query)
 		}
 		// netdev is bound right before last_updated_epoch.
-		if got := ins.Arguments[len(ins.Arguments)-2]; got != want {
+		if got := ins.Arguments[len(ins.Arguments)-3]; got != want {
 			t.Errorf("insert %d netdev = %v, want %q", i, got, want)
 		}
 	}
@@ -775,5 +781,61 @@ func TestConnectWithRetry_ZeroTimeoutSingleAttempt(t *testing.T) {
 	}
 	if opens != 1 || len(delays) != 0 {
 		t.Errorf("opens = %d, delays = %v; want one attempt and no wait", opens, delays)
+	}
+}
+
+// TestRegisterRNICs_DoesNotTakeOverActiveGID checks that the insert only
+// replaces another agent's row once it is inactive, and that a GID whose
+// insert changed no row is reported as skipped.
+func TestRegisterRNICs_DoesNotTakeOverActiveGID(t *testing.T) {
+	fake := &fakeConn{writeParameterizedResults: []gorqlite.WriteResult{
+		{RowsAffected: 0}, // DELETE of the agent's own rows
+		{RowsAffected: 1}, // fe80::1 inserted
+		{RowsAffected: 0}, // fe80::2 held by another active agent
+	}}
+	reg := newTestRegistry(fake)
+	skipped, err := reg.RegisterRNICs(context.Background(), "agent-1", "10.0.0.1",
+		[]*controller_agent.RnicInfo{testRnic("fe80::1"), testRnic("fe80::2")})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(skipped) != 1 || skipped[0] != "fe80::2" {
+		t.Fatalf("skipped = %v, want [fe80::2]", skipped)
+	}
+	ins := fake.writeParameterizedCalls[0][1]
+	if strings.Contains(ins.Query, "OR REPLACE") || !strings.Contains(ins.Query, "WHERE rnics.last_updated_epoch <= ?") {
+		t.Fatalf("insert does not guard active rows:\n%s", ins.Query)
+	}
+	if got := ins.Arguments[len(ins.Arguments)-1]; got != wantActiveCutoff {
+		t.Errorf("takeover cutoff = %v, want %v", got, wantActiveCutoff)
+	}
+}
+
+// TestGetRNICsByGIDs_Chunks checks that the batch lookup issues one query per
+// gidLookupChunk GIDs, each with an IN list and the active cutoff.
+func TestGetRNICsByGIDs_Chunks(t *testing.T) {
+	fake := &fakeConn{}
+	reg := newTestRegistry(fake)
+	gids := make([]string, gidLookupChunk+3)
+	for i := range gids {
+		gids[i] = fmt.Sprintf("fe80::%x", i+1)
+	}
+	if _, err := reg.GetRNICsByGIDs(context.Background(), gids); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n := len(fake.queryOneParameterizedCalls); n != 2 {
+		t.Fatalf("queries = %d, want 2", n)
+	}
+	for i, want := range []int{gidLookupChunk, 3} {
+		q := fake.queryOneParameterizedCalls[i]
+		if !strings.Contains(q.Query, "rnic_gid IN (") {
+			t.Fatalf("query %d is not a batch lookup:\n%s", i, q.Query)
+		}
+		if got := len(q.Arguments); got != want+1 {
+			t.Errorf("query %d args = %d, want %d", i, got, want+1)
+		}
+		if got := q.Arguments[len(q.Arguments)-1]; got != wantActiveCutoff {
+			t.Errorf("query %d cutoff = %v, want %v", i, got, wantActiveCutoff)
+		}
 	}
 }

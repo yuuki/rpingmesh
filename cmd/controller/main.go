@@ -130,6 +130,10 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create and configure the gRPC server.
+	// Bound every inbound message: the controller may serve unauthenticated
+	// clients (tls_mode disabled or tls), and the gRPC default of 4 MiB per
+	// message is far above any legitimate request.
+	serverOpts = append(serverOpts, grpc.MaxRecvMsgSize(controller.MaxRecvMsgBytes))
 	grpcServer := grpc.NewServer(serverOpts...)
 	controller_agent.RegisterControllerServiceServer(grpcServer, svc)
 

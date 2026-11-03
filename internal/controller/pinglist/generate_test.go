@@ -27,6 +27,25 @@ func (erroringRnicSource) GetRNICByGID(_ context.Context, _ string) (*controller
 	return nil, nil
 }
 
+func (erroringRnicSource) GetRNICsByGIDs(_ context.Context, _ []string) (map[string]*controller_agent.RnicInfo, error) {
+	return nil, nil
+}
+
+// rowsByGID builds a GetRNICsByGIDs result from a per-GID lookup, for fakes.
+func rowsByGID(ctx context.Context, get func(context.Context, string) (*controller_agent.RnicInfo, error), gids []string) (map[string]*controller_agent.RnicInfo, error) {
+	out := map[string]*controller_agent.RnicInfo{}
+	for _, gid := range gids {
+		r, err := get(ctx, gid)
+		if err != nil {
+			return nil, err
+		}
+		if r != nil {
+			out[gid] = r
+		}
+	}
+	return out, nil
+}
+
 func newTestGenerator(src RnicSource) *PinglistGenerator {
 	return NewPinglistGenerator(src, ECMPConfig{
 		PathsAssumed:        16,

@@ -51,8 +51,15 @@ pub const SECOND_ACK_SLOT_OFFSET: usize = PROBE_PACKET_SIZE;
 /// Number of send slots in the send memory region.
 pub const NUM_SEND_SLOTS: u32 = 32;
 
-/// Number of receive slots in the receive memory region.
-pub const NUM_RECV_SLOTS: u32 = 32;
+/// Number of receive slots in the receive memory region. Every slot is posted
+/// at queue creation (INITIAL_RECV_BUFFERS) and re-posted after each
+/// completion.
+pub const NUM_RECV_SLOTS: u32 = 256;
+
+comptime {
+    if (INITIAL_RECV_BUFFERS != NUM_RECV_SLOTS) @compileError("RDMA_INITIAL_RECV_BUFFERS must equal NUM_RECV_SLOTS");
+    if (CQ_SIZE < NUM_SEND_SLOTS + NUM_RECV_SLOTS) @compileError("RDMA_CQ_SIZE must hold every outstanding send and recv completion");
+}
 
 /// Flag set in the wr_id of every send WR. Recv WRs use the bare slot index
 /// as wr_id, send WRs `SEND_WR_ID_FLAG | slot`, so the CQ poller can tell a

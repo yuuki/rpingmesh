@@ -25,11 +25,12 @@ func newTestService(reg registryClient) *ControllerService {
 // so that ControllerService's RegisterAgent/GetPinglist request handling
 // (validation, error mapping) can be unit tested in isolation.
 type fakeRegistry struct {
-	registerErr   error
-	registerCalls int
-	lastAgentID   string
-	lastAgentIP   string
-	lastRnics     []*controller_agent.RnicInfo
+	registerErr     error
+	registerSkipped []string
+	registerCalls   int
+	lastAgentID     string
+	lastAgentIP     string
+	lastRnics       []*controller_agent.RnicInfo
 
 	torMeshRnics  []*controller_agent.RnicInfo
 	torMeshErr    error
@@ -42,12 +43,12 @@ type fakeRegistry struct {
 	lastInterTorExcludeTorID string
 }
 
-func (f *fakeRegistry) RegisterRNICs(_ context.Context, agentID, agentIP string, rnics []*controller_agent.RnicInfo) error {
+func (f *fakeRegistry) RegisterRNICs(_ context.Context, agentID, agentIP string, rnics []*controller_agent.RnicInfo) ([]string, error) {
 	f.registerCalls++
 	f.lastAgentID = agentID
 	f.lastAgentIP = agentIP
 	f.lastRnics = rnics
-	return f.registerErr
+	return f.registerSkipped, f.registerErr
 }
 
 func (f *fakeRegistry) GetRNICsByToR(_ context.Context, torID string) ([]*controller_agent.RnicInfo, error) {
@@ -64,6 +65,10 @@ func (f *fakeRegistry) GetActiveRNICsInOtherToRs(_ context.Context, excludeTorID
 // service-level tests exercise the GID self-exclusion fallback; the same-host
 // and plane filtering itself is covered by the pinglist package's unit tests.
 func (f *fakeRegistry) GetRNICByGID(_ context.Context, _ string) (*controller_agent.RnicInfo, error) {
+	return nil, nil
+}
+
+func (f *fakeRegistry) GetRNICsByGIDs(_ context.Context, _ []string) (map[string]*controller_agent.RnicInfo, error) {
 	return nil, nil
 }
 
@@ -106,7 +111,7 @@ func TestRegisterAgent_EmptyTorID(t *testing.T) {
 				AgentId:  "agent-1",
 				Hostname: "host-1",
 				TorId:    tc.torID,
-				Rnics:    []*controller_agent.RnicInfo{{Gid: "gid-1"}},
+				Rnics:    []*controller_agent.RnicInfo{{Gid: "fe80::1"}},
 			})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -130,7 +135,7 @@ func TestRegisterAgent_ReservedTorID(t *testing.T) {
 	_, err := svc.RegisterAgent(context.Background(), &controller_agent.AgentRegistrationRequest{
 		AgentId: "agent-1",
 		TorId:   " unspecified ",
-		Rnics:   []*controller_agent.RnicInfo{{Gid: "gid-1"}},
+		Rnics:   []*controller_agent.RnicInfo{{Gid: "fe80::1"}},
 	})
 	if err == nil {
 		t.Fatal("expected an error for reserved tor_id, got nil")
@@ -148,8 +153,8 @@ func TestRegisterAgent_RegistryFailure(t *testing.T) {
 		AgentId: "agent-1",
 		TorId:   "tor-1",
 		Rnics: []*controller_agent.RnicInfo{
-			{Gid: "gid-1"},
-			{Gid: "gid-2"},
+			{Gid: "fe80::1"},
+			{Gid: "fe80::2"},
 		},
 	})
 
@@ -180,8 +185,8 @@ func TestRegisterAgent_Success(t *testing.T) {
 		Hostname: "host-1",
 		TorId:    "tor-1",
 		Rnics: []*controller_agent.RnicInfo{
-			{Gid: "gid-1"},
-			{Gid: "gid-2"},
+			{Gid: "fe80::1"},
+			{Gid: "fe80::2"},
 		},
 	})
 
@@ -213,7 +218,7 @@ func TestGetPinglist_MissingAgentID(t *testing.T) {
 	svc := newTestService(&fakeRegistry{})
 
 	_, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
-		RequesterGid: "gid-1",
+		RequesterGid: "fe80::1",
 	})
 	if err == nil {
 		t.Fatal("expected an error for missing agent_id, got nil")
@@ -242,7 +247,7 @@ func TestGetPinglist_UnknownType(t *testing.T) {
 
 	_, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
 		AgentId:      "agent-1",
-		RequesterGid: "gid-1",
+		RequesterGid: "fe80::1",
 		Type:         controller_agent.PinglistType(999),
 	})
 	if err == nil {
@@ -256,15 +261,15 @@ func TestGetPinglist_UnknownType(t *testing.T) {
 func TestGetPinglist_TorMeshSuccess(t *testing.T) {
 	fake := &fakeRegistry{
 		torMeshRnics: []*controller_agent.RnicInfo{
-			{Gid: "requester-gid"}, // excluded from results (self)
-			{Gid: "peer-gid", TorId: "tor-1"},
+			{Gid: "fe80::ff"}, // excluded from results (self)
+			{Gid: "fe80::2", TorId: "tor-1"},
 		},
 	}
 	svc := newTestService(fake)
 
 	resp, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
 		AgentId:      "agent-1",
-		RequesterGid: "requester-gid",
+		RequesterGid: "fe80::ff",
 		TorId:        "tor-1",
 		Type:         controller_agent.PinglistType_TOR_MESH,
 	})
@@ -274,8 +279,8 @@ func TestGetPinglist_TorMeshSuccess(t *testing.T) {
 	if len(resp.GetTargets()) != 1 {
 		t.Fatalf("got %d targets, want 1 (requester's own RNIC excluded)", len(resp.GetTargets()))
 	}
-	if resp.GetTargets()[0].GetTargetGid() != "peer-gid" {
-		t.Errorf("target GID = %q, want peer-gid", resp.GetTargets()[0].GetTargetGid())
+	if resp.GetTargets()[0].GetTargetGid() != "fe80::2" {
+		t.Errorf("target GID = %q, want fe80::2", resp.GetTargets()[0].GetTargetGid())
 	}
 }
 
@@ -285,7 +290,7 @@ func TestGetPinglist_RegistryFailure(t *testing.T) {
 
 	_, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
 		AgentId:      "agent-1",
-		RequesterGid: "gid-1",
+		RequesterGid: "fe80::1",
 		TorId:        "tor-1",
 		Type:         controller_agent.PinglistType_TOR_MESH,
 	})
@@ -314,7 +319,7 @@ func TestGetPinglist_CanonicalizesEmptyTorID(t *testing.T) {
 
 			_, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
 				AgentId:      "agent-1",
-				RequesterGid: "gid-1",
+				RequesterGid: "fe80::1",
 				TorId:        tc.torID,
 				Type:         tc.ptype,
 			})
@@ -347,15 +352,15 @@ func TestRegisterAgent_PerRnicTorID(t *testing.T) {
 		Hostname: "host-1",
 		TorId:    "host-tor",
 		Rnics: []*controller_agent.RnicInfo{
-			{Gid: "gid-1", TorId: "leaf-a"},
-			{Gid: "gid-2", TorId: " leaf-b "},
-			{Gid: "gid-3"},
+			{Gid: "fe80::1", TorId: "leaf-a"},
+			{Gid: "fe80::2", TorId: " leaf-b "},
+			{Gid: "fe80::3"},
 		},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := map[string]string{"gid-1": "leaf-a", "gid-2": "leaf-b", "gid-3": "host-tor"}
+	want := map[string]string{"fe80::1": "leaf-a", "fe80::2": "leaf-b", "fe80::3": "host-tor"}
 	for _, rnic := range fake.lastRnics {
 		if rnic.GetTorId() != want[rnic.GetGid()] {
 			t.Errorf("rnic %s: torID=%q, want %q", rnic.GetGid(), rnic.GetTorId(), want[rnic.GetGid()])
@@ -372,7 +377,7 @@ func TestRegisterAgent_PerRnicReservedTorID(t *testing.T) {
 
 	_, err := svc.RegisterAgent(context.Background(), &controller_agent.AgentRegistrationRequest{
 		AgentId: "agent-1",
-		Rnics:   []*controller_agent.RnicInfo{{Gid: "gid-1", TorId: "unspecified"}},
+		Rnics:   []*controller_agent.RnicInfo{{Gid: "fe80::1", TorId: "unspecified"}},
 	})
 	if code := statusCode(t, err); code != codes.InvalidArgument {
 		t.Errorf("code = %v, want InvalidArgument", code)
@@ -391,9 +396,9 @@ func TestRegisterAgent_StoresPerRnicPlane(t *testing.T) {
 		Hostname: "host-1",
 		TorId:    "tor-1",
 		Rnics: []*controller_agent.RnicInfo{
-			{Gid: "gid-1", PlaneId: " rail0 "},
-			{Gid: "gid-2", PlaneId: "rail1"},
-			{Gid: "gid-3"}, // older agent / no plane configured
+			{Gid: "fe80::1", PlaneId: " rail0 "},
+			{Gid: "fe80::2", PlaneId: "rail1"},
+			{Gid: "fe80::3"}, // older agent / no plane configured
 		},
 	})
 	if err != nil {
@@ -417,8 +422,8 @@ func TestRegisterAgent_StoresPerRnicPlane(t *testing.T) {
 func TestGetPinglist_ForwardsRequestPlane(t *testing.T) {
 	fake := &fakeRegistry{
 		interTorRnics: []*controller_agent.RnicInfo{
-			{Gid: "r0-gid", TorId: "tor-2", PlaneId: "rail0"},
-			{Gid: "r1-gid", TorId: "tor-3", PlaneId: "rail1"},
+			{Gid: "fe80::a0", TorId: "tor-2", PlaneId: "rail0"},
+			{Gid: "fe80::a1", TorId: "tor-3", PlaneId: "rail1"},
 		},
 	}
 	svc := newTestService(fake)
@@ -426,7 +431,7 @@ func TestGetPinglist_ForwardsRequestPlane(t *testing.T) {
 	for plane, want := range map[string]int{"": 2, " rail1 ": 1} {
 		resp, err := svc.GetPinglist(context.Background(), &controller_agent.PinglistRequest{
 			AgentId:      "agent-1",
-			RequesterGid: "requester-gid",
+			RequesterGid: "fe80::ff",
 			TorId:        "tor-1",
 			PlaneId:      plane,
 			Type:         controller_agent.PinglistType_INTER_TOR,
@@ -437,8 +442,8 @@ func TestGetPinglist_ForwardsRequestPlane(t *testing.T) {
 		if got := len(resp.GetTargets()); got != want {
 			t.Errorf("plane %q: got %d targets, want %d", plane, got, want)
 		}
-		if plane != "" && resp.GetTargets()[0].GetTargetGid() != "r1-gid" {
-			t.Errorf("plane %q: target = %s, want r1-gid", plane, resp.GetTargets()[0].GetTargetGid())
+		if plane != "" && resp.GetTargets()[0].GetTargetGid() != "fe80::a1" {
+			t.Errorf("plane %q: target = %s, want fe80::a1", plane, resp.GetTargets()[0].GetTargetGid())
 		}
 	}
 }

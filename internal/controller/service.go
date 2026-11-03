@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/controller/pinglist"
@@ -20,7 +21,9 @@ import (
 // against a fake instead of a real rqlite-backed registry.
 type registryClient interface {
 	pinglist.RnicSource
-	RegisterRNICs(ctx context.Context, agentID, agentIP string, rnics []*controller_agent.RnicInfo) error
+	// RegisterRNICs replaces agentID's RNIC set and returns the GIDs it
+	// skipped because another agent holds an active registration for them.
+	RegisterRNICs(ctx context.Context, agentID, agentIP string, rnics []*controller_agent.RnicInfo) ([]string, error)
 }
 
 // probeAnalyzer is the subset of the analyzer used by ReportProbeAnalysis,
@@ -42,6 +45,9 @@ type ControllerService struct {
 	// nil when the analyzer is disabled, in which case ReportProbeAnalysis
 	// accepts-and-drops.
 	analyzer probeAnalyzer
+	// now is the clock used to bound reported window starts (time.Now;
+	// injectable in tests).
+	now func() time.Time
 }
 
 // NewControllerService creates a new ControllerService backed by the given
@@ -54,6 +60,7 @@ func NewControllerService(reg registryClient, ecmp pinglist.ECMPConfig, interTor
 	return &ControllerService{
 		registry: reg,
 		pinglist: pinglist.NewPinglistGenerator(reg, ecmp, interTorSampleSize, unspecifiedMeshMax),
+		now:      time.Now,
 	}
 }
 
@@ -78,6 +85,9 @@ func (s *ControllerService) RegisterAgent(
 	// Validate required fields.
 	if req.GetAgentId() == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "agent_id is required")
+	}
+	if err := validateRegistration(req); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	torID := probe.CanonicalTorID(req.GetTorId())
 	if probe.IsReservedTorID(torID) {
@@ -117,7 +127,8 @@ func (s *ControllerService) RegisterAgent(
 	// partial failure (e.g. one malformed RNIC) must not silently leave
 	// some of the agent's RNICs registered while others are dropped, so any
 	// error here fails the whole registration rather than being swallowed.
-	if err := s.registry.RegisterRNICs(ctx, req.GetAgentId(), req.GetAgentIp(), rnics); err != nil {
+	skipped, err := s.registry.RegisterRNICs(ctx, req.GetAgentId(), req.GetAgentIp(), rnics)
+	if err != nil {
 		log.Error().Err(err).
 			Str("agentID", req.GetAgentId()).
 			Int("rnicCount", len(rnics)).
@@ -129,14 +140,28 @@ func (s *ControllerService) RegisterAgent(
 		}, status.Errorf(codes.Internal, "failed to register RNICs: %v", err)
 	}
 
+	message := "Successfully registered agent"
+	if len(skipped) > 0 {
+		// Another agent_id holds an active row for these GIDs. Taking them
+		// over would let any client that can reach the controller redirect
+		// every prober's traffic for a victim RNIC; a genuine move (a host
+		// renamed, an RNIC moved) takes effect on a heartbeat once the old
+		// row leaves the active window.
+		log.Warn().
+			Str("agentID", req.GetAgentId()).
+			Strs("gids", skipped).
+			Msg("Skipped RNICs already registered by another active agent")
+		message = fmt.Sprintf("registered agent; skipped %d RNIC(s) registered by another active agent", len(skipped))
+	}
+
 	log.Info().
 		Str("agentID", req.GetAgentId()).
-		Int("rnicCount", len(req.GetRnics())).
+		Int("rnicCount", len(req.GetRnics())-len(skipped)).
 		Msg("Agent registered successfully")
 
 	return &controller_agent.AgentRegistrationResponse{
 		Success:        true,
-		Message:        "Successfully registered agent",
+		Message:        message,
 		PerRnicTorId:   true,
 		PerRnicPlaneId: true,
 		// The analyzer evaluates SERVICE_TRACING path summaries against the
@@ -158,6 +183,9 @@ func (s *ControllerService) GetPinglist(
 	}
 	if req.GetRequesterGid() == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "requester_gid is required")
+	}
+	if err := validateGID("requester_gid", req.GetRequesterGid()); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
 	torID := probe.CanonicalTorID(req.GetTorId())
@@ -199,8 +227,8 @@ func (s *ControllerService) GetPinglist(
 }
 
 // MaxTargetRnicInfoGIDs caps the GIDs one GetTargetRnicInfo request may
-// carry: each GID costs a registry query, and an agent resolves the flows of
-// one RNIC per request, so a larger batch is almost certainly a bug.
+// carry: an agent resolves the flows of one RNIC per request, so a larger
+// batch is almost certainly a bug.
 const MaxTargetRnicInfoGIDs = 4096
 
 // GetTargetRnicInfo resolves the destination GIDs of traced service flows
@@ -218,6 +246,9 @@ func (s *ControllerService) GetTargetRnicInfo(
 	}
 	if req.GetRequesterGid() == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "requester_gid is required")
+	}
+	if err := validateGID("requester_gid", req.GetRequesterGid()); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if n := len(req.GetTargetGids()); n > MaxTargetRnicInfoGIDs {
 		return nil, status.Errorf(codes.InvalidArgument,
@@ -260,6 +291,25 @@ func (s *ControllerService) ReportProbeAnalysis(
 			Msg("ReportProbeAnalysis received but analyzer is disabled; dropping")
 		return &controller_agent.ProbeAnalysisAck{Accepted: false}, nil
 	}
+
+	if n := len(req.GetSummaries()); n > MaxSummariesPerReport {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"too many summaries: %d (max %d)", n, MaxSummariesPerReport)
+	}
+	now := s.now()
+	kept := make([]*controller_agent.PathSummary, 0, len(req.GetSummaries()))
+	for _, sum := range req.GetSummaries() {
+		if summaryAcceptable(sum, now) {
+			kept = append(kept, sum)
+		}
+	}
+	if dropped := len(req.GetSummaries()) - len(kept); dropped > 0 {
+		log.Warn().
+			Str("agentID", req.GetAgentId()).
+			Int("dropped", dropped).
+			Msg("Dropped malformed probe analysis summaries (oversized fields or future window)")
+	}
+	req.Summaries = kept
 
 	violations := s.analyzer.Ingest(ctx, req)
 

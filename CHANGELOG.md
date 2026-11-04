@@ -4,33 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-### Security
-
-- The agent accepts a probe ACK only when its source GID and QPN are those of
-  the responder it probed, so a host that guesses a sequence number cannot
-  complete another target's probe with forged timestamps. Dropped ACKs
-  (unknown sequence number or unexpected source) are reported as one
-  rate-limited Warn summary instead of one log line each.
-- The controller validates registrations: at most 256 RNICs, parseable GIDs
-  and IP addresses, and string fields of at most 255 bytes. It no longer lets
-  one `agent_id` take over a GID whose row another agent refreshed within
-  `active_threshold_sec`.
-- The controller caps inbound gRPC messages at 1 MiB and probe analysis
-  reports at 1024 summaries. It drops summaries with oversized fields or a
-  window starting more than 10 minutes in the future.
-- `GetTargetRnicInfo` looks up its GIDs in batched `IN (...)` queries instead
-  of one rqlite query per GID.
-- The agent keeps at most 4096 targets from one pinglist response.
-
-### Fixed
-
-- Each queue posts 256 receive buffers instead of 32, and its CQ holds 512
-  completions instead of 256. A UD datagram that finds no posted receive is
-  dropped silently, so a burst that arrived while the CQ poller slept (ACK
-  pairs from many targets, or probes from many probers) was counted as
-  probe loss. This made `TestResponderAckPairBurst` flaky on soft-RoCE.
-
-## [0.9.0] - 2026-11-03
+## [0.9.0] - 2026-11-04
 
 ### Added
 
@@ -73,6 +47,44 @@ All notable changes to this project are documented in this file.
   SDK's per-instrument cap of 2000 attribute sets for the analyzer, whose
   violation counter can need `4 × T × (T−1)` series for T ToRs now that it
   carries `network`.
+- Service tracing recovers queue pairs that exist before the tracer starts
+  (`rpingmesh.agent.service_qps_unbound` counts those without a usable
+  address vector) and reconciles only the devices the agent inventoried.
+- Optional bounded service identity labels: `service_tracing_service_labels`
+  maps cgroup v2 paths to a fixed label set, reported as the optional
+  `service` attribute on the service instruments. The default `[]` disables
+  the attribute.
+- Optional tracing of kernel ULP connections (NVMe-oF, NFS/RDMA, Lustre) with
+  CO-RE probes, behind `service_tracing_kernel_ulp_enabled` (default
+  `false`; needs `/sys/kernel/btf/ib_core`). A failure keeps uverbs tracing
+  active. Kernel connections carry no PID or cgroup attribution.
+- `cmd/dc-trace`, an experimental, opt-in Linux diagnostic collector for
+  libmlx5 and UCX direct DC (dynamically connected) send submissions. DC is
+  not part of the service-probe source; see
+  `docs/design/ebpf-service-tracing.md`.
+- `make generate-bpf` / `make check-bpf`, a systemd drop-in granting
+  `CAP_BPF` and `CAP_PERFMON`
+  (`packaging/systemd/rpingmesh-agent.service.d/10-service-tracing.conf`,
+  shipped as an example by the agent package), and a soft-RoCE e2e test that
+  traces `ibv_rc_pingpong`.
+
+### Security
+
+- The agent accepts a probe ACK only when its source GID and QPN are those of
+  the responder it probed, so a host that guesses a sequence number cannot
+  complete another target's probe with forged timestamps. Dropped ACKs
+  (unknown sequence number or unexpected source) are reported as one
+  rate-limited Warn summary instead of one log line each.
+- The controller validates registrations: at most 256 RNICs, parseable GIDs
+  and IP addresses, and string fields of at most 255 bytes. It no longer lets
+  one `agent_id` take over a GID whose row another agent refreshed within
+  `active_threshold_sec`.
+- The controller caps inbound gRPC messages at 1 MiB and probe analysis
+  reports at 1024 summaries. It drops summaries with oversized fields or a
+  window starting more than 10 minutes in the future.
+- `GetTargetRnicInfo` looks up its GIDs in batched `IN (...)` queries instead
+  of one rqlite query per GID.
+- The agent keeps at most 4096 targets from one pinglist response.
 
 ### Fixed
 
@@ -81,11 +93,11 @@ All notable changes to this project are documented in this file.
   the reporter from reading results for its duration, and the fan-in's
   non-blocking tee then dropped results once its channel filled, which at
   service-tracing rates took a second or two of controller latency.
-- `make generate-bpf` / `make check-bpf`, a systemd drop-in granting
-  `CAP_BPF` and `CAP_PERFMON`
-  (`packaging/systemd/rpingmesh-agent.service.d/10-service-tracing.conf`,
-  shipped as an example by the agent package), and a soft-RoCE e2e test that
-  traces `ibv_rc_pingpong`.
+- Each queue posts 256 receive buffers instead of 32, and its CQ holds 512
+  completions instead of 256. A UD datagram that finds no posted receive is
+  dropped silently, so a burst that arrived while the CQ poller slept (ACK
+  pairs from many targets, or probes from many probers) was counted as
+  probe loss. This made `TestResponderAckPairBurst` flaky on soft-RoCE.
 
 ### Changed
 

@@ -893,7 +893,7 @@ Each release tag publishes Linux/amd64 packages and archives for both binaries,
 built with the EL9 agent builder, together with `checksums.txt`:
 
 ```sh
-gh release download v0.9.0 --repo yuuki/rpingmesh \
+gh release download v0.10.0 --repo yuuki/rpingmesh \
     --pattern 'rpingmesh-*' --pattern checksums.txt
 sha256sum -c --ignore-missing checksums.txt
 sudo apt install ./rpingmesh-controller_*.deb
@@ -980,7 +980,7 @@ TimeoutStartSec=150
 
 ### Upgrading
 
-The release that added [OTLP export security](#otlp-export-security) refuses
+v0.10.0, which added [OTLP export security](#otlp-export-security), refuses
 to start when `OTEL_EXPORTER_OTLP_HEADERS` or
 `OTEL_EXPORTER_OTLP_METRICS_HEADERS` sets an `authorization` header while
 `otel_collector_tls_enabled` is false, because that header would travel in
@@ -1011,9 +1011,9 @@ The release that renamed the analyzer's "SLA" identifiers to SLO vocabulary
 (see the changelog) renames the violation counter to
 `rpingmesh.analyzer.slo_violations_total` without an alias: point dashboards
 and alert rules at the new name and at `RpingmeshSLOViolation` when upgrading
-the controller. The old `analyzer_sla_*` controller keys keep working for one
-minor release with a startup warning; rename them before upgrading to the
-release after it. The `ProbeAnalysisAck` field rename keeps its field number,
+the controller. The old `analyzer_sla_*` controller keys keep working through
+v0.10 with a startup warning; rename them before upgrading to the release
+after it. The `ProbeAnalysisAck` field rename keeps its field number,
 so agents and controllers of different versions still interoperate.
 
 ## Observability

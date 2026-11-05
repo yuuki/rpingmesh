@@ -441,7 +441,7 @@ To choose `service_level` and `traffic_class`, see
 | `otel_collector_addr` | `localhost:4317` | OTLP/gRPC collector as `host:port`, without a URL scheme |
 | `otel_collector_tls_enabled` | `false` | Export over TLS, verifying the collector's certificate; see [OTLP export security](#otlp-export-security) |
 | `otel_collector_tls_ca_file`, `otel_collector_tls_server_name` | `""` | CA bundle (empty uses the system roots) and name to verify (empty uses the host in `otel_collector_addr`) |
-| `otel_collector_bearer_token_file` | `""` | File holding a bearer token sent with every export; requires TLS |
+| `otel_collector_bearer_token_file` | `""` | Absolute path of a file holding a bearer token sent with every export; requires TLS |
 | `metrics_target_rnic_labels` | `off` | Export `rpingmesh.target_rnic.*` metrics labelled with the destination RNIC (`target_hostname`, `target_rdma_device`, `target_netdev`): `off`, `counters` (probe counters only), or `all` (counters and RTT histograms). See [Metrics](#metrics) before enabling |
 | `metrics_target_rnic_labels_scope` | `stable` | `stable` labels only targets whose set is stable across pinglist refreshes and gives sampled targets (inter-ToR, capped untagged ToR-mesh) the value `_sampled`; `all` labels sampled targets too |
 | `metrics_prober_delay_target_tor` | `false` | Attach `target_tor` to `rpingmesh.prober_delay_ns`. Off by default because the prober delay is time spent on the probing host, so `target_tor` only multiplies its series by the ToRs probed |
@@ -665,10 +665,10 @@ with the same four keys:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `otel_collector_tls_enabled` | `false` | Use TLS and verify the collector's certificate chain and host name. `false` keeps plaintext gRPC, the behavior of earlier releases |
-| `otel_collector_tls_ca_file` | `""` | PEM bundle of the CAs that sign the collector's certificate; empty uses the system roots |
+| `otel_collector_tls_enabled` | `false` | Use TLS and verify the collector's certificate chain and host name. `false` keeps plaintext gRPC, the behavior of earlier releases. Only boolean values are accepted: `yes` or `on` is an error, not `false` |
+| `otel_collector_tls_ca_file` | `""` | PEM bundle of the CAs that sign the collector's certificate; empty uses the system roots (the controller's container image includes them) |
 | `otel_collector_tls_server_name` | `""` | Name verified against the certificate and sent as SNI; empty uses the host in `otel_collector_addr`. Set it when that is an IP address or a name the certificate does not carry |
-| `otel_collector_bearer_token_file` | `""` | File holding a bearer token, sent as `authorization: Bearer <token>` with every export; empty sends none |
+| `otel_collector_bearer_token_file` | `""` | Absolute path of a file holding a bearer token, sent as `authorization: Bearer <token>` with every export; empty sends none |
 
 Certificate verification cannot be disabled. A failed handshake fails the
 export, and the exporter never retries in plaintext, whatever the
@@ -680,11 +680,17 @@ probing.
 Both binaries refuse to start, with an error that names the key and the file,
 when:
 
+- `otel_collector_tls_enabled` is not a boolean;
 - a token file, CA file or server name is set without
   `otel_collector_tls_enabled: true` (the token is never sent over plaintext);
+- `OTEL_EXPORTER_OTLP_HEADERS` or `OTEL_EXPORTER_OTLP_METRICS_HEADERS`, which
+  the exporter also honors, sets an `authorization` header while TLS is off,
+  or while a token file is set (the request would carry two tokens). Other
+  headers in these variables keep working;
 - the CA file is unreadable or holds no PEM certificate;
-- the token file is unreadable, empty, larger than 16 KiB, or contains
-  whitespace, control or non-ASCII characters inside the token.
+- the token file path is relative (the value is then not echoed, in case it
+  is the token itself), or the file is unreadable, empty, larger than 16 KiB,
+  or contains whitespace, control or non-ASCII characters inside the token.
 
 These checks run whenever the keys are set, even with `metrics_enabled: false`
 or `analyzer_enabled: false`.
@@ -762,7 +768,8 @@ after all of them have moved:
    restarting rolls a host back.
 4. **Make the Collector strict.** Once the plaintext receiver accepts no more
    data points (the Collector's own `otelcol_receiver_accepted_metric_points`
-   metrics, labelled by `receiver`), require the token on the TLS receiver and
+   metric, `..._total` in some Collector versions, labelled by `receiver`),
+   require the token on the TLS receiver and
    remove the plaintext one:
 
    ```yaml
@@ -972,6 +979,14 @@ TimeoutStartSec=150
 ```
 
 ### Upgrading
+
+The release that added [OTLP export security](#otlp-export-security) refuses
+to start when `OTEL_EXPORTER_OTLP_HEADERS` or
+`OTEL_EXPORTER_OTLP_METRICS_HEADERS` sets an `authorization` header while
+`otel_collector_tls_enabled` is false, because that header would travel in
+plaintext. Earlier releases sent it. Before upgrading a host that sets one,
+move the token to `otel_collector_bearer_token_file` with TLS, or remove the
+header.
 
 Upgrade the controller before the agents. An older controller does not
 understand per-device ToRs or planes: agents that set `device_tor_ids` log an

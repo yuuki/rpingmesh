@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/pflag"
 	"github.com/yuuki/rpingmesh/internal/testutil/tlscerts"
 )
 
@@ -170,6 +171,156 @@ func TestReadBearerTokenFile(t *testing.T) {
 			}
 		})
 	}
+
+	// A relative value is most likely the token itself, typed into the path
+	// key: it is rejected without being echoed.
+	t.Run("relative path is not echoed", func(t *testing.T) {
+		_, err := readBearerTokenFile(secret)
+		checkErr(t, err, "otel_collector_bearer_token_file must be an absolute path")
+		if err != nil && strings.Contains(err.Error(), secret) {
+			t.Errorf("error %q reveals the value", err)
+		}
+	})
+
+	t.Run("permission denied", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads files regardless of their mode")
+		}
+		path := writeSecret(t, secret)
+		if err := os.Chmod(path, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		_, err := readBearerTokenFile(path)
+		checkErr(t, err, "permission denied")
+	})
+}
+
+// TestOTLPExporterConfig_EnvAuthorizationHeader verifies that an
+// authorization header set through the OpenTelemetry environment variables,
+// which the exporter attaches to every request, cannot bypass the rule that
+// no token is sent over plaintext, nor duplicate the token file's token.
+func TestOTLPExporterConfig_EnvAuthorizationHeader(t *testing.T) {
+	const envSecret = "env-secret-value"
+	tokenFile := writeSecret(t, testOTLPToken)
+	tests := []struct {
+		name    string
+		env     string
+		value   string
+		cfg     OTLPExporterConfig
+		wantErr string
+	}{
+		{"plaintext", "OTEL_EXPORTER_OTLP_HEADERS", "Authorization=Bearer%20" + envSecret,
+			OTLPExporterConfig{}, "OTEL_EXPORTER_OTLP_HEADERS sets an authorization header, which would be sent over plaintext"},
+		{"plaintext, metrics variable, padded key", "OTEL_EXPORTER_OTLP_METRICS_HEADERS", "x-tenant=a, authorization =" + envSecret,
+			OTLPExporterConfig{}, "OTEL_EXPORTER_OTLP_METRICS_HEADERS sets an authorization header"},
+		{"TLS with token file", "OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer%20" + envSecret,
+			OTLPExporterConfig{TLSEnabled: true, BearerTokenFile: tokenFile}, "in addition to otel_collector_bearer_token_file"},
+		{"TLS without token file", "OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer%20" + envSecret,
+			OTLPExporterConfig{TLSEnabled: true}, ""},
+		// Other headers keep working in plaintext, as before.
+		{"plaintext, other headers", "OTEL_EXPORTER_OTLP_HEADERS", "x-scope-orgid=tenant-a,x-authorization-hint=1",
+			OTLPExporterConfig{}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(tt.env, tt.value)
+			tt.cfg.Endpoint = "localhost:4317"
+			err := tt.cfg.Validate()
+			checkErr(t, err, tt.wantErr)
+			if err != nil && strings.Contains(err.Error(), envSecret) {
+				t.Errorf("error %q reveals the header value", err)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_OTLPTLSEnabledIsStrict verifies that the TLS switch accepts
+// only boolean values: viper would read "yes" (a string in YAML 1.2) or "on"
+// as false, silently exporting in plaintext.
+func TestLoadConfig_OTLPTLSEnabledIsStrict(t *testing.T) {
+	const wantErr = "otel_collector_tls_enabled must be true or false"
+	type result struct {
+		tls bool
+		err error
+	}
+	// load loads both binaries' configuration from path (and the
+	// environment), without flags.
+	load := func(path string) map[string]result {
+		out := map[string]result{}
+		if agent, err := LoadAgentConfig(path, nil); err != nil {
+			out["agent"] = result{err: err}
+		} else {
+			out["agent"] = result{tls: agent.OtelCollectorTLSEnabled}
+		}
+		if controller, err := LoadControllerConfig(path, nil); err != nil {
+			out["controller"] = result{err: err}
+		} else {
+			out["controller"] = result{tls: controller.OtelCollectorTLSEnabled}
+		}
+		return out
+	}
+
+	for _, value := range []string{"yes", "on", `"enabled"`, "Yes"} {
+		t.Run("YAML "+value, func(t *testing.T) {
+			path := writeYAML(t, "config.yaml", "otel_collector_tls_enabled: "+value+"\n")
+			for name, got := range load(path) {
+				t.Run(name, func(t *testing.T) { checkErr(t, got.err, wantErr) })
+			}
+		})
+	}
+	t.Run("env on", func(t *testing.T) {
+		t.Setenv("RPINGMESH_OTEL_COLLECTOR_TLS_ENABLED", "on")
+		for name, got := range load("") {
+			t.Run(name, func(t *testing.T) { checkErr(t, got.err, wantErr) })
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		yaml string
+		env  string
+		want bool
+	}{
+		{name: "YAML true", yaml: "otel_collector_tls_enabled: true\n", want: true},
+		{name: "YAML false", yaml: "otel_collector_tls_enabled: false\n", want: false},
+		{name: "env 1", env: "1", want: true},
+		{name: "env FALSE", env: "FALSE", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := ""
+			if tc.yaml != "" {
+				path = writeYAML(t, "config.yaml", tc.yaml)
+			}
+			if tc.env != "" {
+				t.Setenv("RPINGMESH_OTEL_COLLECTOR_TLS_ENABLED", tc.env)
+			}
+			for name, got := range load(path) {
+				if got.err != nil || got.tls != tc.want {
+					t.Errorf("%s: TLSEnabled = %v, err = %v; want %v, nil", name, got.tls, got.err, tc.want)
+				}
+			}
+		})
+	}
+
+	t.Run("flag", func(t *testing.T) {
+		agentFlags := pflag.NewFlagSet("agent", pflag.ContinueOnError)
+		BindAgentFlags(agentFlags)
+		controllerFlags := pflag.NewFlagSet("controller", pflag.ContinueOnError)
+		BindControllerFlags(controllerFlags)
+		for name, flags := range map[string]*pflag.FlagSet{"agent": agentFlags, "controller": controllerFlags} {
+			if err := flags.Parse([]string{"--otel-collector-tls-enabled"}); err != nil {
+				t.Fatalf("%s: parse flags: %v", name, err)
+			}
+		}
+		agent, err := LoadAgentConfig("", agentFlags)
+		if err != nil || !agent.OtelCollectorTLSEnabled {
+			t.Errorf("agent: TLSEnabled = %v, err = %v; want true, nil", agent != nil && agent.OtelCollectorTLSEnabled, err)
+		}
+		controller, err := LoadControllerConfig("", controllerFlags)
+		if err != nil || !controller.OtelCollectorTLSEnabled {
+			t.Errorf("controller: TLSEnabled = %v, err = %v; want true, nil", controller != nil && controller.OtelCollectorTLSEnabled, err)
+		}
+	})
 }
 
 // TestLoadAgentConfig_OTLPExporter verifies the agent's keys from YAML and

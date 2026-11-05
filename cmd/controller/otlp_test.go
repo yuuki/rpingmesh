@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/config"
 	"github.com/yuuki/rpingmesh/internal/controller"
 	"github.com/yuuki/rpingmesh/internal/controller/pinglist"
@@ -19,6 +23,7 @@ import (
 // analyzer's meter provider, built from the controller configuration, exports
 // to a collector that requires TLS and a bearer token. The collector listens
 // on 127.0.0.1 with a certificate for another name, signed by a private CA.
+// The controller's logs must not contain the token.
 func TestSetupAnalyzer_ExportsOverTLSWithBearerToken(t *testing.T) {
 	const (
 		collectorName = "collector.test"
@@ -58,6 +63,11 @@ func TestSetupAnalyzer_ExportsOverTLSWithBearerToken(t *testing.T) {
 		MaxFlowLabels:       config.DefaultEcmpMaxFlowLabels,
 	}, config.DefaultInterTorSampleSize, config.DefaultUnspecifiedMeshMaxTargets)
 
+	var logs bytes.Buffer
+	prevLogger := log.Logger
+	log.Logger = zerolog.New(&logs)
+	t.Cleanup(func() { log.Logger = prevLogger })
+
 	provider := setupAnalyzer(cfg, svc)
 	if provider == nil {
 		t.Fatal("setupAnalyzer returned no meter provider")
@@ -86,5 +96,12 @@ func TestSetupAnalyzer_ExportsOverTLSWithBearerToken(t *testing.T) {
 	}
 	if got := reqs[0].ServiceNames(); !slices.Equal(got, []string{analyzerServiceName}) {
 		t.Errorf("service.name = %q, want %q", got, analyzerServiceName)
+	}
+	out := logs.String()
+	if !strings.Contains(out, `"otelCollectorBearerAuth":true`) {
+		t.Errorf("analyzer startup log does not report bearer authentication:\n%s", out)
+	}
+	if strings.Contains(out, token) {
+		t.Errorf("logs reveal the token:\n%s", out)
 	}
 }

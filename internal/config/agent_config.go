@@ -433,6 +433,12 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		agentID = hostname
 	}
 
+	// Parsed strictly: a typo must not silently mean plaintext.
+	otlpTLSEnabled, err := strictBool(v, "otel_collector_tls_enabled")
+	if err != nil {
+		return nil, err
+	}
+
 	config := &AgentConfig{
 		AgentID:                          agentID,
 		HostName:                         hostname,
@@ -449,7 +455,7 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		LogFormat:                        v.GetString("log_format"),
 		ProbeIntervalMS:                  v.GetUint32("probe_interval_ms"),
 		OtelCollectorAddr:                v.GetString("otel_collector_addr"),
-		OtelCollectorTLSEnabled:          v.GetBool("otel_collector_tls_enabled"),
+		OtelCollectorTLSEnabled:          otlpTLSEnabled,
 		OtelCollectorTLSCAFile:           v.GetString("otel_collector_tls_ca_file"),
 		OtelCollectorTLSServerName:       v.GetString("otel_collector_tls_server_name"),
 		OtelCollectorBearerTokenFile:     v.GetString("otel_collector_bearer_token_file"),

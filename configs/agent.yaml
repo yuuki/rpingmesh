@@ -151,12 +151,14 @@ otel_collector_addr: "localhost:4317"
 # fallback). The CA bundle and the token are read once at startup: changing
 # them needs a restart. See README "OTLP export security" for the staged
 # migration.
-otel_collector_tls_enabled: false
+otel_collector_tls_enabled: false       # true or false only; "yes" is an error
 otel_collector_tls_ca_file: ""          # PEM CA bundle; empty = system roots
 otel_collector_tls_server_name: ""      # name to verify; empty = host of otel_collector_addr
-# File holding the bearer token (requires TLS), e.g. a systemd credential
+# Absolute path of the file holding the bearer token (requires TLS), e.g. a
+# systemd credential
 # (packaging/systemd/rpingmesh-agent.service.d/30-otel-collector-token.conf).
-# The token is never read from this file, the environment or a flag.
+# The token is never read from this file, the environment or a flag, and an
+# authorization header in OTEL_EXPORTER_OTLP_HEADERS is refused without TLS.
 otel_collector_bearer_token_file: ""
 # Per-destination-RNIC metrics (rpingmesh.target_rnic.*, labelled with
 # target_hostname, target_rdma_device, target_netdev): "off", "counters" (probe

@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/config"
 	"github.com/yuuki/rpingmesh/internal/testutil/otlptest"
 	"github.com/yuuki/rpingmesh/internal/testutil/tlscerts"
@@ -294,26 +297,136 @@ func TestOTLPExporterOptions_RejectsTokenWithoutTLS(t *testing.T) {
 // settings fail provider construction instead of yielding a plaintext or
 // unauthenticated exporter.
 func TestNewMeterProvider_InvalidSettingsFail(t *testing.T) {
-	tests := map[string]config.OTLPExporterConfig{
-		"CA file is not PEM": {
-			Endpoint: "127.0.0.1:1", TLSEnabled: true,
-			CAFile: writeTestFile(t, "ca.pem", "not a certificate", 0o644),
+	tests := []struct {
+		name    string
+		cfg     config.OTLPExporterConfig
+		wantErr string
+	}{
+		{
+			name: "CA file is not PEM",
+			cfg: config.OTLPExporterConfig{
+				Endpoint: "127.0.0.1:1", TLSEnabled: true,
+				CAFile: writeTestFile(t, "ca.pem", "not a certificate", 0o644),
+			},
+			wantErr: "failed to parse any PEM certificates from otel_collector_tls_ca_file",
 		},
-		"token file missing": {
-			Endpoint: "127.0.0.1:1", TLSEnabled: true,
-			BearerTokenFile: filepath.Join(t.TempDir(), "missing-token"),
+		{
+			name: "token file missing",
+			cfg: config.OTLPExporterConfig{
+				Endpoint: "127.0.0.1:1", TLSEnabled: true,
+				BearerTokenFile: filepath.Join(t.TempDir(), "missing-token"),
+			},
+			wantErr: "no such file or directory",
 		},
-		"token without TLS": {
-			Endpoint:        "127.0.0.1:1",
-			BearerTokenFile: writeTestFile(t, "token", testBearerToken, 0o600),
+		{
+			name: "token without TLS",
+			cfg: config.OTLPExporterConfig{
+				Endpoint:        "127.0.0.1:1",
+				BearerTokenFile: writeTestFile(t, "token", testBearerToken, 0o600),
+			},
+			wantErr: "otel_collector_bearer_token_file requires otel_collector_tls_enabled",
 		},
 	}
-	for name, cfg := range tests {
-		t.Run(name, func(t *testing.T) {
-			provider, err := NewMeterProvider(context.Background(), cfg, "rpingmesh-test")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider, err := NewMeterProvider(context.Background(), tt.cfg, "rpingmesh-test")
 			if err == nil {
 				_ = provider.Shutdown(context.Background())
 				t.Fatal("NewMeterProvider succeeded, want an error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error %q does not contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestOTLPExport_EnvAuthorizationHeaderNotSentOverPlaintext verifies that an
+// authorization header set through OTEL_EXPORTER_OTLP_HEADERS, which the
+// exporter would otherwise attach to every request, does not reach a
+// plaintext collector: building the exporter fails.
+func TestOTLPExport_EnvAuthorizationHeaderNotSentOverPlaintext(t *testing.T) {
+	collector := otlptest.Start(t, otlptest.Options{})
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer%20"+testBearerToken)
+
+	_, err := NewMeterProvider(context.Background(), config.OTLPExporterConfig{Endpoint: collector.Addr()}, "rpingmesh-test")
+	if err == nil || !strings.Contains(err.Error(), "would be sent over plaintext") {
+		t.Fatalf("NewMeterProvider = %v, want an error about plaintext", err)
+	}
+	if strings.Contains(err.Error(), testBearerToken) {
+		t.Errorf("error %q reveals the token", err)
+	}
+	if n := len(collector.Accepted()); n != 0 {
+		t.Errorf("collector accepted %d requests, want 0", n)
+	}
+}
+
+// captureLogs redirects the global zerolog logger, from which the telemetry
+// loggers derive, to a buffer until the test ends.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := log.Logger
+	log.Logger = zerolog.New(&buf)
+	t.Cleanup(func() { log.Logger = prev })
+	return &buf
+}
+
+// TestOTLPExport_TokenNeverLogged exports through both the agent's and the
+// analyzer's paths, with a token file other users can read and with a
+// private one, and checks the logs: the token never appears, the
+// world-readable file draws a warning naming the file, the private one none.
+func TestOTLPExport_TokenNeverLogged(t *testing.T) {
+	fx := newTLSFixture(t)
+	collector := otlptest.Start(t, otlptest.Options{TLS: fx.cert, BearerToken: testBearerToken})
+
+	for _, tc := range []struct {
+		name     string
+		perm     os.FileMode
+		wantWarn bool
+	}{
+		{"world-readable", 0o644, true},
+		{"private", 0o600, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLogs(t)
+			cfg := fx.tlsConfig(collector.Addr())
+			cfg.BearerTokenFile = writeTestFile(t, "token", testBearerToken+"\n", tc.perm)
+			// os.WriteFile applies the umask; set the mode explicitly.
+			if err := os.Chmod(cfg.BearerTokenFile, tc.perm); err != nil {
+				t.Fatal(err)
+			}
+
+			mc, err := NewMetricsCollector(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("NewMetricsCollector: %v", err)
+			}
+			flushOne(t, mc.meterProvider)
+			if err := mc.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+			provider, err := NewMeterProvider(context.Background(), cfg, "rpingmesh-analyzer")
+			if err != nil {
+				t.Fatalf("NewMeterProvider: %v", err)
+			}
+			flushOne(t, provider)
+			if err := provider.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+
+			out := logs.String()
+			if strings.Contains(out, testBearerToken) {
+				t.Errorf("logs reveal the token:\n%s", out)
+			}
+			if !strings.Contains(out, `"collector_bearer_auth":true`) {
+				t.Errorf("logs do not report bearer authentication:\n%s", out)
+			}
+			warned := strings.Contains(out, "accessible to other users")
+			if warned != tc.wantWarn {
+				t.Errorf("permission warning logged = %v, want %v:\n%s", warned, tc.wantWarn, out)
+			}
+			if warned && !strings.Contains(out, cfg.BearerTokenFile) {
+				t.Errorf("permission warning does not name the file:\n%s", out)
 			}
 		})
 	}

@@ -24,15 +24,19 @@ func newOTLPExporter(ctx context.Context, cfg config.OTLPExporterConfig, extra .
 
 // otlpExporterOptions translates cfg into exporter options.
 //
-// The transport security is always set explicitly, either plaintext or TLS
-// credentials, so the OTEL_EXPORTER_OTLP_* environment variables cannot change
-// it: with TLS enabled, OTEL_EXPORTER_OTLP_INSECURE=true does not downgrade
-// the connection, because the exporter prefers explicit credentials over the
-// insecure flag. A failed TLS handshake fails the export; there is no
-// fallback to plaintext.
+// With TLS enabled the transport credentials are set explicitly, after the
+// OTEL_EXPORTER_OTLP_* environment variables are applied, so none of them can
+// downgrade or replace them: OTEL_EXPORTER_OTLP_INSECURE=true has no effect,
+// because the exporter prefers explicit credentials over the insecure flag. A
+// failed TLS handshake fails the export; there is no fallback to plaintext.
+// In plaintext mode the exporter keeps its pre-existing behavior, in which
+// OTEL_EXPORTER_OTLP_CERTIFICATE (or a client certificate variable) still
+// switches it to TLS; config.OTLPExporterConfig.Credentials refuses an
+// authorization header from OTEL_EXPORTER_OTLP_HEADERS in that mode.
 //
-// The CA bundle and the bearer token are read here, once. Changing either
-// file takes effect when the process restarts.
+// The CA bundle and the bearer token are read when the exporter is built
+// (and once before, by the configuration's validation at startup). Changing
+// either file takes effect when the process restarts.
 func otlpExporterOptions(cfg config.OTLPExporterConfig) ([]otlpmetricgrpc.Option, error) {
 	tlsCfg, token, err := cfg.Credentials()
 	if err != nil {

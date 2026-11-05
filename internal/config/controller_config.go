@@ -205,6 +205,11 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		return nil, err
 	}
 	deprecations := applyRenamedKeys(v, flags, controllerRenamedKeys)
+	// Parsed strictly: a typo must not silently mean plaintext.
+	otlpTLSEnabled, err := strictBool(v, "otel_collector_tls_enabled")
+	if err != nil {
+		return nil, err
+	}
 
 	config := &ControllerConfig{
 		ListenAddr:                v.GetString("listen_addr"),
@@ -228,7 +233,7 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		AnalyzerWindowRetention:           v.GetInt("analyzer_window_retention"),
 		AnalyzerMetricsCardinalityLimit:   v.GetInt("analyzer_metrics_cardinality_limit"),
 		OtelCollectorAddr:                 v.GetString("otel_collector_addr"),
-		OtelCollectorTLSEnabled:           v.GetBool("otel_collector_tls_enabled"),
+		OtelCollectorTLSEnabled:           otlpTLSEnabled,
 		OtelCollectorTLSCAFile:            v.GetString("otel_collector_tls_ca_file"),
 		OtelCollectorTLSServerName:        v.GetString("otel_collector_tls_server_name"),
 		OtelCollectorBearerTokenFile:      v.GetString("otel_collector_bearer_token_file"),

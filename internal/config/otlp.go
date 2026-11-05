@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -66,11 +67,16 @@ func (c OTLPExporterConfig) Validate() error {
 // configuration, which is nil for plaintext, and the bearer token, which is
 // "" when no token file is configured. It rejects a URL scheme in the
 // endpoint, TLS-only settings without TLS (in particular a bearer token,
-// which is never sent over plaintext), an unreadable or unparsable CA bundle,
-// and an unreadable, empty or malformed token file. Errors name the
+// which is never sent over plaintext), an authorization header in the
+// OpenTelemetry environment variables that would be sent over plaintext or
+// next to the token file's token, an unreadable or unparsable CA bundle, and
+// a relative, unreadable, empty or malformed token file. Errors name the
 // configuration key and the file but never include the token.
 func (c OTLPExporterConfig) Credentials() (*tls.Config, string, error) {
 	if err := validateOTLPEndpoint(c.Endpoint); err != nil {
+		return nil, "", err
+	}
+	if err := c.rejectEnvAuthorizationHeader(); err != nil {
 		return nil, "", err
 	}
 	if !c.TLSEnabled {
@@ -119,12 +125,64 @@ func (c OTLPExporterConfig) rejectTLSOnlySettings() error {
 	return nil
 }
 
+// otlpHeaderEnvVars are the OpenTelemetry SDK environment variables whose
+// headers the exporter attaches to every export request, in addition to the
+// settings of OTLPExporterConfig.
+var otlpHeaderEnvVars = []string{"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_METRICS_HEADERS"}
+
+// rejectEnvAuthorizationHeader refuses an authorization header set through
+// otlpHeaderEnvVars when it would be sent over plaintext, or next to the
+// token of otel_collector_bearer_token_file (the request would carry two
+// authorization values). The exporter honors those variables, so without
+// this check a credential set there would bypass the rule that no token is
+// sent over plaintext. Other headers, such as a tenant ID, are left alone,
+// and so is an authorization header over TLS without a token file.
+func (c OTLPExporterConfig) rejectEnvAuthorizationHeader() error {
+	name, ok := envAuthorizationHeader()
+	switch {
+	case !ok:
+		return nil
+	case !c.TLSEnabled:
+		return fmt.Errorf("%s sets an authorization header, which would be sent over plaintext; set %s: true, and preferably move the token to %s",
+			name, keyOtelCollectorTLSEnabled, keyOtelCollectorBearerTokenFile)
+	case c.BearerTokenFile != "":
+		return fmt.Errorf("%s sets an authorization header in addition to %s; remove one of them",
+			name, keyOtelCollectorBearerTokenFile)
+	default:
+		return nil
+	}
+}
+
+// envAuthorizationHeader returns the first of otlpHeaderEnvVars that sets an
+// authorization header. It splits the value as the OpenTelemetry SDK does,
+// into comma-separated key=value pairs with space-trimmed keys, and compares
+// keys case-insensitively because gRPC lower-cases metadata keys.
+func envAuthorizationHeader() (string, bool) {
+	for _, name := range otlpHeaderEnvVars {
+		for _, pair := range strings.Split(os.Getenv(name), ",") {
+			key, _, found := strings.Cut(pair, "=")
+			if found && strings.EqualFold(strings.TrimSpace(key), "authorization") {
+				return name, true
+			}
+		}
+	}
+	return "", false
+}
+
 // readBearerTokenFile reads a bearer token from path. Surrounding whitespace,
 // such as a trailing newline, is removed. The token must be non-empty
 // printable ASCII without spaces (the characters an HTTP/2 header value can
 // carry unambiguously); the file holds the token only, without the "Bearer"
 // scheme. Errors name the file but never include its contents.
+//
+// path must be absolute. A relative value is rejected without being echoed:
+// it is most likely the token itself, put in the path key by mistake, and
+// echoing it would print the secret.
 func readBearerTokenFile(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("%s must be an absolute path (the value is not shown, in case it is the token itself)",
+			keyOtelCollectorBearerTokenFile)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", keyOtelCollectorBearerTokenFile, err)

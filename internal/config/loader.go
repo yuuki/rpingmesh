@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/pflag"
@@ -150,6 +151,25 @@ func readConfigFile(v *viper.Viper, configPath string) error {
 		return fmt.Errorf("failed to read config file: %w", err)
 	}
 	return nil
+}
+
+// strictBool returns the boolean value of key, accepting only a boolean or a
+// string strconv.ParseBool understands ("true", "false", "1", "0", ...).
+// viper's GetBool turns any other value into false without an error, which
+// would make a typo such as `otel_collector_tls_enabled: yes` (a string in
+// YAML 1.2) silently mean plaintext. Use it for switches whose false value
+// weakens security.
+func strictBool(v *viper.Viper, key string) (bool, error) {
+	raw := v.Get(key)
+	switch val := raw.(type) {
+	case bool:
+		return val, nil
+	case string:
+		if b, err := strconv.ParseBool(strings.TrimSpace(val)); err == nil {
+			return b, nil
+		}
+	}
+	return false, fmt.Errorf("%s must be true or false, got %q", key, fmt.Sprint(raw))
 }
 
 // envPrefix is the prefix of the environment variables both binaries read:

@@ -182,8 +182,8 @@ vet:
 	go vet ./...
 	@echo "==> Vet complete"
 
-# Rank the most complex functions with cccc (https://github.com/moznion/cccc);
-# what is analyzed is configured in cccc.toml.
+# Rank the most complex functions with cccc (https://github.com/moznion/cccc)
+# and, like CI, fail when one exceeds max-cognitive in cccc.toml.
 complexity:
 	cccc --table --top-cognitive 20 .
 
@@ -391,7 +391,7 @@ help:
 	@echo "  test-go              Run Go tests (internal/probe only, pure Go)"
 	@echo "  test-zig             Run Zig unit tests (zig build test)"
 	@echo "  vet                  Run go vet ./..."
-	@echo "  complexity           Rank the most complex functions with cccc (settings in cccc.toml)"
+	@echo "  complexity           Rank functions by complexity; fails above max-cognitive in cccc.toml"
 	@echo "  test-all             Run go test on all packages except ./e2e/..., plus test-zig (Linux, full build env)"
 	@echo "  setup-colima         Install rdma_rxe kernel module on Colima VM (run once)"
 	@echo "  test-e2e             Run RDMA e2e tests via Docker (requires Colima)"

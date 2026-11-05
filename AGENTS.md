@@ -37,6 +37,7 @@ Run active-development commands from the repository root.
 - `make test`: Run the portable Go tests in `internal/probe/`.
 - `make test-zig`: Run the Zig unit tests (needs libibverbs headers, not hardware).
 - `make vet`: Run `go vet` for all Go packages.
+- `make complexity`: Rank the most complex functions with cccc (settings in `cccc.toml`).
 - `make test-scripts`: Run the stdlib-only Python tests of `scripts/topology/`.
 - `make test-all`: Run Zig tests and all non-e2e Go tests in a Linux RDMA build environment.
 - `make test-e2e-controller`: Run the controller integration path in Docker.

@@ -1329,6 +1329,17 @@ metrics and tolerates runs in which no probe succeeds. Soft-RoCE in the CI
 topology does not complete every probe and ACK exchange, so that test does not
 guarantee that the success path runs end to end.
 
+### Code complexity
+
+CI measures Cognitive and Cyclomatic Complexity with
+[cccc](https://github.com/moznion/cccc) on pull requests and pushes to `main`
+and writes the totals and the 20 most complex functions to the job summary
+(`.github/workflows/complexity.yml`). It only reports; no complexity
+threshold fails the build. `cccc.toml` sets what is analyzed: tests, generated
+code and vendored sources are excluded. To see the same ranking locally,
+install cccc (a [release binary](https://github.com/moznion/cccc/releases) or
+`cargo install cccc-cli`) and run `make complexity`.
+
 ### Changing the Zig library
 
 1. If the C ABI changes, update `zig/include/rdma_bridge.h` first.

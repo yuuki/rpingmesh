@@ -4,7 +4,7 @@
 
 .PHONY: all build build-zig build-go build-controller build-agent build-dc-trace \
         generate generate-proto generate-bpf check-bpf \
-        clean test test-go test-zig test-scripts test-all vet \
+        clean test test-go test-zig test-scripts test-all vet complexity \
         test-e2e setup-colima test-e2e-controller clean-e2e-controller \
         check-nfpm package package-agent package-controller \
         package-build-agent package-build-agent-el9 package-build-controller \
@@ -181,6 +181,11 @@ vet:
 	@echo "==> Running go vet..."
 	go vet ./...
 	@echo "==> Vet complete"
+
+# Rank the most complex functions with cccc (https://github.com/moznion/cccc);
+# what is analyzed is configured in cccc.toml.
+complexity:
+	cccc --table --top-cognitive 20 .
 
 # Run all Go tests in the module (excluding ./e2e/..., which requires live
 # infrastructure or RDMA hardware/soft-RoCE and is exercised by
@@ -386,6 +391,7 @@ help:
 	@echo "  test-go              Run Go tests (internal/probe only, pure Go)"
 	@echo "  test-zig             Run Zig unit tests (zig build test)"
 	@echo "  vet                  Run go vet ./..."
+	@echo "  complexity           Rank the most complex functions with cccc (settings in cccc.toml)"
 	@echo "  test-all             Run go test on all packages except ./e2e/..., plus test-zig (Linux, full build env)"
 	@echo "  setup-colima         Install rdma_rxe kernel module on Colima VM (run once)"
 	@echo "  test-e2e             Run RDMA e2e tests via Docker (requires Colima)"

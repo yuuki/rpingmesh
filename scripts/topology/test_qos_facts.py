@@ -272,6 +272,112 @@ class SummarizeTest(unittest.TestCase):
                          ["host-p/mlx5_0:1", "host-p/mlx5_1:1"])
         self.assertEqual(sorted(s["dscp_map"]["unknown"]), ["host-p/mlx5_0:1", "host-p/mlx5_1:1"])
 
+    def test_render_mixed_fleet(self):
+        self.assertEqual(self.render("qos-host-a.json", "qos-host-b.json", "qos-host-c-no-override.json",
+                                     "qos-host-p-trust-pcp.json"), """\
+4 hosts, 8 RDMA ports with a netdev
+
+Consistency (majority / outliers):
+  trust mode      : dscp  (6/8 ports, 2 differ)
+      outlier host-p/mlx5_0:1: pcp
+      outlier host-p/mlx5_1:1: pcp
+  PFC priorities  : 3  (8/8 ports, consistent)
+  DSCP->prio map  : p0:0-7 p1:8-15 p2:16-23 p3:24-31 p4:32-39 p5:40-47 p6:48-55 p7:56-63  \
+(6/6 ports, consistent, 2 unknown)
+      unknown: host-p/mlx5_0:1, host-p/mlx5_1:1
+  tclass override : 106  (5/8 ports, 3 differ)
+      outlier host-c/mlx5_1:1: not set
+      outlier host-p/mlx5_0:1: not set
+      outlier host-p/mlx5_1:1: not set
+  RoCE v2 GID idx : 3  (8/8 ports, consistent)
+
+PFC-enabled priorities and the DSCPs mapping to them:
+  priority 3: DSCP 24-31
+
+Candidate traffic_class values (suggestions, not a decision):
+  106  DSCP 26 ECT(0)  -> priority 3 (PFC on)  [NIC override on 5 port(s)]
+   96  DSCP 24 Not-ECT -> priority 3 (PFC on)  [DSCP << 2]
+  100  DSCP 25 Not-ECT -> priority 3 (PFC on)  [DSCP << 2]
+  104  DSCP 26 Not-ECT -> priority 3 (PFC on)  [DSCP << 2]
+  108  DSCP 27 Not-ECT -> priority 3 (PFC on)  [DSCP << 2]
+  112  DSCP 28 Not-ECT -> priority 3 (PFC on)  [DSCP << 2]
+  116  DSCP 29 Not-ECT -> priority 3 (PFC on)  [DSCP << 2]
+  120  DSCP 30 Not-ECT -> priority 3 (PFC on)  [DSCP << 2]
+  124  DSCP 31 Not-ECT -> priority 3 (PFC on)  [DSCP << 2]
+  The low 2 bits are ECN: DSCP<<2 is Not-ECT, +2 is ECT(0). Prefer the value the
+  workload emits (e.g. an override verbatim) and verify the ECN on the wire.
+service_level: 0 (trust dscp: SL does not select the queue)
+
+Traffic over 5 s on 8 ports (rx+tx bytes, pause frames):
+  priority 0:        501050000 bytes ( 11.0%)  pause 0
+  priority 3:       4050000000 bytes ( 89.0%)  pause 12
+  most bytes: priority 3 (busiest priority per port: p0: 1, p3: 7)
+      host-c/mlx5_1:1: most bytes in priority 0
+  These counters include all traffic in a priority, not only RoCE; pause
+  counters move only under congestion, so zero does not prove a priority is unused.
+""")
+
+    def test_render_trust_pcp_without_dscp_map(self):
+        text = self.render("qos-host-p-trust-pcp.json")
+        self.assertIn("  DSCP->prio map  : unknown  (0/0 ports, no data, 2 unknown)\n"
+                      "      unknown: host-p/mlx5_0:1, host-p/mlx5_1:1\n", text)
+        self.assertIn("  priority 3: DSCP (none in the DSCP map)\n"
+                      "  (trust pcp: the queue is selected by the VLAN PCP, not by DSCP)\n", text)
+        self.assertIn("  none: no override and no DSCP mapping to a PFC-enabled priority\n", text)
+
+    @staticmethod
+    def sparse_ports(n, counters):
+        """Ports without trust, PFC or GID data, alternating DSCP maps and
+        overrides that map to a non-PFC priority (4) or to no priority (200)."""
+        return [{"id": f"host-{i}/mlx5_0:1", "host": f"host-{i}", "netdev": "eth0", "trust": None, "pfc": (),
+                 "dscp_prio": {0: 0, 1: 1} if i % 2 else None, "override": (4, 200, None)[i % 3],
+                 "override_status": None, "counters": counters(i), "interval_s": 2 if i % 2 else 2.5,
+                 "gid_indices": ()} for i in range(n)]
+
+    def render_summary(self, ports):
+        out = io.StringIO()
+        summ.render(summ.summarize(ports), out)
+        return out.getvalue()
+
+    def test_render_without_pfc_or_traffic(self):
+        # Counters with pause frames but no bytes: no priority carries the most bytes.
+        def counters(i):
+            if i % 4 == 3:
+                return None
+            return {"0": {"rx_bytes": 0, "tx_bytes": 0}, "5": {"rx_pause": i, "tx_pause": None}, "6": {}}
+        text = self.render_summary(self.sparse_ports(12, counters))
+        self.assertIn("  trust mode      : unknown  (0/0 ports, no data, 12 unknown)\n"
+                      "  PFC priorities  : none  (12/12 ports, consistent)\n", text)
+        self.assertIn("  RoCE v2 GID idx : unknown  (0/0 ports, no data, 12 unknown)\n\n", text)
+        self.assertIn("\nNo PFC-enabled priority found (or PFC state unavailable).\n\n", text)
+        self.assertIn("    4  DSCP  1 Not-ECT -> priority 1 (PFC OFF)  [NIC override on 4 port(s)]\n"
+                      "  200  DSCP 50 Not-ECT -> priority ? (PFC ?)  [NIC override on 4 port(s)]\n", text)
+        self.assertIn("service_level: ? (trust mode unknown)\n\n", text)
+        self.assertIn("Traffic over 2/2.5 s on 9 ports (rx+tx bytes, pause frames):\n"
+                      "  priority 5:                0 bytes (  0.0%)  pause 45\n"
+                      "  These counters include", text)
+        self.assertNotIn("most bytes", text)
+
+    def test_render_busiest_priority_per_port(self):
+        def counters(i):
+            return {"0": {"rx_bytes": 10 * i, "tx_bytes": None}, "2": {"rx_bytes": 30, "tx_bytes": 5, "rx_pause": 1}}
+        text = self.render_summary(self.sparse_ports(7, counters))
+        self.assertIn("  priority 0:              210 bytes ( 46.2%)  pause 0\n"
+                      "  priority 2:              245 bytes ( 53.8%)  pause 7\n"
+                      "  most bytes: priority 2 (busiest priority per port: p0: 3, p2: 4)\n"
+                      "      host-4/mlx5_0:1: most bytes in priority 0\n"
+                      "      host-5/mlx5_0:1: most bytes in priority 0\n"
+                      "      host-6/mlx5_0:1: most bytes in priority 0\n", text)
+
+    def test_render_without_counters_or_ports(self):
+        text = self.render_summary(self.sparse_ports(3, lambda i: None))
+        self.assertIn("Traffic: no per-priority counter deltas (collected with --interval 0, "
+                      "or ethtool unavailable).\n", text)
+        self.assertTrue(self.render_summary([]).startswith(
+            "0 hosts, 0 RDMA ports with a netdev\n\n"
+            "Consistency (majority / outliers):\n"
+            "  trust mode      : unknown  (0/0 ports, no data)\n"))
+
 
 if __name__ == "__main__":
     unittest.main()

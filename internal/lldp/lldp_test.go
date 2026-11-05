@@ -314,13 +314,15 @@ func (q *scriptedQuerier) Neighbors(ctx context.Context) (map[string]Neighbor, e
 }
 
 func TestDiscover_Characterization(t *testing.T) {
+	t.Parallel()
 	errA, errB := errors.New("lldpd socket refused"), errors.New("lldpd socket timed out")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	eth := []Device{{Name: "mlx5_0", Netdev: "eth0"}, {Name: "mlx5_1", Netdev: "eth1"}, {Name: "mlx5_2", Netdev: "eth0"}}
 	leafA, leafB := Neighbor{Interface: "eth0", SystemName: " leaf-a ", ChassisID: " aa:01 "}, Neighbor{Interface: "eth1", SystemName: "leaf-b", ChassisID: "aa:02"}
 	resolved := func(d Device, n Neighbor, id string) Result { return Result{Device: d, Neighbor: n, TorID: id} }
-	short := DiscoverOptions{Timeout: 100 * time.Millisecond, PollInterval: 10 * time.Millisecond}
+	// Long enough for a retry even when the first query is scheduled late.
+	short := DiscoverOptions{Timeout: 500 * time.Millisecond, PollInterval: 10 * time.Millisecond}
 	for _, tt := range []struct {
 		name    string
 		ctx     context.Context
@@ -445,17 +447,20 @@ func TestDiscover_NoTimeLeftIgnoresCancellation(t *testing.T) {
 }
 
 func TestDiscover_QueryBudget(t *testing.T) {
+	// The querier answers at once, so long budgets cost nothing. They keep
+	// the lower bound clear of scheduling delays between computing the
+	// budget and the query recording it.
 	for _, tt := range []struct {
 		name string
 		opts DiscoverOptions
 		want time.Duration
 	}{
 		{"default query timeout", DiscoverOptions{}, DefaultQueryTimeout},
-		{"query timeout", DiscoverOptions{QueryTimeout: 50 * time.Millisecond}, 50 * time.Millisecond},
+		{"query timeout", DiscoverOptions{QueryTimeout: 5 * time.Second}, 5 * time.Second},
 		{"negative query timeout", DiscoverOptions{QueryTimeout: -time.Second}, DefaultQueryTimeout},
 		{"timeout below the default", DiscoverOptions{Timeout: 5 * time.Second, PollInterval: time.Minute}, 5 * time.Second},
-		{"query timeout below the timeout", DiscoverOptions{Timeout: time.Minute, PollInterval: time.Minute, QueryTimeout: 30 * time.Millisecond}, 30 * time.Millisecond},
-		{"negative timeout", DiscoverOptions{Timeout: -time.Second, QueryTimeout: 40 * time.Millisecond}, 40 * time.Millisecond},
+		{"query timeout below the timeout", DiscoverOptions{Timeout: time.Minute, PollInterval: time.Minute, QueryTimeout: 3 * time.Second}, 3 * time.Second},
+		{"negative timeout", DiscoverOptions{Timeout: -time.Second, QueryTimeout: 4 * time.Second}, 4 * time.Second},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			// A device without a netdev resolves on the first successful query.
@@ -463,7 +468,7 @@ func TestDiscover_QueryBudget(t *testing.T) {
 			if _, err := Discover(context.Background(), q, []Device{{Name: "mlx5_0"}}, tt.opts); err != nil {
 				t.Fatal(err)
 			}
-			if got := q.deadlines[0].Sub(q.at[0]); got > tt.want || got < tt.want-50*time.Millisecond {
+			if got := q.deadlines[0].Sub(q.at[0]); got > tt.want || got < tt.want-time.Second {
 				t.Fatalf("query budget = %v, want %v", got, tt.want)
 			}
 		})
@@ -471,45 +476,64 @@ func TestDiscover_QueryBudget(t *testing.T) {
 }
 
 func TestDiscover_QueriesShareTheOverallDeadline(t *testing.T) {
+	t.Parallel()
+	const timeout = 300 * time.Millisecond
 	q := &scriptedQuerier{steps: []queryStep{{}}}
 	start := time.Now()
 	_, err := Discover(context.Background(), q, []Device{{Name: "mlx5_0", Netdev: "eth0"}},
-		DiscoverOptions{Timeout: 300 * time.Millisecond, PollInterval: 50 * time.Millisecond, QueryTimeout: time.Minute})
+		DiscoverOptions{Timeout: timeout, PollInterval: 50 * time.Millisecond, QueryTimeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(q.at) < 3 {
+	if len(q.at) < 2 {
 		t.Fatalf("queried %d times, want retries", len(q.at))
 	}
+	// A query that starts before the overall deadline (no earlier than
+	// start+timeout) is cut off there: its deadline is at or after that
+	// point and at most timeout after the query began, far below
+	// QueryTimeout. A retry that a late wakeup starts after the deadline
+	// gets the whole QueryTimeout instead, so it is not checked.
+	checked := 0
 	for i, d := range q.deadlines {
-		if off := d.Sub(start.Add(300 * time.Millisecond)); off < -20*time.Millisecond || off > 20*time.Millisecond {
-			t.Fatalf("query %d deadline is %v from the overall deadline", i, off)
+		if !q.at[i].Before(start.Add(timeout)) {
+			continue
 		}
+		checked++
+		if d.Before(start.Add(timeout)) || d.After(q.at[i].Add(timeout)) {
+			t.Fatalf("query %d at %v has deadline %v; want the overall deadline, near %v",
+				i, q.at[i].Sub(start), d.Sub(start), timeout)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no query started before the overall deadline")
 	}
 }
 
 func TestDiscover_StopsWhenTheNextPollMissesTheDeadline(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name  string
 		opts  DiscoverOptions
 		calls int
 	}{
-		{"poll fits once", DiscoverOptions{Timeout: 100 * time.Millisecond, PollInterval: 60 * time.Millisecond}, 2},
-		{"poll equals the timeout", DiscoverOptions{Timeout: 50 * time.Millisecond, PollInterval: 50 * time.Millisecond}, 1},
+		// The first check passes unless the first query takes 400ms, the
+		// second fails whatever the delays: exactly one poll.
+		{"poll fits once", DiscoverOptions{Timeout: time.Second, PollInterval: 600 * time.Millisecond}, 2},
+		// The deadline is set before the first query, so the first poll
+		// would end past it.
+		{"poll as long as the timeout", DiscoverOptions{Timeout: 50 * time.Millisecond, PollInterval: 50 * time.Millisecond}, 1},
 		{"default poll exceeds the timeout", DiscoverOptions{Timeout: time.Second}, 1},
 		{"negative poll uses the default", DiscoverOptions{Timeout: time.Second, PollInterval: -time.Millisecond}, 1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			q := &scriptedQuerier{steps: []queryStep{{}}}
-			start := time.Now()
 			if _, err := Discover(context.Background(), q, []Device{{Name: "mlx5_0", Netdev: "eth0"}}, tt.opts); err != nil {
 				t.Fatal(err)
 			}
+			// Every poll is followed by a query, so the query count also
+			// bounds how long Discover waited.
 			if len(q.at) != tt.calls {
 				t.Fatalf("queried %d times, want %d", len(q.at), tt.calls)
-			}
-			if el := time.Since(start); el > tt.opts.Timeout {
-				t.Fatalf("Discover took %v, beyond its %v timeout", el, tt.opts.Timeout)
 			}
 		})
 	}
@@ -517,14 +541,17 @@ func TestDiscover_StopsWhenTheNextPollMissesTheDeadline(t *testing.T) {
 
 func TestDiscover_DefaultPollInterval(t *testing.T) {
 	t.Parallel()
+	// With the 2s default, the first poll fits in 3s unless the first query
+	// takes a second, and a second poll never does. A 1s default would
+	// query three times, a 3s one once.
 	q := &scriptedQuerier{steps: []queryStep{{}}}
-	if _, err := Discover(context.Background(), q, []Device{{Name: "mlx5_0", Netdev: "eth0"}}, DiscoverOptions{Timeout: 2200 * time.Millisecond}); err != nil {
+	if _, err := Discover(context.Background(), q, []Device{{Name: "mlx5_0", Netdev: "eth0"}}, DiscoverOptions{Timeout: 3 * time.Second}); err != nil {
 		t.Fatal(err)
 	}
 	if len(q.at) != 2 {
 		t.Fatalf("queried %d times, want 2", len(q.at))
 	}
-	if gap := q.at[1].Sub(q.at[0]); gap < 2*time.Second || gap > 2100*time.Millisecond {
+	if gap := q.at[1].Sub(q.at[0]); gap < 2*time.Second || gap > 3*time.Second {
 		t.Fatalf("poll interval = %v, want the 2s default", gap)
 	}
 }

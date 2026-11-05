@@ -352,9 +352,22 @@ func TestServiceTracingSnapshotsExistingQP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	devices, err := servicetrace.UverbsDevices("")
+	all, err := servicetrace.UverbsDevices("")
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Snapshot only the soft-RoCE devices, as the agent snapshots only the
+	// devices it monitors: a runner can have other RDMA devices whose driver
+	// cannot dump QPs (Azure MANA answers EOPNOTSUPP), which would fail the
+	// whole snapshot.
+	devices := make(map[uint32]string)
+	for dev, name := range all {
+		if name == proberDeviceName || name == responderDeviceName {
+			devices[dev] = name
+		}
+	}
+	if len(devices) != 2 {
+		t.Fatalf("no uverbs nodes for %s and %s in %v", proberDeviceName, responderDeviceName, all)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

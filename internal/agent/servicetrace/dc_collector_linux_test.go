@@ -834,3 +834,94 @@ func TestUCXStreamsRejectUnsupportedLayout(t *testing.T) {
 		t.Fatal("accepted incorrect endpoint channel width")
 	}
 }
+
+func TestOpenDCCollectorRejectsInvalidOptions(t *testing.T) {
+	const required = "DC collector requires a PID, provider/debug ELF, device and port"
+	valid := DCOptions{PID: os.Getpid(), Library: "lib", DebugFile: "debug", Device: "mlx5_0", Port: 1}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*DCOptions)
+		want   string
+	}{
+		{"zero PID", func(o *DCOptions) { o.PID = 0 }, required},
+		{"negative PID", func(o *DCOptions) { o.PID = -1 }, required},
+		{"zero port", func(o *DCOptions) { o.Port = 0 }, required},
+		{"no library", func(o *DCOptions) { o.Library = "" }, required},
+		{"no debug file", func(o *DCOptions) { o.DebugFile = "" }, required},
+		{"no device", func(o *DCOptions) { o.Device = "" }, required},
+		{"device path", func(o *DCOptions) { o.Device = "class/mlx5_0" }, required},
+		{"device dot", func(o *DCOptions) { o.Device = "." }, required},
+		{"device dot-dot", func(o *DCOptions) { o.Device = ".." }, required},
+		{"streams without DevX", func(o *DCOptions) { o.UCXStreams = true }, "UCX streams require UCX DevX"},
+	} {
+		options := valid
+		tc.mutate(&options)
+		if c, err := OpenDCCollector(options); err == nil || err.Error() != tc.want {
+			if c != nil {
+				c.Close()
+			}
+			t.Fatalf("%s: got %v, want %q", tc.name, err, tc.want)
+		}
+	}
+}
+
+// Every case fails before the BPF objects are loaded, so this needs neither
+// BPF privileges nor RDMA hardware.
+func TestOpenDCCollectorPreflightErrors(t *testing.T) {
+	file := buildDCFixture(t)
+	other := buildDCFixture(t, "-DTEST_UCX_BAD_DCI") // valid provider, different build ID
+	child := exec.Command(file)
+	stdin, err := child.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { stdin.Close(); child.Process.Kill(); child.Wait() }()
+	if scan := bufio.NewScanner(stdout); !scan.Scan() || scan.Text() != "ready" {
+		t.Fatal("fixture not ready")
+	}
+	const unmapped = "selected provider inode is not executable in the target process"
+	const ucxPair = "UCX library and matching debug ELF must both be supplied"
+	base := DCOptions{PID: child.Process.Pid, Library: file, DebugFile: file, Device: "test-device", Port: 1}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*DCOptions)
+		want   string
+	}{
+		{"no such process", func(o *DCOptions) { o.PID = 1 << 30 }, "open target pidfd: no such process"},
+		{"missing library", func(o *DCOptions) { o.Library = "/nonexistent/libmlx5.so" }, "open /nonexistent/libmlx5.so: no such file or directory"},
+		{"invalid debug file", func(o *DCOptions) { o.DebugFile = "/dev/null" }, "open provider debug ELF: cannot read ELF identifier 'EOF' in record at byte 0x0"},
+		{"mismatching debug file", func(o *DCOptions) { o.DebugFile = other }, "provider and debug build IDs differ"},
+		{"provider not mapped", func(o *DCOptions) { o.PID = os.Getpid() }, unmapped},
+		{"UCX library only", func(o *DCOptions) { o.UCXLibrary = file }, ucxPair},
+		{"UCX debug file only", func(o *DCOptions) { o.UCXDebugFile = file }, ucxPair},
+		{"UCX DevX only", func(o *DCOptions) { o.UCXDevX = true }, ucxPair},
+		{"UCX AM only", func(o *DCOptions) { o.UCXAM = true }, ucxPair},
+		{"UCX RMA only", func(o *DCOptions) { o.UCXRMA = true }, ucxPair},
+		{"UCX atomic only", func(o *DCOptions) { o.UCXAtomic = true }, ucxPair},
+		{"UCX tag only", func(o *DCOptions) { o.UCXTag = true }, ucxPair},
+		{"missing UCX library", func(o *DCOptions) { o.UCXLibrary, o.UCXDebugFile = "/nonexistent/uct.so", file }, "open /nonexistent/uct.so: no such file or directory"},
+		{"mismatching UCX debug file", func(o *DCOptions) { o.UCXLibrary, o.UCXDebugFile = file, other }, "UCX and debug build IDs differ"},
+		{"unsupported UCX layout", func(o *DCOptions) { o.UCXLibrary, o.UCXDebugFile = other, other }, "UCX uct_dc_mlx5_ep.dci: field size does not match supported ABI"},
+		{"UCX streams layout", func(o *DCOptions) { o.UCXLibrary, o.UCXDebugFile, o.UCXDevX, o.UCXStreams = file, other, true, true }, "UCX and debug build IDs differ"},
+		{"UCX library not mapped", func(o *DCOptions) {
+			o.UCXLibrary = buildDCFixture(t)
+			o.UCXDebugFile = o.UCXLibrary
+		}, unmapped},
+	} {
+		options := base
+		tc.mutate(&options)
+		if c, err := OpenDCCollector(options); err == nil || err.Error() != tc.want {
+			if c != nil {
+				c.Close()
+			}
+			t.Fatalf("%s: got %v, want %q", tc.name, err, tc.want)
+		}
+	}
+}

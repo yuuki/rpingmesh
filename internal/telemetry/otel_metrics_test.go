@@ -555,7 +555,7 @@ func TestStartResultConsumer_PerResultSourceTor(t *testing.T) {
 // error path with an already-cancelled context, which fails fast without
 // attempting a real export.
 func TestNewMetricsCollector_Construct(t *testing.T) {
-	mc, err := NewMetricsCollector(context.Background(), "127.0.0.1:1", WithServiceName("rpingmesh-test"))
+	mc, err := NewMetricsCollector(context.Background(), config.OTLPExporterConfig{Endpoint: "127.0.0.1:1"}, WithServiceName("rpingmesh-test"))
 	if err != nil {
 		t.Fatalf("NewMetricsCollector: %v", err)
 	}

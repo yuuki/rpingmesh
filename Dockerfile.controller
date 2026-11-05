@@ -33,10 +33,13 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux go build -o /app/bin/rpingmesh-controller ./cmd/controller/
 
-# Runtime image — minimal footprint.
+# Runtime image — minimal footprint. ca-certificates provides the system
+# roots that verify the OpenTelemetry Collector's certificate when
+# otel_collector_tls_enabled is true and otel_collector_tls_ca_file is empty.
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
         netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 

@@ -121,6 +121,14 @@ type ControllerConfig struct {
 	// metrics to (service.name=rpingmesh-analyzer). Only used when the analyzer
 	// is enabled; export is best-effort.
 	OtelCollectorAddr string `mapstructure:"otel_collector_addr"`
+	// OtelCollectorTLSEnabled, OtelCollectorTLSCAFile,
+	// OtelCollectorTLSServerName and OtelCollectorBearerTokenFile secure the
+	// analyzer's OTLP export; see OTLPExporterConfig. They are independent of
+	// the tls_* keys of the gRPC server.
+	OtelCollectorTLSEnabled      bool   `mapstructure:"otel_collector_tls_enabled"`
+	OtelCollectorTLSCAFile       string `mapstructure:"otel_collector_tls_ca_file"`
+	OtelCollectorTLSServerName   string `mapstructure:"otel_collector_tls_server_name"`
+	OtelCollectorBearerTokenFile string `mapstructure:"otel_collector_bearer_token_file"`
 	// TLS settings for the gRPC server. See internal/config/tls.go for mode
 	// semantics. TLSMode defaults to TLSModeDisabled, preserving plaintext
 	// gRPC for backward compatibility. These keys are symmetric with
@@ -173,6 +181,10 @@ var controllerKeys = []keySpec{
 	{key: "analyzer_window_retention", def: DefaultAnalyzerWindowRetention, help: "Number of recent windows the analyzer retains in memory"},
 	{key: "analyzer_metrics_cardinality_limit", def: DefaultAnalyzerMetricsCardinalityLimit, help: "Maximum attribute sets per analyzer metric instrument (0 = OTel SDK default 2000, otherwise >= 2000)"},
 	{key: "otel_collector_addr", def: DefaultControllerOtelCollectorAddr, help: "OTLP gRPC collector endpoint for analyzer metrics"},
+	{key: "otel_collector_tls_enabled", def: false, help: "Export analyzer metrics over TLS, verifying the collector's certificate and host name"},
+	{key: "otel_collector_tls_ca_file", def: "", help: "PEM CA bundle that verifies the collector's certificate (empty = system roots; requires otel-collector-tls-enabled)"},
+	{key: "otel_collector_tls_server_name", def: "", help: "Name verified against the collector's certificate (empty = host of otel-collector-addr; requires otel-collector-tls-enabled)"},
+	{key: "otel_collector_bearer_token_file", def: "", help: "File holding the bearer token sent to the collector (requires otel-collector-tls-enabled)"},
 	{key: "tls_mode", def: TLSModeDisabled, help: "gRPC transport security mode (disabled|tls|mtls)"},
 	{key: "tls_cert_file", def: "", help: "Server certificate file (required when tls-mode is tls or mtls)"},
 	{key: "tls_key_file", def: "", help: "Server private key file (required when tls-mode is tls or mtls)"},
@@ -193,6 +205,11 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		return nil, err
 	}
 	deprecations := applyRenamedKeys(v, flags, controllerRenamedKeys)
+	// Parsed strictly: a typo must not silently mean plaintext.
+	otlpTLSEnabled, err := strictBool(v, "otel_collector_tls_enabled")
+	if err != nil {
+		return nil, err
+	}
 
 	config := &ControllerConfig{
 		ListenAddr:                v.GetString("listen_addr"),
@@ -216,6 +233,10 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		AnalyzerWindowRetention:           v.GetInt("analyzer_window_retention"),
 		AnalyzerMetricsCardinalityLimit:   v.GetInt("analyzer_metrics_cardinality_limit"),
 		OtelCollectorAddr:                 v.GetString("otel_collector_addr"),
+		OtelCollectorTLSEnabled:           otlpTLSEnabled,
+		OtelCollectorTLSCAFile:            v.GetString("otel_collector_tls_ca_file"),
+		OtelCollectorTLSServerName:        v.GetString("otel_collector_tls_server_name"),
+		OtelCollectorBearerTokenFile:      v.GetString("otel_collector_bearer_token_file"),
 		TLSMode:                           v.GetString("tls_mode"),
 		TLSCertFile:                       v.GetString("tls_cert_file"),
 		TLSKeyFile:                        v.GetString("tls_key_file"),
@@ -260,13 +281,25 @@ func (c *ControllerConfig) Validate() error {
 	if err := c.validateAnalyzer(); err != nil {
 		return err
 	}
-	if err := validateOTLPEndpoint(c.OtelCollectorAddr); err != nil {
+	if err := c.OTLPExporter().Validate(); err != nil {
 		return err
 	}
 	// The controller is the gRPC server of the controller-agent connection:
 	// fail fast if the certificate files required by tls_mode are missing,
 	// rather than at the first client handshake.
 	return validateTLSFiles(tlsRoleServer, c.TLSMode, c.TLSCertFile, c.TLSKeyFile, c.TLSCAFile)
+}
+
+// OTLPExporter returns the connection settings of the analyzer's OTLP metric
+// exporter.
+func (c *ControllerConfig) OTLPExporter() OTLPExporterConfig {
+	return OTLPExporterConfig{
+		Endpoint:        c.OtelCollectorAddr,
+		TLSEnabled:      c.OtelCollectorTLSEnabled,
+		CAFile:          c.OtelCollectorTLSCAFile,
+		ServerName:      c.OtelCollectorTLSServerName,
+		BearerTokenFile: c.OtelCollectorBearerTokenFile,
+	}
 }
 
 // validateEndpoints checks listen_addr and the database settings.

@@ -23,9 +23,9 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/internal/buildinfo"
+	"github.com/yuuki/rpingmesh/internal/config"
 	"github.com/yuuki/rpingmesh/internal/probe"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -429,13 +429,14 @@ func buildResource(serviceName string) (*resource.Resource, error) {
 }
 
 // NewMetricsCollector creates a MetricsCollector that exports OTLP metrics
-// over insecure gRPC to collectorAddr (e.g., "localhost:4317"), flushing
-// every periodicReaderInterval, and registers every instrument on it.
+// over gRPC to the collector described by exporterCfg (plaintext, or TLS with
+// an optional bearer token), flushing every periodicReaderInterval, and
+// registers every instrument on it.
 //
 // By default the OTel resource reports service.name="rpingmesh-agent"; pass
 // WithServiceName to override it (e.g. for non-agent processes reusing this
 // collector).
-func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Option) (*MetricsCollector, error) {
+func NewMetricsCollector(ctx context.Context, exporterCfg config.OTLPExporterConfig, opts ...Option) (*MetricsCollector, error) {
 	options := defaultCollectorOptions()
 	for _, opt := range opts {
 		opt(&options)
@@ -445,7 +446,7 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 	if options.cardinalityLimit > 0 {
 		providerOpts = append(providerOpts, sdkmetric.WithCardinalityLimit(options.cardinalityLimit))
 	}
-	provider, err := NewMeterProvider(ctx, collectorAddr, options.serviceName, providerOpts...)
+	provider, err := NewMeterProvider(ctx, exporterCfg, options.serviceName, providerOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -456,7 +457,9 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 	}
 
 	mc.logger.Info().
-		Str("collector_addr", collectorAddr).
+		Str("collector_addr", exporterCfg.Endpoint).
+		Bool("collector_tls", exporterCfg.TLSEnabled).
+		Bool("collector_bearer_auth", exporterCfg.BearerTokenFile != "").
 		Dur("flush_interval", periodicReaderInterval).
 		Bool("target_rnic_labels", options.targetRnicLabels.Enabled).
 		Bool("target_rnic_labels_histograms", options.targetRnicLabels.Histograms).
@@ -476,12 +479,12 @@ func NewMetricsCollector(ctx context.Context, collectorAddr string, opts ...Opti
 // the controller-side analyzer (service.name="rpingmesh-analyzer"), which
 // registers its own instruments on the returned provider. The caller owns the
 // provider's lifecycle (Shutdown).
-func NewMeterProvider(ctx context.Context, collectorAddr, serviceName string, opts ...sdkmetric.Option) (*sdkmetric.MeterProvider, error) {
-	exporter, err := otlpmetricgrpc.New(
-		ctx,
-		otlpmetricgrpc.WithEndpoint(collectorAddr),
-		otlpmetricgrpc.WithInsecure(),
-	)
+//
+// exporterCfg selects plaintext or TLS and the optional bearer token; it
+// fails when the TLS or token settings are invalid (see
+// config.OTLPExporterConfig.Credentials), and never falls back to plaintext.
+func NewMeterProvider(ctx context.Context, exporterCfg config.OTLPExporterConfig, serviceName string, opts ...sdkmetric.Option) (*sdkmetric.MeterProvider, error) {
+	exporter, err := newOTLPExporter(ctx, exporterCfg)
 	if err != nil {
 		return nil, err
 	}

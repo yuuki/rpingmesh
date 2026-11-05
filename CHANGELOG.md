@@ -4,6 +4,40 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- TLS and bearer-token authentication for the OTLP metric export of the agent
+  and of the controller's analyzer (#122), with four keys shared by both
+  binaries: `otel_collector_tls_enabled`, `otel_collector_tls_ca_file`
+  (empty uses the system roots), `otel_collector_tls_server_name` (empty uses
+  the host in `otel_collector_addr`) and `otel_collector_bearer_token_file`.
+  The defaults keep plaintext gRPC without authentication. With TLS the
+  collector's certificate chain and host name are verified and a failed
+  handshake never falls back to plaintext. The token is read only from a
+  file given by an absolute path, such as a systemd credential, never
+  appears in logs or errors, and is attached as per-RPC credentials that
+  gRPC refuses to send without transport security. A non-boolean
+  `otel_collector_tls_enabled`, a token, CA file or server name without TLS,
+  and an unreadable or malformed CA or token file fail startup. The CA
+  bundle and the token are read once at startup, so changing them requires
+  a restart. The new `30-otel-collector-token.conf` systemd drop-ins
+  (shipped as examples) pass the token as a credential, and README "OTLP
+  export security" describes the staged migration: senders first, the
+  Collector's authentication requirement last. These keys are independent of
+  the controller–agent `tls_*` keys.
+- The controller container image (`Dockerfile.controller`) installs
+  `ca-certificates`, so a TLS export without `otel_collector_tls_ca_file`
+  can verify the collector against the system roots.
+
+### Changed
+
+- Both binaries refuse to start when `OTEL_EXPORTER_OTLP_HEADERS` or
+  `OTEL_EXPORTER_OTLP_METRICS_HEADERS` sets an `authorization` header while
+  `otel_collector_tls_enabled` is false (the header would travel in
+  plaintext, which earlier releases did), or together with
+  `otel_collector_bearer_token_file`. Other headers in these variables are
+  unaffected. See README "Upgrading".
+
 ## [0.9.0] - 2026-11-04
 
 ### Added

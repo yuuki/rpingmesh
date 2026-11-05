@@ -160,6 +160,8 @@ class CollectTest(unittest.TestCase):
                 out = out(cmd, calls[key])
             if out is None:
                 return {"cmd": key, "status": "unavailable", "stdout": None}
+            if isinstance(out, dict):  # a whole probe record, e.g. a failure
+                return {"cmd": key, **out}
             return {"cmd": key, "status": "ok", "stdout": out}
 
         with mock.patch.object(qos.rnic, "SYS_IB", self.sys_ib), \
@@ -209,12 +211,164 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(p["counters"]["status"], "unavailable")
         json.dumps(facts)  # serializable
 
+    def add_port(self, dev, port, ndev=None):
+        """A port directory with one RoCE v2 GID; ndev names the GID's netdev."""
+        base = os.path.join(self.sys_ib, dev, "ports", port)
+        for sub in ("gids", "gid_attrs/types", "gid_attrs/ndevs"):
+            os.makedirs(os.path.join(base, sub), exist_ok=True)
+        self.write(base, "state", "4: ACTIVE")
+        self.write(base, "link_layer", "Ethernet")
+        self.write(base, "gids/1", "0000:0000:0000:0000:0000:ffff:0a00:0101")
+        self.write(base, "gid_attrs/types/1", "RoCE v2")
+        if ndev:
+            self.write(base, "gid_attrs/ndevs/0", ndev)
+
+    def collect_tree(self, interval, ethtool):
+        """collect() over an edge-case tree with netdev_qos stubbed out."""
+        self.add_port("mlx5_0", "2", "eth0")     # shares eth0 with port 1
+        self.add_port("mlx5_0", "10")            # no netdev; sorts after 2
+        os.makedirs(os.path.join(self.sys_ib, "mlx5_2", "ports", "x"))  # unsortable ports
+        os.makedirs(os.path.join(self.sys_ib, "mlx5_3"))                 # no ports directory
+        self.add_port("mlx5_4", "1")
+        for nd in ("eth4b", "eth4a"):            # netdev from the PCI function's net/
+            os.makedirs(os.path.join(self.sys_ib, "mlx5_4", "device", "net", nd))
+        self.write(self.sys_ib, "README", "")    # a file, not a device
+        qos_calls = []
+
+        def fake_qos(nd):
+            qos_calls.append(nd)
+            return {"netdev": nd}
+
+        gmtime = qos.time.struct_time((2026, 2, 3, 4, 5, 6, 1, 34, 0))
+        with mock.patch.object(qos, "netdev_qos", fake_qos), \
+                mock.patch.object(qos.socket, "gethostname", lambda: "node-1"), \
+                mock.patch.object(qos.time, "gmtime", lambda: gmtime), \
+                mock.patch.object(qos.shutil, "which", lambda t: "/usr/sbin/dcb" if t == "dcb" else None):
+            facts = self.run_collect({"ethtool": ethtool}, interval)
+        return facts, qos_calls
+
+    @staticmethod
+    def ethtool_lines(*lines):
+        return "NIC statistics:\n" + "".join(f"     {line}\n" for line in lines)
+
+    def expected_ports(self, counters):
+        gid = {"index": 1, "gid": "0000:0000:0000:0000:0000:ffff:0a00:0101", "type": "RoCE v2", "ndev": None}
+        tc_absent = {"status": "absent", "raw": None, "tclass": None}
+
+        def entry(port, nd, gids, tc=tc_absent):
+            return {"port": port, "state": "4: ACTIVE", "link_layer": "Ethernet", "netdev": nd, "rocev2_gids": gids,
+                    "tc_override": tc, "qos": {"netdev": nd} if nd else None, "counters": counters(nd)}
+
+        v2 = [{"index": 3, "gid": "0000:0000:0000:0000:0000:ffff:0a00:0001", "type": "RoCE v2", "ndev": "eth0"}]
+        return [
+            {"device": "mlx5_0", "ports": [
+                entry(1, "eth0", v2, {"status": "set", "raw": "Global tclass=106", "tclass": 106}),
+                entry(2, "eth0", [gid]),
+                entry(10, None, [gid]),
+            ]},
+            {"device": "mlx5_1", "ports": [entry(1, "eth1", [dict(v2[0], ndev="eth1")])]},
+            {"device": "mlx5_4", "ports": [entry(1, "eth4a", [gid])]},
+        ]
+
+    def test_collect_tree_with_counter_failures(self):
+        before = self.ethtool_lines("rx_prio3_bytes: 100", "tx_prio3_bytes: 50", "rx_prio3_pause: 7")
+        after = self.ethtool_lines("rx_prio3_bytes: 160", "tx_prio3_bytes: 40", "rx_prio5_bytes: 9")
+
+        def ethtool(cmd, n):
+            nd = cmd[2]
+            if nd == "eth0":
+                return before if n == 1 else after
+            if nd == "eth1":
+                return self.ethtool_lines("rx_bytes: 1")  # no per-priority counters
+            return before if n == 1 else {"status": "failed", "stdout": "", "stderr": "boom"}
+
+        facts, qos_calls = self.collect_tree(5, ethtool)
+        lines = {"before": ["rx_prio3_bytes: 100", "tx_prio3_bytes: 50", "rx_prio3_pause: 7"],
+                 "after": ["rx_prio3_bytes: 160", "tx_prio3_bytes: 40", "rx_prio5_bytes: 9"]}
+        counters = {
+            "eth0": {"interval_s": 5, "prio": {"3": {"rx_bytes": 60, "tx_bytes": None}}, "status": "ok", "raw": lines},
+            "eth1": {"status": "no_prio_counters", "interval_s": 5, "prio": None, "raw": {"before": [], "after": []}},
+            "eth4a": {"status": "failed", "interval_s": 5, "prio": None, "raw": {"before": lines["before"], "after": []}},
+            None: None,
+        }
+        self.assertEqual(facts, {
+            "hostname": "node-1",
+            "collected_at": "2026-02-03T04:05:06Z",
+            "tools": {"mlnx_qos": False, "dcb": True, "ethtool": False},
+            "devices": self.expected_ports(counters.get),
+        })
+        self.assertEqual(qos_calls, ["eth0", "eth1", "eth4a"])
+
+    def test_collect_tree_without_sampling(self):
+        def ethtool(cmd, n):
+            raise AssertionError("sampled counters with --interval 0")
+
+        facts, qos_calls = self.collect_tree(0, ethtool)
+        self.assertEqual(facts["devices"], self.expected_ports(lambda nd: {"status": "skipped"}))
+        self.assertEqual(qos_calls, ["eth0", "eth1", "eth4a"])
+
     def test_main_without_rdma(self):
         out = io.StringIO()
         with mock.patch.object(qos.rnic, "SYS_IB", os.path.join(self.sys_ib, "missing")), \
                 contextlib.redirect_stdout(out):
             qos.main(["--interval", "0"])
         self.assertEqual(json.loads(out.getvalue())["devices"], [])
+
+
+class LoadPortsTest(unittest.TestCase):
+    def write_facts(self, *docs):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        paths = []
+        for i, doc in enumerate(docs):
+            paths.append(os.path.join(d.name, f"qos-{i}.json"))
+            with open(paths[-1], "w") as f:
+                f.write(doc if isinstance(doc, str) else json.dumps(doc))
+        return paths
+
+    def test_records_and_defaults(self):
+        full = {"port": 1, "netdev": "eth0",
+                "qos": {"trust": "dscp", "pfc_enabled": [5, 3], "dscp_prio": {"26": 3, "0": "0"}},
+                "tc_override": {"tclass": 106, "status": "set"},
+                "counters": {"status": "ok", "prio": {"3": {"rx_bytes": 1}}, "interval_s": 5},
+                "rocev2_gids": [{"index": 7}, {"index": 3}]}
+        paths = self.write_facts(
+            {"hostname": "node-1.example.test", "devices": [
+                {"device": "mlx5_0", "ports": [
+                    full,
+                    {"port": 2, "netdev": None, "qos": {"trust": "pcp"}},
+                    {"port": 3, "netdev": ""},
+                    {"port": 4, "netdev": "eth4", "qos": None, "tc_override": None, "rocev2_gids": None,
+                     "counters": {"status": "unavailable", "prio": {"0": {}}, "interval_s": 5}},
+                    {"port": 5, "netdev": "eth5", "qos": {"pfc_enabled": [], "dscp_prio": {}}},
+                ]},
+                {"device": "mlx5_1", "ports": None},
+                {"device": "mlx5_2"},
+            ]},
+            {"devices": None},
+            {"hostname": "", "devices": [{"ports": [{"netdev": "eth9"}]}]},
+            {},
+        )
+        empty = {"trust": None, "pfc": None, "dscp_prio": None, "override": None, "override_status": None,
+                 "counters": None, "interval_s": None, "gid_indices": ()}
+        self.assertEqual(summ.load_ports(paths), [
+            {"id": "node-1/mlx5_0:1", "host": "node-1", "netdev": "eth0", "trust": "dscp", "pfc": (3, 5),
+             "dscp_prio": {26: 3, 0: 0}, "override": 106, "override_status": "set",
+             "counters": {"3": {"rx_bytes": 1}}, "interval_s": 5, "gid_indices": (3, 7)},
+            {**empty, "id": "node-1/mlx5_0:4", "host": "node-1", "netdev": "eth4", "interval_s": 5},
+            {**empty, "id": "node-1/mlx5_0:5", "host": "node-1", "netdev": "eth5", "pfc": (), "dscp_prio": {}},
+            {**empty, "id": "?/None:None", "host": "?", "netdev": "eth9"},
+        ])
+
+    def test_malformed_input_raises(self):
+        for doc, exc in (("not json", ValueError), ("[]", AttributeError),
+                         ({"devices": [{"ports": [{"netdev": "eth0", "rocev2_gids": [{}]}]}]}, KeyError),
+                         ({"devices": [{"ports": [{"netdev": "eth0", "qos": {"dscp_prio": {"x": 1}}}]}]}, ValueError),
+                         ({"devices": [{"ports": [{"netdev": "eth0", "qos": {"pfc_enabled": 3}}]}]}, TypeError)):
+            with self.subTest(doc=doc), self.assertRaises(exc):
+                summ.load_ports(self.write_facts(doc))
+        with self.assertRaises(FileNotFoundError):
+            summ.load_ports([os.path.join(TESTDATA, "missing.json")])
 
 
 class SummarizeTest(unittest.TestCase):
@@ -368,6 +522,98 @@ Traffic over 5 s on 8 ports (rx+tx bytes, pause frames):
                       "      host-4/mlx5_0:1: most bytes in priority 0\n"
                       "      host-5/mlx5_0:1: most bytes in priority 0\n"
                       "      host-6/mlx5_0:1: most bytes in priority 0\n", text)
+
+    @staticmethod
+    def port(i, **fields):
+        p = {"id": f"h{i % 3}/mlx5_{i}:1", "host": f"h{i % 3}", "netdev": "eth0", "trust": "dscp", "pfc": (3, 4),
+             "dscp_prio": {1: 0, 24: 3, 26: 3, 63: 7}, "override": None, "override_status": None,
+             "counters": None, "interval_s": None, "gid_indices": (3,)}
+        p.update(fields)
+        return p
+
+    def test_summary_candidates_and_tallies(self):
+        ports = [self.port(0, override=106), self.port(1, override=104, trust="pcp"), self.port(2, override=106),
+                 self.port(3, override=7, pfc=(3,), gid_indices=()), self.port(4, override=255, dscp_prio=None),
+                 self.port(5, trust=None, gid_indices=(1, 3), dscp_prio={63: 7, 26: 3, 24: 3, 1: 0}),
+                 self.port(6, override=200)]
+        dmap = ((1, 0), (24, 3), (26, 3), (63, 7))
+        s = summ.summarize(ports)
+        self.assertEqual(s.pop("traffic"), {"ports_with_counters": 0, "interval_s": [], "by_priority": {},
+                                            "total_bytes": 0, "top_priority": None, "top_priority_per_port": {},
+                                            "ports_busiest_elsewhere": []})
+        self.assertEqual(s, {
+            "hosts": 3, "ports": 7,
+            "trust": {"majority": "dscp", "counts": {"dscp": 5, "pcp": 1},
+                      "outliers": [("h1/mlx5_1:1", "pcp")], "unknown": ["h2/mlx5_5:1"]},
+            "pfc_enabled": {"majority": (3, 4), "counts": {(3, 4): 6, (3,): 1},
+                            "outliers": [("h0/mlx5_3:1", (3,))], "unknown": []},
+            "dscp_map": {"majority": dmap, "counts": {dmap: 6}, "outliers": [], "unknown": ["h1/mlx5_4:1"]},
+            "override": {"majority": 106, "counts": {106: 2, 104: 1, 7: 1, 255: 1, None: 1, 200: 1},
+                         "outliers": [("h1/mlx5_1:1", 104), ("h0/mlx5_3:1", 7), ("h1/mlx5_4:1", 255), ("h2/mlx5_5:1", None),
+                                      ("h0/mlx5_6:1", 200)],
+                         "unknown": []},
+            "rocev2_gid_indices": {"majority": (3,), "counts": {(3,): 5, (1, 3): 1},
+                                   "outliers": [("h2/mlx5_5:1", (1, 3))], "unknown": ["h0/mlx5_3:1"]},
+            "lossless_priorities": [3, 4],
+            "lossless_dscps": {3: [24, 26], 4: []},
+            "candidates": [
+                {"traffic_class": 106, "dscp": 26, "ecn": "ECT(0)", "priority": 3, "pfc_enabled": True,
+                 "source": "NIC override on 2 port(s)"},
+                {"traffic_class": 104, "dscp": 26, "ecn": "Not-ECT", "priority": 3, "pfc_enabled": True,
+                 "source": "NIC override on 1 port(s)"},
+                {"traffic_class": 7, "dscp": 1, "ecn": "CE", "priority": 0, "pfc_enabled": False,
+                 "source": "NIC override on 1 port(s)"},
+                {"traffic_class": 255, "dscp": 63, "ecn": "CE", "priority": 7, "pfc_enabled": False,
+                 "source": "NIC override on 1 port(s)"},
+                {"traffic_class": 200, "dscp": 50, "ecn": "Not-ECT", "priority": None, "pfc_enabled": None,
+                 "source": "NIC override on 1 port(s)"},
+                {"traffic_class": 96, "dscp": 24, "ecn": "Not-ECT", "priority": 3, "pfc_enabled": True,
+                 "source": "DSCP << 2"},
+            ],
+            "service_level": {"candidates": [0], "note": "trust dscp: SL does not select the queue"},
+        })
+
+    def test_summary_service_level_by_trust(self):
+        for trust, sl in (("pcp", {"candidates": [3, 4], "note": "trust pcp: SL maps to the PCP only for VLAN-tagged "
+                                   "RoCE; DSCP (traffic_class) does not select the queue"}),
+                          ("dscp", {"candidates": [0], "note": "trust dscp: SL does not select the queue"}),
+                          ("both", {"candidates": [], "note": "trust mode unknown"}),
+                          (None, {"candidates": [], "note": "trust mode unknown"})):
+            with self.subTest(trust=trust):
+                s = summ.summarize([self.port(0, trust=trust)])
+                self.assertEqual(s["service_level"], sl)
+        s = summ.summarize([self.port(0, pfc=None, dscp_prio=None)])
+        self.assertEqual((s["lossless_priorities"], s["lossless_dscps"], s["candidates"]), ([], {}, []))
+
+    def test_summary_traffic(self):
+        ports = [
+            # A tie keeps the first priority of the port.
+            self.port(0, interval_s=5, counters={"3": {"rx_bytes": 5, "tx_bytes": None, "tx_pause": 2},
+                                                 "0": {"rx_bytes": 5}}),
+            self.port(1, interval_s=None, counters={"0": {"rx_bytes": 0, "tx_bytes": 0, "rx_pause": 4}}),
+            self.port(2, counters={}),  # an empty sample is not a port with counters
+            self.port(3, interval_s=2.5, counters={"0": {"tx_bytes": 9}, "5": {"rx_bytes": 1, "rx_pause": None}}),
+            self.port(4, interval_s=5, counters={"5": {"rx_bytes": 10}, "3": {"rx_bytes": 10}}),
+        ]
+        self.assertEqual(summ.summarize(ports)["traffic"], {
+            "ports_with_counters": 4,
+            "interval_s": [2.5, 5],
+            "by_priority": {0: {"bytes": 14, "pause": 4}, 3: {"bytes": 15, "pause": 2}, 5: {"bytes": 11, "pause": 0}},
+            "total_bytes": 40,
+            "top_priority": 3,
+            "top_priority_per_port": {3: 1, 0: 1, 5: 1},
+            "ports_busiest_elsewhere": [{"port": "h0/mlx5_3:1", "priority": 0}, {"port": "h1/mlx5_4:1", "priority": 5}],
+        })
+        # Equal totals: the priority seen first carries the most bytes.
+        tie = summ.summarize([self.port(0, counters={"5": {"rx_bytes": 3}}), self.port(1, counters={"2": {"tx_bytes": 3}})])
+        self.assertEqual((tie["traffic"]["top_priority"], tie["traffic"]["ports_busiest_elsewhere"]),
+                         (5, [{"port": "h1/mlx5_1:1", "priority": 2}]))
+        # Pause frames without bytes: no priority carries the most bytes.
+        idle = summ.summarize([self.port(0, counters={"4": {"rx_pause": 3, "rx_bytes": 0}})])
+        self.assertEqual(idle["traffic"], {"ports_with_counters": 1, "interval_s": [],
+                                           "by_priority": {4: {"bytes": 0, "pause": 3}}, "total_bytes": 0,
+                                           "top_priority": None, "top_priority_per_port": {},
+                                           "ports_busiest_elsewhere": []})
 
     def test_render_without_counters_or_ports(self):
         text = self.render_summary(self.sparse_ports(3, lambda i: None))

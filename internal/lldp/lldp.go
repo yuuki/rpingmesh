@@ -236,54 +236,85 @@ func Discover(ctx context.Context, q Querier, devices []Device, opts DiscoverOpt
 	}
 	deadline := time.Now().Add(opts.Timeout)
 
-	var lastErr error
-	succeeded := false
+	d := discovery{results: results, field: opts.Field}
 	for {
-		// Bound each query by queryTimeout and by the overall deadline. With
-		// no time left (Timeout 0), the single query gets queryTimeout.
-		budget := queryTimeout
-		if remaining := time.Until(deadline); remaining > 0 && remaining < budget {
-			budget = remaining
-		}
-		qctx, cancel := context.WithTimeout(ctx, budget)
-		neighbors, err := q.Neighbors(qctx)
-		cancel()
-		if err != nil {
-			lastErr = err
-		} else {
-			succeeded = true
-			pending := 0
-			for i := range results {
-				// A device without a netdev can never resolve; do not wait for it.
-				if results[i].TorID != "" || results[i].Device.Netdev == "" {
-					continue
-				}
-				if n, ok := neighbors[results[i].Device.Netdev]; ok {
-					results[i].Neighbor = n
-					results[i].TorID = n.TorID(opts.Field)
-				}
-				if results[i].TorID == "" {
-					pending++
-				}
-			}
-			if pending == 0 {
-				return results, nil
-			}
+		neighbors, err := queryNeighbors(ctx, q, queryBudget(queryTimeout, deadline))
+		if d.observe(neighbors, err) {
+			return results, nil
 		}
 		if !time.Now().Add(poll).Before(deadline) {
-			break
+			return results, d.failure(d.lastErr)
 		}
 		select {
 		case <-ctx.Done():
-			if !succeeded {
-				return results, ctx.Err()
-			}
-			return results, nil
+			return results, d.failure(ctx.Err())
 		case <-time.After(poll):
 		}
 	}
-	if !succeeded {
-		return results, lastErr
+}
+
+// queryBudget bounds a query by queryTimeout and by the overall deadline.
+// With no time left (Timeout 0), the single query gets queryTimeout.
+func queryBudget(queryTimeout time.Duration, deadline time.Time) time.Duration {
+	if remaining := time.Until(deadline); remaining > 0 && remaining < queryTimeout {
+		return remaining
 	}
-	return results, nil
+	return queryTimeout
+}
+
+// queryNeighbors runs one query, cut off after budget.
+func queryNeighbors(ctx context.Context, q Querier, budget time.Duration) (map[string]Neighbor, error) {
+	qctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	return q.Neighbors(qctx)
+}
+
+// discovery is the state Discover carries between queries.
+type discovery struct {
+	results   []Result
+	field     string
+	succeeded bool
+	lastErr   error
+}
+
+// observe records one query's outcome and reports whether every device that
+// can resolve has a ToR ID.
+func (d *discovery) observe(neighbors map[string]Neighbor, err error) bool {
+	if err != nil {
+		d.lastErr = err
+		return false
+	}
+	d.succeeded = true
+	return d.resolve(neighbors) == 0
+}
+
+// resolve looks up the neighbor of every unresolved device and returns how
+// many devices still wait for a ToR ID. A device keeps the ToR ID and
+// neighbor it resolved with.
+func (d *discovery) resolve(neighbors map[string]Neighbor) int {
+	pending := 0
+	for i := range d.results {
+		r := &d.results[i]
+		// A device without a netdev can never resolve; do not wait for it.
+		if r.TorID != "" || r.Device.Netdev == "" {
+			continue
+		}
+		if n, ok := neighbors[r.Device.Netdev]; ok {
+			r.Neighbor = n
+			r.TorID = n.TorID(d.field)
+		}
+		if r.TorID == "" {
+			pending++
+		}
+	}
+	return pending
+}
+
+// failure is Discover's error once it stops for reason: none after any
+// successful query.
+func (d *discovery) failure(reason error) error {
+	if d.succeeded {
+		return nil
+	}
+	return reason
 }

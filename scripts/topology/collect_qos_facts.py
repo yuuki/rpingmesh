@@ -254,55 +254,16 @@ def sample_counters(netdevs):
 
 
 def collect(interval):
-    try:
-        devices = sorted(os.listdir(rnic.SYS_IB))
-    except OSError:
-        devices = []
-    ports = []  # (dev, port_id, netdev)
-    for dev in devices:
-        try:
-            port_ids = sorted(os.listdir(os.path.join(rnic.SYS_IB, dev, "ports")), key=int)
-        except (OSError, ValueError):
-            port_ids = []
-        for p in port_ids:
-            ports.append((dev, p, rnic.port_netdev(dev, p)))
-
+    ports = rdma_ports()
     netdevs = sorted({nd for _, _, nd in ports if nd})
     qos = {nd: netdev_qos(nd) for nd in netdevs}
     counters = {}
     if interval > 0 and netdevs:
-        first = sample_counters(netdevs)
-        time.sleep(interval)
-        second = sample_counters(netdevs)
-        for nd in netdevs:
-            a, b = first[nd], second[nd]
-            if a["counters"] and b["counters"]:
-                c = counter_deltas(a["counters"], b["counters"], interval)
-                c["status"] = "ok"
-            else:
-                c = {"status": b["status"] if b["status"] != "ok" else "no_prio_counters",
-                     "interval_s": interval, "prio": None}
-            c["raw"] = {"before": a["lines"], "after": b["lines"]}
-            counters[nd] = c
+        counters = counter_samples(netdevs, interval)
 
     out_devs = {}
     for dev, p, nd in ports:
-        base = os.path.join(rnic.SYS_IB, dev, "ports", p)
-        gids = [g for g in rnic.gid_table(dev, p)
-                if (g.get("type") or "").lower().startswith("roce v2")]
-        entry = {
-            "port": int(p),
-            "state": rnic.read(os.path.join(base, "state")),
-            "link_layer": rnic.read(os.path.join(base, "link_layer")),
-            "netdev": nd,
-            "rocev2_gids": gids,
-            "tc_override": tc_override(dev, p),
-            "qos": qos.get(nd),
-            "counters": counters.get(nd) if nd else None,
-        }
-        if interval <= 0:
-            entry["counters"] = {"status": "skipped"}
-        out_devs.setdefault(dev, []).append(entry)
+        out_devs.setdefault(dev, []).append(port_entry(dev, p, nd, qos, counters, interval))
 
     return {
         "hostname": socket.gethostname(),
@@ -310,6 +271,67 @@ def collect(interval):
         "tools": {t: shutil.which(t) is not None for t in ("mlnx_qos", "dcb", "ethtool")},
         "devices": [{"device": d, "ports": ps} for d, ps in sorted(out_devs.items())],
     }
+
+
+def rdma_ports():
+    """(dev, port_id, netdev) of every RDMA port, in device and port order."""
+    try:
+        devices = sorted(os.listdir(rnic.SYS_IB))
+    except OSError:
+        devices = []
+    ports = []
+    for dev in devices:
+        for p in port_ids(dev):
+            ports.append((dev, p, rnic.port_netdev(dev, p)))
+    return ports
+
+
+def port_ids(dev):
+    """A device's port directories in numeric order, none if unreadable."""
+    try:
+        return sorted(os.listdir(os.path.join(rnic.SYS_IB, dev, "ports")), key=int)
+    except (OSError, ValueError):
+        return []
+
+
+def counter_samples(netdevs, interval):
+    """Per-netdev counter deltas between two samples interval seconds apart."""
+    first = sample_counters(netdevs)
+    time.sleep(interval)
+    second = sample_counters(netdevs)
+    return {nd: sample_delta(first[nd], second[nd], interval) for nd in netdevs}
+
+
+def sample_delta(a, b, interval):
+    """One netdev's counter deltas, or the reason there are none."""
+    if a["counters"] and b["counters"]:
+        c = counter_deltas(a["counters"], b["counters"], interval)
+        c["status"] = "ok"
+    else:
+        c = {"status": b["status"] if b["status"] != "ok" else "no_prio_counters",
+             "interval_s": interval, "prio": None}
+    c["raw"] = {"before": a["lines"], "after": b["lines"]}
+    return c
+
+
+def port_entry(dev, p, nd, qos, counters, interval):
+    """The facts recorded for one RDMA port."""
+    base = os.path.join(rnic.SYS_IB, dev, "ports", p)
+    gids = [g for g in rnic.gid_table(dev, p)
+            if (g.get("type") or "").lower().startswith("roce v2")]
+    entry = {
+        "port": int(p),
+        "state": rnic.read(os.path.join(base, "state")),
+        "link_layer": rnic.read(os.path.join(base, "link_layer")),
+        "netdev": nd,
+        "rocev2_gids": gids,
+        "tc_override": tc_override(dev, p),
+        "qos": qos.get(nd),
+        "counters": counters.get(nd) if nd else None,
+    }
+    if interval <= 0:
+        entry["counters"] = {"status": "skipped"}
+    return entry
 
 
 def main(argv=None):

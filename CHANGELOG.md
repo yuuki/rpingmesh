@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-05
+
 ### Added
 
 - TLS and bearer-token authentication for the OTLP metric export of the agent
@@ -37,6 +39,12 @@ All notable changes to this project are documented in this file.
   plaintext, which earlier releases did), or together with
   `otel_collector_bearer_token_file`. Other headers in these variables are
   unaffected. See README "Upgrading".
+
+### Deprecated
+
+- The `analyzer_sla_*` keys deprecated in 0.9.0, with their flags and
+  environment variables, still work in this release with the startup
+  warning. They are removed in the next minor release.
 
 ## [0.9.0] - 2026-11-04
 

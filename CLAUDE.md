@@ -33,7 +33,7 @@ make test                                       # go test on every pure-Go packa
 go test -v ./internal/probe/... -run TestName  # Run a specific test
 go test -race ./internal/probe/...             # Run with race detector
 make vet                                        # go vet ./...
-make complexity                                 # cccc complexity ranking (needs cccc; fails above max-cognitive in cccc.toml)
+make complexity                                 # cccc complexity ranking (needs cccc; CI tracks the scores with octocov)
 make test-zig                                   # zig build test (needs libibverbs headers, not hardware)
 make test-scripts                               # Python tests for scripts/topology/
 make test-all                                   # test-zig + go test on all packages except ./e2e/... (Linux, full Cgo/RDMA build env)

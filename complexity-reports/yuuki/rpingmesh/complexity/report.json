@@ -1,0 +1,60 @@
+{
+  "repository": "yuuki/rpingmesh/complexity",
+  "ref": "refs/heads/main",
+  "commit": "8715af4aab5eb2250d9c86291e45129a180f2ebd",
+  "base_ref": "refs/heads/main",
+  "timestamp": "2026-11-05T13:07:35.619820706Z",
+  "custom_metrics": [
+    {
+      "key": "code_complexity",
+      "name": "Code Complexity",
+      "metrics": [
+        {
+          "key": "function_count",
+          "name": "Function count",
+          "value": 1006
+        },
+        {
+          "key": "cognitive_sum",
+          "name": "Cognitive: total",
+          "value": 3170
+        },
+        {
+          "key": "cognitive_max",
+          "name": "Cognitive: max",
+          "value": 34
+        },
+        {
+          "key": "cognitive_median",
+          "name": "Cognitive: median",
+          "value": 1
+        },
+        {
+          "key": "cognitive_p90",
+          "name": "Cognitive: p90",
+          "value": 9
+        },
+        {
+          "key": "cyclomatic_sum",
+          "name": "Cyclomatic: total",
+          "value": 3577
+        },
+        {
+          "key": "cyclomatic_max",
+          "name": "Cyclomatic: max",
+          "value": 32
+        },
+        {
+          "key": "cyclomatic_median",
+          "name": "Cyclomatic: median",
+          "value": 2
+        },
+        {
+          "key": "cyclomatic_p90",
+          "name": "Cyclomatic: p90",
+          "value": 8
+        }
+      ]
+    }
+  ]
+}

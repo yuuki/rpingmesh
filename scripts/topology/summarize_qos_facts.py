@@ -43,31 +43,42 @@ def load_ports(paths):
     for path in paths:
         with open(path) as f:
             facts = json.load(f)
-        host = short(facts.get("hostname"))
-        for dev in facts.get("devices") or []:
-            for p in dev.get("ports") or []:
-                if not p.get("netdev"):
-                    continue
-                qos = p.get("qos") or {}
-                pfc = qos.get("pfc_enabled")
-                dmap = qos.get("dscp_prio")
-                ov = p.get("tc_override") or {}
-                cnt = p.get("counters") or {}
-                ports.append({
-                    "id": f"{host}/{dev.get('device')}:{p.get('port')}",
-                    "host": host,
-                    "netdev": p.get("netdev"),
-                    "trust": qos.get("trust"),
-                    "pfc": tuple(sorted(pfc)) if pfc is not None else None,
-                    "dscp_prio": ({int(k): int(v) for k, v in dmap.items()}
-                                  if dmap is not None else None),
-                    "override": ov.get("tclass"),
-                    "override_status": ov.get("status"),
-                    "counters": cnt.get("prio") if cnt.get("status") == "ok" else None,
-                    "interval_s": cnt.get("interval_s"),
-                    "gid_indices": tuple(sorted(g["index"] for g in p.get("rocev2_gids") or [])),
-                })
+        ports.extend(host_ports(facts))
     return ports
+
+
+def host_ports(facts):
+    """The records of one host's RDMA ports that have a netdev."""
+    host = short(facts.get("hostname"))
+    ports = []
+    for dev in facts.get("devices") or []:
+        for p in dev.get("ports") or []:
+            if p.get("netdev"):
+                ports.append(port_record(host, dev, p))
+    return ports
+
+
+def port_record(host, dev, p):
+    """One port in the shape that summarize() tallies."""
+    qos = p.get("qos") or {}
+    pfc = qos.get("pfc_enabled")
+    dmap = qos.get("dscp_prio")
+    ov = p.get("tc_override") or {}
+    cnt = p.get("counters") or {}
+    return {
+        "id": f"{host}/{dev.get('device')}:{p.get('port')}",
+        "host": host,
+        "netdev": p.get("netdev"),
+        "trust": qos.get("trust"),
+        "pfc": tuple(sorted(pfc)) if pfc is not None else None,
+        "dscp_prio": ({int(k): int(v) for k, v in dmap.items()}
+                      if dmap is not None else None),
+        "override": ov.get("tclass"),
+        "override_status": ov.get("status"),
+        "counters": cnt.get("prio") if cnt.get("status") == "ok" else None,
+        "interval_s": cnt.get("interval_s"),
+        "gid_indices": tuple(sorted(g["index"] for g in p.get("rocev2_gids") or [])),
+    }
 
 
 def tally(ports, key, known=lambda v: v is not None):
@@ -103,10 +114,32 @@ def summarize(ports):
     majority_map = dict(dmap["majority"] or ())
     by_prio = dscps_by_prio(majority_map)
     lossless_dscps = {p: by_prio.get(p, []) for p in lossless}
+    candidates = tclass_candidates(override["counts"], majority_map, lossless, lossless_dscps)
+    sl = service_level_hint(trust["majority"], lossless)
+    traffic = traffic_summary(ports)
 
+    return {
+        "hosts": len({p["host"] for p in ports}),
+        "ports": len(ports),
+        "trust": trust,
+        "pfc_enabled": pfc,
+        "dscp_map": dmap,
+        "override": override,
+        "rocev2_gid_indices": gids,
+        "lossless_priorities": lossless,
+        "lossless_dscps": lossless_dscps,
+        "candidates": candidates,
+        "service_level": sl,
+        "traffic": traffic,
+    }
+
+
+def tclass_candidates(override_counts, majority_map, lossless, lossless_dscps):
+    """Every override value, most common first, then DSCP << 2 for each DSCP
+    mapping to a PFC-enabled priority that no override already offers."""
     candidates = []
     seen = set()
-    for value, n in override["counts"].most_common():
+    for value, n in override_counts.most_common():
         if value is None:
             continue
         dscp, prio = value >> 2, majority_map.get(value >> 2)
@@ -121,17 +154,22 @@ def summarize(ports):
                 candidates.append({
                     "traffic_class": d << 2, "dscp": d, "ecn": ECN[0], "priority": prio,
                     "pfc_enabled": True, "source": "DSCP << 2"})
+    return candidates
 
-    if trust["majority"] == "pcp":
-        sl = {"candidates": lossless,
-              "note": "trust pcp: SL maps to the PCP only for VLAN-tagged RoCE; "
-                      "DSCP (traffic_class) does not select the queue"}
-    elif trust["majority"] == "dscp":
-        sl = {"candidates": [0], "note": "trust dscp: SL does not select the queue"}
-    else:
-        sl = {"candidates": [], "note": "trust mode unknown"}
 
-    # Traffic between the two counter samples, summed over every port.
+def service_level_hint(trust, lossless):
+    """The service_level suggestion for the majority trust mode."""
+    if trust == "pcp":
+        return {"candidates": lossless,
+                "note": "trust pcp: SL maps to the PCP only for VLAN-tagged RoCE; "
+                        "DSCP (traffic_class) does not select the queue"}
+    if trust == "dscp":
+        return {"candidates": [0], "note": "trust dscp: SL does not select the queue"}
+    return {"candidates": [], "note": "trust mode unknown"}
+
+
+def traffic_summary(ports):
+    """Traffic between the two counter samples, summed over every port."""
     traffic = collections.defaultdict(lambda: collections.Counter())
     top_per_port = collections.Counter()
     busiest = {}  # port id -> priority with the most bytes on that port
@@ -142,41 +180,42 @@ def summarize(ports):
             continue
         with_counters += 1
         intervals.add(p["interval_s"])
-        port_bytes = {}
-        for prio, c in p["counters"].items():
-            b = (c.get("rx_bytes") or 0) + (c.get("tx_bytes") or 0)
-            port_bytes[int(prio)] = b
-            traffic[int(prio)]["bytes"] += b
-            traffic[int(prio)]["pause"] += (c.get("rx_pause") or 0) + (c.get("tx_pause") or 0)
-        if port_bytes and max(port_bytes.values()) > 0:
-            busiest[p["id"]] = max(port_bytes, key=lambda k: port_bytes[k])
-            top_per_port[busiest[p["id"]]] += 1
+        prio = busiest_priority(add_port_traffic(traffic, p["counters"]))
+        if prio is not None:
+            busiest[p["id"]] = prio
+            top_per_port[prio] += 1
     total = sum(t["bytes"] for t in traffic.values())
     top = max(traffic, key=lambda k: traffic[k]["bytes"]) if total else None
-
     return {
-        "hosts": len({p["host"] for p in ports}),
-        "ports": len(ports),
-        "trust": trust,
-        "pfc_enabled": pfc,
-        "dscp_map": dmap,
-        "override": override,
-        "rocev2_gid_indices": gids,
-        "lossless_priorities": lossless,
-        "lossless_dscps": lossless_dscps,
-        "candidates": candidates,
-        "service_level": sl,
-        "traffic": {
-            "ports_with_counters": with_counters,
-            "interval_s": sorted(i for i in intervals if i is not None),
-            "by_priority": {k: dict(v) for k, v in sorted(traffic.items())},
-            "total_bytes": total,
-            "top_priority": top,
-            "top_priority_per_port": dict(top_per_port),
-            "ports_busiest_elsewhere": [{"port": pid, "priority": prio}
-                                        for pid, prio in busiest.items() if prio != top],
-        },
+        "ports_with_counters": with_counters,
+        "interval_s": sorted(i for i in intervals if i is not None),
+        "by_priority": {k: dict(v) for k, v in sorted(traffic.items())},
+        "total_bytes": total,
+        "top_priority": top,
+        "top_priority_per_port": dict(top_per_port),
+        "ports_busiest_elsewhere": [{"port": pid, "priority": prio}
+                                    for pid, prio in busiest.items() if prio != top],
     }
+
+
+def add_port_traffic(traffic, counters):
+    """Add one port's bytes and pause frames to traffic, per priority, and
+    return the port's bytes per priority."""
+    port_bytes = {}
+    for prio, c in counters.items():
+        b = (c.get("rx_bytes") or 0) + (c.get("tx_bytes") or 0)
+        port_bytes[int(prio)] = b
+        traffic[int(prio)]["bytes"] += b
+        traffic[int(prio)]["pause"] += (c.get("rx_pause") or 0) + (c.get("tx_pause") or 0)
+    return port_bytes
+
+
+def busiest_priority(port_bytes):
+    """The priority with the most bytes, the first one on a tie; None when
+    the port carried no bytes."""
+    if port_bytes and max(port_bytes.values()) > 0:
+        return max(port_bytes, key=lambda k: port_bytes[k])
+    return None
 
 
 def ranges(nums):

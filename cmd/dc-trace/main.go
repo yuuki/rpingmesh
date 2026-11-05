@@ -54,51 +54,77 @@ func run() error {
 		return fmt.Errorf("-ucx-streams requires -ucx-devx")
 	}
 	if check {
-		if err := servicetrace.CheckDCProvider(options.Library, options.DebugFile); err != nil {
-			return err
-		}
-		if options.UCXLibrary != "" || options.UCXDebugFile != "" {
-			if err := servicetrace.CheckUCXDC(options.UCXLibrary, options.UCXDebugFile); err != nil {
-				return err
-			}
-		}
-		if options.UCXDevX {
-			if err := servicetrace.CheckUCXDCDevX(options.Library, options.DebugFile, options.UCXLibrary, options.UCXDebugFile); err != nil {
-				return err
-			}
-		}
-		if options.UCXStreams {
-			if err := servicetrace.CheckUCXDCStreams(options.Library, options.DebugFile, options.UCXLibrary, options.UCXDebugFile); err != nil {
-				return err
-			}
-		}
-		if options.UCXAM {
-			if err := servicetrace.CheckUCXDCAM(options.UCXLibrary, options.UCXDebugFile); err != nil {
-				return err
-			}
-		}
-		if options.UCXRMA {
-			if err := servicetrace.CheckUCXDCRMA(options.UCXLibrary, options.UCXDebugFile); err != nil {
-				return err
-			}
-		}
-		if options.UCXAtomic {
-			if err := servicetrace.CheckUCXDCAtomic(options.UCXLibrary, options.UCXDebugFile); err != nil {
-				return err
-			}
-		}
-		if options.UCXTag {
-			if err := servicetrace.CheckUCXDCTag(options.UCXLibrary, options.UCXDebugFile); err != nil {
-				return err
-			}
-		}
-		fmt.Println("Provider layout validated; BPF was not loaded.")
-		return nil
+		return checkLayouts(options)
 	}
 	if port == 0 || port > 255 || duration <= 0 || options.Capacity <= 0 || options.IdleTimeout <= 0 {
 		return fmt.Errorf("port must be 1..255; duration, capacity and idle-timeout must be positive")
 	}
 	options.Port = uint8(port)
+	return observe(options, duration)
+}
+
+// checkLayouts validates the provider and every selected UCX adapter layout
+// without loading BPF.
+func checkLayouts(options servicetrace.DCOptions) error {
+	if err := servicetrace.CheckDCProvider(options.Library, options.DebugFile); err != nil {
+		return err
+	}
+	if err := checkUCXLifecycle(options); err != nil {
+		return err
+	}
+	if err := checkUCXOperations(options); err != nil {
+		return err
+	}
+	fmt.Println("Provider layout validated; BPF was not loaded.")
+	return nil
+}
+
+// checkUCXLifecycle validates the UCX adapter and its DevX and stream
+// lifecycle layouts.
+func checkUCXLifecycle(options servicetrace.DCOptions) error {
+	if options.UCXLibrary != "" || options.UCXDebugFile != "" {
+		if err := servicetrace.CheckUCXDC(options.UCXLibrary, options.UCXDebugFile); err != nil {
+			return err
+		}
+	}
+	if options.UCXDevX {
+		if err := servicetrace.CheckUCXDCDevX(options.Library, options.DebugFile, options.UCXLibrary, options.UCXDebugFile); err != nil {
+			return err
+		}
+	}
+	if options.UCXStreams {
+		if err := servicetrace.CheckUCXDCStreams(options.Library, options.DebugFile, options.UCXLibrary, options.UCXDebugFile); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkUCXOperations validates the submission symbols of the selected UCX
+// operations.
+func checkUCXOperations(options servicetrace.DCOptions) error {
+	for _, operation := range []struct {
+		enabled bool
+		check   func(library, debugFile string) error
+	}{
+		{options.UCXAM, servicetrace.CheckUCXDCAM},
+		{options.UCXRMA, servicetrace.CheckUCXDCRMA},
+		{options.UCXAtomic, servicetrace.CheckUCXDCAtomic},
+		{options.UCXTag, servicetrace.CheckUCXDCTag},
+	} {
+		if !operation.enabled {
+			continue
+		}
+		if err := operation.check(options.UCXLibrary, options.UCXDebugFile); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// observe attaches the collector and prints its statistics every second and
+// once more when the observation ends.
+func observe(options servicetrace.DCOptions, duration time.Duration) error {
 	collector, err := servicetrace.OpenDCCollector(options)
 	if err != nil {
 		return err

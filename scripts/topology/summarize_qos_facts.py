@@ -204,34 +204,49 @@ def fmt_value(name, v):
 def render(s, out):
     w = out.write
     w(f"{s['hosts']} hosts, {s['ports']} RDMA ports with a netdev\n\n")
+    render_consistency(s, w)
+    w("\n")
+    render_lossless(s, w)
+    w("\n")
+    render_candidates(s, w)
+    render_traffic(s["traffic"], w)
 
+
+def render_consistency(s, w):
     w("Consistency (majority / outliers):\n")
     for name, label in (("trust", "trust mode"), ("pfc_enabled", "PFC priorities"),
                         ("dscp_map", "DSCP->prio map"), ("override", "tclass override"),
                         ("rocev2_gid_indices", "RoCE v2 GID idx")):
-        t = s[name]
-        n_known = sum(t["counts"].values())
-        state = ("no data" if not n_known else "consistent" if not t["outliers"]
-                 else f"{len(t['outliers'])} differ")
-        maj = "unknown" if not t["counts"] else fmt_value(name, t["majority"])
-        w(f"  {label:<16}: {maj}  ({t['counts'][t['majority']] if t['counts'] else 0}/{n_known} ports, {state}"
-          f"{', ' + str(len(t['unknown'])) + ' unknown' if t['unknown'] else ''})\n")
-        for pid, v in t["outliers"]:
-            w(f"      outlier {pid}: {fmt_value(name, v)}\n")
-        if t["unknown"] and len(t["unknown"]) <= 10:
-            w(f"      unknown: {', '.join(t['unknown'])}\n")
-    w("\n")
+        render_tally(name, label, s[name], w)
 
-    if s["lossless_priorities"]:
-        w("PFC-enabled priorities and the DSCPs mapping to them:\n")
-        for prio, ds in s["lossless_dscps"].items():
-            w(f"  priority {prio}: DSCP {ranges(ds) if ds else '(none in the DSCP map)'}\n")
-        if s["trust"]["majority"] == "pcp":
-            w("  (trust pcp: the queue is selected by the VLAN PCP, not by DSCP)\n")
-    else:
+
+def render_tally(name, label, t, w):
+    """One consistency line, then its outliers and (up to 10) unknown ports."""
+    n_known = sum(t["counts"].values())
+    state = ("no data" if not n_known else "consistent" if not t["outliers"]
+             else f"{len(t['outliers'])} differ")
+    maj = "unknown" if not t["counts"] else fmt_value(name, t["majority"])
+    w(f"  {label:<16}: {maj}  ({t['counts'][t['majority']] if t['counts'] else 0}/{n_known} ports, {state}"
+      f"{', ' + str(len(t['unknown'])) + ' unknown' if t['unknown'] else ''})\n")
+    for pid, v in t["outliers"]:
+        w(f"      outlier {pid}: {fmt_value(name, v)}\n")
+    if t["unknown"] and len(t["unknown"]) <= 10:
+        w(f"      unknown: {', '.join(t['unknown'])}\n")
+
+
+def render_lossless(s, w):
+    if not s["lossless_priorities"]:
         w("No PFC-enabled priority found (or PFC state unavailable).\n")
-    w("\n")
+        return
+    w("PFC-enabled priorities and the DSCPs mapping to them:\n")
+    for prio, ds in s["lossless_dscps"].items():
+        w(f"  priority {prio}: DSCP {ranges(ds) if ds else '(none in the DSCP map)'}\n")
+    if s["trust"]["majority"] == "pcp":
+        w("  (trust pcp: the queue is selected by the VLAN PCP, not by DSCP)\n")
 
+
+def render_candidates(s, w):
+    """The traffic_class candidates followed by the service_level hint."""
     w("Candidate traffic_class values (suggestions, not a decision):\n")
     if not s["candidates"]:
         w("  none: no override and no DSCP mapping to a PFC-enabled priority\n")
@@ -245,23 +260,24 @@ def render(s, out):
     sl = s["service_level"]
     w(f"service_level: {', '.join(map(str, sl['candidates'])) or '?'} ({sl['note']})\n\n")
 
-    t = s["traffic"]
+
+def render_traffic(t, w):
     if not t["ports_with_counters"]:
         w("Traffic: no per-priority counter deltas (collected with --interval 0, or ethtool unavailable).\n")
-    else:
-        w(f"Traffic over {'/'.join(f'{i:g}' for i in t['interval_s'])} s on "
-          f"{t['ports_with_counters']} ports (rx+tx bytes, pause frames):\n")
-        for prio, v in t["by_priority"].items():
-            share = 100.0 * v.get("bytes", 0) / t["total_bytes"] if t["total_bytes"] else 0.0
-            if v.get("bytes") or v.get("pause"):
-                w(f"  priority {prio}: {v.get('bytes', 0):>16} bytes ({share:5.1f}%)  pause {v.get('pause', 0)}\n")
-        if t["top_priority"] is not None:
-            per = ", ".join(f"p{k}: {n}" for k, n in sorted(t["top_priority_per_port"].items()))
-            w(f"  most bytes: priority {t['top_priority']} (busiest priority per port: {per})\n")
-            for e in t["ports_busiest_elsewhere"]:
-                w(f"      {e['port']}: most bytes in priority {e['priority']}\n")
-        w("  These counters include all traffic in a priority, not only RoCE; pause\n"
-          "  counters move only under congestion, so zero does not prove a priority is unused.\n")
+        return
+    w(f"Traffic over {'/'.join(f'{i:g}' for i in t['interval_s'])} s on "
+      f"{t['ports_with_counters']} ports (rx+tx bytes, pause frames):\n")
+    for prio, v in t["by_priority"].items():
+        share = 100.0 * v.get("bytes", 0) / t["total_bytes"] if t["total_bytes"] else 0.0
+        if v.get("bytes") or v.get("pause"):
+            w(f"  priority {prio}: {v.get('bytes', 0):>16} bytes ({share:5.1f}%)  pause {v.get('pause', 0)}\n")
+    if t["top_priority"] is not None:
+        per = ", ".join(f"p{k}: {n}" for k, n in sorted(t["top_priority_per_port"].items()))
+        w(f"  most bytes: priority {t['top_priority']} (busiest priority per port: {per})\n")
+        for e in t["ports_busiest_elsewhere"]:
+            w(f"      {e['port']}: most bytes in priority {e['priority']}\n")
+    w("  These counters include all traffic in a priority, not only RoCE; pause\n"
+      "  counters move only under congestion, so zero does not prove a priority is unused.\n")
 
 
 def to_json(s):

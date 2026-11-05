@@ -89,12 +89,8 @@ func CheckDCProvider(library, debugFile string) error {
 }
 
 func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
-	if options.PID <= 0 || options.Port == 0 || options.Library == "" || options.DebugFile == "" ||
-		options.Device == "" || filepath.Base(options.Device) != options.Device || options.Device == "." || options.Device == ".." {
-		return nil, fmt.Errorf("DC collector requires a PID, provider/debug ELF, device and port")
-	}
-	if options.UCXStreams && !options.UCXDevX {
-		return nil, fmt.Errorf("UCX streams require UCX DevX")
+	if err := validateDCOptions(options); err != nil {
+		return nil, err
 	}
 	if options.Capacity == 0 {
 		options.Capacity = 4096
@@ -116,83 +112,181 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("open target pidfd: %w", err)
 	}
-	c.library, err = os.Open(options.Library)
+	profile, pinned, err := c.openProvider()
 	if err != nil {
 		return nil, err
 	}
-	// Pin the actual inode throughout inspection and attachment, including
-	// when the library pathname is replaced during a package upgrade.
-	pinned := fmt.Sprintf("/proc/self/fd/%d", c.library.Fd())
-	profile, err := inspectDCProviderMode(pinned, options.DebugFile, options.UCXDevX)
+	ucx, ucxPinned, err := c.openUCXProvider(profile.machine)
 	if err != nil {
 		return nil, err
-	}
-	if (runtime.GOARCH == "amd64" && profile.machine != elf.EM_X86_64) ||
-		(runtime.GOARCH == "arm64" && profile.machine != elf.EM_AARCH64) ||
-		(runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64") {
-		return nil, fmt.Errorf("provider architecture does not match collector")
-	}
-	if err = dcLibraryMapped(options.PID, c.library); err != nil {
-		return nil, err
-	}
-	var ucx *ucxDCProvider
-	var ucxPinned string
-	if options.UCXLibrary != "" || options.UCXDebugFile != "" || options.UCXDevX || options.UCXAM || options.UCXRMA || options.UCXAtomic || options.UCXTag {
-		if options.UCXLibrary == "" || options.UCXDebugFile == "" {
-			return nil, fmt.Errorf("UCX library and matching debug ELF must both be supplied")
-		}
-		c.ucxLibrary, err = os.Open(options.UCXLibrary)
-		if err != nil {
-			return nil, err
-		}
-		ucxPinned = fmt.Sprintf("/proc/self/fd/%d", c.ucxLibrary.Fd())
-		ucx, err = inspectUCXDCOperations(ucxPinned, options.UCXDebugFile, options.UCXDevX, options.UCXStreams, options.UCXAM, options.UCXRMA, options.UCXAtomic, options.UCXTag)
-		if err != nil {
-			return nil, err
-		}
-		if ucx.machine != profile.machine {
-			return nil, fmt.Errorf("UCX/provider architectures differ")
-		}
-		if err = dcLibraryMapped(options.PID, c.ucxLibrary); err != nil {
-			return nil, err
-		}
 	}
 	if !c.alive() {
 		return nil, fmt.Errorf("target process exited")
 	}
-	_ = rlimit.RemoveMemlock()
-	if err = loadDcObjects(&c.objs, nil); err != nil {
-		return nil, fmt.Errorf("load DC BPF (requires BPF/perf privileges): %w", err)
-	}
-	var config bytes.Buffer
-	_ = binary.Write(&config, binary.LittleEndian, uint32(options.PID))
-	_ = binary.Write(&config, binary.LittleEndian, profile.layout)
-	if err = c.objs.DcSettings.Put(uint32(0), config.Bytes()); err != nil {
-		return nil, err
-	}
-	if ucx != nil {
-		if options.UCXDevX {
-			ucx.layout.DevXEnabled = 1
-			ucx.layout.DevXContext, ucx.layout.DevXQPN = profile.devxContext, profile.devxQPN
-		}
-		if err = c.objs.DcUcxLayout.Put(uint32(0), ucx.layout); err != nil {
-			return nil, err
-		}
-	}
-	if c.reader, err = ringbuf.NewReader(c.objs.DcEvents); err != nil {
+	if err = c.loadBPF(profile, ucx); err != nil {
 		return nil, err
 	}
 	exe, err := link.OpenExecutable(pinned)
 	if err != nil {
 		return nil, err
 	}
+	if err = c.attachProcessInvalidation(); err != nil {
+		return nil, err
+	}
+	if err = c.attachProviderProbes(exe, profile); err != nil {
+		return nil, err
+	}
+	if ucx != nil {
+		if err = c.attachUCXProbes(ucxPinned, ucx); err != nil {
+			return nil, err
+		}
+	}
+	if !c.alive() {
+		return nil, fmt.Errorf("target process exited during attachment")
+	}
+	return c, nil
+}
+
+func validateDCOptions(options DCOptions) error {
+	if options.PID <= 0 || options.Port == 0 || options.Library == "" || options.DebugFile == "" ||
+		options.Device == "" || filepath.Base(options.Device) != options.Device || options.Device == "." || options.Device == ".." {
+		return fmt.Errorf("DC collector requires a PID, provider/debug ELF, device and port")
+	}
+	if options.UCXStreams && !options.UCXDevX {
+		return fmt.Errorf("UCX streams require UCX DevX")
+	}
+	return nil
+}
+
+// wantsUCX reports whether any option selects the UCX adapter. Streams need
+// DevX, so UCXStreams alone never reaches this check.
+func (o DCOptions) wantsUCX() bool {
+	return o.UCXLibrary != "" || o.UCXDebugFile != "" || o.UCXDevX || o.UCXAM || o.UCXRMA || o.UCXAtomic || o.UCXTag
+}
+
+// openProvider opens and inspects the provider library and checks that the
+// target process maps it. It returns the pinned path of the open library.
+func (c *DCCollector) openProvider() (*dcProvider, string, error) {
+	var err error
+	c.library, err = os.Open(c.options.Library)
+	if err != nil {
+		return nil, "", err
+	}
+	// Pin the actual inode throughout inspection and attachment, including
+	// when the library pathname is replaced during a package upgrade.
+	pinned := fmt.Sprintf("/proc/self/fd/%d", c.library.Fd())
+	profile, err := inspectDCProviderMode(pinned, c.options.DebugFile, c.options.UCXDevX)
+	if err != nil {
+		return nil, "", err
+	}
+	if !dcMachineMatchesCollector(profile.machine) {
+		return nil, "", fmt.Errorf("provider architecture does not match collector")
+	}
+	if err := dcLibraryMapped(c.options.PID, c.library); err != nil {
+		return nil, "", err
+	}
+	return profile, pinned, nil
+}
+
+func dcMachineMatchesCollector(machine elf.Machine) bool {
+	switch runtime.GOARCH {
+	case "amd64":
+		return machine == elf.EM_X86_64
+	case "arm64":
+		return machine == elf.EM_AARCH64
+	}
+	return false
+}
+
+// openUCXProvider opens and inspects the optional UCX library like
+// openProvider. It returns a nil provider when no option selects UCX.
+func (c *DCCollector) openUCXProvider(machine elf.Machine) (*ucxDCProvider, string, error) {
+	options := c.options
+	if !options.wantsUCX() {
+		return nil, "", nil
+	}
+	if options.UCXLibrary == "" || options.UCXDebugFile == "" {
+		return nil, "", fmt.Errorf("UCX library and matching debug ELF must both be supplied")
+	}
+	var err error
+	c.ucxLibrary, err = os.Open(options.UCXLibrary)
+	if err != nil {
+		return nil, "", err
+	}
+	pinned := fmt.Sprintf("/proc/self/fd/%d", c.ucxLibrary.Fd())
+	ucx, err := inspectUCXDCOperations(pinned, options.UCXDebugFile, options.UCXDevX, options.UCXStreams, options.UCXAM, options.UCXRMA, options.UCXAtomic, options.UCXTag)
+	if err != nil {
+		return nil, "", err
+	}
+	if ucx.machine != machine {
+		return nil, "", fmt.Errorf("UCX/provider architectures differ")
+	}
+	if err := dcLibraryMapped(options.PID, c.ucxLibrary); err != nil {
+		return nil, "", err
+	}
+	return ucx, pinned, nil
+}
+
+// loadBPF loads the DC objects, configures them for the target and the
+// inspected layouts, and opens the event ring.
+func (c *DCCollector) loadBPF(profile *dcProvider, ucx *ucxDCProvider) error {
+	_ = rlimit.RemoveMemlock()
+	if err := loadDcObjects(&c.objs, nil); err != nil {
+		return fmt.Errorf("load DC BPF (requires BPF/perf privileges): %w", err)
+	}
+	var config bytes.Buffer
+	_ = binary.Write(&config, binary.LittleEndian, uint32(c.options.PID))
+	_ = binary.Write(&config, binary.LittleEndian, profile.layout)
+	if err := c.objs.DcSettings.Put(uint32(0), config.Bytes()); err != nil {
+		return err
+	}
+	if ucx != nil {
+		if c.options.UCXDevX {
+			ucx.layout.DevXEnabled = 1
+			ucx.layout.DevXContext, ucx.layout.DevXQPN = profile.devxContext, profile.devxQPN
+		}
+		if err := c.objs.DcUcxLayout.Put(uint32(0), ucx.layout); err != nil {
+			return err
+		}
+	}
+	var err error
+	c.reader, err = ringbuf.NewReader(c.objs.DcEvents)
+	return err
+}
+
+// attachProcessInvalidation installs the exit and exec hooks that disable the
+// TGID filter before any uprobe is attached.
+func (c *DCCollector) attachProcessInvalidation() error {
+	exitLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{Name: "sched_process_exit", Program: c.objs.DcExit})
+	if err != nil {
+		return fmt.Errorf("attach process-exit invalidation: %w", err)
+	}
+	c.links = append(c.links, exitLink)
+	// If exit happened before the hook was installed, do not enable uprobes.
+	// Otherwise the hook disables the TGID filter before PID reuse is possible.
+	if !c.alive() {
+		return fmt.Errorf("target process exited before attachment")
+	}
+	execLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{Name: "sched_process_exec", Program: c.objs.DcExec})
+	if err != nil {
+		return fmt.Errorf("attach process-exec invalidation: %w", err)
+	}
+	c.links = append(c.links, execLink)
+	return nil
+}
+
+// dcProviderProbe hooks a provider function, resolved by name.
+type dcProviderProbe struct {
+	name string
+	prog *ebpf.Program
+	ret  bool
+}
+
+// providerProbes lists the provider hooks in attachment order.
+func (c *DCCollector) providerProbes(profile *dcProvider) []dcProviderProbe {
 	// Install retirement/return probes before enabling creation. This excludes
 	// partially observed QPs during attachment and prevents stale registration.
-	probes := []struct {
-		name string
-		prog *ebpf.Program
-		ret  bool
-	}{
+	probes := []dcProviderProbe{
 		{"mlx5_destroy_qp", c.objs.DcRetire, false},
 		{"mlx5dv_modify_qp_udp_sport", c.objs.DcRetire, false},
 		{"mlx5_modify_qp", c.objs.DcModifyExit, true},
@@ -201,121 +295,98 @@ func OpenDCCollector(options DCOptions) (_ *DCCollector, err error) {
 		{"mlx5_send_wr_complete", c.objs.DcCompleteEnter, false},
 	}
 	if profile.symbols["mlx5dv_devx_qp_modify"] != 0 {
-		probes = append(probes, struct {
-			name string
-			prog *ebpf.Program
-			ret  bool
-		}{"mlx5dv_devx_qp_modify", c.objs.DcRetire, false})
+		probes = append(probes, dcProviderProbe{"mlx5dv_devx_qp_modify", c.objs.DcRetire, false})
 	}
-	exitLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{Name: "sched_process_exit", Program: c.objs.DcExit})
-	if err != nil {
-		return nil, fmt.Errorf("attach process-exit invalidation: %w", err)
+	if c.options.UCXDevX {
+		probes = append(probes,
+			dcProviderProbe{"mlx5dv_devx_obj_destroy", c.objs.DcRetire, false},
+			dcProviderProbe{"mlx5dv_devx_obj_modify", c.objs.DcDevxModify, false})
 	}
-	c.links = append(c.links, exitLink)
-	// If exit happened before the hook was installed, do not enable uprobes.
-	// Otherwise the hook disables the TGID filter before PID reuse is possible.
-	if !c.alive() {
-		return nil, fmt.Errorf("target process exited before attachment")
-	}
-	execLink, err := link.AttachRawTracepoint(link.RawTracepointOptions{Name: "sched_process_exec", Program: c.objs.DcExec})
-	if err != nil {
-		return nil, fmt.Errorf("attach process-exec invalidation: %w", err)
-	}
-	c.links = append(c.links, execLink)
-	if options.UCXDevX {
-		probes = append(probes, struct {
-			name string
-			prog *ebpf.Program
-			ret  bool
-		}{"mlx5dv_devx_obj_destroy", c.objs.DcRetire, false},
-			struct {
-				name string
-				prog *ebpf.Program
-				ret  bool
-			}{"mlx5dv_devx_obj_modify", c.objs.DcDevxModify, false})
-	}
-	probes = append(probes,
-		struct {
-			name string
-			prog *ebpf.Program
-			ret  bool
-		}{"mlx5dv_create_qp", c.objs.DcCreateExit, true},
-		struct {
-			name string
-			prog *ebpf.Program
-			ret  bool
-		}{"mlx5dv_create_qp", c.objs.DcCreateEnter, false})
-	for _, p := range probes {
+	return append(probes,
+		dcProviderProbe{"mlx5dv_create_qp", c.objs.DcCreateExit, true},
+		dcProviderProbe{"mlx5dv_create_qp", c.objs.DcCreateEnter, false})
+}
+
+func (c *DCCollector) attachProviderProbes(exe *link.Executable, profile *dcProvider) error {
+	for _, p := range c.providerProbes(profile) {
 		// PID-scoped perf events do not inherit to worker threads. Attach
 		// across tasks and filter the target TGID in BPF before any reads.
-		opts := &link.UprobeOptions{Address: profile.symbols[p.name]}
-		var hook link.Link
-		if p.ret {
-			hook, err = exe.Uretprobe("", p.prog, opts)
-		} else {
-			hook, err = exe.Uprobe("", p.prog, opts)
-		}
+		hook, err := attachDCHook(exe, dcHook{profile.symbols[p.name], p.prog, p.ret})
 		if err != nil {
-			return nil, fmt.Errorf("attach DC %s: %w", p.name, err)
+			return fmt.Errorf("attach DC %s: %w", p.name, err)
 		}
 		c.links = append(c.links, hook)
 	}
-	if ucx != nil {
-		ucxExe, err := link.OpenExecutable(ucxPinned)
+	return nil
+}
+
+// dcHook is a uprobe, or a uretprobe if ret is set, at a file offset.
+type dcHook struct {
+	offset uint64
+	prog   *ebpf.Program
+	ret    bool
+}
+
+func attachDCHook(exe *link.Executable, h dcHook) (link.Link, error) {
+	opts := &link.UprobeOptions{Address: h.offset}
+	if h.ret {
+		return exe.Uretprobe("", h.prog, opts)
+	}
+	return exe.Uprobe("", h.prog, opts)
+}
+
+// ucxHooks lists the UCX hooks of the selected operations in attachment order.
+func (c *DCCollector) ucxHooks(ucx *ucxDCProvider) []dcHook {
+	objs := &c.objs
+	hooks := []dcHook{{ucx.symbol, objs.DcUcxExit, true}, {ucx.symbol, objs.DcUcxEnter, false}}
+	if c.options.UCXAM {
+		hooks = appendUCXSubmissionHooks(hooks, ucx.amSymbols[:], objs.DcUcxExit,
+			objs.DcUcxEnter, objs.DcUcxBcopyEnter, objs.DcUcxZcopyEnter)
+	}
+	if c.options.UCXRMA {
+		hooks = appendUCXSubmissionHooks(hooks, ucx.rmaSymbols[:], objs.DcUcxExit,
+			objs.DcUcxPutShortEnter, objs.DcUcxPutBcopyEnter, objs.DcUcxPutZcopyEnter, objs.DcUcxGetEnter, objs.DcUcxGetEnter)
+	}
+	if c.options.UCXAtomic {
+		hooks = appendUCXSubmissionHooks(hooks, ucx.atomicSymbols[:], objs.DcUcxExit,
+			objs.DcUcxAtomic32PostEnter, objs.DcUcxAtomic64PostEnter, objs.DcUcxAtomic32FetchEnter, objs.DcUcxAtomic64FetchEnter, objs.DcUcxAtomicCswap32Enter, objs.DcUcxAtomicCswap64Enter)
+	}
+	if c.options.UCXTag {
+		hooks = appendUCXSubmissionHooks(hooks, ucx.tagSymbols[:], objs.DcUcxExit,
+			objs.DcUcxEnter, objs.DcUcxTagBcopyEnter, objs.DcUcxTagZcopyEnter, objs.DcUcxTagRequestEnter, objs.DcUcxTagRndvEnter)
+	}
+	if c.options.UCXDevX {
+		hooks = append(hooks, dcHook{ucx.connectSymbol, objs.DcDevxConnectExit, true},
+			dcHook{ucx.connectSymbol, objs.DcDevxConnectEnter, false},
+			dcHook{ucx.createSymbol, objs.DcDevxCreateExit, true},
+			dcHook{ucx.createSymbol, objs.DcDevxCreateEnter, false})
+	}
+	return hooks
+}
+
+// appendUCXSubmissionHooks appends, for each symbols[i], the shared return
+// probe followed by the entry probe enters[i].
+func appendUCXSubmissionHooks(hooks []dcHook, symbols []uint64, exit *ebpf.Program, enters ...*ebpf.Program) []dcHook {
+	for i, enter := range enters {
+		hooks = append(hooks, dcHook{symbols[i], exit, true}, dcHook{symbols[i], enter, false})
+	}
+	return hooks
+}
+
+func (c *DCCollector) attachUCXProbes(pinned string, ucx *ucxDCProvider) error {
+	ucxExe, err := link.OpenExecutable(pinned)
+	if err != nil {
+		return err
+	}
+	// Provider retirement hooks are active before UCX creation is enabled.
+	for _, h := range c.ucxHooks(ucx) {
+		hook, err := attachDCHook(ucxExe, h)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("attach UCX DC probe: %w", err)
 		}
-		type ucxProbe struct {
-			offset uint64
-			prog   *ebpf.Program
-			ret    bool
-		}
-		hooks := []ucxProbe{{ucx.symbol, c.objs.DcUcxExit, true}, {ucx.symbol, c.objs.DcUcxEnter, false}}
-		if options.UCXAM {
-			for i, enter := range []*ebpf.Program{c.objs.DcUcxEnter, c.objs.DcUcxBcopyEnter, c.objs.DcUcxZcopyEnter} {
-				hooks = append(hooks, ucxProbe{ucx.amSymbols[i], c.objs.DcUcxExit, true}, ucxProbe{ucx.amSymbols[i], enter, false})
-			}
-		}
-		if options.UCXRMA {
-			for i, enter := range []*ebpf.Program{c.objs.DcUcxPutShortEnter, c.objs.DcUcxPutBcopyEnter, c.objs.DcUcxPutZcopyEnter, c.objs.DcUcxGetEnter, c.objs.DcUcxGetEnter} {
-				hooks = append(hooks, ucxProbe{ucx.rmaSymbols[i], c.objs.DcUcxExit, true}, ucxProbe{ucx.rmaSymbols[i], enter, false})
-			}
-		}
-		if options.UCXAtomic {
-			for i, enter := range []*ebpf.Program{c.objs.DcUcxAtomic32PostEnter, c.objs.DcUcxAtomic64PostEnter, c.objs.DcUcxAtomic32FetchEnter, c.objs.DcUcxAtomic64FetchEnter, c.objs.DcUcxAtomicCswap32Enter, c.objs.DcUcxAtomicCswap64Enter} {
-				hooks = append(hooks, ucxProbe{ucx.atomicSymbols[i], c.objs.DcUcxExit, true}, ucxProbe{ucx.atomicSymbols[i], enter, false})
-			}
-		}
-		if options.UCXTag {
-			for i, enter := range []*ebpf.Program{c.objs.DcUcxEnter, c.objs.DcUcxTagBcopyEnter, c.objs.DcUcxTagZcopyEnter, c.objs.DcUcxTagRequestEnter, c.objs.DcUcxTagRndvEnter} {
-				hooks = append(hooks, ucxProbe{ucx.tagSymbols[i], c.objs.DcUcxExit, true}, ucxProbe{ucx.tagSymbols[i], enter, false})
-			}
-		}
-		if options.UCXDevX {
-			hooks = append(hooks, ucxProbe{ucx.connectSymbol, c.objs.DcDevxConnectExit, true},
-				ucxProbe{ucx.connectSymbol, c.objs.DcDevxConnectEnter, false},
-				ucxProbe{ucx.createSymbol, c.objs.DcDevxCreateExit, true},
-				ucxProbe{ucx.createSymbol, c.objs.DcDevxCreateEnter, false})
-		}
-		// Provider retirement hooks are active before UCX creation is enabled.
-		for _, h := range hooks {
-			var hook link.Link
-			opts := &link.UprobeOptions{Address: h.offset}
-			if h.ret {
-				hook, err = ucxExe.Uretprobe("", h.prog, opts)
-			} else {
-				hook, err = ucxExe.Uprobe("", h.prog, opts)
-			}
-			if err != nil {
-				return nil, fmt.Errorf("attach UCX DC probe: %w", err)
-			}
-			c.links = append(c.links, hook)
-		}
+		c.links = append(c.links, hook)
 	}
-	if !c.alive() {
-		return nil, fmt.Errorf("target process exited during attachment")
-	}
-	return c, nil
+	return nil
 }
 
 func dcLibraryMapped(pid int, library *os.File) error {

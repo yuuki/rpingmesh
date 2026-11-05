@@ -115,6 +115,82 @@ def describe(vals):
             f"p90={q(0.9):.0f} max={vals[-1]:.0f} ns")
 
 
+def name_pairs(medians, gid_index):
+    """Key the pair medians by (host, device) endpoints instead of GIDs; also
+    return the GIDs that are missing from the facts files."""
+    named = {}
+    unknown = set()
+    for (src, tgt), rtt in medians.items():
+        if src in gid_index and tgt in gid_index:
+            named[(gid_index[src], gid_index[tgt])] = rtt
+        else:
+            unknown.update(g for g in (src, tgt) if g not in gid_index)
+    return named, unknown
+
+
+def load_mapping(path):
+    """(short hostname, device) -> ToR from build_device_tor_map.py JSON."""
+    with open(path) as f:
+        raw = json.load(f)
+    return {(h.split(".")[0], d): t for h, devs in raw.items() for d, t in devs.items()}
+
+
+def classify_pairs(named, tor_of, threshold):
+    """Split the pair medians into same-ToR and cross-ToR RTTs and collect the
+    pairs that contradict the mapping."""
+    same, cross, contradictions, unmapped = [], [], [], 0
+    for (a, b), rtt in named.items():
+        ta, tb = tor_of.get(a), tor_of.get(b)
+        if ta is None or tb is None:
+            unmapped += 1
+            continue
+        if ta == tb:
+            same.append(rtt)
+            if rtt > threshold:
+                contradictions.append((rtt, a, b, "same ToR but slow", ta, tb))
+        else:
+            cross.append(rtt)
+            if rtt < threshold:
+                contradictions.append((rtt, a, b, "cross ToR but fast", ta, tb))
+    return same, cross, contradictions, unmapped
+
+
+def check_mapping(named, tor_of, threshold, max_listed):
+    same, cross, contradictions, unmapped = classify_pairs(named, tor_of, threshold)
+    print(f"same-ToR pairs : {describe(same)}")
+    print(f"cross-ToR pairs: {describe(cross)}")
+    print(f"unmapped pairs : {unmapped}")
+    print(f"contradictions : {len(contradictions)}")
+    for rtt, a, b, why, ta, tb in sorted(contradictions)[:max_listed]:
+        print(f"  {why}: {a[0]}/{a[1]} ({ta}) -> {b[0]}/{b[1]} ({tb}) median {rtt:.0f} ns")
+
+
+def print_groups(named, threshold, max_listed):
+    """Link every pair below threshold and print the connected components."""
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for (a, b), rtt in named.items():
+        find(a)
+        find(b)
+        if rtt < threshold:
+            parent[find(a)] = find(b)
+    groups = collections.defaultdict(list)
+    for node in parent:
+        groups[find(node)].append(node)
+    print(f"inferred groups (pairs below {threshold:.0f} ns linked): {len(groups)}")
+    for members in sorted(groups.values(), key=len, reverse=True):
+        devs = collections.Counter(d for _, d in members)
+        print(f"  {len(members)} RNICs, devices {dict(devs)}: "
+              + ", ".join(f"{h}/{d}" for h, d in sorted(members)[:max_listed]))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -127,13 +203,7 @@ def main():
 
     gid_index = load_gid_index(args.facts)
     medians = load_pair_rtts(args.logs)
-    named = {}
-    unknown = set()
-    for (src, tgt), rtt in medians.items():
-        if src in gid_index and tgt in gid_index:
-            named[(gid_index[src], gid_index[tgt])] = rtt
-        else:
-            unknown.update(g for g in (src, tgt) if g not in gid_index)
+    named, unknown = name_pairs(medians, gid_index)
     if unknown:
         sys.stderr.write(f"WARNING: {len(unknown)} GIDs not found in the facts files\n")
     if not named:
@@ -144,53 +214,10 @@ def main():
     print(f"threshold: {threshold:.0f} ns" + ("" if args.cluster_threshold_ns else " (widest gap)"))
 
     if args.mapping:
-        with open(args.mapping) as f:
-            raw = json.load(f)
-        tor_of = {(h.split(".")[0], d): t for h, devs in raw.items() for d, t in devs.items()}
-        same, cross, contradictions, unmapped = [], [], [], 0
-        for (a, b), rtt in named.items():
-            ta, tb = tor_of.get(a), tor_of.get(b)
-            if ta is None or tb is None:
-                unmapped += 1
-                continue
-            if ta == tb:
-                same.append(rtt)
-                if rtt > threshold:
-                    contradictions.append((rtt, a, b, "same ToR but slow", ta, tb))
-            else:
-                cross.append(rtt)
-                if rtt < threshold:
-                    contradictions.append((rtt, a, b, "cross ToR but fast", ta, tb))
-        print(f"same-ToR pairs : {describe(same)}")
-        print(f"cross-ToR pairs: {describe(cross)}")
-        print(f"unmapped pairs : {unmapped}")
-        print(f"contradictions : {len(contradictions)}")
-        for rtt, a, b, why, ta, tb in sorted(contradictions)[: args.max_listed]:
-            print(f"  {why}: {a[0]}/{a[1]} ({ta}) -> {b[0]}/{b[1]} ({tb}) median {rtt:.0f} ns")
+        check_mapping(named, load_mapping(args.mapping), threshold, args.max_listed)
 
     if args.cluster_threshold_ns or not args.mapping:
-        parent = {}
-
-        def find(x):
-            parent.setdefault(x, x)
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        for (a, b), rtt in named.items():
-            find(a)
-            find(b)
-            if rtt < threshold:
-                parent[find(a)] = find(b)
-        groups = collections.defaultdict(list)
-        for node in parent:
-            groups[find(node)].append(node)
-        print(f"inferred groups (pairs below {threshold:.0f} ns linked): {len(groups)}")
-        for members in sorted(groups.values(), key=len, reverse=True):
-            devs = collections.Counter(d for _, d in members)
-            print(f"  {len(members)} RNICs, devices {dict(devs)}: "
-                  + ", ".join(f"{h}/{d}" for h, d in sorted(members)[: args.max_listed]))
+        print_groups(named, threshold, args.max_listed)
 
 
 if __name__ == "__main__":

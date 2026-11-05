@@ -69,6 +69,103 @@ def short(host):
     return host.split(".")[0]
 
 
+def load_host_groups(path):
+    """Short hostname -> group from a CSV of hostname,group ('#' rows are comments)."""
+    groups = {}
+    with open(path) as f:
+        for row in csv.reader(f):
+            if len(row) >= 2 and not row[0].startswith("#"):
+                groups[short(row[0].strip())] = row[1].strip()
+    return groups
+
+
+def lldp_tor(host, dev, port, warnings):
+    tor = (port.get("lldp") or {}).get("system_name")
+    if not tor:
+        warnings.append(f"{host}/{dev}: no LLDP neighbor ({(port.get('lldp') or {}).get('source')})")
+    return tor
+
+
+def subnet_tor(host, dev, port, prefixlen, warnings):
+    ip = ipv4_of(port)
+    if not ip:
+        warnings.append(f"{host}/{dev}: no IPv4 address on {port.get('netdev')}")
+        return None
+    return str(ipaddress.ip_network(f"{ip.ip}/{prefixlen}", strict=False))
+
+
+def group_rail_tor(host, dev, port, args, groups, warnings):
+    group = groups.get(short(host))
+    if group is None:
+        warnings.append(f"{host}: not in --host-groups")
+        return None
+    if args.rail_key == "device":
+        return f"{group}-{dev}"
+    rail = subnet_tor(host, dev, port, args.rail_prefixlen, warnings)
+    if rail is None:
+        return None
+    return f"{group}-{rail}"
+
+
+def rnic_tor(host, dev, port, args, groups, warnings):
+    """The ToR ID of one RNIC under args.strategy, or a false value (with a
+    warning) when the strategy cannot place it."""
+    if args.strategy == "lldp":
+        return lldp_tor(host, dev, port, warnings)
+    if args.strategy == "subnet":
+        return subnet_tor(host, dev, port, args.prefixlen, warnings)
+    return group_rail_tor(host, dev, port, args, groups, warnings)
+
+
+def map_rnics(args, allowed, groups, warnings):
+    """host -> {device: tor} in input order, and tor -> ["host/device"]."""
+    mapping = collections.OrderedDict()   # host -> {device: tor}
+    members = collections.defaultdict(list)  # tor -> ["host/device"]
+    for path in args.facts:
+        with open(path) as f:
+            facts = json.load(f)
+        for host, dev, port in rnics(facts, allowed):
+            tor = rnic_tor(host, dev, port, args, groups, warnings)
+            if not tor:
+                continue
+            mapping.setdefault(host, collections.OrderedDict())[dev] = tor
+            members[tor].append(f"{short(host)}/{dev}")
+    return mapping, members
+
+
+def consistency_warnings(members):
+    """A ToR that holds two RNICs of one host contradicts a rail-optimized
+    layout; a single-member ToR gets an empty ToR-mesh."""
+    warnings = []
+    for tor, ms in sorted(members.items()):
+        hosts = collections.Counter(m.split("/")[0] for m in ms)
+        dup = [h for h, n in hosts.items() if n > 1]
+        if dup:
+            warnings.append(f"ToR {tor}: several RNICs of the same host ({', '.join(sorted(dup))})")
+        if len(ms) == 1:
+            warnings.append(f"ToR {tor}: only one RNIC ({ms[0]}); its ToR-mesh will be empty")
+    return warnings
+
+
+def write_mapping(mapping, fmt):
+    if fmt == "json":
+        json.dump(mapping, sys.stdout, indent=1)
+        sys.stdout.write("\n")
+        return
+    for host, devs in mapping.items():
+        sys.stdout.write(f"# --- {host} ---\ndevice_tor_ids:\n")
+        for dev, tor in devs.items():
+            sys.stdout.write(f'  {dev}: "{tor}"\n')
+
+
+def write_summary(mapping, members, warnings):
+    sys.stderr.write(f"{len(members)} ToRs, {sum(len(m) for m in members.values())} RNICs on {len(mapping)} hosts\n")
+    for tor, ms in sorted(members.items()):
+        sys.stderr.write(f"  {tor}: {len(ms)} RNICs\n")
+    for w in warnings:
+        sys.stderr.write(f"WARNING: {w}\n")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -89,75 +186,15 @@ def main():
     if args.strategy == "group-rail":
         if not args.host_groups:
             ap.error("--host-groups is required for group-rail")
-        with open(args.host_groups) as f:
-            for row in csv.reader(f):
-                if len(row) >= 2 and not row[0].startswith("#"):
-                    groups[short(row[0].strip())] = row[1].strip()
+        groups = load_host_groups(args.host_groups)
     if args.strategy == "subnet" and not args.prefixlen:
         ap.error("--prefixlen is required for subnet")
 
-    mapping = collections.OrderedDict()   # host -> {device: tor}
-    members = collections.defaultdict(list)  # tor -> ["host/device"]
     warnings = []
-
-    for path in args.facts:
-        with open(path) as f:
-            facts = json.load(f)
-        for host, dev, port in rnics(facts, allowed):
-            tor = None
-            if args.strategy == "lldp":
-                tor = (port.get("lldp") or {}).get("system_name")
-                if not tor:
-                    warnings.append(f"{host}/{dev}: no LLDP neighbor ({(port.get('lldp') or {}).get('source')})")
-            elif args.strategy == "subnet":
-                ip = ipv4_of(port)
-                if ip:
-                    tor = str(ipaddress.ip_network(f"{ip.ip}/{args.prefixlen}", strict=False))
-                else:
-                    warnings.append(f"{host}/{dev}: no IPv4 address on {port.get('netdev')}")
-            else:
-                group = groups.get(short(host))
-                if group is None:
-                    warnings.append(f"{host}: not in --host-groups")
-                    continue
-                if args.rail_key == "device":
-                    rail = dev
-                else:
-                    ip = ipv4_of(port)
-                    if not ip:
-                        warnings.append(f"{host}/{dev}: no IPv4 address on {port.get('netdev')}")
-                        continue
-                    rail = str(ipaddress.ip_network(f"{ip.ip}/{args.rail_prefixlen}", strict=False))
-                tor = f"{group}-{rail}"
-            if not tor:
-                continue
-            mapping.setdefault(host, collections.OrderedDict())[dev] = tor
-            members[tor].append(f"{short(host)}/{dev}")
-
-    # Consistency checks: a ToR that holds two RNICs of one host contradicts a
-    # rail-optimized layout; a single-member ToR gets an empty ToR-mesh.
-    for tor, ms in sorted(members.items()):
-        hosts = collections.Counter(m.split("/")[0] for m in ms)
-        dup = [h for h, n in hosts.items() if n > 1]
-        if dup:
-            warnings.append(f"ToR {tor}: several RNICs of the same host ({', '.join(sorted(dup))})")
-        if len(ms) == 1:
-            warnings.append(f"ToR {tor}: only one RNIC ({ms[0]}); its ToR-mesh will be empty")
-
-    if args.format == "json":
-        json.dump(mapping, sys.stdout, indent=1)
-        sys.stdout.write("\n")
-    else:
-        for host, devs in mapping.items():
-            sys.stdout.write(f"# --- {host} ---\ndevice_tor_ids:\n")
-            for dev, tor in devs.items():
-                sys.stdout.write(f'  {dev}: "{tor}"\n')
-
-    sys.stderr.write(f"{len(members)} ToRs, {sum(len(m) for m in members.values())} RNICs on {len(mapping)} hosts\n")
-    for tor, ms in sorted(members.items()):
-        sys.stderr.write(f"  {tor}: {len(ms)} RNICs\n")
-    for w in warnings:
-        sys.stderr.write(f"WARNING: {w}\n")
+    mapping, members = map_rnics(args, allowed, groups, warnings)
+    warnings.extend(consistency_warnings(members))
+    write_mapping(mapping, args.format)
+    write_summary(mapping, members, warnings)
 
 
 if __name__ == "__main__":

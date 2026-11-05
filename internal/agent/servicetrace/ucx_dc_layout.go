@@ -1,7 +1,6 @@
 package servicetrace
 
 import (
-	"bytes"
 	"debug/dwarf"
 	"debug/elf"
 	"fmt"
@@ -61,53 +60,68 @@ func inspectUCXDCOperations(library, debugFile string, devx, streams, am, rma, a
 		return nil, err
 	}
 	defer dbg.Close()
-	if lib.Class != elf.ELFCLASS64 || lib.Data != elf.ELFDATA2LSB || lib.Type != elf.ET_DYN ||
-		(lib.Machine != elf.EM_X86_64 && lib.Machine != elf.EM_AARCH64) ||
-		dbg.Machine != lib.Machine || dbg.Class != lib.Class || dbg.Data != lib.Data {
-		return nil, fmt.Errorf("unsupported or mismatching UCX ELF architecture")
-	}
-	lid, err := dcBuildID(lib)
+	data, err := dcMatchingDWARF(lib, dbg, "UCX")
 	if err != nil {
 		return nil, err
-	}
-	did, err := dcBuildID(dbg)
-	if err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(lid, did) {
-		return nil, fmt.Errorf("UCX and debug build IDs differ")
-	}
-	data, err := dbg.DWARF()
-	if err != nil {
-		return nil, fmt.Errorf("full UCX DWARF is required: %w", err)
 	}
 	p := &ucxDCProvider{machine: lib.Machine}
+	if streams {
+		p.layout.StreamsEnabled = 1
+	}
+	types, err := ucxDCStructs(data)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range ucxDCFields(&p.layout, devx, streams) {
+		if err := ucxResolveField(f, types[f.root]); err != nil {
+			return nil, err
+		}
+	}
+	if err := ucxCheckBaseLayouts(types, devx); err != nil {
+		return nil, err
+	}
+	syms, err := dbg.Symbols()
+	if err != nil {
+		return nil, err
+	}
+	if err := ucxResolveFunctions(lib, syms, ucxDCFunctions(p, devx, am, rma, atomic, tag)); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func ucxDCFields(layout *ucxDCLayout, devx, streams bool) []dcDWARFField {
 	fields := []dcDWARFField{
-		{&p.layout.EPInterface, "uct_dc_mlx5_ep", "super.super.iface", 8},
-		{&p.layout.EPDCI, "uct_dc_mlx5_ep", "dci", 2},
-		{&p.layout.InterfaceBuffer, "uct_dc_mlx5_iface", "tx.dcis.buffer", 8},
-		{&p.layout.InterfaceLength, "uct_dc_mlx5_iface", "tx.dcis.length", 2},
-		{&p.layout.DCIWQ, "uct_dc_dci", "txwq", -1},
-		{&p.layout.WQType, "uct_ib_mlx5_txwq", "super.type", 4},
-		{&p.layout.WQQP, "uct_ib_mlx5_txwq", "super.verbs.qp", 8},
-		{&p.layout.WQQPN, "uct_ib_mlx5_txwq", "super.qp_num", 4},
-		{&p.layout.WQStart, "uct_ib_mlx5_txwq", "qstart", 8},
-		{&p.layout.WQEnd, "uct_ib_mlx5_txwq", "qend", 8},
-		{&p.layout.WQCurrent, "uct_ib_mlx5_txwq", "curr", 8},
-		{&p.layout.WQDB, "uct_ib_mlx5_txwq", "dbrec", 8},
-		{&p.layout.WQPrevious, "uct_ib_mlx5_txwq", "prev_sw_pi", 2},
-		{&p.layout.WQProducer, "uct_ib_mlx5_txwq", "sw_pi", 2},
+		{&layout.EPInterface, "uct_dc_mlx5_ep", "super.super.iface", 8},
+		{&layout.EPDCI, "uct_dc_mlx5_ep", "dci", 2},
+		{&layout.InterfaceBuffer, "uct_dc_mlx5_iface", "tx.dcis.buffer", 8},
+		{&layout.InterfaceLength, "uct_dc_mlx5_iface", "tx.dcis.length", 2},
+		{&layout.DCIWQ, "uct_dc_dci", "txwq", -1},
+		{&layout.WQType, "uct_ib_mlx5_txwq", "super.type", 4},
+		{&layout.WQQP, "uct_ib_mlx5_txwq", "super.verbs.qp", 8},
+		{&layout.WQQPN, "uct_ib_mlx5_txwq", "super.qp_num", 4},
+		{&layout.WQStart, "uct_ib_mlx5_txwq", "qstart", 8},
+		{&layout.WQEnd, "uct_ib_mlx5_txwq", "qend", 8},
+		{&layout.WQCurrent, "uct_ib_mlx5_txwq", "curr", 8},
+		{&layout.WQDB, "uct_ib_mlx5_txwq", "dbrec", 8},
+		{&layout.WQPrevious, "uct_ib_mlx5_txwq", "prev_sw_pi", 2},
+		{&layout.WQProducer, "uct_ib_mlx5_txwq", "sw_pi", 2},
 	}
 	if devx {
 		fields = append(fields,
-			dcDWARFField{&p.layout.WQDevXObject, "uct_ib_mlx5_txwq", "super.devx.obj", 8},
-			dcDWARFField{&p.layout.WQDevXBuffer, "uct_ib_mlx5_txwq", "super.devx.wq_buf", 8},
-			dcDWARFField{&p.layout.InterfacePort, "uct_dc_mlx5_iface", "super.super.super.config.port_num", 1})
+			dcDWARFField{&layout.WQDevXObject, "uct_ib_mlx5_txwq", "super.devx.obj", 8},
+			dcDWARFField{&layout.WQDevXBuffer, "uct_ib_mlx5_txwq", "super.devx.wq_buf", 8},
+			dcDWARFField{&layout.InterfacePort, "uct_dc_mlx5_iface", "super.super.super.config.port_num", 1})
 	}
 	if streams {
-		fields = append(fields, dcDWARFField{&p.layout.EPChannel, "uct_dc_mlx5_ep", "dci_channel_index", 1})
-		p.layout.StreamsEnabled = 1
+		fields = append(fields, dcDWARFField{&layout.EPChannel, "uct_dc_mlx5_ep", "dci_channel_index", 1})
 	}
+	return fields
+}
+
+// ucxDCStructs collects every complete definition of the UCX structures in
+// DWARF order.
+func ucxDCStructs(data *dwarf.Data) (map[string][]*dwarf.StructType, error) {
 	types := make(map[string][]*dwarf.StructType)
 	r := data.Reader()
 	for {
@@ -116,108 +130,135 @@ func inspectUCXDCOperations(library, debugFile string, devx, streams, am, rma, a
 			return nil, err
 		}
 		if e == nil {
-			break
+			return types, nil
 		}
 		if e.Tag != dwarf.TagStructType {
 			continue
 		}
 		name, _ := e.Val(dwarf.AttrName).(string)
-		switch name {
-		case "uct_dc_mlx5_ep", "uct_dc_mlx5_iface", "uct_dc_dci", "uct_ib_mlx5_txwq":
-			t, err := data.Type(e.Offset)
-			if err != nil {
-				return nil, err
-			}
-			if s, ok := t.(*dwarf.StructType); ok && !s.Incomplete {
-				types[name] = append(types[name], s)
-			}
+		if !ucxDCStructWanted(name) {
+			continue
+		}
+		s, err := dcCompleteStruct(data, e)
+		if err != nil {
+			return nil, err
+		}
+		if s != nil {
+			types[name] = append(types[name], s)
 		}
 	}
-	for _, f := range fields {
-		candidates := types[f.root]
-		if len(candidates) == 0 {
-			return nil, fmt.Errorf("missing UCX DWARF type %s", f.root)
-		}
-		for i, s := range candidates {
-			off, err := dcFieldOffset(s, f.path, f.size)
-			if err != nil {
-				return nil, fmt.Errorf("UCX %s.%s: %w", f.root, f.path, err)
-			}
-			if i > 0 && (off != *f.out || s.Size() != candidates[0].Size()) {
-				return nil, fmt.Errorf("ambiguous UCX layout for %s.%s", f.root, f.path)
-			}
-			*f.out = off
-		}
+}
+
+func ucxDCStructWanted(name string) bool {
+	switch name {
+	case "uct_dc_mlx5_ep", "uct_dc_mlx5_iface", "uct_dc_dci", "uct_ib_mlx5_txwq":
+		return true
 	}
+	return false
+}
+
+// ucxResolveField stores the field's offset and requires every definition of
+// its root structure to agree on both the offset and the structure size.
+func ucxResolveField(f dcDWARFField, candidates []*dwarf.StructType) error {
+	if len(candidates) == 0 {
+		return fmt.Errorf("missing UCX DWARF type %s", f.root)
+	}
+	for i, s := range candidates {
+		off, err := dcFieldOffset(s, f.path, f.size)
+		if err != nil {
+			return fmt.Errorf("UCX %s.%s: %w", f.root, f.path, err)
+		}
+		if i > 0 && (off != *f.out || s.Size() != candidates[0].Size()) {
+			return fmt.Errorf("ambiguous UCX layout for %s.%s", f.root, f.path)
+		}
+		*f.out = off
+	}
+	return nil
+}
+
+// ucxCheckBaseLayouts requires the base-class chains that UCT converts
+// pointers through to start at offset zero in every definition.
+func ucxCheckBaseLayouts(types map[string][]*dwarf.StructType, devx bool) error {
 	// UCT passes base-class pointers; both container chains must start at zero.
 	for root, path := range map[string]string{
 		"uct_dc_mlx5_ep":    "super.super",
 		"uct_dc_mlx5_iface": "super.super.super.super.super",
 	} {
-		for _, s := range types[root] {
-			off, err := dcFieldOffset(s, path, -1)
-			if err != nil || off != 0 {
-				return nil, fmt.Errorf("unsupported UCX base layout: %s", root)
-			}
+		if !ucxPathAtZero(types[root], path) {
+			return fmt.Errorf("unsupported UCX base layout: %s", root)
 		}
 	}
-	if devx {
-		for _, s := range types["uct_ib_mlx5_txwq"] {
-			off, err := dcFieldOffset(s, "super", -1)
-			if err != nil || off != 0 {
-				return nil, fmt.Errorf("unsupported UCX QP base layout")
-			}
+	if devx && !ucxPathAtZero(types["uct_ib_mlx5_txwq"], "super") {
+		return fmt.Errorf("unsupported UCX QP base layout")
+	}
+	return nil
+}
+
+// ucxPathAtZero reports whether path resolves to offset zero in every
+// structure definition.
+func ucxPathAtZero(definitions []*dwarf.StructType, path string) bool {
+	for _, s := range definitions {
+		off, err := dcFieldOffset(s, path, -1)
+		if err != nil || off != 0 {
+			return false
 		}
 	}
-	syms, err := dbg.Symbols()
-	if err != nil {
-		return nil, err
-	}
+	return true
+}
+
+// ucxDCFunctions maps every function the selected operations need to the
+// field of p that receives its file offset.
+func ucxDCFunctions(p *ucxDCProvider, devx, am, rma, atomic, tag bool) map[string]*uint64 {
 	wanted := map[string]*uint64{"uct_dc_mlx5_ep_am_short": &p.symbol}
 	if am {
-		for i, name := range []string{"uct_dc_mlx5_ep_am_short_iov", "uct_dc_mlx5_ep_am_bcopy", "uct_dc_mlx5_ep_am_zcopy"} {
-			wanted[name] = &p.amSymbols[i]
-		}
+		ucxWantFunctions(wanted, p.amSymbols[:], "uct_dc_mlx5_ep_am_short_iov", "uct_dc_mlx5_ep_am_bcopy", "uct_dc_mlx5_ep_am_zcopy")
 	}
 	if rma {
-		for i, name := range []string{"uct_dc_mlx5_ep_put_short", "uct_dc_mlx5_ep_put_bcopy", "uct_dc_mlx5_ep_put_zcopy", "uct_dc_mlx5_ep_get_bcopy", "uct_dc_mlx5_ep_get_zcopy"} {
-			wanted[name] = &p.rmaSymbols[i]
-		}
+		ucxWantFunctions(wanted, p.rmaSymbols[:], "uct_dc_mlx5_ep_put_short", "uct_dc_mlx5_ep_put_bcopy", "uct_dc_mlx5_ep_put_zcopy", "uct_dc_mlx5_ep_get_bcopy", "uct_dc_mlx5_ep_get_zcopy")
 	}
 	if atomic {
-		for i, name := range []string{"uct_dc_mlx5_ep_atomic32_post", "uct_dc_mlx5_ep_atomic64_post", "uct_dc_mlx5_ep_atomic32_fetch", "uct_dc_mlx5_ep_atomic64_fetch", "uct_dc_mlx5_ep_atomic_cswap32", "uct_dc_mlx5_ep_atomic_cswap64"} {
-			wanted[name] = &p.atomicSymbols[i]
-		}
+		ucxWantFunctions(wanted, p.atomicSymbols[:], "uct_dc_mlx5_ep_atomic32_post", "uct_dc_mlx5_ep_atomic64_post", "uct_dc_mlx5_ep_atomic32_fetch", "uct_dc_mlx5_ep_atomic64_fetch", "uct_dc_mlx5_ep_atomic_cswap32", "uct_dc_mlx5_ep_atomic_cswap64")
 	}
 	if tag {
-		for i, name := range []string{"uct_dc_mlx5_ep_tag_eager_short", "uct_dc_mlx5_ep_tag_eager_bcopy", "uct_dc_mlx5_ep_tag_eager_zcopy", "uct_dc_mlx5_ep_tag_rndv_request", "uct_dc_mlx5_ep_tag_rndv_zcopy"} {
-			wanted[name] = &p.tagSymbols[i]
-		}
+		ucxWantFunctions(wanted, p.tagSymbols[:], "uct_dc_mlx5_ep_tag_eager_short", "uct_dc_mlx5_ep_tag_eager_bcopy", "uct_dc_mlx5_ep_tag_eager_zcopy", "uct_dc_mlx5_ep_tag_rndv_request", "uct_dc_mlx5_ep_tag_rndv_zcopy")
 	}
 	if devx {
 		wanted["uct_dc_mlx5_iface_create_dci"] = &p.createSymbol
 		wanted["uct_dc_mlx5_iface_dci_connect"] = &p.connectSymbol
 	}
+	return wanted
+}
+
+// ucxWantFunctions maps names[i] to targets[i].
+func ucxWantFunctions(wanted map[string]*uint64, targets []uint64, names ...string) {
+	for i, name := range names {
+		wanted[name] = &targets[i]
+	}
+}
+
+// ucxResolveFunctions stores the file offset of every wanted function,
+// rejecting a function defined at several offsets or not at all.
+func ucxResolveFunctions(lib *elf.File, syms []elf.Symbol, wanted map[string]*uint64) error {
 	for _, s := range syms {
 		target := wanted[s.Name]
-		if target == nil || elf.ST_TYPE(s.Info) != elf.STT_FUNC || s.Section == elf.SHN_UNDEF || s.Size == 0 {
+		if target == nil {
 			continue
 		}
-		off, ok := dcExecutableOffset(lib, s.Value, s.Size)
+		off, ok := dcFunctionOffset(lib, s)
 		if !ok {
 			continue
 		}
 		if *target != 0 && *target != off {
-			return nil, fmt.Errorf("ambiguous UCX function %s", s.Name)
+			return fmt.Errorf("ambiguous UCX function %s", s.Name)
 		}
 		*target = off
 	}
 	for name, target := range wanted {
 		if *target == 0 {
-			return nil, fmt.Errorf("required UCX function %s is unavailable", name)
+			return fmt.Errorf("required UCX function %s is unavailable", name)
 		}
 	}
-	return p, nil
+	return nil
 }
 
 // CheckUCXDC performs the optional adapter's non-privileged ELF/DWARF checks.

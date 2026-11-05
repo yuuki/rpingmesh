@@ -6,6 +6,7 @@ import (
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -48,10 +49,40 @@ func inspectDCProviderMode(library, debugFile string, devx bool) (*dcProvider, e
 		return nil, fmt.Errorf("open provider debug ELF: %w", err)
 	}
 	defer dbg.Close()
+	data, err := dcMatchingDWARF(lib, dbg, "provider")
+	if err != nil {
+		return nil, err
+	}
+	types, candidates, err := dcProviderStructs(data, devx)
+	if err != nil {
+		return nil, err
+	}
+	p := &dcProvider{symbols: make(map[string]uint64), machine: lib.Machine}
+	if err := dcResolveProviderLayout(p, types, candidates, devx); err != nil {
+		return nil, err
+	}
+	syms, err := dbg.Symbols()
+	if err != nil {
+		return nil, fmt.Errorf("full provider symbol table is required: %w", err)
+	}
+	required := append([]string(nil), dcRequiredSymbols...)
+	if devx {
+		required = append(required, "mlx5dv_devx_obj_modify", "mlx5dv_devx_obj_destroy")
+	}
+	if err := dcResolveProviderFunctions(lib, syms, required, p.symbols); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// dcMatchingDWARF checks that dbg describes the same 64-bit little-endian
+// x86-64 or arm64 shared-object build as lib and returns its full DWARF.
+// what names the library in error messages ("provider" or "UCX").
+func dcMatchingDWARF(lib, dbg *elf.File, what string) (*dwarf.Data, error) {
 	if lib.Class != elf.ELFCLASS64 || lib.Data != elf.ELFDATA2LSB || lib.Type != elf.ET_DYN ||
 		(lib.Machine != elf.EM_X86_64 && lib.Machine != elf.EM_AARCH64) ||
 		dbg.Machine != lib.Machine || dbg.Class != lib.Class || dbg.Data != lib.Data {
-		return nil, fmt.Errorf("unsupported or mismatching provider ELF architecture")
+		return nil, fmt.Errorf("unsupported or mismatching %s ELF architecture", what)
 	}
 	lid, err := dcBuildID(lib)
 	if err != nil {
@@ -62,47 +93,94 @@ func inspectDCProviderMode(library, debugFile string, devx bool) (*dcProvider, e
 		return nil, err
 	}
 	if !bytes.Equal(lid, did) {
-		return nil, fmt.Errorf("provider and debug build IDs differ")
+		return nil, fmt.Errorf("%s and debug build IDs differ", what)
 	}
 	data, err := dbg.DWARF()
 	if err != nil {
-		return nil, fmt.Errorf("full provider DWARF is required: %w", err)
+		return nil, fmt.Errorf("full %s DWARF is required: %w", what, err)
 	}
+	return data, nil
+}
+
+// dcProviderStructs collects every complete definition of the provider
+// structures in DWARF order. types holds the last definition of each name,
+// and definitions of one name that differ in size are rejected as they appear.
+func dcProviderStructs(data *dwarf.Data, devx bool) (map[string]*dwarf.StructType, map[string][]*dwarf.StructType, error) {
 	types := make(map[string]*dwarf.StructType)
 	candidates := make(map[string][]*dwarf.StructType)
 	r := data.Reader()
 	for {
 		e, err := r.Next()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if e == nil {
-			break
+			return types, candidates, nil
 		}
 		if e.Tag != dwarf.TagStructType {
 			continue
 		}
 		name, _ := e.Val(dwarf.AttrName).(string)
-		switch name {
-		case "mlx5_qp", "ibv_qp", "ibv_context", "mlx5dv_qp_init_attr", "ibv_qp_attr", "mlx5dv_devx_obj":
-			if name == "mlx5dv_devx_obj" && !devx {
-				continue
-			}
-			t, err := data.Type(e.Offset)
-			if err != nil {
-				return nil, err
-			}
-			s, ok := t.(*dwarf.StructType)
-			if ok && !s.Incomplete {
-				if old := types[name]; old != nil && old.Size() != s.Size() {
-					return nil, fmt.Errorf("ambiguous provider DWARF type %s", name)
-				}
-				types[name] = s
-				candidates[name] = append(candidates[name], s)
-			}
+		if !dcProviderStructWanted(name, devx) {
+			continue
+		}
+		s, err := dcCompleteStruct(data, e)
+		if err != nil {
+			return nil, nil, err
+		}
+		if s == nil {
+			continue
+		}
+		if old := types[name]; old != nil && old.Size() != s.Size() {
+			return nil, nil, fmt.Errorf("ambiguous provider DWARF type %s", name)
+		}
+		types[name] = s
+		candidates[name] = append(candidates[name], s)
+	}
+}
+
+func dcProviderStructWanted(name string, devx bool) bool {
+	switch name {
+	case "mlx5_qp", "ibv_qp", "ibv_context", "mlx5dv_qp_init_attr", "ibv_qp_attr":
+		return true
+	case "mlx5dv_devx_obj":
+		return devx
+	}
+	return false
+}
+
+// dcCompleteStruct returns the structure type an entry defines, or nil when
+// the type is not a complete structure.
+func dcCompleteStruct(data *dwarf.Data, e *dwarf.Entry) (*dwarf.StructType, error) {
+	t, err := data.Type(e.Offset)
+	if err != nil {
+		return nil, err
+	}
+	if s, ok := t.(*dwarf.StructType); ok && !s.Incomplete {
+		return s, nil
+	}
+	return nil, nil
+}
+
+// dcResolveProviderLayout fills p's layout and DevX offsets from the provider
+// structures and checks the verbs_qp container relationship.
+func dcResolveProviderLayout(p *dcProvider, types map[string]*dwarf.StructType, candidates map[string][]*dwarf.StructType, devx bool) error {
+	for _, f := range dcProviderFields(p, devx) {
+		if err := dcResolveProviderField(f, types[f.root], candidates[f.root]); err != nil {
+			return err
 		}
 	}
-	p := &dcProvider{symbols: make(map[string]uint64), machine: lib.Machine}
+	// ibv_qp_ex and verbs_qp must start with the ordinary ibv_qp. The provider
+	// converts the callback's qp pointer via this exact container relationship.
+	for _, candidate := range candidates["mlx5_qp"] {
+		if err := dcValidateQPBase(candidate, p.layout.QPBase, types["ibv_qp"].Size()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func dcProviderFields(p *dcProvider, devx bool) []dcDWARFField {
 	fields := []dcDWARFField{
 		{&p.layout.QPBase, "mlx5_qp", "verbs_qp", -1},
 		{&p.layout.QPNum, "ibv_qp", "qp_num", 4},
@@ -124,60 +202,58 @@ func inspectDCProviderMode(library, debugFile string, devx bool) (*dcProvider, e
 	if devx {
 		fields = append(fields, dcDWARFField{&p.devxContext, "mlx5dv_devx_obj", "context", 8}, dcDWARFField{&p.devxQPN, "mlx5dv_devx_obj", "object_id", 4})
 	}
-	for _, f := range fields {
-		off, err := dcFieldOffset(types[f.root], f.path, f.size)
-		if err != nil {
-			return nil, fmt.Errorf("%s.%s: %w", f.root, f.path, err)
-		}
-		*f.out = off
-		for _, alternative := range candidates[f.root] {
-			other, err := dcFieldOffset(alternative, f.path, f.size)
-			if err != nil || other != off {
-				return nil, fmt.Errorf("ambiguous provider layout for %s.%s", f.root, f.path)
-			}
-		}
-	}
-	// ibv_qp_ex and verbs_qp must start with the ordinary ibv_qp. The provider
-	// converts the callback's qp pointer via this exact container relationship.
-	for _, candidate := range candidates["mlx5_qp"] {
-		if err := dcValidateQPBase(candidate, p.layout.QPBase, types["ibv_qp"].Size()); err != nil {
-			return nil, err
-		}
-	}
-	syms, err := dbg.Symbols()
+	return fields
+}
+
+// dcResolveProviderField stores the field's offset in root and requires every
+// alternative definition of the root structure to agree on it.
+func dcResolveProviderField(f dcDWARFField, root *dwarf.StructType, alternatives []*dwarf.StructType) error {
+	off, err := dcFieldOffset(root, f.path, f.size)
 	if err != nil {
-		return nil, fmt.Errorf("full provider symbol table is required: %w", err)
+		return fmt.Errorf("%s.%s: %w", f.root, f.path, err)
 	}
-	required := append([]string(nil), dcRequiredSymbols...)
-	if devx {
-		required = append(required, "mlx5dv_devx_obj_modify", "mlx5dv_devx_obj_destroy")
+	*f.out = off
+	for _, alternative := range alternatives {
+		other, err := dcFieldOffset(alternative, f.path, f.size)
+		if err != nil || other != off {
+			return fmt.Errorf("ambiguous provider layout for %s.%s", f.root, f.path)
+		}
 	}
+	return nil
+}
+
+// dcResolveProviderFunctions records the file offsets of the required
+// functions and of the optional mlx5dv_devx_qp_modify in symbols, rejecting
+// a function defined at several offsets.
+func dcResolveProviderFunctions(lib *elf.File, syms []elf.Symbol, required []string, symbols map[string]uint64) error {
 	for _, s := range syms {
-		wanted := s.Name == "mlx5dv_devx_qp_modify"
-		for _, name := range required {
-			wanted = wanted || s.Name == name
-		}
-		if !wanted {
+		if s.Name != "mlx5dv_devx_qp_modify" && !slices.Contains(required, s.Name) {
 			continue
 		}
-		if elf.ST_TYPE(s.Info) != elf.STT_FUNC || s.Section == elf.SHN_UNDEF || s.Size == 0 {
-			continue
-		}
-		offset, ok := dcExecutableOffset(lib, s.Value, s.Size)
+		offset, ok := dcFunctionOffset(lib, s)
 		if !ok {
 			continue
 		}
-		if old, exists := p.symbols[s.Name]; exists && old != offset {
-			return nil, fmt.Errorf("ambiguous provider function %s", s.Name)
+		if old, exists := symbols[s.Name]; exists && old != offset {
+			return fmt.Errorf("ambiguous provider function %s", s.Name)
 		}
-		p.symbols[s.Name] = offset
+		symbols[s.Name] = offset
 	}
 	for _, name := range required {
-		if p.symbols[name] == 0 {
-			return nil, fmt.Errorf("required provider function %s is unavailable", name)
+		if symbols[name] == 0 {
+			return fmt.Errorf("required provider function %s is unavailable", name)
 		}
 	}
-	return p, nil
+	return nil
+}
+
+// dcFunctionOffset returns the file offset of a defined, sized function
+// symbol that lies inside an executable segment of lib.
+func dcFunctionOffset(lib *elf.File, s elf.Symbol) (uint64, bool) {
+	if elf.ST_TYPE(s.Info) != elf.STT_FUNC || s.Section == elf.SHN_UNDEF || s.Size == 0 {
+		return 0, false
+	}
+	return dcExecutableOffset(lib, s.Value, s.Size)
 }
 
 func dcValidateQPBase(qp *dwarf.StructType, want uint32, size int64) error {

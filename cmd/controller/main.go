@@ -270,7 +270,7 @@ func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerServi
 		if cfg.AnalyzerMetricsCardinalityLimit > 0 {
 			providerOpts = append(providerOpts, sdkmetric.WithCardinalityLimit(cfg.AnalyzerMetricsCardinalityLimit))
 		}
-		p, err := telemetry.NewMeterProvider(context.Background(), cfg.OtelCollectorAddr, analyzerServiceName, providerOpts...)
+		p, err := telemetry.NewMeterProvider(context.Background(), cfg.OTLPExporter(), analyzerServiceName, providerOpts...)
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to create analyzer meter provider; continuing with log-only findings")
 		} else {
@@ -325,6 +325,9 @@ func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerServi
 		Int("windowRetention", cfg.AnalyzerWindowRetention).
 		Int("metricsCardinalityLimit", cfg.AnalyzerMetricsCardinalityLimit).
 		Bool("metricsEnabled", metrics != nil).
+		Str("otelCollectorAddr", cfg.OtelCollectorAddr).
+		Bool("otelCollectorTLS", cfg.OtelCollectorTLSEnabled).
+		Bool("otelCollectorBearerAuth", cfg.OtelCollectorBearerTokenFile != "").
 		Msg("Analyzer enabled")
 
 	return provider

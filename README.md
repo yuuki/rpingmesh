@@ -439,6 +439,9 @@ To choose `service_level` and `traffic_class`, see
 |-----|---------|-------------|
 | `metrics_enabled` | `true` | Export OTLP metrics |
 | `otel_collector_addr` | `localhost:4317` | OTLP/gRPC collector as `host:port`, without a URL scheme |
+| `otel_collector_tls_enabled` | `false` | Export over TLS, verifying the collector's certificate; see [OTLP export security](#otlp-export-security) |
+| `otel_collector_tls_ca_file`, `otel_collector_tls_server_name` | `""` | CA bundle (empty uses the system roots) and name to verify (empty uses the host in `otel_collector_addr`) |
+| `otel_collector_bearer_token_file` | `""` | File holding a bearer token sent with every export; requires TLS |
 | `metrics_target_rnic_labels` | `off` | Export `rpingmesh.target_rnic.*` metrics labelled with the destination RNIC (`target_hostname`, `target_rdma_device`, `target_netdev`): `off`, `counters` (probe counters only), or `all` (counters and RTT histograms). See [Metrics](#metrics) before enabling |
 | `metrics_target_rnic_labels_scope` | `stable` | `stable` labels only targets whose set is stable across pinglist refreshes and gives sampled targets (inter-ToR, capped untagged ToR-mesh) the value `_sampled`; `all` labels sampled targets too |
 | `metrics_prober_delay_target_tor` | `false` | Attach `target_tor` to `rpingmesh.prober_delay_ns`. Off by default because the prober delay is time spent on the probing host, so `target_tor` only multiplies its series by the ToRs probed |
@@ -595,6 +598,7 @@ devices; `summarize_qos_facts.py` reports such ports as override outliers.
 | `analyzer_window_retention` | `20` | Number of recent windows kept in memory |
 | `analyzer_metrics_cardinality_limit` | `20000` | Maximum attribute sets per analyzer metric instrument; extra sets fold into one `otel.metric.overflow="true"` series. `rpingmesh.analyzer.slo_violations_total` can need up to 4 × T × (T−1) series for T ToRs, all at once in a wide outage; the default covers about 70 ToRs. `0` keeps the OTel SDK default (2000); otherwise at least 2000 |
 | `otel_collector_addr` | `localhost:4317` | OTLP/gRPC collector for analyzer metrics |
+| `otel_collector_tls_enabled`, `otel_collector_tls_ca_file`, `otel_collector_tls_server_name`, `otel_collector_bearer_token_file` | `false`, `""`, `""`, `""` | As for the agent; see [OTLP export security](#otlp-export-security) |
 | `log_level`, `log_format` | `info`, `console` | As for the agent |
 | `tls_mode` | `disabled` | `disabled`, `tls`, or `mtls` |
 | `tls_cert_file`, `tls_key_file` | `""` | Server certificate and key (`tls`, `mtls`) |
@@ -620,7 +624,9 @@ capped.
 
 Controller–agent gRPC is plaintext by default, and both binaries log a warning
 at startup in that mode. Set the same `tls_mode` on both sides to enable
-transport security:
+transport security. The `tls_*` keys cover only this connection; the metric
+export to the OpenTelemetry Collector has its own keys (see
+[OTLP export security](#otlp-export-security)).
 
 | Mode | Controller needs | Agent needs | Authentication |
 |------|------------------|-------------|----------------|
@@ -650,6 +656,139 @@ client can do instead:
 These limits do not authenticate anyone. A client that can reach the
 controller can still read the registered topology and register GIDs that no
 active agent holds.
+
+### OTLP export security
+
+The agent's metrics and the controller's analyzer metrics go to
+`otel_collector_addr` over OTLP/gRPC. Both binaries secure that connection
+with the same four keys:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `otel_collector_tls_enabled` | `false` | Use TLS and verify the collector's certificate chain and host name. `false` keeps plaintext gRPC, the behavior of earlier releases |
+| `otel_collector_tls_ca_file` | `""` | PEM bundle of the CAs that sign the collector's certificate; empty uses the system roots |
+| `otel_collector_tls_server_name` | `""` | Name verified against the certificate and sent as SNI; empty uses the host in `otel_collector_addr`. Set it when that is an IP address or a name the certificate does not carry |
+| `otel_collector_bearer_token_file` | `""` | File holding a bearer token, sent as `authorization: Bearer <token>` with every export; empty sends none |
+
+Certificate verification cannot be disabled. A failed handshake fails the
+export, and the exporter never retries in plaintext, whatever the
+`OTEL_EXPORTER_OTLP_*` environment variables say. Export failures, such as a
+rejected token or an unverifiable certificate, are reported by the
+OpenTelemetry SDK on stderr (the journal under systemd) and do not stop
+probing.
+
+Both binaries refuse to start, with an error that names the key and the file,
+when:
+
+- a token file, CA file or server name is set without
+  `otel_collector_tls_enabled: true` (the token is never sent over plaintext);
+- the CA file is unreadable or holds no PEM certificate;
+- the token file is unreadable, empty, larger than 16 KiB, or contains
+  whitespace, control or non-ASCII characters inside the token.
+
+These checks run whenever the keys are set, even with `metrics_enabled: false`
+or `analyzer_enabled: false`.
+
+**The token.** The token is read only from the file, never from YAML, an
+environment variable or a flag, so it does not appear in the configuration or
+on the command line. The file holds the token alone, without the `Bearer`
+scheme; surrounding whitespace such as a trailing newline is ignored. Neither
+binary logs the token or puts it in an error: logs and errors show at most the
+file's path and whether TLS and a token are configured. Keep the file readable
+by the service only (for example owner `rpingmesh`, mode `0400`, or owner
+`root`, group `rpingmesh`, mode `0440`); a binary logs a warning when the file
+grants any permission to users outside its owner and group. Under systemd 248
+or later, pass it as a credential instead, so the source file can stay readable
+by root only. The drop-ins
+`packaging/systemd/rpingmesh-{agent,controller}.service.d/30-otel-collector-token.conf`,
+which the packages ship under `/usr/share/doc/rpingmesh-*/examples/`, do this:
+
+```ini
+[Service]
+LoadCredential=otel-collector-token:/etc/rpingmesh/otel-collector-token
+Environment=RPINGMESH_OTEL_COLLECTOR_BEARER_TOKEN_FILE=%d/otel-collector-token
+```
+
+**Changing the CA bundle or the token requires a restart.** Both are read once
+at startup. To rotate the token without losing data, make the Collector
+accept the new token while it still accepts the old one, replace the token
+file and restart every agent and the controller, then retire the old token.
+To rotate the Collector's CA, distribute a bundle holding both CAs and restart
+the senders before the Collector switches certificates.
+
+#### Migrating to TLS and authentication
+
+A Collector that requires TLS or a token rejects every sender that is not yet
+configured for it. Change the senders first, and make the Collector strict only
+after all of them have moved:
+
+1. **Prepare.** Issue the Collector a server certificate for the name the
+   senders will verify, and put the CA bundle (unless a public CA signed the
+   certificate) and the token file on every agent host and the controller
+   host.
+2. **Add a TLS receiver next to the plaintext one.** Give the Collector a
+   second OTLP/gRPC receiver with TLS but without authentication, on another
+   port, in the same metrics pipeline. For example, with
+   `opentelemetry-collector-contrib`:
+
+   ```yaml
+   receivers:
+     otlp:                    # existing plaintext receiver, removed in step 4
+       protocols:
+         grpc:
+           endpoint: 0.0.0.0:4317
+     otlp/tls:
+       protocols:
+         grpc:
+           endpoint: 0.0.0.0:4319
+           tls:
+             cert_file: /etc/otelcol/collector.crt
+             key_file: /etc/otelcol/collector.key
+   service:
+     pipelines:
+       metrics:
+         receivers: [otlp, otlp/tls]
+   ```
+
+3. **Move the senders.** On the controller and on the agents, a few hosts at a
+   time, point `otel_collector_addr` at the TLS receiver, set
+   `otel_collector_tls_enabled: true`, `otel_collector_tls_ca_file` and
+   `otel_collector_tls_server_name` as needed, and
+   `otel_collector_bearer_token_file`, then restart. The token is sent before
+   the Collector checks it, which is harmless. An invalid setting stops the
+   binary at startup, and an agent that does not start does not probe, so try
+   a few hosts first. Check that their series keep updating and that their
+   journals show no export errors. Until step 4, reverting these settings and
+   restarting rolls a host back.
+4. **Make the Collector strict.** Once the plaintext receiver accepts no more
+   data points (the Collector's own `otelcol_receiver_accepted_metric_points`
+   metrics, labelled by `receiver`), require the token on the TLS receiver and
+   remove the plaintext one:
+
+   ```yaml
+   extensions:
+     bearertokenauth:
+       filename: /etc/otelcol/rpingmesh-token
+   receivers:
+     otlp/tls:
+       protocols:
+         grpc:
+           endpoint: 0.0.0.0:4319
+           tls:
+             cert_file: /etc/otelcol/collector.crt
+             key_file: /etc/otelcol/collector.key
+           auth:
+             authenticator: bearertokenauth
+   service:
+     extensions: [bearertokenauth]
+     pipelines:
+       metrics:
+         receivers: [otlp/tls]
+   ```
+
+A deployment that only adds a token to an existing TLS connection follows the
+same order: configure the token on every sender first, then enable the
+authenticator.
 
 ### Self-protection
 
@@ -1405,8 +1544,9 @@ acceptable; GIDs and other destination-RNIC identities are not.
 - **Self-protection is coarse.** It reacts only to the agent's own CPU and
   memory use, with static thresholds and a four-step multiplier, and never
   stops probing.
-- **Plaintext gRPC by default.** TLS is opt-in, and certificates are not
-  reloaded without a restart.
+- **Plaintext gRPC by default.** TLS is opt-in, for the controller–agent
+  connection and the OTLP export alike, and certificates, CA bundles and the
+  OTLP bearer token are not reloaded without a restart.
 - **No agent container image.** The agent needs Cgo, libibverbs, and access to
   the host's RDMA devices, so it ships as packages and archives only. The
   repository provides `Dockerfile.controller` for the controller and Dockerfiles

@@ -67,6 +67,15 @@ contents:
     file_info:
       mode: 0644
 
+  # Passes the OTLP bearer token of the analyzer's metric export as a
+  # systemd credential. Shipped as an example: it names a token file only the
+  # operator can provide.
+  - src: packaging/systemd/rpingmesh-controller.service.d/30-otel-collector-token.conf
+    dst: /usr/share/doc/rpingmesh-controller/examples/rpingmesh-controller.service.d/30-otel-collector-token.conf
+    type: doc
+    file_info:
+      mode: 0644
+
 scripts:
   postinstall: packaging/nfpm/scripts/postinstall-controller.sh
   preremove: packaging/nfpm/scripts/preremove-controller.sh

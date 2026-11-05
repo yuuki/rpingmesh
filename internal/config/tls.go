@@ -129,7 +129,7 @@ func ServerTLSConfig(mode, certFile, keyFile, caFile string) (*tls.Config, error
 		if err != nil {
 			return nil, err
 		}
-		caPool, err := loadCACertPool(caFile)
+		caPool, err := loadCACertPool("tls_ca_file", caFile)
 		if err != nil {
 			return nil, err
 		}
@@ -158,7 +158,7 @@ func ClientTLSConfig(mode, certFile, keyFile, caFile, serverName string) (*tls.C
 	case TLSModeDisabled, "":
 		return nil, nil
 	case TLSModeTLS:
-		caPool, err := loadCACertPool(caFile)
+		caPool, err := loadCACertPool("tls_ca_file", caFile)
 		if err != nil {
 			return nil, err
 		}
@@ -172,7 +172,7 @@ func ClientTLSConfig(mode, certFile, keyFile, caFile, serverName string) (*tls.C
 		if err != nil {
 			return nil, err
 		}
-		caPool, err := loadCACertPool(caFile)
+		caPool, err := loadCACertPool("tls_ca_file", caFile)
 		if err != nil {
 			return nil, err
 		}
@@ -197,15 +197,17 @@ func loadKeyPair(role tlsRole, certFile, keyFile string) (tls.Certificate, error
 	return cert, nil
 }
 
-// loadCACertPool reads and parses a PEM-encoded CA bundle from caFile.
-func loadCACertPool(caFile string) (*x509.CertPool, error) {
+// loadCACertPool reads and parses a PEM-encoded CA bundle from caFile. key
+// is the configuration key that names the file (tls_ca_file or
+// otel_collector_tls_ca_file), for the error message.
+func loadCACertPool(key, caFile string) (*x509.CertPool, error) {
 	pemBytes, err := os.ReadFile(caFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read tls_ca_file %q: %w", caFile, err)
+		return nil, fmt.Errorf("failed to read %s %q: %w", key, caFile, err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(pemBytes) {
-		return nil, fmt.Errorf("failed to parse any PEM certificates from tls_ca_file %q", caFile)
+		return nil, fmt.Errorf("failed to parse any PEM certificates from %s %q", key, caFile)
 	}
 	return pool, nil
 }

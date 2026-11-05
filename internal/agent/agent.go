@@ -1263,8 +1263,9 @@ func (a *Agent) createMetricsCollector(ctx context.Context) {
 
 	a.logger.Info().
 		Str("collector_addr", a.cfg.OtelCollectorAddr).
+		Bool("collector_tls", a.cfg.OtelCollectorTLSEnabled).
 		Msg("Creating metrics collector")
-	mc, err := telemetry.NewMetricsCollector(ctx, a.cfg.OtelCollectorAddr,
+	mc, err := telemetry.NewMetricsCollector(ctx, a.cfg.OTLPExporter(),
 		telemetry.WithTargetRnicLabels(targetRnicLabels(a.cfg)),
 		telemetry.WithCardinalityLimit(a.cfg.MetricsCardinalityLimit),
 		telemetry.WithProberDelayTargetTor(a.cfg.MetricsProberDelayTargetTor),

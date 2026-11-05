@@ -179,7 +179,15 @@ type AgentConfig struct {
 	LogFormat         string `mapstructure:"log_format"`
 	ProbeIntervalMS   uint32 `mapstructure:"probe_interval_ms"`
 	OtelCollectorAddr string `mapstructure:"otel_collector_addr"`
-	MetricsEnabled    bool   `mapstructure:"metrics_enabled"`
+	// OtelCollectorTLSEnabled, OtelCollectorTLSCAFile,
+	// OtelCollectorTLSServerName and OtelCollectorBearerTokenFile secure the
+	// OTLP export to the collector; see OTLPExporterConfig. They are
+	// independent of the tls_* keys of the controller connection.
+	OtelCollectorTLSEnabled      bool   `mapstructure:"otel_collector_tls_enabled"`
+	OtelCollectorTLSCAFile       string `mapstructure:"otel_collector_tls_ca_file"`
+	OtelCollectorTLSServerName   string `mapstructure:"otel_collector_tls_server_name"`
+	OtelCollectorBearerTokenFile string `mapstructure:"otel_collector_bearer_token_file"`
+	MetricsEnabled               bool   `mapstructure:"metrics_enabled"`
 	// MetricsTargetRnicLabels adds destination-RNIC attributes
 	// (target_hostname, target_rdma_device, target_netdev) to probe metrics:
 	// "off" (default) adds none, "counters" adds them to the probe counters
@@ -354,6 +362,10 @@ var agentKeys = []keySpec{
 	{key: "log_format", def: logging.DefaultFormat, help: "Log output format: console or json"},
 	{key: "probe_interval_ms", def: uint32(500), help: "Minimum interval in milliseconds between two probes to the same target (per-target rate ceiling)"},
 	{key: "otel_collector_addr", def: "localhost:4317", help: "OpenTelemetry collector address"},
+	{key: "otel_collector_tls_enabled", def: false, help: "Export OTLP metrics over TLS, verifying the collector's certificate and host name"},
+	{key: "otel_collector_tls_ca_file", def: "", help: "PEM CA bundle that verifies the collector's certificate (empty = system roots; requires otel-collector-tls-enabled)"},
+	{key: "otel_collector_tls_server_name", def: "", help: "Name verified against the collector's certificate (empty = host of otel-collector-addr; requires otel-collector-tls-enabled)"},
+	{key: "otel_collector_bearer_token_file", def: "", help: "File holding the bearer token sent to the collector (requires otel-collector-tls-enabled)"},
 	{key: "metrics_enabled", def: true, help: "Enable OpenTelemetry metrics export"},
 	{key: "metrics_target_rnic_labels", def: DefaultMetricsTargetRnicLabels, noFlag: true},
 	{key: "metrics_target_rnic_labels_scope", def: DefaultMetricsTargetRnicLabelsScope, noFlag: true},
@@ -437,6 +449,10 @@ func LoadAgentConfig(configPath string, flags *pflag.FlagSet) (*AgentConfig, err
 		LogFormat:                        v.GetString("log_format"),
 		ProbeIntervalMS:                  v.GetUint32("probe_interval_ms"),
 		OtelCollectorAddr:                v.GetString("otel_collector_addr"),
+		OtelCollectorTLSEnabled:          v.GetBool("otel_collector_tls_enabled"),
+		OtelCollectorTLSCAFile:           v.GetString("otel_collector_tls_ca_file"),
+		OtelCollectorTLSServerName:       v.GetString("otel_collector_tls_server_name"),
+		OtelCollectorBearerTokenFile:     v.GetString("otel_collector_bearer_token_file"),
 		MetricsEnabled:                   v.GetBool("metrics_enabled"),
 		MetricsTargetRnicLabels:          v.GetString("metrics_target_rnic_labels"),
 		MetricsTargetRnicLabelsScope:     v.GetString("metrics_target_rnic_labels_scope"),
@@ -535,7 +551,7 @@ func (c *AgentConfig) Validate() error {
 	if err := c.validateSelfProtection(); err != nil {
 		return err
 	}
-	if err := validateOTLPEndpoint(c.OtelCollectorAddr); err != nil {
+	if err := c.OTLPExporter().Validate(); err != nil {
 		return err
 	}
 	// The agent is the gRPC client of the controller connection: fail fast
@@ -778,6 +794,17 @@ func (c *AgentConfig) validateSelfProtection() error {
 		return fmt.Errorf("throttle_cpu_percent must be in (0, 100] when self_protection_enabled, got: %g", c.ThrottleCPUPercent)
 	}
 	return nil
+}
+
+// OTLPExporter returns the connection settings of the OTLP metric exporter.
+func (c *AgentConfig) OTLPExporter() OTLPExporterConfig {
+	return OTLPExporterConfig{
+		Endpoint:        c.OtelCollectorAddr,
+		TLSEnabled:      c.OtelCollectorTLSEnabled,
+		CAFile:          c.OtelCollectorTLSCAFile,
+		ServerName:      c.OtelCollectorTLSServerName,
+		BearerTokenFile: c.OtelCollectorBearerTokenFile,
+	}
 }
 
 // EffectiveTorMeshProbeRate returns the per-target probe rate (probes/sec) to

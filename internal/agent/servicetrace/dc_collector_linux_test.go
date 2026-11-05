@@ -869,7 +869,8 @@ func TestOpenDCCollectorRejectsInvalidOptions(t *testing.T) {
 // BPF privileges nor RDMA hardware.
 func TestOpenDCCollectorPreflightErrors(t *testing.T) {
 	file := buildDCFixture(t)
-	other := buildDCFixture(t, "-DTEST_UCX_BAD_DCI") // valid provider, different build ID
+	other := buildDCFixture(t, "-DTEST_UCX_BAD_DCI")          // valid provider, different build ID
+	badChannel := buildDCFixture(t, "-DTEST_UCX_BAD_CHANNEL") // valid unless streams are enabled
 	child := exec.Command(file)
 	stdin, err := child.StdinPipe()
 	if err != nil {
@@ -896,7 +897,6 @@ func TestOpenDCCollectorPreflightErrors(t *testing.T) {
 	}{
 		{"no such process", func(o *DCOptions) { o.PID = 1 << 30 }, "open target pidfd: no such process"},
 		{"missing library", func(o *DCOptions) { o.Library = "/nonexistent/libmlx5.so" }, "open /nonexistent/libmlx5.so: no such file or directory"},
-		{"invalid debug file", func(o *DCOptions) { o.DebugFile = "/dev/null" }, "open provider debug ELF: cannot read ELF identifier 'EOF' in record at byte 0x0"},
 		{"mismatching debug file", func(o *DCOptions) { o.DebugFile = other }, "provider and debug build IDs differ"},
 		{"provider not mapped", func(o *DCOptions) { o.PID = os.Getpid() }, unmapped},
 		{"UCX library only", func(o *DCOptions) { o.UCXLibrary = file }, ucxPair},
@@ -909,7 +909,9 @@ func TestOpenDCCollectorPreflightErrors(t *testing.T) {
 		{"missing UCX library", func(o *DCOptions) { o.UCXLibrary, o.UCXDebugFile = "/nonexistent/uct.so", file }, "open /nonexistent/uct.so: no such file or directory"},
 		{"mismatching UCX debug file", func(o *DCOptions) { o.UCXLibrary, o.UCXDebugFile = file, other }, "UCX and debug build IDs differ"},
 		{"unsupported UCX layout", func(o *DCOptions) { o.UCXLibrary, o.UCXDebugFile = other, other }, "UCX uct_dc_mlx5_ep.dci: field size does not match supported ABI"},
-		{"UCX streams layout", func(o *DCOptions) { o.UCXLibrary, o.UCXDebugFile, o.UCXDevX, o.UCXStreams = file, other, true, true }, "UCX and debug build IDs differ"},
+		{"unsupported UCX streams layout", func(o *DCOptions) {
+			o.UCXLibrary, o.UCXDebugFile, o.UCXDevX, o.UCXStreams = badChannel, badChannel, true, true
+		}, "UCX uct_dc_mlx5_ep.dci_channel_index: field size does not match supported ABI"},
 		{"UCX library not mapped", func(o *DCOptions) {
 			o.UCXLibrary = buildDCFixture(t)
 			o.UCXDebugFile = o.UCXLibrary
@@ -923,5 +925,21 @@ func TestOpenDCCollectorPreflightErrors(t *testing.T) {
 			}
 			t.Fatalf("%s: got %v, want %q", tc.name, err, tc.want)
 		}
+	}
+	// debug/elf owns the wording of its parse errors; this package prefixes
+	// and wraps them.
+	_, elfErr := elf.Open("/dev/null")
+	if elfErr == nil {
+		t.Fatal("debug/elf accepted /dev/null")
+	}
+	options := base
+	options.DebugFile = "/dev/null"
+	c, err := OpenDCCollector(options)
+	if c != nil {
+		c.Close()
+	}
+	if err == nil || err.Error() != "open provider debug ELF: "+elfErr.Error() ||
+		errors.Unwrap(err) == nil || errors.Unwrap(err).Error() != elfErr.Error() {
+		t.Fatalf("invalid debug file: got %v, want the debug/elf error %q wrapped", err, elfErr)
 	}
 }

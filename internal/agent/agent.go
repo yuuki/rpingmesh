@@ -909,18 +909,24 @@ func (a *Agent) createClusterMonitors() {
 // buildRegistrationRequest builds the registration request from the agent's
 // configuration and RNIC state. Used for the initial registration and for
 // the heartbeats.
+//
+// The host, RDMA device and netdev names come from the kernel, which accepts
+// bytes that are not valid UTF-8 in them; a proto3 string must be valid
+// UTF-8 or the whole request fails to marshal, so such bytes are sent as
+// U+FFFD. The agent keeps the raw names for its sysfs lookups.
 func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRequest {
+	hostname := strings.ToValidUTF8(a.cfg.HostName, "\uFFFD")
 	rnics := make([]*controller_agent.RnicInfo, 0, len(a.rnics))
 	for _, r := range a.rnics {
 		info := &controller_agent.RnicInfo{
 			Gid:        r.dev.Info.GID,
 			Qpn:        r.responder.GetQueueInfo().QPN,
 			IpAddress:  r.dev.Info.IPAddr,
-			HostName:   a.cfg.HostName,
+			HostName:   hostname,
 			TorId:      r.torID,
-			DeviceName: r.dev.Info.DeviceName,
+			DeviceName: strings.ToValidUTF8(r.dev.Info.DeviceName, "\uFFFD"),
 			PlaneId:    r.planeID,
-			Netdev:     r.netdev,
+			Netdev:     strings.ToValidUTF8(r.netdev, "\uFFFD"),
 		}
 		rnics = append(rnics, info)
 		a.logger.Debug().
@@ -935,7 +941,7 @@ func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRe
 	return &controller_agent.AgentRegistrationRequest{
 		AgentId:  a.cfg.AgentID,
 		AgentIp:  a.agentIP,
-		Hostname: a.cfg.HostName,
+		Hostname: hostname,
 		TorId:    a.canonicalTorID,
 		Rnics:    rnics,
 	}
@@ -946,7 +952,7 @@ func (a *Agent) buildRegistrationRequest() *controller_agent.AgentRegistrationRe
 // local address but sends nothing. Best-effort; "" on any error (e.g. an
 // addr with no host such as ":50051").
 func outboundIP(controllerAddr string) string {
-	conn, err := net.Dial("udp", controllerAddr)
+	conn, err := net.Dial("udp", controllerAddr) //nolint:noctx // a UDP dial only does a route lookup and sends nothing
 	if err != nil {
 		return ""
 	}

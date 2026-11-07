@@ -483,10 +483,10 @@ func (q *Queue) SendAckPair(targetGID [16]byte, targetQPN uint32, flowLabel uint
 		pktPtr,
 		C.uint64_t(recvTimestampNS),
 	)
-	switch {
-	case rc == 0:
+	switch rc {
+	case 0:
 		return nil
-	case rc == C.RDMA_ACK_PAIR_NO_FREE_SLOT:
+	case C.RDMA_ACK_PAIR_NO_FREE_SLOT:
 		return ErrNoFreeSendSlot
 	default:
 		return fmt.Errorf("rdma_send_ack_pair failed (rc=%d): %s", int(rc), GetLastError())

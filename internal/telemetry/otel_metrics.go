@@ -190,12 +190,21 @@ type TargetRnicLabels struct {
 }
 
 // deviceMetricLabel returns name, or unspecifiedDeviceLabel when it is empty,
-// so the attribute is always present with a fixed, non-empty value.
+// so the attribute is always present with a fixed, non-empty value. Bytes
+// that are not valid UTF-8 become U+FFFD (see validUTF8).
 func deviceMetricLabel(name string) string {
 	if name = strings.TrimSpace(name); name != "" {
-		return name
+		return validUTF8(name)
 	}
 	return unspecifiedDeviceLabel
+}
+
+// validUTF8 replaces the bytes of s that are not valid UTF-8 with U+FFFD.
+// Linux accepts such bytes in netdev, RDMA device and host names, but OTLP
+// carries attribute values as protobuf strings, and one invalid string fails
+// the marshaling of a whole export, losing every metric in it.
+func validUTF8(s string) string {
+	return strings.ToValidUTF8(s, "\uFFFD")
 }
 
 // defaultServiceName is the OTel resource service.name used when
@@ -392,7 +401,7 @@ func instanceID() string {
 		log.Warn().Err(err).Msg("os.Hostname failed; falling back to a random service.instance.id")
 		return uuid.NewString()
 	}
-	return host
+	return validUTF8(host)
 }
 
 // buildResource builds the OTel resource identifying this service, merging
@@ -420,7 +429,7 @@ func buildResource(serviceName string) (*resource.Resource, error) {
 		semconv.ServiceInstanceID(instanceID()),
 	}
 	if host, err := os.Hostname(); err == nil && host != "" {
-		attrs = append(attrs, semconv.HostName(host))
+		attrs = append(attrs, semconv.HostName(validUTF8(host)))
 	}
 	return resource.Merge(
 		resource.Default(),

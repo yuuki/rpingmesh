@@ -410,7 +410,7 @@ func dcLibraryMapped(pid int, library *os.File) error {
 			continue
 		}
 		ino, err := strconv.ParseUint(fields[4], 10, 64)
-		if err == nil && ino == st.Ino && unix.Mkdev(major, minor) == uint64(st.Dev) {
+		if err == nil && ino == st.Ino && unix.Mkdev(major, minor) == uint64(st.Dev) { //nolint:unconvert // Stat_t field types differ across GOARCH
 			return nil
 		}
 	}
@@ -530,7 +530,7 @@ func (c *DCCollector) validDeviceFD(fd int32) bool {
 		return false
 	}
 	devices, err := UverbsDevices(c.options.sysfsRoot)
-	return err == nil && devices[MakeDev(unix.Major(uint64(stat.Rdev)), unix.Minor(uint64(stat.Rdev)))] == c.options.Device
+	return err == nil && devices[MakeDev(unix.Major(uint64(stat.Rdev)), unix.Minor(uint64(stat.Rdev)))] == c.options.Device //nolint:unconvert // Stat_t field types differ across GOARCH
 }
 
 func (c *DCCollector) roceV2(index uint8) bool {

@@ -208,7 +208,7 @@ type labelSet struct {
 func newProberCore(probeInterval time.Duration) *Prober {
 	p := &Prober{
 		pending:                    make(map[uint64]*pendingProbe),
-		agentEpoch:                 rand.Uint32(),
+		agentEpoch:                 rand.Uint32(), //nolint:gosec // G404: only needs to differ across restarts, not to be unpredictable
 		resultChan:                 make(chan *probe.ProbeResult, resultChanSize),
 		refreshHint:                make(chan struct{}, 1),
 		probeInterval:              probeInterval,
@@ -414,7 +414,7 @@ func (p *Prober) passTargetsLocked(ptype controller_agent.PinglistType) []*contr
 			out = append(out, t)
 		}
 	}
-	rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+	rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] }) //nolint:gosec // G404: probe order spreading, not security
 	return out
 }
 

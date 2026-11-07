@@ -17,7 +17,7 @@ const (
 	keyOtelCollectorTLSEnabled      = "otel_collector_tls_enabled"
 	keyOtelCollectorTLSCAFile       = "otel_collector_tls_ca_file"
 	keyOtelCollectorTLSServerName   = "otel_collector_tls_server_name"
-	keyOtelCollectorBearerTokenFile = "otel_collector_bearer_token_file"
+	keyOtelCollectorBearerTokenFile = "otel_collector_bearer_token_file" //nolint:gosec // G101: a config key name, not a credential
 )
 
 // maxBearerTokenFileBytes bounds the size of otel_collector_bearer_token_file.

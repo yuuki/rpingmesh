@@ -1,0 +1,122 @@
+name: Security
+
+# CodeQL (Go and the Python tooling under scripts/) and govulncheck. GitHub
+# Actions workflows are audited by zizmor in test.yml (job "workflows")
+# instead of CodeQL's actions language. If code scanning's "default setup"
+# is enabled in the repository settings, switch it off: it conflicts with
+# this advanced setup.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '19 14 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  codeql:
+    name: codeql (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write # upload the results to code scanning
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Manual build: the Go packages need the generated protobuf code,
+          # and the agent links librdmabridge.a (Zig, libibverbs, librdmacm).
+          - language: go
+            build-mode: manual
+          - language: python
+            build-mode: none
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Zig
+        if: matrix.language == 'go'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+
+      - name: Install system dependencies (protoc, libibverbs, librdmacm)
+        if: matrix.language == 'go'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler libibverbs-dev librdmacm-dev
+
+      - name: Install protoc Go plugins
+        if: matrix.language == 'go'
+        run: |
+          make install-protoc-plugins
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # Build the prerequisites before CodeQL starts tracing, so that only
+      # the Go build below is traced.
+      - name: Build librdmabridge.a and generate protobuf bindings
+        if: matrix.language == 'go'
+        run: make build-zig generate-proto
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Build Go packages
+        if: matrix.build-mode == 'manual'
+        run: go build ./...
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:${{ matrix.language }}
+
+  # Known vulnerabilities in the dependencies that the code actually reaches.
+  # The archived legacy/ module is frozen and not scanned.
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install protoc Go plugins
+        run: |
+          make install-protoc-plugins
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: govulncheck
+        run: make vuln

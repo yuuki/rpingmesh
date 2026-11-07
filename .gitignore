@@ -9,6 +9,8 @@
 /tmp/
 *.test
 coverage.out
+# Benchmark output of `make bench`
+/bench.txt
 /vendor/
 
 # Local tool state

@@ -3,8 +3,9 @@
 # clang, libibverbs-dev, librdmacm-dev
 
 .PHONY: all build build-zig build-go build-controller build-agent build-dc-trace \
-        generate generate-proto generate-bpf check-bpf \
+        generate generate-proto generate-bpf check-bpf install-protoc-plugins \
         clean test test-go test-zig test-scripts test-all vet complexity \
+        check lint fmt lint-actions test-race test-fuzz test-integration bench vuln \
         test-e2e setup-colima test-e2e-controller clean-e2e-controller \
         check-nfpm package package-agent package-controller \
         package-build-agent package-build-agent-el9 package-build-controller \
@@ -61,6 +62,34 @@ endif
 # Oldest glibc the released agent must run on (RHEL 9 family).
 AGENT_GLIBC_FLOOR := 2.34
 
+# Tool versions. CI pins the same versions (.github/workflows/test.yml and
+# security.yml); bump them together.
+GOLANGCI_LINT_VERSION      ?= v2.15.0
+GOVULNCHECK_VERSION        ?= v1.9.0
+ACTIONLINT_VERSION         ?= v1.7.12
+ZIZMOR_VERSION             ?= 1.32.0
+# protoc-gen-go follows google.golang.org/protobuf in go.mod; the gRPC plugin
+# is a separate module and is pinned here.
+PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.2
+FUZZTIME                   ?= 30s
+# Extra flags for each fuzz run, e.g. FUZZFLAGS=-parallel=2 on a shared host.
+FUZZFLAGS                  ?=
+BENCH_COUNT                ?= 6
+
+# `go run pkg@version` would otherwise build a tool with the Go version of the
+# tool's own go.mod, and a golangci-lint built with an older Go refuses this
+# module. Evaluated here, inside the module, `go env GOVERSION` is the
+# toolchain go.mod selects (GOTOOLCHAIN=auto).
+GO_TOOLCHAIN := $(shell go env GOVERSION 2>/dev/null)
+
+# Each tool can be overridden with an installed binary, e.g.
+# `make lint GOLANGCI_LINT=golangci-lint`.
+GOLANGCI_LINT ?= GOTOOLCHAIN=$(GO_TOOLCHAIN) go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+GOVULNCHECK   ?= GOTOOLCHAIN=$(GO_TOOLCHAIN) go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
+ACTIONLINT    ?= GOTOOLCHAIN=$(GO_TOOLCHAIN) go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
+# uvx or pipx (preinstalled on GitHub-hosted runners) runs the pinned zizmor.
+ZIZMOR        ?= $(if $(shell command -v uvx 2>/dev/null),uvx zizmor@$(ZIZMOR_VERSION),pipx run zizmor==$(ZIZMOR_VERSION))
+
 # Default target
 all: build
 
@@ -80,6 +109,14 @@ generate-proto:
 	@echo "==> Generating protobuf code..."
 	cd $(PROTO_DIR) && go generate
 	@echo "==> Proto generation complete"
+
+# Install the protoc plugins generate-proto needs into $(go env GOPATH)/bin:
+# protoc-gen-go at the google.golang.org/protobuf version in go.mod and
+# protoc-gen-go-grpc at PROTOC_GEN_GO_GRPC_VERSION. protoc itself comes from
+# the system (e.g. `apt-get install protobuf-compiler`).
+install-protoc-plugins:
+	go install google.golang.org/protobuf/cmd/protoc-gen-go
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
 
 # Compile the service-tracing eBPF program with bpf2go (go.mod tool). The
 # generated objects under internal/agent/servicetrace/ are committed, so
@@ -152,7 +189,8 @@ build-dc-trace:
 # or `make test-e2e` / `make test-e2e-controller` for the Docker-based suites.
 PURE_GO_TEST_PKGS := ./internal/probe/... ./internal/config/... ./internal/telemetry/... \
 	./internal/lldp/... ./internal/logging/... ./internal/buildinfo/... \
-	./internal/controller/... ./internal/agent/controller_client/... ./cmd/controller/...
+	./internal/controller/... ./internal/agent/controller_client/... \
+	./internal/agent/servicetrace/... ./cmd/controller/...
 
 test: test-go
 
@@ -197,6 +235,77 @@ test-all: test-zig
 	@echo "==> Running all Go tests (excluding ./e2e/...)..."
 	go test $$(go list ./... | grep -v '/e2e')
 	@echo "==> Tests complete"
+
+# ---------------------------------------------------------------------------
+# Quality gates. `make check` is the local pre-PR gate: what the required PR
+# CI jobs check that needs neither root, RDMA hardware nor network services.
+# It needs protoc (for generate-proto), Zig, libibverbs-dev and librdmacm-dev
+# on Linux; see AGENTS.md for the conditional extras (check-bpf, e2e).
+# ---------------------------------------------------------------------------
+
+check: lint lint-actions test-race test-zig test-scripts
+
+# golangci-lint (linters and gofmt, configured in .golangci.yml) and go.mod
+# tidiness. The controller packages import the generated protobuf code, so it
+# is generated first. legacy/ is a separate, frozen module and is not linted.
+lint: generate
+	$(GOLANGCI_LINT) run ./...
+	go mod tidy -diff
+
+# Apply the formatters configured in .golangci.yml.
+fmt:
+	$(GOLANGCI_LINT) fmt ./...
+
+# Lint (actionlint) and audit (zizmor) the GitHub Actions workflows. zizmor's
+# online audits need a GitHub token (GH_TOKEN); without one it runs offline.
+lint-actions:
+	$(ACTIONLINT)
+	$(ZIZMOR) $(if $(GH_TOKEN),,--offline) .
+
+# Unit tests with the race detector. On Linux this is every package except
+# ./e2e/... (the same set as test-all), after building librdmabridge.a and the
+# protobuf code. Elsewhere the Cgo packages cannot build, so only the pure-Go
+# packages run. Tests that need root (the eBPF tracer load/attach tests) skip
+# when run unprivileged.
+ifeq ($(shell uname -s),Linux)
+test-race: build-zig generate
+	go test -race $$(go list ./... | grep -v '/e2e')
+else
+test-race: generate
+	go test -race $(PURE_GO_TEST_PKGS)
+endif
+
+# Directories that define Go fuzz targets; only their test binaries are built.
+FUZZ_DIRS = $(sort $(dir $(shell grep -rl --include='*_test.go' '^func Fuzz' internal cmd)))
+
+# Run every Go fuzz target for FUZZTIME (Linux: internal/rdmabridge needs
+# librdmabridge.a). New crashers are written to the package's
+# testdata/fuzz/<FuzzName>/; commit them as regression seeds with the fix.
+test-fuzz: build-zig generate
+	@set -e; for dir in $(FUZZ_DIRS); do \
+		pkg=./$${dir%/}; \
+		targets=$$(go test -list '^Fuzz' $$pkg); \
+		for f in $$(printf '%s\n' "$$targets" | grep '^Fuzz'); do \
+			echo "==> $$pkg $$f ($(FUZZTIME))"; \
+			go test -run='^$$' -fuzz="^$$f\$$" -fuzztime=$(FUZZTIME) $(FUZZFLAGS) $$pkg; \
+		done; \
+	done
+
+# Tests that need network services in containers (Docker): the
+# agent-to-controller suite against rqlite. The soft-RoCE suite (test-e2e)
+# additionally needs a privileged container and the rdma_rxe module.
+test-integration: test-e2e-controller
+
+# Benchmarks of every non-e2e package, written to bench.txt (gitignored);
+# compare two runs with benchstat. Linux only, like test-race.
+bench: build-zig generate
+	@go test -run='^$$' -bench=. -benchmem -count=$(BENCH_COUNT) $$(go list ./... | grep -v '/e2e') > bench.txt 2>&1; \
+		rc=$$?; cat bench.txt; exit $$rc
+
+# Known vulnerabilities reachable from the code (root module; legacy/ is
+# frozen and not scanned).
+vuln: generate
+	$(GOVULNCHECK) ./...
 
 # Install rdma_rxe kernel module on the Colima VM (run once before first test-e2e).
 # Requires colima to be running: colima start
@@ -387,9 +496,20 @@ help:
 	@echo "  generate-proto       Generate protobuf Go code"
 	@echo "  generate-bpf         Compile the service-tracing eBPF program (needs clang with the BPF backend)"
 	@echo "  check-bpf            Verify the eBPF program compiles and its committed Go bindings are current"
-	@echo "  test                 Run tests"
-	@echo "  test-go              Run Go tests (internal/probe only, pure Go)"
+	@echo "  install-protoc-plugins  Install the pinned protoc-gen-go and protoc-gen-go-grpc"
+	@echo "  check                Local pre-PR gate: lint, lint-actions, test-race, test-zig, test-scripts"
+	@echo "  lint                 golangci-lint (.golangci.yml) and go mod tidy -diff"
+	@echo "  fmt                  Apply the formatters of .golangci.yml"
+	@echo "  lint-actions         actionlint and zizmor on .github/"
+	@echo "  test                 Run tests (alias of test-go)"
+	@echo "  test-go              Run Go tests of every pure-Go package (no Cgo, no RDMA hardware)"
+	@echo "  test-race            Go unit tests with -race (Linux: all non-e2e packages)"
+	@echo "  test-fuzz            Run every Go fuzz target for FUZZTIME (default 30s)"
+	@echo "  test-integration     Container-based integration tests (alias of test-e2e-controller)"
+	@echo "  bench                Run Go benchmarks into bench.txt (compare with benchstat)"
+	@echo "  vuln                 govulncheck ./..."
 	@echo "  test-zig             Run Zig unit tests (zig build test)"
+	@echo "  test-scripts         Run the Python tests of scripts/topology/"
 	@echo "  vet                  Run go vet ./..."
 	@echo "  complexity           Rank the most complex functions with cccc (settings in cccc.toml)"
 	@echo "  test-all             Run go test on all packages except ./e2e/..., plus test-zig (Linux, full build env)"

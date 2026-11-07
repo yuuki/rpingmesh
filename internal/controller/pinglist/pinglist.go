@@ -234,7 +234,7 @@ func (g *PinglistGenerator) GenerateTorMeshPinglist(
 
 	if unspecified && g.unspecifiedMeshMax > 0 && len(targets) > g.unspecifiedMeshMax {
 		eligible := len(targets)
-		rand.Shuffle(len(targets), func(i, j int) {
+		rand.Shuffle(len(targets), func(i, j int) { //nolint:gosec // G404: sampling a mesh subset, not security
 			targets[i], targets[j] = targets[j], targets[i]
 		})
 		targets = targets[:g.unspecifiedMeshMax]
@@ -410,8 +410,10 @@ func (g *PinglistGenerator) buildPingTarget(requesterGID string, rnic *controlle
 		// distinct 20-bit labels without the controller enumerating them.
 		FlowLabelSeed:  seed,
 		FlowLabelCount: g.flowLabelCount,
-		SourcePort:     deterministicSourcePort(requesterGID, targetGID),
-		Priority:       deterministicPriority(requesterGID, targetGID),
+		// source_port and priority are deprecated in the .proto, which says
+		// why the controller still fills them.
+		SourcePort: deterministicSourcePort(requesterGID, targetGID), //nolint:staticcheck // SA1019: see above
+		Priority:   deterministicPriority(requesterGID, targetGID),   //nolint:staticcheck // SA1019: see above
 	}
 }
 

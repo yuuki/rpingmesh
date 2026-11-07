@@ -58,7 +58,6 @@ type fakeResolver struct {
 	targets map[string]*controller_agent.PingTarget
 	err     error
 	calls   [][]string
-	gids    []string
 }
 
 func (f *fakeResolver) GetTargetRnicInfo(_ context.Context, _, requesterGID string, gids []string) ([]*controller_agent.PingTarget, error) {
@@ -112,7 +111,6 @@ const (
 )
 
 var (
-	localGID, _  = probe.ParseGID(localGIDStr)
 	remoteGID, _ = probe.ParseGID("0000:0000:0000:0000:0000:ffff:0a00:0002")
 	remoteGIDStr = probe.FormatGID(remoteGID)
 )

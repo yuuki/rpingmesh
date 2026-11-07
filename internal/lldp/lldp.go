@@ -10,6 +10,7 @@ package lldp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -86,7 +87,8 @@ func (q CLIQuerier) Neighbors(ctx context.Context) (map[string]Neighbor, error) 
 	cmd.WaitDelay = time.Second
 	out, err := cmd.Output()
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
 			return nil, fmt.Errorf("%s show neighbors: %w: %s", path, err, strings.TrimSpace(string(ee.Stderr)))
 		}
 		return nil, fmt.Errorf("%s show neighbors: %w", path, err)

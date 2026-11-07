@@ -5,28 +5,38 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   release:
     name: Build and publish release
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write # gh release create publishes the release and its assets
     steps:
+      # The full history and tags let `git describe` name the version. The
+      # release is published with gh and GH_TOKEN, not with git, so the
+      # checkout keeps no credentials.
       - name: Checkout release tag
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
+      # No build caches in the release job: a cache written by another
+      # workflow run must not be able to change the released binaries.
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.27.3'
+          cache: false
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
+          use-cache: false
 
       - name: Install system dependencies
         run: |
@@ -34,10 +44,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             protobuf-compiler libibverbs-dev librdmacm-dev
 
+      # Pinned plugin versions (see install-protoc-plugins in the Makefile).
       - name: Install protoc Go plugins
         run: |
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+          make install-protoc-plugins
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Generate protobuf bindings
@@ -53,7 +63,9 @@ jobs:
         run: make test-zig
 
       - name: Run Go tests excluding e2e
-        run: go test $(go list ./... | grep -v '/e2e')
+        run: |
+          # shellcheck disable=SC2046 # the package list is split on purpose
+          go test $(go list ./... | grep -v '/e2e')
 
       - name: Run controller e2e tests
         run: make test-e2e-controller
@@ -64,7 +76,7 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # AGENT_BUILDER=el9 links the agent inside an Enterprise Linux 9
       # container (Dockerfile.agent-el9) so the released binary runs on
@@ -76,7 +88,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum * > checksums.txt
+          sha256sum -- * > checksums.txt
 
       - name: Extract release notes
         run: |

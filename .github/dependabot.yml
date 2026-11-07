@@ -1,0 +1,61 @@
+# Version updates arrive monthly, grouped into one PR per ecosystem, and only
+# after a release has been public for a week (compromised releases are usually
+# pulled within days). Security updates are not delayed by this schedule.
+#
+# legacy/ is a separate, frozen Go module (see AGENTS.md) and is not updated.
+# The Go and Zig versions pinned in go.mod, mise.toml, the workflows, the
+# Dockerfiles' GO_VERSION/ZIG_VERSION build args and docker-compose.e2e.yml
+# are bumped together by hand; a golang base-image bump from the docker
+# ecosystem below is the reminder to do so.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directories: ["/"]
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+    groups:
+      go-modules:
+        patterns: ["*"]
+
+  # Base images of the release build (Dockerfile.agent-el9) and of the CI
+  # e2e images (Dockerfile.controller, Dockerfile.e2e, Dockerfile.e2e-controller).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+    groups:
+      docker:
+        patterns: ["*"]
+
+  # The rqlite image pinned in docker-compose.e2e-controller.yml (CI).
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+    groups:
+      docker-compose:
+        patterns: ["*"]

@@ -1458,12 +1458,23 @@ host.
 
 ## Development
 
+[CONTRIBUTING.md](CONTRIBUTING.md) describes how to propose changes;
+[AGENTS.md](AGENTS.md) is the detailed guide to the code base, every make
+target and the compatibility contracts.
+
 ### Tests
 
 ```sh
+make check          # pre-PR gate: lint, lint-actions, test-race, test-zig, test-scripts (Linux)
 make test           # Go tests of every pure-Go package (no Cgo, no RDMA hardware)
+make test-race      # Go tests with the race detector (Linux: every package except e2e/)
 make test-zig       # Zig unit tests (needs libibverbs headers, not hardware)
 make test-scripts   # Python tests of scripts/topology/ (standard library only)
+make test-fuzz      # every Go fuzz target for FUZZTIME (default 30s)
+make bench          # benchmarks into bench.txt (compare runs with benchstat)
+make lint           # golangci-lint and go mod tidy -diff
+make lint-actions   # actionlint and zizmor on the GitHub Actions workflows
+make vuln           # govulncheck
 make vet            # go vet ./...
 make test-all       # Zig tests and every Go package except e2e/ (Linux build environment)
 ```
@@ -1515,7 +1526,8 @@ reads in `uverbs_uapi.h` and the few kernel types it needs in
 `vmlinux_min.h`. After a change, run `make generate-bpf` (a clang with the
 BPF backend, version 14 or later; on macOS point `BPF2GO_CC` and
 `BPF2GO_STRIP` at Homebrew's LLVM, since Apple's clang lacks the target) and
-commit the regenerated `uverbs_x86_bpfel.*` and `uverbs_arm64_bpfel.*`.
+commit the regenerated `*_x86_bpfel.*` and `*_arm64_bpfel.*` files (`uverbs`,
+`kernel` and `dc`).
 `make check-bpf` compiles the program into a temporary directory and fails
 if the committed Go bindings are stale; CI runs it, and loads the committed
 objects into the runner's kernel with `TestTracerOpenClose`. The soft-RoCE

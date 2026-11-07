@@ -70,7 +70,7 @@ type Collector struct {
 // ends.
 func Start(t testing.TB, opts Options) *Collector {
 	t.Helper()
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	lis, err := net.Listen("tcp", "127.0.0.1:0") //nolint:noctx // test helper; binding a loopback socket does not block
 	if err != nil {
 		t.Fatalf("otlptest: listen: %v", err)
 	}

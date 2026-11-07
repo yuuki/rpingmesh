@@ -51,14 +51,14 @@ type Tracer struct {
 // tracer, so the caller can log why and continue without it.
 func Open() (*Tracer, error) {
 	if _, err := os.Stat(vmlinuxBTF); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrNoBTF, err)
+		return nil, fmt.Errorf("%w: %v", ErrNoBTF, err) //nolint:errorlint // only the sentinel is wrapped; the cause is detail text
 	}
 	// The feature probe creates a map, so without CAP_BPF it fails with
 	// EPERM before saying anything about the kernel.
 	if err := features.HaveMapType(ebpf.RingBuf); err != nil {
 		switch {
 		case isPermissionError(err):
-			return nil, fmt.Errorf("%w: %v", ErrPermission, err)
+			return nil, fmt.Errorf("%w: %v", ErrPermission, err) //nolint:errorlint // only the sentinel is wrapped; the cause is detail text
 		case errors.Is(err, ebpf.ErrNotSupported):
 			return nil, fmt.Errorf("service tracing: BPF ring buffers are not supported (Linux 5.8+ required): %w", err)
 		}
@@ -73,7 +73,7 @@ func Open() (*Tracer, error) {
 	t := &Tracer{logger: log.With().Str("component", "service_tracer").Logger()}
 	if err := loadUverbsObjects(&t.objs, nil); err != nil {
 		if isPermissionError(err) {
-			return nil, fmt.Errorf("%w: %v", ErrPermission, err)
+			return nil, fmt.Errorf("%w: %v", ErrPermission, err) //nolint:errorlint // only the sentinel is wrapped; the cause is detail text
 		}
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
@@ -130,9 +130,9 @@ func (t *Tracer) attach() error {
 		if err != nil {
 			switch {
 			case errors.Is(err, os.ErrNotExist):
-				return fmt.Errorf("%w: %s: %v", ErrNoUverbs, p.symbol, err)
+				return fmt.Errorf("%w: %s: %v", ErrNoUverbs, p.symbol, err) //nolint:errorlint // only the sentinel is wrapped; the cause is detail text
 			case isPermissionError(err):
-				return fmt.Errorf("%w: attach %s: %v", ErrPermission, p.symbol, err)
+				return fmt.Errorf("%w: attach %s: %v", ErrPermission, p.symbol, err) //nolint:errorlint // only the sentinel is wrapped; the cause is detail text
 			}
 			return fmt.Errorf("service tracing: attach kprobe to %s: %w", p.symbol, err)
 		}

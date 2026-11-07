@@ -2,12 +2,14 @@ package lldp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // json0Sample mirrors `lldpcli -f json0 show neighbors` with two interfaces:
@@ -554,4 +556,41 @@ func TestDiscover_DefaultPollInterval(t *testing.T) {
 	if gap := q.at[1].Sub(q.at[0]); gap < 2*time.Second || gap > 3*time.Second {
 		t.Fatalf("poll interval = %v, want the 2s default", gap)
 	}
+}
+
+// FuzzParseJSON0 checks that ParseJSON0 accepts only valid JSON (lldpcli
+// output is external input) and keys every neighbor by its non-empty local
+// interface name. Every field is valid UTF-8 even when the switch sent
+// arbitrary bytes in a TLV (encoding/json replaces them with U+FFFD), so a
+// ToR ID taken from LLDP can always travel in a protobuf string or an OTel
+// attribute.
+func FuzzParseJSON0(f *testing.F) {
+	f.Add([]byte(json0Sample))
+	f.Add([]byte(`{"lldp":[{}]}`))
+	f.Add([]byte(`{"lldp":[{"interface":[{"name":"eth0"},{"name":"eth0","chassis":[{"name":[{"value":"x"}]}]}]}]}`))
+	f.Add([]byte(`{"lldp":{"interface":"not a list"}}`))
+	f.Add([]byte("{\"lldp\":[{\"interface\":[{\"name\":\"eth0\",\"chassis\":[{\"name\":[{\"value\":\"leaf-\xff\\udc80\"}]}]}]}]}"))
+	f.Add([]byte(`{}`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		got, err := ParseJSON0(data)
+		if err != nil {
+			if got != nil {
+				t.Fatalf("partial result %v with error %v", got, err)
+			}
+			return
+		}
+		if !json.Valid(data) {
+			t.Fatalf("accepted invalid JSON %q", data)
+		}
+		for name, n := range got {
+			if name == "" || n.Interface != name {
+				t.Fatalf("neighbor %+v keyed by %q", n, name)
+			}
+			for _, v := range []string{n.Interface, n.SystemName, n.ChassisID, n.PortID, n.PortDescr} {
+				if !utf8.ValidString(v) {
+					t.Fatalf("neighbor %+v has a field that is not valid UTF-8", n)
+				}
+			}
+		}
+	})
 }

@@ -2,10 +2,12 @@
 //
 // Leaf module (imports only std) so the send path (packet.zig) and the CQ
 // poller (cq.zig) share one codec without an import cycle. The Go side
-// implements the same layout independently (SerializeProbePacket /
-// DeserializeProbePacket in internal/rdmabridge/bridge.go) and
-// internal/agent/responder.go interprets the decoded fields; keep all three
-// in sync. Explicit BigEndian serialization (no packed struct casting) keeps
+// implements the same layout independently (SerializeProbePacket in
+// internal/rdmabridge/bridge.go, which internal/agent/responder.go uses to
+// rebuild a received probe for the ACK path; received packets are decoded
+// here and reach Go as rdma_completion_event_t fields); keep them in sync.
+// The golden bytes of the layout test below are repeated in
+// internal/rdmabridge/wire_test.go. Explicit BigEndian serialization (no packed struct casting) keeps
 // the format portable.
 //
 // Wire format (PACKET_SIZE = 40 bytes):
@@ -237,4 +239,48 @@ test "writeT4 touches only the T4 field" {
     try std.testing.expectEqual(@as(u64, 0x0102030405060708), std.mem.readInt(u64, buf[OFFSET_T4..][0..8], .big));
     for (buf[0..OFFSET_T4]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
     for (buf[OFFSET_RESERVED..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+}
+
+test "serialize and deserialize are inverse on random packets and bytes" {
+    // Property test over the wire contract that internal/rdmabridge's
+    // SerializeProbePacket also implements. The seed is the test runner's
+    // (zig build test --seed=...), so a failure can be reproduced.
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const random = prng.random();
+    var i: usize = 0;
+    while (i < 10_000) : (i += 1) {
+        // Any packet of the current version survives a round trip, and
+        // serialization overwrites every byte of a garbage-filled buffer.
+        const pkt = ProbePacket{
+            .version = PACKET_VERSION,
+            .msg_type = random.int(u8),
+            .ack_type = random.int(u8),
+            .flags = random.int(u8),
+            .sequence_num = random.int(u64),
+            .t1 = random.int(u64),
+            .t3 = random.int(u64),
+            .t4 = random.int(u64),
+        };
+        var buf: Bytes = undefined;
+        random.bytes(&buf);
+        serializeProbePacket(&pkt, &buf);
+        const back = deserializeProbePacket(&buf) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(pkt, back);
+        const zeros: [PACKET_SIZE - OFFSET_RESERVED]u8 = @splat(0);
+        try std.testing.expectEqualSlices(u8, &zeros, buf[OFFSET_RESERVED..]);
+
+        // Arbitrary bytes decode only with the current version, and
+        // re-encoding a decoded packet reproduces every non-reserved byte.
+        var raw: Bytes = undefined;
+        random.bytes(&raw);
+        if (random.boolean()) raw[OFFSET_VERSION] = PACKET_VERSION;
+        if (deserializeProbePacket(&raw)) |decoded| {
+            try std.testing.expectEqual(PACKET_VERSION, raw[OFFSET_VERSION]);
+            var again: Bytes = undefined;
+            serializeProbePacket(&decoded, &again);
+            try std.testing.expectEqualSlices(u8, raw[0..OFFSET_RESERVED], again[0..OFFSET_RESERVED]);
+        } else {
+            try std.testing.expect(raw[OFFSET_VERSION] != PACKET_VERSION);
+        }
+    }
 }

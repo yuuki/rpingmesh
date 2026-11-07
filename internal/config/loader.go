@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -141,7 +142,7 @@ func bindPFlags(v *viper.Viper, flags *pflag.FlagSet) error {
 func readConfigFile(v *viper.Viper, configPath string) error {
 	if err := v.ReadInConfig(); err != nil {
 		if configPath == "" {
-			if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			if errors.As(err, new(viper.ConfigFileNotFoundError)) {
 				return nil
 			}
 			if os.IsNotExist(err) {

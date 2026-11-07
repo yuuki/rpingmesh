@@ -399,11 +399,11 @@ func (r *RnicRegistry) RegisterRNICs(
 
 	for i, res := range results[1:] {
 		if res.Err != nil {
-			return nil, fmt.Errorf("failed to register RNIC %s: %w", rnics[i].GetGid(), res.Err)
+			return nil, fmt.Errorf("failed to register RNIC %s: %w", rnics[i].GetGid(), res.Err) //nolint:gosec // G602: len(results) == len(rnics)+1 is checked above
 		}
 		// An upsert whose WHERE rejected the update changes no row.
 		if res.RowsAffected == 0 {
-			skipped = append(skipped, rnics[i].GetGid())
+			skipped = append(skipped, rnics[i].GetGid()) //nolint:gosec // G602: len(results) == len(rnics)+1 is checked above
 		}
 	}
 

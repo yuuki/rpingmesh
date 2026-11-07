@@ -239,7 +239,7 @@ func TestPinglistTorMesh(t *testing.T) {
 
 	// Verify deterministic 5-tuple fields are populated.
 	for _, tgt := range targets {
-		if tgt.GetFlowLabel() == 0 && tgt.GetSourcePort() == 0 {
+		if tgt.GetFlowLabel() == 0 && tgt.GetSourcePort() == 0 { //nolint:staticcheck // SA1019: the controller still fills the deprecated source_port
 			t.Errorf("PingTarget %s has zero flow_label and source_port", tgt.GetTargetGid())
 		}
 		if tgt.GetTargetQpn() == 0 {

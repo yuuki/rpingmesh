@@ -86,15 +86,6 @@ func fakeProbers(n int) []*Prober {
 	return probers
 }
 
-// deviceTorIDs returns each rnic's resolved ToR, in order.
-func (a *Agent) deviceTorIDs() []string {
-	tors := make([]string, 0, len(a.rnics))
-	for _, r := range a.rnics {
-		tors = append(tors, r.torID)
-	}
-	return tors
-}
-
 // newTestAgent builds an Agent with the given fake devices and probers
 // wired in, for use by tests that exercise createClusterMonitors and
 // createResultsFanIn without initializing any real RDMA resources.
@@ -142,12 +133,26 @@ func TestAgent_CreateClusterMonitors_OnePerDeviceWithMatchingRequesterGID(t *tes
 	}
 }
 
+// stopFanInAtCleanup tears the fan-in down when the test ends, the way
+// Agent.Stop does: every prober is destroyed first (closing its Results()),
+// then stopResultsFanIn waits for the fan-in goroutines.
+func stopFanInAtCleanup(t *testing.T, a *Agent, probers []*Prober) {
+	t.Helper()
+	t.Cleanup(func() {
+		for _, p := range probers {
+			p.Destroy()
+		}
+		a.stopResultsFanIn()
+	})
+}
+
 func TestAgent_CreateResultsFanIn_MergesResultsFromEveryProber(t *testing.T) {
 	probers := []*Prober{fakeProber(4), fakeProber(4)}
 	a := newTestAgent(nil, probers)
 	a.metricsResultsActive = true // a metrics consumer will drain a.results
 
 	a.createResultsFanIn()
+	stopFanInAtCleanup(t, a, probers)
 
 	// Emit one distinguishable result from each prober directly onto its
 	// resultChan (emitResult is unexported but same-package, matching the
@@ -181,6 +186,7 @@ func TestAgent_CreateResultsFanIn_TeesToAnalysis(t *testing.T) {
 	a.metricsResultsActive = true // a metrics consumer will drain a.results
 
 	a.createResultsFanIn()
+	stopFanInAtCleanup(t, a, probers)
 
 	if a.analysisResults == nil {
 		t.Fatal("analysisResults channel not created when analysis enabled")

@@ -84,7 +84,7 @@ func inode(path string) (uint64, error) {
 	if !ok {
 		return 0, fmt.Errorf("no inode for %s", path)
 	}
-	return uint64(st.Ino), nil
+	return uint64(st.Ino), nil //nolint:unconvert // Stat_t field types differ across GOARCH
 }
 
 // recordWatchedDevices records the uverbs node of every opened device. A

@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- A host, RDMA device or netdev name that is not valid UTF-8 (Linux accepts
+  such names) no longer breaks the agent: its registration request failed to
+  marshal, so the agent never registered, and every OTLP metric export
+  failed, so all of its metrics were lost. Such bytes are now sent as U+FFFD
+  in the registration and in metric attributes; the agent still uses the
+  raw names for its sysfs lookups.
+
+### Changed
+
+- Development tooling: `make check` (the pre-PR gate), `lint`
+  (golangci-lint), `lint-actions` (actionlint and zizmor), `test-race`,
+  `test-fuzz`, `test-integration`, `bench` and `vuln`; Go fuzz targets for
+  the decoders of external input, goroutine-leak checks and fault-injection
+  tests for unresponsive controllers and rqlite nodes; CI jobs for lint,
+  fuzzing and the workflow audit, a CodeQL and govulncheck workflow,
+  Dependabot, and every GitHub Action pinned to a commit. `make test` now
+  also covers `internal/agent/servicetrace`, as documented.
+
 ## [0.10.0] - 2026-11-05
 
 ### Added

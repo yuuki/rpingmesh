@@ -156,7 +156,7 @@ func observe(options servicetrace.DCOptions, duration time.Duration) error {
 		case <-tick.C:
 			if err := write(); err != nil {
 				cancel()
-				<-done
+				<-done //nolint:errcheck // wait for Run to stop; the write error is the one reported
 				return err
 			}
 		}

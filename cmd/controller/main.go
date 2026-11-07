@@ -138,7 +138,7 @@ func run(cmd *cobra.Command, args []string) error {
 	controller_agent.RegisterControllerServiceServer(grpcServer, svc)
 
 	// Start listening on the configured address.
-	lis, err := net.Listen("tcp", cfg.ListenAddr)
+	lis, err := net.Listen("tcp", cfg.ListenAddr) //nolint:noctx // binding a socket does not block; shutdown stops the server
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", cfg.ListenAddr, err)
 	}

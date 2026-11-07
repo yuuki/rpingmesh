@@ -1459,8 +1459,8 @@ host.
 ## Development
 
 [CONTRIBUTING.md](CONTRIBUTING.md) describes how to propose changes;
-[AGENTS.md](AGENTS.md) is the detailed guide to the code base, every make
-target and the compatibility contracts.
+[AGENTS.md](AGENTS.md) holds the compatibility contracts and the Git
+conventions.
 
 ### Tests
 

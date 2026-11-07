@@ -18,9 +18,8 @@ make check   # lint, workflow audit, race-enabled unit tests, Zig and script tes
 ```
 
 `make check` needs Linux with Go, Zig 0.17.0, protoc, libibverbs-dev and
-librdmacm-dev; [AGENTS.md](AGENTS.md) lists the prerequisites, every make
-target, which tests need root, Docker or RDMA hardware, and the extra checks
-for changes to the eBPF programs, the Zig library or the protobuf API.
+librdmacm-dev; [AGENTS.md](AGENTS.md) lists the extra checks for changes to
+the eBPF programs, the Zig library or the protobuf API.
 
 - Add or update tests for behaviour changes, and update README.md and
   CHANGELOG.md when users would notice the change.
@@ -34,5 +33,5 @@ for changes to the eBPF programs, the Zig library or the protobuf API.
 
 ## Commit messages
 
-Use Conventional Commits: `feat:`, `fix(agent):`, `docs:`, `ci:`, `build:`,
-`test:`, `refactor:`, with the reason for the change in the body.
+Commits, branches and pull request titles follow the Git conventions in
+[AGENTS.md](AGENTS.md#git-conventions).

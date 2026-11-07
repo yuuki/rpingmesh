@@ -1,9 +1,9 @@
 {
   "repository": "yuuki/rpingmesh/complexity",
   "ref": "refs/heads/main",
-  "commit": "5b8a625287ee37e496d262577bef9016f35595e7",
+  "commit": "3c79716aec48f9c273c666c31700aabf6ce219f5",
   "base_ref": "refs/heads/main",
-  "timestamp": "2026-11-05T13:55:15.511956382Z",
+  "timestamp": "2026-11-07T10:47:22.169605345Z",
   "custom_metrics": [
     {
       "key": "code_complexity",
@@ -12,12 +12,12 @@
         {
           "key": "function_count",
           "name": "Function count",
-          "value": 1006
+          "value": 1008
         },
         {
           "key": "cognitive_sum",
           "name": "Cognitive: total",
-          "value": 3170
+          "value": 3177
         },
         {
           "key": "cognitive_max",
@@ -37,7 +37,7 @@
         {
           "key": "cyclomatic_sum",
           "name": "Cyclomatic: total",
-          "value": 3577
+          "value": 3583
         },
         {
           "key": "cyclomatic_max",

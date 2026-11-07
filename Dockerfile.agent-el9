@@ -17,7 +17,7 @@
 # The final stage contains only the binary, so --output writes
 # bin/rpingmesh-agent and nothing else.
 
-FROM almalinux:9 AS builder
+FROM almalinux:10 AS builder
 
 ARG GO_VERSION=1.27.3
 ARG ZIG_VERSION=0.17.0

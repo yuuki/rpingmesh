@@ -176,8 +176,9 @@ fn sendPacketSync(
     // Reset the completion mailbox before posting so that a reused slot's
     // previous completion value cannot false-match our wait. Safe under the
     // single-sender contract: our previous send on this slot already
-    // completed (that is why the slot was free), so no completion carrying
-    // this wr_id is still in flight to be lost by the reset.
+    // completed and was published (the poller frees a slot only after
+    // publishing its completion), so no completion carrying this wr_id is
+    // still in flight to be lost by the reset.
     queue.send_completion_wr_id.store(types.SEND_WR_ID_NONE, .release);
 
     // The slot is synchronous: its completion is published to the mailbox

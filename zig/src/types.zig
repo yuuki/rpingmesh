@@ -377,9 +377,12 @@ pub const UdQueue = struct {
     //
     // wr_id matching is what makes a LATE completion harmless: if a send
     // times out, its slot is deliberately left allocated (not reused) until
-    // its completion finally arrives, so a stale completion publishes a wr_id
-    // that no current waiter is looking for and is simply ignored -- it can
-    // no longer be misread as the next send's T2/status. Because there is a
+    // its completion finally arrives and has been published, so a stale
+    // completion publishes a wr_id that no current waiter is looking for and
+    // is simply ignored -- it can no longer be misread as the next send's
+    // T2/status. The poller frees the slot only after publishing; freeing it
+    // first would let the next send take the slot, and so its wr_id, before
+    // the stale publish. Because there is a
     // single sender and a QP delivers send completions in post order, the
     // current send's completion is always the last to be published, so the
     // waiter reliably observes its own wr_id without needing to reset the

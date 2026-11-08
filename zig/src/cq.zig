@@ -552,15 +552,21 @@ pub fn processSendCompletion(queue: *types.UdQueue, cq: *c.ibv_cq_ex, pending: *
 /// AsyncSecondAck: reclaim the slot (counting an error status as a failure).
 /// Neither touches the mailbox, so asynchronous pairs never disturb a
 /// synchronous waiter on the same queue.
-/// Sync: free the completed send's slot and publish its result to the
-/// waiting sender, as follows.
+/// Sync: publish the completed send's result to the waiting sender, then
+/// free its slot, as follows.
 ///
 /// The slot is freed here (not by the sender) so that a late completion for a
 /// timed-out send still returns its slot for reuse. The completed wr_id is
-/// stored LAST with release ordering: the waiter in waitSendCompletion() spins
-/// on send_completion_wr_id with acquire ordering, so it only observes the
-/// timestamp/status once its own wr_id is published. See the mailbox invariant
-/// comment in types.zig.
+/// stored after the timestamp/status with release ordering: the waiter in
+/// waitSendCompletion() spins on send_completion_wr_id with acquire ordering,
+/// so it only observes the timestamp/status once its own wr_id is published.
+///
+/// The slot is freed only after that. Freed first, a late completion of a
+/// timed-out send could lose the CPU between the two: the sender would take
+/// the same slot for its next send, reset the mailbox and post, and the late
+/// completion would then publish that slot's wr_id, which the new waiter
+/// matches, returning the old send's T2 and status as its own. See the
+/// mailbox invariant comment in types.zig.
 fn signalSendCompletion(queue: *types.UdQueue, wr_id: u64, timestamp_ns: u64, status: i32, pending: *PendingSecondAcks) void {
     const slot_index = types.wrIdSlot(wr_id);
     switch (queue.sendSlotMode(slot_index)) {
@@ -580,15 +586,16 @@ fn signalSendCompletion(queue: *types.UdQueue, wr_id: u64, timestamp_ns: u64, st
         },
         .Sync => {},
     }
-    // This is the matching completion for the posted WR, so the AH is no
-    // longer referenced and the slot can be released.
-    queue.releaseSendSlot(slot_index);
-
     queue.send_completion_timestamp.store(timestamp_ns, .monotonic);
     queue.send_completion_status.store(status, .monotonic);
-    // Publish last: this release pairs with the sender's acquire load and makes
-    // the timestamp/status above visible once the wr_id matches.
+    // This release pairs with the sender's acquire load and makes the
+    // timestamp/status above visible once the wr_id matches.
     queue.send_completion_wr_id.store(wr_id, .release);
+
+    // This is the matching completion for the posted WR, so the AH is no
+    // longer referenced and the slot can be released: only now, after the
+    // result is published, may a new send reuse the slot and its wr_id.
+    queue.releaseSendSlot(slot_index);
 }
 
 // ---------------------------------------------------------------------------

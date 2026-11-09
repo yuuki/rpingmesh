@@ -5,7 +5,7 @@
 .PHONY: all build build-zig build-go build-controller build-agent build-dc-trace \
         generate generate-proto generate-bpf check-bpf install-protoc-plugins \
         clean test test-go test-zig test-scripts test-all vet complexity \
-        check lint fmt lint-actions test-race test-fuzz test-integration bench vuln \
+        check lint fmt lint-actions lock-actions test-race test-fuzz test-integration bench vuln \
         test-e2e setup-colima test-e2e-controller clean-e2e-controller \
         check-nfpm package package-agent package-controller \
         package-build-agent package-build-agent-el9 package-build-controller \
@@ -68,6 +68,7 @@ GOLANGCI_LINT_VERSION      ?= v2.15.0
 GOVULNCHECK_VERSION        ?= v1.9.0
 ACTIONLINT_VERSION         ?= v1.7.12
 ZIZMOR_VERSION             ?= 1.32.0
+GH_ACTIONS_LOCK_VERSION    ?= v0.4.1
 # protoc-gen-go follows google.golang.org/protobuf in go.mod; the gRPC plugin
 # is a separate module and is pinned here.
 PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.2
@@ -89,6 +90,8 @@ GOVULNCHECK   ?= GOTOOLCHAIN=$(GO_TOOLCHAIN) go run golang.org/x/vuln/cmd/govuln
 ACTIONLINT    ?= GOTOOLCHAIN=$(GO_TOOLCHAIN) go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
 # uvx or pipx (preinstalled on GitHub-hosted runners) runs the pinned zizmor.
 ZIZMOR        ?= $(if $(shell command -v uvx 2>/dev/null),uvx zizmor@$(ZIZMOR_VERSION),pipx run zizmor==$(ZIZMOR_VERSION))
+# gh-actions-lock (the `gh actions-lock` extension) runs through `go run` too.
+GH_ACTIONS_LOCK ?= GOTOOLCHAIN=$(GO_TOOLCHAIN) go run github.com/github/gh-actions-lock/cmd/gh-actions-lock@$(GH_ACTIONS_LOCK_VERSION)
 
 # Default target
 all: build
@@ -258,9 +261,17 @@ fmt:
 
 # Lint (actionlint) and audit (zizmor) the GitHub Actions workflows. zizmor's
 # online audits need a GitHub token (GH_TOKEN); without one it runs offline.
+# gh-actions-lock checks that .github/workflows/actions.lock pins every
+# action the workflows use; with GH_TOKEN it also verifies each pin upstream.
 lint-actions:
 	$(ACTIONLINT)
 	$(ZIZMOR) $(if $(GH_TOKEN),,--offline) .
+	$(GH_ACTIONS_LOCK) $(if $(GH_TOKEN),--verify,--verify-local)
+
+# Pin the actions in .github/workflows/actions.lock after a `uses:` changed,
+# then review the diff. Needs a GitHub token (GH_TOKEN or `gh auth login`).
+lock-actions:
+	$(GH_ACTIONS_LOCK)
 
 # Unit tests with the race detector. On Linux this is every package except
 # ./e2e/... (the same set as test-all), after building librdmabridge.a and the
@@ -500,7 +511,8 @@ help:
 	@echo "  check                Local pre-PR gate: lint, lint-actions, test-race, test-zig, test-scripts"
 	@echo "  lint                 golangci-lint (.golangci.yml) and go mod tidy -diff"
 	@echo "  fmt                  Apply the formatters of .golangci.yml"
-	@echo "  lint-actions         actionlint and zizmor on .github/"
+	@echo "  lint-actions         actionlint and zizmor on .github/, and check .github/workflows/actions.lock"
+	@echo "  lock-actions         Update .github/workflows/actions.lock after changing a uses: line"
 	@echo "  test                 Run tests (alias of test-go)"
 	@echo "  test-go              Run Go tests of every pure-Go package (no Cgo, no RDMA hardware)"
 	@echo "  test-race            Go unit tests with -race (Linux: all non-e2e packages)"

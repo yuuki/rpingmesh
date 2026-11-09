@@ -1473,7 +1473,8 @@ make test-scripts   # Python tests of scripts/topology/ (standard library only)
 make test-fuzz      # every Go fuzz target for FUZZTIME (default 30s)
 make bench          # benchmarks into bench.txt (compare runs with benchstat)
 make lint           # golangci-lint and go mod tidy -diff
-make lint-actions   # actionlint and zizmor on the GitHub Actions workflows
+make lint-actions   # actionlint and zizmor on the GitHub Actions workflows, and their lockfile
+make lock-actions   # update .github/workflows/actions.lock after changing a uses: line
 make vuln           # govulncheck
 make vet            # go vet ./...
 make test-all       # Zig tests and every Go package except e2e/ (Linux build environment)

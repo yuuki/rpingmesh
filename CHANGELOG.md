@@ -23,6 +23,11 @@ All notable changes to this project are documented in this file.
   fuzzing and the workflow audit, a CodeQL and govulncheck workflow,
   Dependabot, and every GitHub Action pinned to a commit. `make test` now
   also covers `internal/agent/servicetrace`, as documented.
+- GitHub Actions: the actions the workflows use, transitive ones included,
+  are pinned in the workflow dependency lockfile
+  `.github/workflows/actions.lock`, and the workflows name them by release
+  tag; `make lint-actions` checks the lockfile (`gh actions-lock --verify` in
+  CI) and `make lock-actions` updates it after a `uses:` line changed.
 
 ## [0.10.0] - 2026-11-05
 

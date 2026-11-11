@@ -25,9 +25,9 @@ priority: "optional"
 maintainer: "R-Pingmesh maintainers"
 description: |
   R-Pingmesh controller service.
-  Manages agent registration and RNIC registry (backed by rqlite) and
-  distributes ToR-mesh/inter-ToR pinglists to agents over gRPC. Pure Go,
-  no RDMA dependency.
+  Manages agent registration and RNIC registry (backed by rqlite or
+  PostgreSQL) and distributes ToR-mesh/inter-ToR pinglists to agents over
+  gRPC. Pure Go, no RDMA dependency.
 homepage: "https://github.com/yuuki/rpingmesh"
 license: "Apache-2.0"
 
@@ -72,6 +72,15 @@ contents:
   # operator can provide.
   - src: packaging/systemd/rpingmesh-controller.service.d/30-otel-collector-token.conf
     dst: /usr/share/doc/rpingmesh-controller/examples/rpingmesh-controller.service.d/30-otel-collector-token.conf
+    type: doc
+    file_info:
+      mode: 0644
+
+  # Passes a libpq password file for a PostgreSQL registry as a systemd
+  # credential. Shipped as an example: it names a file only the operator can
+  # provide.
+  - src: packaging/systemd/rpingmesh-controller.service.d/40-postgresql-pgpass.conf
+    dst: /usr/share/doc/rpingmesh-controller/examples/rpingmesh-controller.service.d/40-postgresql-pgpass.conf
     type: doc
     file_info:
       mode: 0644

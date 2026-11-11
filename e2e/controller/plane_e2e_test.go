@@ -2,10 +2,7 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -13,39 +10,8 @@ import (
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
 
-// executeSQL runs statements through the rqlite HTTP API as one request.
-func executeSQL(t *testing.T, stmts ...string) {
-	t.Helper()
-	payload := make([][]string, len(stmts))
-	for i, s := range stmts {
-		payload[i] = []string{s}
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatalf("marshal statements: %v", err)
-	}
-	resp, err := http.Post(rqliteURL()+"/db/execute", "application/json", strings.NewReader(string(body)))
-	if err != nil {
-		t.Fatalf("execute %v: %v", stmts, err)
-	}
-	defer resp.Body.Close()
-	var out struct {
-		Results []struct {
-			Error string `json:"error"`
-		} `json:"results"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatalf("decode rqlite response: %v", err)
-	}
-	for i, r := range out.Results {
-		if r.Error != "" {
-			t.Fatalf("statement %q failed: %s", stmts[i], r.Error)
-		}
-	}
-}
-
 // TestPlaneRestrictedPinglists drives a rail-optimized topology (two rails,
-// two leaves per rail) through the real controller and rqlite, so the
+// two leaves per rail) through the real controller and database, so the
 // plane_id column round-trips through registration, storage, and the
 // pinglist queries.
 func TestPlaneRestrictedPinglists(t *testing.T) {
@@ -115,32 +81,37 @@ func TestPlaneRestrictedUntaggedMesh(t *testing.T) {
 // empty plane, and new registrations must store planes.
 func TestRegistryPlaneMigration(t *testing.T) {
 	now := time.Now().Unix()
+	// SQLite's INTEGER is 64-bit; PostgreSQL needs BIGINT for the same range.
+	integer := "INTEGER"
+	if usesPostgres() {
+		integer = "BIGINT"
+	}
 	executeSQL(t,
 		`DROP TABLE IF EXISTS rnics`,
-		`CREATE TABLE rnics (
+		fmt.Sprintf(`CREATE TABLE rnics (
 			rnic_gid TEXT PRIMARY KEY,
-			qpn INTEGER NOT NULL,
+			qpn %[1]s NOT NULL,
 			agent_id TEXT NOT NULL,
 			agent_ip TEXT NOT NULL,
 			rnic_ip TEXT NOT NULL,
 			tor_id TEXT NOT NULL,
 			hostname TEXT NOT NULL,
 			device_name TEXT NOT NULL,
-			last_updated_epoch INTEGER NOT NULL
-		)`,
+			last_updated_epoch %[1]s NOT NULL
+		)`, integer),
 		fmt.Sprintf(`INSERT INTO rnics VALUES ('fe80::f1', 900, 'legacy-agent', '192.0.2.1', '10.9.9.1', 'tor-legacy', 'legacy-host', 'mlx5_0', %d)`, now),
 	)
 
 	// Opening twice also covers the already-migrated path.
 	for i := 0; i < 2; i++ {
-		reg, err := registry.NewRnicRegistry(context.Background(), rqliteURL(), 0, 0, 0)
+		reg, err := registry.NewRnicRegistry(context.Background(), databaseURI(), 0, 0, 0)
 		if err != nil {
 			t.Fatalf("NewRnicRegistry (open %d): %v", i+1, err)
 		}
 		reg.Close()
 	}
 
-	reg, err := registry.NewRnicRegistry(context.Background(), rqliteURL(), 0, 0, 0)
+	reg, err := registry.NewRnicRegistry(context.Background(), databaseURI(), 0, 0, 0)
 	if err != nil {
 		t.Fatalf("NewRnicRegistry: %v", err)
 	}

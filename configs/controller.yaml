@@ -3,11 +3,17 @@
 # Server settings
 listen_addr: ":50051"
 
-# Database
+# Database of the RNIC registry. The scheme selects the backend:
+#   rqlite:     http://host:4001 or https://host:4001
+#   PostgreSQL: postgres://user@host:5432/dbname?sslmode=verify-full
+# Keep a PostgreSQL password out of this file: use PGPASSFILE (see
+# packaging/systemd/rpingmesh-controller.service.d/40-postgresql-pgpass.conf)
+# or RPINGMESH_DATABASE_URI in /etc/rpingmesh/controller.env. See README
+# "Using PostgreSQL".
 database_uri: "http://localhost:4001"  # rqlite address
-# Seconds to keep retrying the rqlite connection and schema setup at startup
-# (exponential backoff from 1s up to 30s), so the controller tolerates an
-# rqlite node that is still starting. 0 = single attempt.
+# Seconds to keep retrying the database connection and schema setup at
+# startup (exponential backoff from 1s up to 30s), so the controller tolerates
+# a database that is still starting. 0 = single attempt.
 database_connect_timeout_sec: 120
 
 # ECMP path coverage (R-Pingmesh Eq.(1))
@@ -21,7 +27,7 @@ ecmp_max_flow_labels: 64          # Hard cap on labels per target (bounds amplif
 # Unset tor_id agents share one virtual rack. Their ToR-mesh pinglist is capped
 # after same-host / same-family filters so a forgotten fleet-wide setting
 # cannot become N^2 high-rate probes. 0 = unlimited (named ToR-mesh is never
-# capped). The empty-ToR rqlite query itself is not paginated.
+# capped). The empty-ToR registry query itself is not paginated.
 unspecified_mesh_max_targets: 32
 
 # Analyzer (Phase 1)

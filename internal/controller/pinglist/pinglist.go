@@ -21,7 +21,7 @@ const DefaultInterTorSampleSize = 5
 // RnicSource is the subset of registry.RnicRegistry's read API required to
 // generate pinglists. It is declared here, at the point of use, so that
 // PinglistGenerator can be unit tested against a fake instead of a real
-// rqlite-backed registry.
+// database-backed registry.
 type RnicSource interface {
 	GetRNICsByToR(ctx context.Context, torID string) ([]*controller_agent.RnicInfo, error)
 	// GetActiveRNICsInOtherToRs returns all active RNICs in ToRs other than

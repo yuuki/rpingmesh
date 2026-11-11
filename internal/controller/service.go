@@ -18,7 +18,7 @@ import (
 // PinglistGenerator, its read methods (GetRNICsByToR,
 // GetActiveRNICsInOtherToRs, GetRNICByGID). It is declared here, at the
 // point of use, so that RegisterAgent and GetPinglist can be unit tested
-// against a fake instead of a real rqlite-backed registry.
+// against a fake instead of a real database-backed registry.
 type registryClient interface {
 	pinglist.RnicSource
 	// RegisterRNICs replaces agentID's RNIC set and returns the GIDs it
@@ -185,6 +185,10 @@ func (s *ControllerService) GetPinglist(
 		return nil, status.Errorf(codes.InvalidArgument, "requester_gid is required")
 	}
 	if err := validateGID("requester_gid", req.GetRequesterGid()); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	// The ToR is a query parameter of the registry lookups.
+	if err := checkNoNUL("tor_id", req.GetTorId()); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 

@@ -303,8 +303,11 @@ test-fuzz: build-zig generate
 	done
 
 # Tests that need network services in containers (Docker): the
-# agent-to-controller suite against rqlite. The soft-RoCE suite (test-e2e)
-# additionally needs a privileged container and the rdma_rxe module.
+# agent-to-controller suite against rqlite and against PostgreSQL. The
+# registry's own PostgreSQL tests run in test-race when
+# RPINGMESH_TEST_POSTGRES_URI names a database they may create schemas in.
+# The soft-RoCE suite (test-e2e) additionally needs a privileged container
+# and the rdma_rxe module.
 test-integration: test-e2e-controller
 
 # Benchmarks of every non-e2e package, written to bench.txt (gitignored);

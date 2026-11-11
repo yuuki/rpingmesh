@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -32,7 +33,7 @@ const (
 	// agents that omit tor_id. 0 means unlimited.
 	DefaultUnspecifiedMeshMaxTargets = 32
 	// DefaultDatabaseConnectTimeoutSec is how long (seconds) the controller
-	// keeps retrying its rqlite connection and schema initialization at
+	// keeps retrying its database connection and schema initialization at
 	// startup before exiting. 0 disables retries (a single attempt).
 	DefaultDatabaseConnectTimeoutSec = 120
 
@@ -77,9 +78,13 @@ const (
 
 // ControllerConfig holds all configuration for the controller.
 type ControllerConfig struct {
-	ListenAddr  string `mapstructure:"listen_addr"`
+	ListenAddr string `mapstructure:"listen_addr"`
+	// DatabaseURI locates the RNIC registry database. Its scheme selects the
+	// backend: http or https for rqlite, postgres or postgresql for
+	// PostgreSQL. It may carry a password: log it only through
+	// RedactDatabaseURI.
 	DatabaseURI string `mapstructure:"database_uri"`
-	// DatabaseConnectTimeoutSec bounds the startup retry of the rqlite
+	// DatabaseConnectTimeoutSec bounds the startup retry of the database
 	// connection (exponential backoff, 1s to 30s). 0 makes a single attempt.
 	DatabaseConnectTimeoutSec int    `mapstructure:"database_connect_timeout_sec"`
 	LogLevel                  string `mapstructure:"log_level"`
@@ -162,8 +167,8 @@ var controllerRenamedKeys = []renamedKey{
 // affect --help, which pflag sorts by name.
 var controllerKeys = []keySpec{
 	{key: "listen_addr", def: ":50051", help: "Address to listen on for gRPC connections"},
-	{key: "database_uri", def: "http://localhost:4001", help: "rqlite database connection URI"},
-	{key: "database_connect_timeout_sec", def: DefaultDatabaseConnectTimeoutSec, help: "Seconds to keep retrying the rqlite connection at startup (0 = single attempt)"},
+	{key: "database_uri", def: "http://localhost:4001", help: "Registry database URI: http(s)://host:port for rqlite, postgres://user@host:port/dbname for PostgreSQL"},
+	{key: "database_connect_timeout_sec", def: DefaultDatabaseConnectTimeoutSec, help: "Seconds to keep retrying the database connection at startup (0 = single attempt)"},
 	{key: "log_level", def: "info", help: "Log level (debug, info, warn, error)"},
 	{key: "log_format", def: logging.DefaultFormat, help: "Log output format: console or json"},
 	{key: "active_threshold_sec", def: DefaultActiveThresholdSec, help: "Window (seconds) within which an RNIC is considered active"},
@@ -314,9 +319,25 @@ func (c *ControllerConfig) validateEndpoints() error {
 	if strings.TrimSpace(c.DatabaseURI) == "" {
 		return fmt.Errorf("database_uri must not be empty")
 	}
-	u, err := url.Parse(c.DatabaseURI)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("database_uri %q is not a valid URL", c.DatabaseURI)
+	// The URI may carry a password, so errors quote it redacted.
+	switch scheme := databaseURIScheme(c.DatabaseURI); scheme {
+	case "http", "https": // rqlite
+		u, err := url.Parse(c.DatabaseURI)
+		if err != nil {
+			return fmt.Errorf("database_uri %q is not a valid URL", RedactDatabaseURI(c.DatabaseURI))
+		}
+		if u.Host == "" {
+			return fmt.Errorf("database_uri %q is not a valid URL: it has no host", RedactDatabaseURI(c.DatabaseURI))
+		}
+	case "postgres", "postgresql":
+		// pgx parses the rest when the registry opens, and rejects a
+		// malformed URI before any connection attempt. net/url is not used
+		// here: it rejects URIs pgx accepts, such as a list of IPv6 hosts.
+		// The host may also come from PGHOST or default to the local Unix
+		// socket, as in libpq.
+	default:
+		return fmt.Errorf("database_uri %q has an unsupported scheme %q: use http or https for rqlite, postgres or postgresql for PostgreSQL",
+			RedactDatabaseURI(c.DatabaseURI), scheme)
 	}
 	if c.DatabaseConnectTimeoutSec < 0 {
 		return fmt.Errorf("database_connect_timeout_sec must be >= 0, got: %d", c.DatabaseConnectTimeoutSec)
@@ -400,4 +421,66 @@ func (c *ControllerConfig) validateAnalyzer() error {
 			MinMetricsCardinalityLimit, c.AnalyzerMetricsCardinalityLimit)
 	}
 	return nil
+}
+
+// databaseURIScheme returns the lower-cased scheme of a database_uri (the
+// text before "://"), or "" when it has none.
+func databaseURIScheme(uri string) string {
+	scheme, _, ok := strings.Cut(uri, "://")
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(scheme)
+}
+
+// redactedQueryParams are the URI query parameters that carry a secret:
+// PostgreSQL's password and the passphrase of its client key.
+var redactedQueryParams = []string{"password", "sslpassword"}
+
+// RedactDatabaseURI returns uri with its passwords replaced by "xxxxx", for
+// logs and error messages: the password of the user information and the
+// values of the password and sslpassword query parameters.
+//
+// The URI is split as libpq and pgx split it, not as net/url does: the user
+// information ends at the first '@' before any '/', and the query starts at
+// the first '?' after it and splits on '&' only. net/url disagrees on
+// passwords holding '#', '?' or ';', and would print them. When an '@' or a
+// '#' remains after the user information, the parsers may disagree on where
+// the password ends (an unescaped '/' in it, say), so only the scheme is
+// shown; of a string without a scheme, nothing is.
+func RedactDatabaseURI(uri string) string {
+	const mask = "xxxxx"
+	scheme, rest, ok := strings.Cut(uri, "://")
+	if !ok {
+		return "(not shown)"
+	}
+	var b strings.Builder
+	b.WriteString(scheme + "://")
+	if i := strings.IndexAny(rest, "@/"); i >= 0 && rest[i] == '@' {
+		user, _, hasPassword := strings.Cut(rest[:i], ":")
+		b.WriteString(user)
+		if hasPassword {
+			b.WriteString(":" + mask)
+		}
+		b.WriteByte('@')
+		rest = rest[i+1:]
+	}
+	if strings.ContainsAny(rest, "@#") {
+		return scheme + "://(not shown)"
+	}
+	base, query, hasQuery := strings.Cut(rest, "?")
+	b.WriteString(base)
+	if !hasQuery {
+		return b.String()
+	}
+	params := strings.Split(query, "&")
+	for i, param := range params {
+		rawKey, _, _ := strings.Cut(param, "=")
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil || slices.ContainsFunc(redactedQueryParams, func(secret string) bool { return strings.EqualFold(key, secret) }) {
+			params[i] = rawKey + "=" + mask
+		}
+	}
+	b.WriteString("?" + strings.Join(params, "&"))
+	return b.String()
 }

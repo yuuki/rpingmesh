@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/yuuki/rpingmesh/internal/probe"
@@ -48,6 +49,27 @@ func checkLen(field, v string, limit int) error {
 	return nil
 }
 
+// checkNoNUL rejects a string holding a NUL byte. gRPC only guarantees valid
+// UTF-8, which allows NUL, but PostgreSQL cannot store NUL in TEXT: such a
+// value would make a registration or lookup fail with an internal error on
+// that backend while rqlite stores it. Rejecting it up front keeps both
+// backends alike. No interface, host or switch name contains NUL.
+func checkNoNUL(field, v string) error {
+	if strings.IndexByte(v, 0) >= 0 {
+		return fmt.Errorf("%s contains a NUL byte", field)
+	}
+	return nil
+}
+
+// checkText checks a free-form string stored in the registry: bounded
+// length and no NUL byte.
+func checkText(field, v string, limit int) error {
+	if err := checkLen(field, v, limit); err != nil {
+		return err
+	}
+	return checkNoNUL(field, v)
+}
+
 // validateGID checks that gid is a parseable GID of bounded length.
 func validateGID(field, gid string) error {
 	if err := checkLen(field, gid, maxGIDLen); err != nil {
@@ -76,13 +98,13 @@ func validateIP(field, ip string) error {
 // validateRegistration checks the identity and bounds of a RegisterAgent
 // request before anything is written to the registry.
 func validateRegistration(req *controller_agent.AgentRegistrationRequest) error {
-	if err := checkLen("agent_id", req.GetAgentId(), maxFieldLen); err != nil {
+	if err := checkText("agent_id", req.GetAgentId(), maxFieldLen); err != nil {
 		return err
 	}
-	if err := checkLen("hostname", req.GetHostname(), maxFieldLen); err != nil {
+	if err := checkText("hostname", req.GetHostname(), maxFieldLen); err != nil {
 		return err
 	}
-	if err := checkLen("tor_id", req.GetTorId(), maxFieldLen); err != nil {
+	if err := checkText("tor_id", req.GetTorId(), maxFieldLen); err != nil {
 		return err
 	}
 	if err := validateIP("agent_ip", req.GetAgentIp()); err != nil {
@@ -108,7 +130,7 @@ func validateRegistration(req *controller_agent.AgentRegistrationRequest) error 
 			{"device_name", rnic.GetDeviceName()},
 			{"netdev", rnic.GetNetdev()},
 		} {
-			if err := checkLen(fmt.Sprintf("rnic %d %s", i, f.name), f.v, maxFieldLen); err != nil {
+			if err := checkText(fmt.Sprintf("rnic %d %s", i, f.name), f.v, maxFieldLen); err != nil {
 				return err
 			}
 		}

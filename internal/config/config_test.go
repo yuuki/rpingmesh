@@ -224,6 +224,17 @@ func TestControllerConfig_Validate(t *testing.T) {
 		{"invalid listen addr", func(c *ControllerConfig) { c.ListenAddr = "not-a-valid-addr-no-colon" }, "listen_addr"},
 		{"empty database uri", func(c *ControllerConfig) { c.DatabaseURI = "" }, "database_uri must not be empty"},
 		{"database uri without scheme", func(c *ControllerConfig) { c.DatabaseURI = "localhost:4001" }, "database_uri"},
+		{"rqlite uri without host", func(c *ControllerConfig) { c.DatabaseURI = "http:///db" }, "it has no host"},
+		{"https rqlite uri", func(c *ControllerConfig) { c.DatabaseURI = "https://rqlite.example:4001" }, ""},
+		{"postgres uri", func(c *ControllerConfig) {
+			c.DatabaseURI = "postgres://rpm@db.example:5432/rpingmesh?sslmode=verify-full"
+		}, ""},
+		{"postgresql uri", func(c *ControllerConfig) { c.DatabaseURI = "postgresql://rpm@db.example/rpingmesh" }, ""},
+		{"postgres uri over the default socket", func(c *ControllerConfig) { c.DatabaseURI = "postgres:///rpingmesh" }, ""},
+		{"postgres uri with IPv6 hosts", func(c *ControllerConfig) {
+			c.DatabaseURI = "postgres://rpm@[2001:db8::1]:5432,[2001:db8::2]:5432/rpingmesh?target_session_attrs=read-write"
+		}, ""},
+		{"unsupported database scheme", func(c *ControllerConfig) { c.DatabaseURI = "mysql://db.example/rpingmesh" }, "unsupported scheme"},
 		{"zero database connect timeout disables retries", func(c *ControllerConfig) { c.DatabaseConnectTimeoutSec = 0 }, ""},
 		{"negative database connect timeout", func(c *ControllerConfig) { c.DatabaseConnectTimeoutSec = -1 }, "database_connect_timeout_sec"},
 		{"unknown log level", func(c *ControllerConfig) { c.LogLevel = "loud" }, "log_level"},
@@ -1129,4 +1140,61 @@ func TestLoadControllerConfig_RenamedKeys(t *testing.T) {
 			t.Errorf("Deprecations = %q, want none", cfg.Deprecations)
 		}
 	})
+}
+
+func TestRedactDatabaseURI(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"http://localhost:4001", "http://localhost:4001"},
+		{"http://rq:s3cret@rqlite.example:4001", "http://rq:xxxxx@rqlite.example:4001"},
+		{"http://rq:s3%cret@rqlite.example:4001", "http://rq:xxxxx@rqlite.example:4001"},
+		{"postgres://rpm@db.example/rpingmesh?sslmode=verify-full", "postgres://rpm@db.example/rpingmesh?sslmode=verify-full"},
+		{"postgres://rpm:s3cret@db.example/rpingmesh", "postgres://rpm:xxxxx@db.example/rpingmesh"},
+		{"postgres://rpm:s3%cret@db.example/rpingmesh", "postgres://rpm:xxxxx@db.example/rpingmesh"},
+		{"postgres://rpm:s3cret@[2001:db8::1]:5432,[2001:db8::2]:5432/rpingmesh", "postgres://rpm:xxxxx@[2001:db8::1]:5432,[2001:db8::2]:5432/rpingmesh"},
+		// Passwords that pgx accepts and net/url splits elsewhere.
+		{"postgres://rpm:2024#s3cret@db.example/rpingmesh", "postgres://rpm:xxxxx@db.example/rpingmesh"},
+		{"postgres://rpm:?s3cret@db.example/rpingmesh", "postgres://rpm:xxxxx@db.example/rpingmesh"},
+		{"postgres://rpm:#s3cret@db.example/rpingmesh", "postgres://rpm:xxxxx@db.example/rpingmesh"},
+		{"postgres://rpm:42?s3cret@db.example/rpingmesh", "postgres://rpm:xxxxx@db.example/rpingmesh"},
+		{"postgres://db.example/rpingmesh?user=rpm&Password=s3cret", "postgres://db.example/rpingmesh?user=rpm&Password=xxxxx"},
+		{"postgres://db.example/rpingmesh?sslpassword=s3cret&sslmode=verify-full", "postgres://db.example/rpingmesh?sslpassword=xxxxx&sslmode=verify-full"},
+		{"postgres://db.example/rpingmesh?user=rpm&password=s3;cret", "postgres://db.example/rpingmesh?user=rpm&password=xxxxx"},
+		{"postgres://db.example/rpingmesh?password=s3%zzcret", "postgres://db.example/rpingmesh?password=xxxxx"},
+		{"postgres://db.example/rpingmesh?pass%77ord=s3cret", "postgres://db.example/rpingmesh?pass%77ord=xxxxx"},
+		{"postgres://db.example/rpingmesh?pass%zzord=s3cret", "postgres://db.example/rpingmesh?pass%zzord=xxxxx"},
+		// Where the password ends is ambiguous: an unescaped '/' in it.
+		{"postgres://rpm:s3/cret@db.example/rpingmesh", "postgres://(not shown)"},
+		{"http://rq:s3cret@rqlite.example:4001/#frag", "http://(not shown)"},
+		{"not a URI s3cret", "(not shown)"},
+	} {
+		got := RedactDatabaseURI(tc.in)
+		if got != tc.want {
+			t.Errorf("RedactDatabaseURI(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+		if strings.Contains(got, "s3") || strings.Contains(got, "cret") {
+			t.Errorf("RedactDatabaseURI(%q) leaks the password: %q", tc.in, got)
+		}
+	}
+}
+
+// TestControllerConfig_ValidateRedactsDatabaseURI checks that a rejected
+// database_uri is quoted without its password.
+func TestControllerConfig_ValidateRedactsDatabaseURI(t *testing.T) {
+	for _, uri := range []string{
+		"mysql://rpm:s3cret@db.example/rpingmesh",
+		"http://rq:s3cret@/db",
+		"http://rq:s3%cret@rqlite.example:4001",
+		"mysql://rpm:s3%cret@db.example/rpingmesh",
+	} {
+		c := validControllerConfig()
+		c.DatabaseURI = uri
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("Validate(%q) = nil, want an error", uri)
+			continue
+		}
+		if strings.Contains(err.Error(), "s3cret") || strings.Contains(err.Error(), "s3%cret") {
+			t.Errorf("Validate(%q) error leaks the password: %v", uri, err)
+		}
+	}
 }

@@ -70,6 +70,22 @@ jobs:
     name: unit
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # A throwaway PostgreSQL for the registry's PostgreSQL tests in test-race
+    # (they skip without RPINGMESH_TEST_POSTGRES_URI). This is the oldest
+    # release the README supports; e2e-controller runs the newest.
+    services:
+      postgres:
+        image: postgres:15.19
+        env:
+          # Not a secret: the server lives only as long as this job.
+          POSTGRES_PASSWORD: rpingmesh-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -119,6 +135,8 @@ jobs:
         run: make test-scripts
 
       - name: Run Go unit tests with the race detector (excludes ./e2e/...)
+        env:
+          RPINGMESH_TEST_POSTGRES_URI: postgres://postgres:rpingmesh-ci@127.0.0.1:5432/postgres?sslmode=disable
         run: make test-race
 
       # Load the service-tracing eBPF objects into the runner's kernel and
@@ -231,9 +249,9 @@ jobs:
           path: bin/rpingmesh-agent
           retention-days: 14
 
-  # Agent-to-Controller e2e tests: pure-Go gRPC path against a real
-  # rqlite-backed Controller, no RDMA hardware needed. Runs entirely via
-  # docker compose (see docker-compose.e2e-controller.yml).
+  # Agent-to-Controller e2e tests: pure-Go gRPC path against real
+  # Controllers backed by rqlite and by PostgreSQL, no RDMA hardware needed.
+  # Runs entirely via docker compose (see docker-compose.e2e-controller.yml).
   e2e-controller:
     name: e2e-controller
     runs-on: ubuntu-latest

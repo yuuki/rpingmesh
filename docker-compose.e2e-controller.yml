@@ -1,3 +1,6 @@
+# The agent-to-controller suite runs twice, once against a controller whose
+# RNIC registry is in rqlite (the default backend) and once against one whose
+# registry is in PostgreSQL; see the e2e_test command below.
 services:
   # rqlite — distributed SQLite used by the controller's RNIC registry.
   rqlite:
@@ -21,6 +24,43 @@ services:
       - RPINGMESH_LOG_LEVEL=debug
     depends_on:
       rqlite:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50051"]
+      interval: 3s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # PostgreSQL — the alternative registry backend (database_uri postgres://).
+  # A throwaway database on the compose network; the password exercises
+  # SCRAM authentication, not secrecy.
+  postgres:
+    image: postgres:18.6
+    environment:
+      - POSTGRES_USER=rpingmesh
+      - POSTGRES_PASSWORD=rpingmesh-e2e
+      - POSTGRES_DB=rpingmesh
+    healthcheck:
+      # Over TCP: while the image runs its init scripts, the server listens
+      # on the Unix socket only.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "rpingmesh", "-d", "rpingmesh"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # Controller whose RNIC registry is in PostgreSQL.
+  controller_postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    environment:
+      - RPINGMESH_DATABASE_URI=postgres://rpingmesh:rpingmesh-e2e@postgres:5432/rpingmesh?sslmode=disable
+      - RPINGMESH_LISTEN_ADDR=:50051
+      - RPINGMESH_LOG_LEVEL=debug
+    depends_on:
+      postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 50051"]
@@ -54,6 +94,8 @@ services:
     restart: "no"
 
   # E2E test runner — simulates agent behaviour via GRPCControllerClient.
+  # The first run targets the rqlite-backed controllers; the second the
+  # PostgreSQL-backed one (the startup-ordering test only runs in the first).
   e2e_test:
     build:
       context: .
@@ -61,15 +103,27 @@ services:
     environment:
       - CONTROLLER_ADDR=controller:50051
       - EARLY_CONTROLLER_ADDR=controller_early:50051
-      - RQLITE_URL=http://rqlite:4001
+      - DATABASE_URI=http://rqlite:4001
+      - POSTGRES_CONTROLLER_ADDR=controller_postgres:50051
+      - POSTGRES_DATABASE_URI=postgres://rpingmesh:rpingmesh-e2e@postgres:5432/rpingmesh?sslmode=disable
       - CGO_ENABLED=0
     depends_on:
       controller:
         condition: service_healthy
       controller_early:
         condition: service_started
-    command: >
-      go test -v -count=1 -timeout 120s ./e2e/controller/...
+      controller_postgres:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        echo "==> Agent-to-controller e2e tests: rqlite"
+        go test -v -count=1 -timeout 120s ./e2e/controller/...
+        echo "==> Agent-to-controller e2e tests: PostgreSQL"
+        CONTROLLER_ADDR="$$POSTGRES_CONTROLLER_ADDR" DATABASE_URI="$$POSTGRES_DATABASE_URI" EARLY_CONTROLLER_ADDR= \
+          go test -v -count=1 -timeout 120s ./e2e/controller/...
     restart: "no"
 
 # NOTE: no top-level `volumes:` for a Go module/build cache here. Dependency

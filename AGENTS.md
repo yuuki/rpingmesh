@@ -15,14 +15,14 @@
 - C ABI, no `bool`: `zig/include/rdma_bridge.h` ↔ `zig/src/main.zig` ↔ `internal/rdmabridge/bridge.go`.
 - eBPF events: `struct qp_event` ↔ `DecodeEvent` (`internal/agent/servicetrace/event.go`); `servicetrace/bpf/uverbs_uapi.h` ↔ the kernel UAPI.
 - gRPC API `proto/controller_agent/controller_agent.proto`: adjacent agent and controller versions interoperate.
-- Registry schema `internal/controller/registry/registry.go`: columns are added by migration only (older controllers share the database).
+- Registry schema, rqlite and PostgreSQL (`internal/controller/registry/`): columns are added by migration only (older controllers share the database).
 - Metric names and attributes: `internal/telemetry/otel_metrics.go`, `internal/controller/analyzer/metrics.go`, queried by `dashboards/`.
 - Configuration keys and defaults (`internal/config/`, `configs/`); `packaging/` (binary names, systemd units and capabilities, nfpm layout).
 
 ## Before opening a pull request
 - `make check`; also `internal/agent/servicetrace/bpf/` → `make generate-bpf check-bpf`; `zig/` → `make build-zig test-zig build-agent`.
 - `.proto` files → `make generate-proto`; parsers or decoders → `make test-fuzz FUZZTIME=1m`; dependencies → `make vuln`.
-- Controller/agent gRPC path or registry → `make test-integration`; RDMA data path → `make test-e2e` (soft-RoCE).
+- Controller/agent gRPC path or registry → `make test-integration`, and the registry's PostgreSQL tests with `RPINGMESH_TEST_POSTGRES_URI` set; RDMA data path → `make test-e2e` (soft-RoCE).
 
 ## Git conventions
 - Branches: `<type>/<issue>-<summary>` (`<type>/<summary>` without an issue); tools' `agent/*`, `claude/*`, `copilot/*`, `dependabot/*` keep their names.

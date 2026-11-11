@@ -48,10 +48,10 @@ implemented (see [Limitations](#limitations)).
 ## Architecture
 
 ```
-                        +----------------------+          +---------+
-                        |      Controller      |<-------->| rqlite  |
-                        | registry, pinglists, |          +---------+
-                        | Phase 1 analyzer     |
+                        +----------------------+          +------------+
+                        |      Controller      |<-------->| rqlite or  |
+                        | registry, pinglists, |          | PostgreSQL |
+                        | Phase 1 analyzer     |          +------------+
                         +----------+-----------+
                                    ^  gRPC: RegisterAgent, GetPinglist,
                                    |        ReportProbeAnalysis,
@@ -76,8 +76,8 @@ implemented (see [Limitations](#limitations)).
 ```
 
 **Controller** (`cmd/controller`, pure Go, `CGO_ENABLED=0`). Stores the RNIC
-registry in rqlite, generates pinglists, and runs the Phase 1 analyzer. It needs
-no RDMA hardware.
+registry in rqlite or PostgreSQL, generates pinglists, and runs the Phase 1
+analyzer. It needs no RDMA hardware.
 
 **Agent** (`cmd/agent`, Go with Cgo, `CGO_ENABLED=1`). Runs on every RDMA host.
 For each RNIC it opens, it runs:
@@ -117,7 +117,7 @@ against its own thresholds.
 | `cmd/` | Agent and controller entry points (cobra CLIs) |
 | `internal/agent/` | Prober, Responder, ClusterMonitor, analysis reporter, watchdog, service monitor |
 | `internal/agent/servicetrace/` | eBPF tracer of application queue pairs (program source under `bpf/`, compiled objects committed) and the connection table |
-| `internal/controller/` | gRPC service, rqlite registry, pinglist generation, analyzer |
+| `internal/controller/` | gRPC service, RNIC registry (rqlite or PostgreSQL), pinglist generation, analyzer |
 | `internal/probe/` | Probe results, RTT calculation, per-path aggregation, rate limiting |
 | `internal/rdmabridge/` | Cgo bindings to librdmabridge |
 | `internal/telemetry/` | OpenTelemetry metrics |
@@ -239,7 +239,7 @@ before an agent restart cannot match probes sent after it.
 | Zig | 0.17.0 | librdmabridge (the version used in CI and e2e) |
 | protoc, protoc-gen-go, protoc-gen-go-grpc | protoc 3.x | gRPC code generation |
 | libibverbs-dev, librdmacm-dev | any | Agent build (Linux only) |
-| rqlite | 10.x | Controller runtime |
+| rqlite 10.x, or PostgreSQL 15 or later | | Controller runtime (the RNIC registry) |
 
 The agent runs only on Linux with an RDMA-capable NIC (for example NVIDIA
 ConnectX) or a soft-RoCE (`rxe`) device. The controller runs anywhere.
@@ -274,6 +274,9 @@ platform; see [Deployment](#deployment) for Linux release builds.
    ```sh
    rqlited -node-id 1 ~/rqlite-data
    ```
+
+   Or point `database_uri` at PostgreSQL instead; see
+   [Using PostgreSQL](#using-postgresql).
 
 2. Start the controller:
 
@@ -581,8 +584,8 @@ devices; `summarize_qos_facts.py` reports such ports as override outliers.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `listen_addr` | `:50051` | gRPC listen address |
-| `database_uri` | `http://localhost:4001` | rqlite URL |
-| `database_connect_timeout_sec` | `120` | How long to retry connecting to rqlite at startup (backoff from 1 s to 30 s); `0` tries once |
+| `database_uri` | `http://localhost:4001` | Registry database: an `http://` or `https://` rqlite URL, or a `postgres://` or `postgresql://` PostgreSQL URI (see [Using PostgreSQL](#using-postgresql)) |
+| `database_connect_timeout_sec` | `120` | How long to retry connecting to the database at startup (backoff from 1 s to 30 s); `0` tries once |
 | `active_threshold_sec` | `300` | An RNIC that has not re-registered within this window is left out of pinglists |
 | `stale_threshold_sec` | `900` | An RNIC that has not re-registered within this window is deleted |
 | `inter_tor_sample_size` | `5` | Number of remote ToRs sampled for each inter-ToR pinglist |
@@ -977,6 +980,67 @@ once `/readyz` succeeds:
 ExecStartPost=/bin/sh -c 'for i in $(seq 1 120); do curl -fsS -o /dev/null http://127.0.0.1:4001/readyz && exit 0; sleep 1; done; exit 1'
 TimeoutStartSec=150
 ```
+
+### Using PostgreSQL
+
+The controller keeps its registry in PostgreSQL (15 or later) instead of
+rqlite when `database_uri` is a `postgres://` or `postgresql://` URI:
+
+```yaml
+database_uri: "postgres://rpingmesh@db.example:5432/rpingmesh?sslmode=verify-full&sslrootcert=/etc/rpingmesh/db-ca.pem"
+```
+
+- **Database and role.** On startup the controller creates the `rnics` table
+  and its indexes, and adds columns a newer release needs, so its role needs
+  the `CREATE` privilege on the schema; since PostgreSQL 15, `public` no
+  longer grants it to every role. A database the role owns is simplest:
+
+  ```sql
+  CREATE ROLE rpingmesh LOGIN;
+  CREATE DATABASE rpingmesh OWNER rpingmesh;
+  ```
+
+  The controller inspects the catalog first and issues DDL only for what is
+  missing. A role with only `USAGE` on the schema and `SELECT`, `INSERT`,
+  `UPDATE` and `DELETE` on `rnics` therefore works once an owner has created
+  the table, for example by starting a controller once with the owner's role;
+  repeat that after an upgrade that adds a column. Select a schema other than
+  the role's default with `search_path`, for example `&search_path=rpingmesh`.
+- **Password.** Keep it out of `controller.yaml`. For anything the URI leaves
+  out, the controller reads the libpq environment variables (`PGPASSWORD`,
+  `PGSSLMODE`, ...) and the password file named by `PGPASSFILE` (default
+  `~/.pgpass`). The drop-in
+  `packaging/systemd/rpingmesh-controller.service.d/40-postgresql-pgpass.conf`,
+  shipped with the package as an example, passes such a file to the unit as a
+  systemd credential. The startup log shows `database_uri` with its password
+  masked.
+- **TLS.** Use `sslmode=verify-full`, with `sslrootcert` when the server's
+  certificate does not chain to a system root, unless the database is
+  reached over a Unix socket (`postgres:///rpingmesh?host=/var/run/postgresql`)
+  or a loopback address. The controller warns at startup when a route
+  connects without authenticating the server: `disable`, `allow`, `prefer`
+  (the default) or `require` without `sslrootcert`.
+- **Connection parameters.** The URI takes the parameters of the
+  [pgx](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#ParseConfig)
+  driver. `connect_timeout` defaults to 10 s, and `application_name` to
+  `rpingmesh-controller`. `pool_max_conns` defaults to the larger of 4 and the
+  number of CPUs. Several hosts with `target_session_attrs=read-write` follow
+  a primary that moves. Behind a pooler in transaction mode, such as
+  PgBouncer, add `default_query_exec_mode=exec`; the default mode keeps
+  prepared statements on each server connection. A query without a deadline
+  of its own is bounded at 10 s, like an rqlite request.
+- **Availability.** PostgreSQL's high availability is up to its operator
+  (a managed service, Patroni, ...). While the database is unreachable,
+  registrations and pinglist requests fail, as with an rqlite cluster that
+  lost its leader.
+- **Switching backends.** The registry is soft state: agents re-register every
+  60 s. A controller pointed at an empty database serves complete pinglists
+  again once every agent has re-registered, so nothing needs to be copied
+  from rqlite. Every controller that serves the same agents must use the same
+  database.
+
+When PostgreSQL runs on the controller host, the controller unit starts after
+`postgresql.service`.
 
 ### Upgrading
 
@@ -1448,13 +1512,15 @@ more than once, but does not increase the service probe rate.
 
 ### Staleness in the registry
 
-The rqlite `rnics` table records each RNIC's last registration as
-`last_updated_epoch INTEGER` (Unix seconds). The controller stamps the value
-and computes the active and stale cut-offs from its own clock, and binds them
-as query parameters, so the checks are integer comparisons that can use an
-index. SQLite's `'now'` is avoided because rqlite rewrites it in write
-statements using the server's local time zone, which shifts it on a non-UTC
-host.
+The `rnics` table records each RNIC's last registration as
+`last_updated_epoch` (Unix seconds; `INTEGER` in rqlite, `BIGINT` in
+PostgreSQL). The controller stamps the value and computes the active and
+stale cut-offs from its own clock, and binds them as query parameters, so the
+checks are integer comparisons that can use an index. SQLite's `'now'` is
+avoided because rqlite rewrites it in write statements using the server's
+local time zone, which shifts it on a non-UTC host. Because the controller's
+clock decides, controllers sharing a database must keep their clocks
+synchronized (NTP), whichever the backend.
 
 ## Development
 
@@ -1484,8 +1550,8 @@ Run one Go test with `go test -v ./internal/probe/... -run TestCalculateRTT`.
 
 The end-to-end suites run in Docker:
 
-- `make test-e2e-controller` runs the agent-to-controller tests against
-  rqlite.
+- `make test-e2e-controller` runs the agent-to-controller tests twice, against
+  a controller backed by rqlite and one backed by PostgreSQL.
 - `make test-e2e` runs the RDMA tests in a privileged container with two
   soft-RoCE devices. It needs the host's `rdma_rxe` kernel module; on macOS,
   run `make setup-colima` once to install it in the Colima VM.

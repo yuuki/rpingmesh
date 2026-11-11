@@ -2,6 +2,7 @@ package controller
 
 import (
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/yuuki/rpingmesh/internal/probe"
@@ -12,7 +13,8 @@ import (
 // FuzzValidateRegistration feeds arbitrary wire-format RegisterAgent
 // requests (the controller may serve unauthenticated agents) through
 // validateRegistration and checks that whatever it accepts respects the
-// bounds the registry relies on. RnicInfo.host_name is not checked: the
+// bounds the registry relies on, on rqlite and PostgreSQL alike.
+// RnicInfo.host_name is not checked: the
 // service overwrites it with the request-wide hostname before storing.
 func FuzzValidateRegistration(f *testing.F) {
 	for _, req := range []*controller_agent.AgentRegistrationRequest{
@@ -58,6 +60,17 @@ func FuzzValidateRegistration(f *testing.F) {
 				if len(s) > maxFieldLen {
 					t.Fatalf("accepted a %d-byte rnic field", len(s))
 				}
+			}
+		}
+		// PostgreSQL cannot store NUL in TEXT: nothing accepted may hold one.
+		stored := []string{req.GetAgentId(), req.GetHostname(), req.GetTorId(), req.GetAgentIp()}
+		for _, rnic := range req.GetRnics() {
+			stored = append(stored, rnic.GetGid(), rnic.GetIpAddress(), rnic.GetTorId(),
+				rnic.GetPlaneId(), rnic.GetDeviceName(), rnic.GetNetdev())
+		}
+		for _, s := range stored {
+			if strings.IndexByte(s, 0) >= 0 {
+				t.Fatalf("accepted a field with a NUL byte: %q", s)
 			}
 		}
 	})

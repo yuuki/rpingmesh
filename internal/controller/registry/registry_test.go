@@ -104,7 +104,7 @@ func (f *fakeConn) WriteParameterizedContext(_ context.Context, statements []gor
 // real rqlite server (no Open/initializeSchema call).
 func newTestRegistry(conn dbConn) *RnicRegistry {
 	return &RnicRegistry{
-		conn:               conn,
+		store:              &rqliteStore{conn: conn},
 		activeThresholdSec: DefaultActiveThresholdSec,
 		staleThresholdSec:  DefaultStaleThresholdSec,
 		now:                func() time.Time { return time.Unix(testNowUnix, 0) },
@@ -611,7 +611,7 @@ func TestInitializeSchema_AddsPlaneColumnToLegacyTable(t *testing.T) {
 	fake := &fakeConn{}
 	reg := newTestRegistry(fake)
 
-	if err := reg.initializeSchema(context.Background()); err != nil {
+	if err := reg.store.initSchema(context.Background()); err != nil {
 		t.Fatalf("initializeSchema: %v", err)
 	}
 	if !strings.Contains(fake.writeOneCalls[0], "plane_id TEXT NOT NULL DEFAULT ''") {
@@ -651,7 +651,7 @@ func TestInitializeSchema_ToleratesConcurrentPlaneMigration(t *testing.T) {
 	fake := &fakeConn{writeOneErrs: map[string]error{
 		"ALTER TABLE": errors.New("duplicate column name: plane_id"),
 	}}
-	if err := newTestRegistry(fake).initializeSchema(context.Background()); err != nil {
+	if err := newTestRegistry(fake).store.initSchema(context.Background()); err != nil {
 		t.Fatalf("initializeSchema: %v, want the duplicate column tolerated", err)
 	}
 }
@@ -662,14 +662,26 @@ func TestInitializeSchema_ToleratesConcurrentPlaneMigration(t *testing.T) {
 func TestInitializeSchema_PlaneMigrationErrorsPropagate(t *testing.T) {
 	alterErr := errors.New("database is locked")
 	if err := newTestRegistry(&fakeConn{writeOneErrs: map[string]error{"ALTER TABLE": alterErr}}).
-		initializeSchema(context.Background()); !errors.Is(err, alterErr) {
+		store.initSchema(context.Background()); !errors.Is(err, alterErr) {
 		t.Errorf("ALTER failure: got %v, want wrapping %v", err, alterErr)
 	}
 
 	queryErr := errors.New("query failed")
 	if err := newTestRegistry(&fakeConn{queryOneParameterizedErr: queryErr}).
-		initializeSchema(context.Background()); !errors.Is(err, queryErr) {
+		store.initSchema(context.Background()); !errors.Is(err, queryErr) {
 		t.Errorf("PRAGMA failure: got %v, want wrapping %v", err, queryErr)
+	}
+}
+
+// rqliteOpener adapts a function returning a (fake) connection to the open
+// function of connectWithRetry.
+func rqliteOpener(open func() (dbConn, error)) func() (store, error) {
+	return func() (store, error) {
+		conn, err := open()
+		if err != nil {
+			return nil, err
+		}
+		return &rqliteStore{conn: conn}, nil
 	}
 }
 
@@ -691,7 +703,7 @@ func TestConnectWithRetry_RetriesUntilReady(t *testing.T) {
 	ready := &fakeConn{}
 
 	var opens int
-	open := func() (dbConn, error) {
+	open := rqliteOpener(func() (dbConn, error) {
 		opens++
 		switch {
 		case opens <= 3:
@@ -701,15 +713,15 @@ func TestConnectWithRetry_RetriesUntilReady(t *testing.T) {
 		default:
 			return ready, nil
 		}
-	}
+	})
 	var delays []time.Duration
-	conn, err := connectWithRetry(context.Background(), open, time.Minute, retryBackoff{
+	st, err := connectWithRetry(context.Background(), open, time.Minute, retryBackoff{
 		initial: time.Second, max: 3 * time.Second, sleep: recordingSleep(&delays),
 	})
 	if err != nil {
 		t.Fatalf("connectWithRetry: %v", err)
 	}
-	if conn != ready {
+	if conn := st.(*rqliteStore).conn; conn != ready {
 		t.Fatalf("got conn %v, want the ready connection", conn)
 	}
 	want := []time.Duration{time.Second, 2 * time.Second, 3 * time.Second, 3 * time.Second}
@@ -733,7 +745,7 @@ func TestConnectWithRetry_RetriesUntilReady(t *testing.T) {
 // returned once the overall connect timeout elapses.
 func TestConnectWithRetry_GivesUpAtDeadline(t *testing.T) {
 	notOpen := errors.New("store is not open")
-	open := func() (dbConn, error) { return nil, notOpen }
+	open := rqliteOpener(func() (dbConn, error) { return nil, notOpen })
 	// A real (short) sleep so the deadline actually passes.
 	_, err := connectWithRetry(context.Background(), open, 50*time.Millisecond, retryBackoff{
 		initial: 10 * time.Millisecond, max: 20 * time.Millisecond,
@@ -752,11 +764,11 @@ func TestConnectWithRetry_StopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	notOpen := errors.New("store is not open")
 	var opens int
-	open := func() (dbConn, error) {
+	open := rqliteOpener(func() (dbConn, error) {
 		opens++
 		cancel()
 		return nil, notOpen
-	}
+	})
 	if _, err := connectWithRetry(ctx, open, time.Hour, retryBackoff{
 		initial: time.Hour, max: time.Hour,
 	}); !errors.Is(err, notOpen) {
@@ -772,7 +784,7 @@ func TestConnectWithRetry_StopsOnCancel(t *testing.T) {
 func TestConnectWithRetry_ZeroTimeoutSingleAttempt(t *testing.T) {
 	notOpen := errors.New("store is not open")
 	var opens int
-	open := func() (dbConn, error) { opens++; return nil, notOpen }
+	open := rqliteOpener(func() (dbConn, error) { opens++; return nil, notOpen })
 	var delays []time.Duration
 	if _, err := connectWithRetry(context.Background(), open, 0, retryBackoff{
 		initial: time.Second, max: time.Second, sleep: recordingSleep(&delays),

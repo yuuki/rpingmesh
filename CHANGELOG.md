@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- PostgreSQL as an alternative to rqlite for the controller's RNIC registry
+  (#136). The scheme of `database_uri` selects the backend: `http://` or
+  `https://` for rqlite, as before, and `postgres://` or `postgresql://` for
+  PostgreSQL 15 or later. The URI takes pgx's connection parameters, and
+  unset values come from the libpq environment variables, such as
+  `PGPASSFILE`; the example drop-in `40-postgresql-pgpass.conf` passes a
+  password file as a systemd credential. On startup the controller creates or
+  migrates the table under an advisory lock, issuing DDL only for what is
+  missing, so a role with row privileges suffices once the table exists. It
+  warns when the server is not authenticated by TLS (`sslmode` other than
+  `verify-ca` or `verify-full`, outside Unix sockets and loopback). A
+  registration aborted by a deadlock or a serialization failure is retried.
+  See README "Using PostgreSQL". `make test-e2e-controller` runs the suite
+  against both backends.
+
 ### Fixed
 
 - A host, RDMA device or netdev name that is not valid UTF-8 (Linux accepts
@@ -15,6 +32,13 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- The controller logs `database_uri` with its password masked, and quotes it
+  masked in configuration errors. `database_uri` must now use one of the
+  schemes above; any other was already unusable.
+- `RegisterAgent` rejects a NUL byte in a free-form field (`agent_id`,
+  `hostname`, the ToR, plane, device and netdev names), and `GetPinglist`
+  in `tor_id`, with `InvalidArgument`, whichever the backend. PostgreSQL
+  cannot store NUL, and a real name never contains one.
 - Development tooling: `make check` (the pre-PR gate), `lint`
   (golangci-lint), `lint-actions` (actionlint and zizmor), `test-race`,
   `test-fuzz`, `test-integration`, `bench` and `vuln`; Go fuzz targets for

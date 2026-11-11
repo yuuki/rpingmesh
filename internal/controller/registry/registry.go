@@ -2,11 +2,11 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/rqlite/gorqlite"
 	"github.com/rs/zerolog/log"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
@@ -25,21 +25,53 @@ const (
 	DefaultStaleThresholdSec = 900
 )
 
-// dbConn is the subset of gorqlite.Connection's API used by RnicRegistry. It
-// is declared here, at the point of use, so that RnicRegistry's methods can
-// be unit tested against a fake connection instead of a real rqlite-backed
-// one.
-type dbConn interface {
-	Close()
-	WriteOneContext(ctx context.Context, sqlStatement string) (gorqlite.WriteResult, error)
-	WriteOneParameterizedContext(ctx context.Context, statement gorqlite.ParameterizedStatement) (gorqlite.WriteResult, error)
-	WriteParameterizedContext(ctx context.Context, sqlStatements []gorqlite.ParameterizedStatement) ([]gorqlite.WriteResult, error)
-	QueryOneParameterizedContext(ctx context.Context, statement gorqlite.ParameterizedStatement) (gorqlite.QueryResult, error)
+// statement is one SQL statement and its bound arguments. Statements are
+// written once, with ? placeholders and SQL that SQLite (rqlite) and
+// PostgreSQL both accept; each store executes them in its own dialect.
+type statement struct {
+	query string
+	args  []any
 }
 
-// RnicRegistry manages RNIC information stored in rqlite.
+// statementError reports which statement of a store.execTx batch failed.
+type statementError struct {
+	index int
+	err   error
+}
+
+func (e *statementError) Error() string {
+	return fmt.Sprintf("statement %d: %v", e.index, e.err)
+}
+
+func (e *statementError) Unwrap() error { return e.err }
+
+// store is the database the registry keeps its rows in: rqlite (rqliteStore)
+// or PostgreSQL (pgStore). RnicRegistry builds every statement and
+// interprets every result; a store only executes them.
+type store interface {
+	// backend names the database for logs ("rqlite" or "postgres").
+	backend() string
+	// initSchema creates the rnics table and its indexes, and adds the
+	// columns that a table created by an older controller lacks.
+	initSchema(ctx context.Context) error
+	// execTx runs stmts in one transaction and returns the number of rows
+	// each statement changed. A failing statement is reported as a
+	// *statementError.
+	execTx(ctx context.Context, stmts []statement) ([]int64, error)
+	// exec runs one statement and returns the number of rows it changed.
+	exec(ctx context.Context, stmt statement) (int64, error)
+	// queryRnics runs a SELECT of rnicColumns and scans every row.
+	queryRnics(ctx context.Context, stmt statement) ([]*controller_agent.RnicInfo, error)
+	// anyOf returns a predicate that matches column against any of values,
+	// and its arguments.
+	anyOf(column string, values []string) (string, []any)
+	close()
+}
+
+// RnicRegistry manages the RNIC information agents register, stored in
+// rqlite or PostgreSQL.
 type RnicRegistry struct {
-	conn dbConn
+	store store
 
 	// activeThresholdSec is the "active" window (seconds) used by queries
 	// that only consider recently-updated RNIC entries.
@@ -52,7 +84,8 @@ type RnicRegistry struct {
 	// (time.Now; injectable in tests). Cutoffs are bound as parameters rather
 	// than using SQLite's 'now': rqlite rewrites 'now' in write statements in
 	// the server's local timezone, so on a non-UTC host the stale cleanup once
-	// deleted every row.
+	// deleted every row. The controller's clock is used on every backend, so
+	// all controllers sharing a database must keep their clocks in sync.
 	now func() time.Time
 }
 
@@ -63,27 +96,29 @@ func (r *RnicRegistry) cutoff(windowSec int) int64 {
 }
 
 // Startup connection retry backoff bounds. rqlited accepts TCP connections
-// before its store is open and a leader is elected, so a controller started
-// alongside rqlite (at boot, or when both units restart) can see transient
-// errors such as "store is not open" on its first attempts.
+// before its store is open and a leader is elected, and PostgreSQL refuses
+// connections while it starts up or recovers, so a controller started
+// alongside its database (at boot, or when both units restart) can see
+// transient errors on its first attempts.
 const (
 	connectInitialBackoff = 1 * time.Second
 	connectMaxBackoff     = 30 * time.Second
 )
 
-// NewRnicRegistry creates a new RNIC registry connected to the given rqlite
-// URI. It initializes the database schema (table + indexes) before
-// returning. activeThresholdSec and staleThresholdSec configure the thresholds
-// described above; a value <= 0 falls back to the corresponding Default*
-// constant.
+// NewRnicRegistry creates a new RNIC registry connected to the database at
+// dbURI and initializes the database schema (table + indexes) before
+// returning. The URI's scheme selects the backend: http or https for rqlite,
+// postgres or postgresql for PostgreSQL (see newPostgresOpener for the
+// parameters it accepts). activeThresholdSec and staleThresholdSec configure
+// the thresholds described above; a value <= 0 falls back to the
+// corresponding Default* constant.
 //
 // Opening the connection and initializing the schema are retried with
 // exponential backoff (1s doubling up to 30s) until they succeed, ctx is
-// cancelled, or connectTimeout elapses, so the controller tolerates an rqlite
-// node that is still starting. connectTimeout <= 0 makes a single attempt.
+// cancelled, or connectTimeout elapses, so the controller tolerates a
+// database that is still starting. connectTimeout <= 0 makes a single
+// attempt. A PostgreSQL URI that pgx cannot parse is not retried.
 func NewRnicRegistry(ctx context.Context, dbURI string, activeThresholdSec, staleThresholdSec int, connectTimeout time.Duration) (*RnicRegistry, error) {
-	log.Info().Str("dbURI", dbURI).Msg("Initializing RNIC registry with rqlite")
-
 	if activeThresholdSec <= 0 {
 		activeThresholdSec = DefaultActiveThresholdSec
 	}
@@ -91,27 +126,44 @@ func NewRnicRegistry(ctx context.Context, dbURI string, activeThresholdSec, stal
 		staleThresholdSec = DefaultStaleThresholdSec
 	}
 
-	open := func() (dbConn, error) {
-		conn, err := gorqlite.Open(dbURI)
-		if err != nil {
+	var open func() (store, error)
+	switch scheme := uriScheme(dbURI); scheme {
+	case "http", "https":
+		open = newRqliteOpener(dbURI)
+	case "postgres", "postgresql":
+		var err error
+		if open, err = newPostgresOpener(dbURI); err != nil {
 			return nil, err
 		}
-		return conn, nil
+	default:
+		return nil, fmt.Errorf("unsupported database URI scheme %q: want http or https (rqlite), or postgres or postgresql (PostgreSQL)", scheme)
 	}
-	conn, err := connectWithRetry(ctx, open, connectTimeout, retryBackoff{
+
+	st, err := connectWithRetry(ctx, open, connectTimeout, retryBackoff{
 		initial: connectInitialBackoff,
 		max:     connectMaxBackoff,
 	})
 	if err != nil {
 		return nil, err
 	}
+	log.Info().Str("backend", st.backend()).Msg("RNIC registry initialized")
 
 	return &RnicRegistry{
-		conn:               conn,
+		store:              st,
 		activeThresholdSec: activeThresholdSec,
 		staleThresholdSec:  staleThresholdSec,
 		now:                time.Now,
 	}, nil
+}
+
+// uriScheme returns the lower-cased scheme of uri (the text before "://"),
+// or "" when uri has none.
+func uriScheme(uri string) string {
+	scheme, _, ok := strings.Cut(uri, "://")
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(scheme)
 }
 
 // retryBackoff bounds the exponential backoff between connection attempts.
@@ -137,23 +189,22 @@ func (b retryBackoff) wait(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// connectWithRetry opens a connection with open and initializes the schema on
-// it, retrying both steps together until they succeed. A connection whose
-// schema initialization fails is closed before the next attempt. It gives up
-// when timeout (> 0) elapses or ctx is cancelled, returning the last attempt's
+// connectWithRetry opens a store with open and initializes the schema on
+// it, retrying both steps together until they succeed. A store whose schema
+// initialization fails is closed before the next attempt. It gives up when
+// timeout (> 0) elapses or ctx is cancelled, returning the last attempt's
 // error; timeout <= 0 makes exactly one attempt.
-func connectWithRetry(ctx context.Context, open func() (dbConn, error), timeout time.Duration, backoff retryBackoff) (dbConn, error) {
-	attemptOnce := func(ctx context.Context) (dbConn, error) {
-		conn, err := open()
+func connectWithRetry(ctx context.Context, open func() (store, error), timeout time.Duration, backoff retryBackoff) (store, error) {
+	attemptOnce := func(ctx context.Context) (store, error) {
+		st, err := open()
 		if err != nil {
-			return nil, fmt.Errorf("failed to connect to rqlite: %w", err)
+			return nil, fmt.Errorf("failed to connect to the registry database: %w", err)
 		}
-		r := &RnicRegistry{conn: conn}
-		if err := r.initializeSchema(ctx); err != nil {
-			conn.Close()
+		if err := st.initSchema(ctx); err != nil {
+			st.close()
 			return nil, fmt.Errorf("failed to initialize schema: %w", err)
 		}
-		return conn, nil
+		return st, nil
 	}
 
 	if timeout <= 0 {
@@ -165,12 +216,12 @@ func connectWithRetry(ctx context.Context, open func() (dbConn, error), timeout 
 
 	delay := backoff.initial
 	for attempt := 1; ; attempt++ {
-		conn, err := attemptOnce(ctx)
+		st, err := attemptOnce(ctx)
 		if err == nil {
 			if attempt > 1 {
-				log.Info().Int("attempt", attempt).Msg("Connected to rqlite")
+				log.Info().Int("attempt", attempt).Msg("Connected to the registry database")
 			}
-			return conn, nil
+			return st, nil
 		}
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("gave up after %d attempt(s) within %s: %w", attempt, timeout, err)
@@ -179,7 +230,7 @@ func connectWithRetry(ctx context.Context, open func() (dbConn, error), timeout 
 			Err(err).
 			Int("attempt", attempt).
 			Dur("retryIn", delay).
-			Msg("rqlite not ready; retrying")
+			Msg("Registry database not ready; retrying")
 		if waitErr := backoff.wait(ctx, delay); waitErr != nil {
 			return nil, fmt.Errorf("gave up after %d attempt(s) within %s: %w", attempt, timeout, err)
 		}
@@ -187,118 +238,34 @@ func connectWithRetry(ctx context.Context, open func() (dbConn, error), timeout 
 	}
 }
 
-// Close closes the underlying rqlite connection.
+// Close closes the underlying database connection.
 func (r *RnicRegistry) Close() error {
-	if r.conn != nil {
-		r.conn.Close()
+	if r.store != nil {
+		r.store.close()
 	}
 	return nil
 }
 
-// initializeSchema creates the rnics table and associated indexes if they
-// do not already exist. Each index is created in a separate write call
-// because rqlite's WriteOne executes a single statement at a time. ctx
-// bounds the startup connection attempt (see connectWithRetry).
-func (r *RnicRegistry) initializeSchema(ctx context.Context) error {
-	createTableSQL := `
-	CREATE TABLE IF NOT EXISTS rnics (
-		rnic_gid TEXT PRIMARY KEY,
-		qpn INTEGER NOT NULL,
-		agent_id TEXT NOT NULL,
-		agent_ip TEXT NOT NULL,
-		rnic_ip TEXT NOT NULL,
-		tor_id TEXT NOT NULL,
-		hostname TEXT NOT NULL,
-		device_name TEXT NOT NULL,
-		last_updated_epoch INTEGER NOT NULL,
-		plane_id TEXT NOT NULL DEFAULT '',
-		netdev TEXT NOT NULL DEFAULT ''
-	);`
+// rnicsTableColumns are the columns of the rnics table that a controller may
+// find missing from a table created by an older release; every store adds
+// them as TEXT NOT NULL with an empty-string default. The default keeps
+// existing rows (and
+// INSERTs from an older controller sharing the database, which name their
+// columns explicitly) valid: an empty plane means "no restriction" and an
+// empty netdev means "unknown". Columns are only ever added, never changed
+// or dropped, because older controllers may share the database.
+var rnicsTableColumns = []string{"plane_id", "netdev"}
 
-	if _, err := r.conn.WriteOneContext(ctx, createTableSQL); err != nil {
-		return fmt.Errorf("failed to create rnics table: %w", err)
-	}
-
-	if err := r.migrateAddColumns(ctx, "plane_id", "netdev"); err != nil {
-		return err
-	}
-
-	// Create each index separately to avoid multi-statement issues.
-	indexes := []string{
-		`CREATE INDEX IF NOT EXISTS idx_rnics_agent_id ON rnics (agent_id);`,
-		`CREATE INDEX IF NOT EXISTS idx_rnics_tor_id ON rnics (tor_id);`,
-		`CREATE INDEX IF NOT EXISTS idx_rnics_rnic_ip ON rnics (rnic_ip);`,
-		`CREATE INDEX IF NOT EXISTS idx_rnics_last_updated ON rnics (last_updated_epoch);`,
-	}
-
-	for _, idx := range indexes {
-		if _, err := r.conn.WriteOneContext(ctx, idx); err != nil {
-			return fmt.Errorf("failed to create index: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// migrateAddColumns adds each of the named TEXT columns (plane_id, netdev)
-// to an rnics table created by a controller that predates them. CREATE TABLE
-// IF NOT EXISTS leaves such a table untouched, so missing columns are
-// detected via PRAGMA table_info and added with ALTER TABLE. The DEFAULT ”
-// keeps existing rows (and INSERTs from an older controller sharing the
-// database, which name their columns explicitly) valid: an empty plane means
-// "no restriction" and an empty netdev means "unknown". A "duplicate column
-// name" error is tolerated, since another controller sharing the rqlite
-// cluster may have added the column concurrently.
-func (r *RnicRegistry) migrateAddColumns(ctx context.Context, columns ...string) error {
-	result, err := r.conn.QueryOneParameterizedContext(ctx, gorqlite.ParameterizedStatement{
-		Query: `PRAGMA table_info(rnics);`,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to inspect rnics table: %w", err)
-	}
-	existing := make(map[string]bool)
-	for result.Next() {
-		row, err := result.Map()
-		if err != nil {
-			return fmt.Errorf("failed to read rnics table info: %w", err)
-		}
-		if name, _ := row["name"].(string); name != "" {
-			existing[name] = true
-		}
-	}
-
-	for _, column := range columns {
-		if existing[column] {
-			continue
-		}
-		log.Info().Str("column", column).Msg("Migrating rnics table: adding column")
-		// column comes from the fixed list above, never from user input.
-		wr, err := r.conn.WriteOneContext(ctx,
-			fmt.Sprintf(`ALTER TABLE rnics ADD COLUMN %s TEXT NOT NULL DEFAULT '';`, column))
-		if err == nil {
-			err = wr.Err
-		}
-		if err != nil && !isDuplicateColumnErr(err, wr.Err) {
-			return fmt.Errorf("failed to add %s column to rnics table: %w", column, err)
-		}
-	}
-	return nil
-}
-
-// isDuplicateColumnErr reports whether an ALTER TABLE ADD COLUMN failed only
-// because the column already exists. gorqlite reports a statement error both
-// as the call error (a summary) and as the result's Err (SQLite's message).
-func isDuplicateColumnErr(errs ...error) bool {
-	for _, err := range errs {
-		if err != nil && strings.Contains(err.Error(), "duplicate column name") {
-			return true
-		}
-	}
-	return false
+// rnicsIndexes are the indexes every store creates on the rnics table.
+var rnicsIndexes = []struct{ name, column string }{
+	{"idx_rnics_agent_id", "agent_id"},
+	{"idx_rnics_tor_id", "tor_id"},
+	{"idx_rnics_rnic_ip", "rnic_ip"},
+	{"idx_rnics_last_updated", "last_updated_epoch"},
 }
 
 // RegisterRNICs replaces the full set of RNIC entries registered for agentID
-// in one rqlite transaction: it deletes every existing row for the agent and
+// in one transaction: it deletes every existing row for the agent and
 // inserts one row per entry in rnics. Set replacement (rather than a per-RNIC
 // upsert) drops RNICs the agent no longer reports as soon as it re-registers,
 // instead of after the stale-threshold window; the DELETE still runs when
@@ -338,6 +305,8 @@ func (r *RnicRegistry) RegisterRNICs(
 
 	// The DELETE above already removed this agent's own rows, so a conflict
 	// here is always another agent's row; it is replaced only once inactive.
+	// SQLite adopted this upsert syntax from PostgreSQL: in both, an update
+	// rejected by the WHERE changes no row.
 	insertSQL := `
 	INSERT INTO rnics
 	(rnic_gid, qpn, agent_id, agent_ip, rnic_ip, tor_id, hostname, device_name, plane_id, netdev, last_updated_epoch)
@@ -358,15 +327,15 @@ func (r *RnicRegistry) RegisterRNICs(
 	now := r.now().Unix()
 	activeCutoff := r.cutoff(r.activeThresholdSec)
 
-	statements := make([]gorqlite.ParameterizedStatement, 0, len(rnics)+1)
-	statements = append(statements, gorqlite.ParameterizedStatement{
-		Query:     deleteSQL,
-		Arguments: []interface{}{agentID},
+	statements := make([]statement, 0, len(rnics)+1)
+	statements = append(statements, statement{
+		query: deleteSQL,
+		args:  []any{agentID},
 	})
 	for _, rnic := range rnics {
-		statements = append(statements, gorqlite.ParameterizedStatement{
-			Query: insertSQL,
-			Arguments: []interface{}{
+		statements = append(statements, statement{
+			query: insertSQL,
+			args: []any{
 				rnic.GetGid(),
 				rnic.GetQpn(),
 				agentID,
@@ -383,52 +352,44 @@ func (r *RnicRegistry) RegisterRNICs(
 		})
 	}
 
-	results, err := r.conn.WriteParameterizedContext(ctx, statements)
-	if err != nil {
+	affected, err := r.store.execTx(ctx, statements)
+	var stmtErr *statementError
+	switch {
+	case errors.As(err, &stmtErr) && stmtErr.index == 0:
+		return nil, fmt.Errorf("failed to delete stale RNICs for agent %s: %w", agentID, stmtErr.err)
+	case errors.As(err, &stmtErr) && stmtErr.index <= len(rnics):
+		return nil, fmt.Errorf("failed to register RNIC %s: %w", rnics[stmtErr.index-1].GetGid(), stmtErr.err)
+	case err != nil:
 		return nil, fmt.Errorf("failed to replace RNICs: %w", err)
 	}
-	// gorqlite returns one result per statement; anything else means the
+	// A store returns one count per statement; anything else means the
 	// response cannot be matched to the statements, so do not index into it.
-	if len(results) != len(statements) {
-		return nil, fmt.Errorf("failed to replace RNICs: got %d results for %d statements", len(results), len(statements))
+	if len(affected) != len(statements) {
+		return nil, fmt.Errorf("failed to replace RNICs: got %d results for %d statements", len(affected), len(statements))
 	}
 
-	if results[0].Err != nil {
-		return nil, fmt.Errorf("failed to delete stale RNICs for agent %s: %w", agentID, results[0].Err)
-	}
-
-	for i, res := range results[1:] {
-		if res.Err != nil {
-			return nil, fmt.Errorf("failed to register RNIC %s: %w", rnics[i].GetGid(), res.Err) //nolint:gosec // G602: len(results) == len(rnics)+1 is checked above
-		}
+	for i, n := range affected[1:] {
 		// An upsert whose WHERE rejected the update changes no row.
-		if res.RowsAffected == 0 {
-			skipped = append(skipped, rnics[i].GetGid()) //nolint:gosec // G602: len(results) == len(rnics)+1 is checked above
+		if n == 0 {
+			skipped = append(skipped, rnics[i].GetGid()) //nolint:gosec // G602: len(affected) == len(rnics)+1 is checked above
 		}
 	}
 
 	return skipped, nil
 }
 
-// rnicColumns is the column list selected by every RNIC read; scanRnicInfo
-// reads rows in this order.
+// rnicColumns is the column list selected by every RNIC read; every store's
+// queryRnics scans rows in this order.
 const rnicColumns = "rnic_gid, qpn, rnic_ip, hostname, tor_id, device_name, plane_id, netdev"
 
 // queryRnics runs `SELECT rnicColumns FROM rnics` followed by where (the WHERE
 // clause plus any trailing ORDER BY / LIMIT, terminated by ';') with the given
 // bound arguments, and scans every returned row.
-func (r *RnicRegistry) queryRnics(ctx context.Context, where string, args ...interface{}) ([]*controller_agent.RnicInfo, error) {
-	stmt := gorqlite.ParameterizedStatement{
-		Query:     "\n\tSELECT " + rnicColumns + "\n\tFROM rnics\n\t" + where,
-		Arguments: args,
-	}
-
-	result, err := r.conn.QueryOneParameterizedContext(ctx, stmt)
-	if err != nil {
-		return nil, err
-	}
-
-	return scanRnicInfoRows(result)
+func (r *RnicRegistry) queryRnics(ctx context.Context, where string, args ...any) ([]*controller_agent.RnicInfo, error) {
+	return r.store.queryRnics(ctx, statement{
+		query: "\n\tSELECT " + rnicColumns + "\n\tFROM rnics\n\t" + where,
+		args:  args,
+	})
 }
 
 // GetRNICsByToR returns all active RNICs (updated within the configured
@@ -504,31 +465,37 @@ func (r *RnicRegistry) GetRNICByGID(
 	return rnics[0], nil
 }
 
-// gidLookupChunk bounds the bound parameters of one GetRNICsByGIDs query,
-// below SQLite's historical 999-variable limit.
+// gidLookupChunk bounds the GIDs of one GetRNICsByGIDs query, below SQLite's
+// historical 999-variable limit.
 const gidLookupChunk = 500
 
 // GetRNICsByGIDs returns the active registry rows (updated within the
 // configured active-threshold window) of the given GIDs, keyed by GID. GIDs
 // that are not registered are absent from the map. The lookup costs one query
 // per gidLookupChunk GIDs rather than one per GID, so a large
-// GetTargetRnicInfo request cannot turn into thousands of rqlite round trips.
+// GetTargetRnicInfo request cannot turn into thousands of database round
+// trips.
+//
+// A GID containing a NUL byte is left out without a query: RegisterAgent
+// only stores parseable GIDs, so it cannot match a row, and PostgreSQL
+// rejects such a string as a parameter, which would fail the whole lookup.
 func (r *RnicRegistry) GetRNICsByGIDs(
 	ctx context.Context,
 	gids []string,
 ) (map[string]*controller_agent.RnicInfo, error) {
 	out := make(map[string]*controller_agent.RnicInfo, len(gids))
-	cutoff := r.cutoff(r.activeThresholdSec)
-	for start := 0; start < len(gids); start += gidLookupChunk {
-		chunk := gids[start:min(start+gidLookupChunk, len(gids))]
-		args := make([]interface{}, 0, len(chunk)+1)
-		for _, gid := range chunk {
-			args = append(args, gid)
+	lookup := make([]string, 0, len(gids))
+	for _, gid := range gids {
+		if !strings.ContainsRune(gid, 0) {
+			lookup = append(lookup, gid)
 		}
-		args = append(args, cutoff)
-		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(chunk)), ", ")
-		rnics, err := r.queryRnics(ctx, `WHERE rnic_gid IN (`+placeholders+`)
-	AND last_updated_epoch > ?;`, args...)
+	}
+	cutoff := r.cutoff(r.activeThresholdSec)
+	for start := 0; start < len(lookup); start += gidLookupChunk {
+		chunk := lookup[start:min(start+gidLookupChunk, len(lookup))]
+		predicate, args := r.store.anyOf("rnic_gid", chunk)
+		rnics, err := r.queryRnics(ctx, `WHERE `+predicate+`
+	AND last_updated_epoch > ?;`, append(args, cutoff)...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to query RNIC info: %w", err)
 		}
@@ -544,58 +511,19 @@ func (r *RnicRegistry) GetRNICsByGIDs(
 func (r *RnicRegistry) CleanupStaleEntries(ctx context.Context) error {
 	log.Info().Msg("Cleaning up stale RNIC entries")
 
-	cleanupSQL := `
+	removed, err := r.store.exec(ctx, statement{
+		query: `
 	DELETE FROM rnics
-	WHERE last_updated_epoch < ?;`
-
-	stmt := gorqlite.ParameterizedStatement{
-		Query:     cleanupSQL,
-		Arguments: []interface{}{r.cutoff(r.staleThresholdSec)},
-	}
-
-	result, err := r.conn.WriteOneParameterizedContext(ctx, stmt)
+	WHERE last_updated_epoch < ?;`,
+		args: []any{r.cutoff(r.staleThresholdSec)},
+	})
 	if err != nil {
 		return fmt.Errorf("failed to cleanup stale entries: %w", err)
 	}
 
 	log.Info().
-		Int64("removed", result.RowsAffected).
+		Int64("removed", removed).
 		Msg("Cleaned up stale RNIC entries")
 
 	return nil
-}
-
-// scanRnicInfoRows converts every row of result into an RnicInfo.
-func scanRnicInfoRows(result gorqlite.QueryResult) ([]*controller_agent.RnicInfo, error) {
-	var rnics []*controller_agent.RnicInfo
-
-	for result.Next() {
-		info, err := scanRnicInfo(result)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan RNIC row: %w", err)
-		}
-		rnics = append(rnics, info)
-	}
-
-	return rnics, nil
-}
-
-// scanRnicInfo converts the current row of a query selecting rnicColumns into
-// an RnicInfo.
-func scanRnicInfo(result gorqlite.QueryResult) (*controller_agent.RnicInfo, error) {
-	var gid, ip, hostname, torID, deviceName, planeID, netdev string
-	var qpn int64
-	if err := result.Scan(&gid, &qpn, &ip, &hostname, &torID, &deviceName, &planeID, &netdev); err != nil {
-		return nil, err
-	}
-	return &controller_agent.RnicInfo{
-		Gid:        gid,
-		Qpn:        uint32(qpn),
-		IpAddress:  ip,
-		HostName:   hostname,
-		TorId:      torID,
-		DeviceName: deviceName,
-		PlaneId:    planeID,
-		Netdev:     netdev,
-	}, nil
 }

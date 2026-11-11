@@ -36,6 +36,12 @@ func TestRegisterAgent_RejectsMalformedInput(t *testing.T) {
 		"long device":      func(r *controller_agent.AgentRegistrationRequest) { r.Rnics[0].DeviceName = long },
 		"long netdev":      func(r *controller_agent.AgentRegistrationRequest) { r.Rnics[0].Netdev = long },
 		"nil rnic":         func(r *controller_agent.AgentRegistrationRequest) { r.Rnics = append(r.Rnics, nil) },
+		"NUL in agent_id":  func(r *controller_agent.AgentRegistrationRequest) { r.AgentId = "agent\x00-1" },
+		"NUL in hostname":  func(r *controller_agent.AgentRegistrationRequest) { r.Hostname = "host\x00" },
+		"NUL in tor_id":    func(r *controller_agent.AgentRegistrationRequest) { r.TorId = "tor\x00" },
+		"NUL in plane_id":  func(r *controller_agent.AgentRegistrationRequest) { r.Rnics[0].PlaneId = "\x00" },
+		"NUL in device":    func(r *controller_agent.AgentRegistrationRequest) { r.Rnics[0].DeviceName = "mlx5\x00" },
+		"NUL in netdev":    func(r *controller_agent.AgentRegistrationRequest) { r.Rnics[0].Netdev = "eth\x000" },
 		"too many rnics": func(r *controller_agent.AgentRegistrationRequest) {
 			for len(r.Rnics) <= MaxRnicsPerAgent {
 				r.Rnics = append(r.Rnics, &controller_agent.RnicInfo{Gid: "fe80::2"})
@@ -80,6 +86,15 @@ func TestRegisterAgent_ReportsSkippedGIDs(t *testing.T) {
 func TestGetPinglist_RejectsBadRequesterGID(t *testing.T) {
 	_, err := newTestService(&fakeRegistry{}).GetPinglist(context.Background(), &controller_agent.PinglistRequest{
 		AgentId: "agent-1", RequesterGid: "junk", Type: controller_agent.PinglistType_TOR_MESH,
+	})
+	if statusCode(t, err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument", statusCode(t, err))
+	}
+}
+
+func TestGetPinglist_RejectsNULInTorID(t *testing.T) {
+	_, err := newTestService(&fakeRegistry{}).GetPinglist(context.Background(), &controller_agent.PinglistRequest{
+		AgentId: "agent-1", RequesterGid: "fe80::1", TorId: "tor\x00", Type: controller_agent.PinglistType_INTER_TOR,
 	})
 	if statusCode(t, err) != codes.InvalidArgument {
 		t.Fatalf("code = %v, want InvalidArgument", statusCode(t, err))

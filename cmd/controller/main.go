@@ -86,7 +86,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	log.Info().
 		Str("listenAddr", cfg.ListenAddr).
-		Str("databaseURI", cfg.DatabaseURI).
+		Str("databaseURI", config.RedactDatabaseURI(cfg.DatabaseURI)).
 		Int("databaseConnectTimeoutSec", cfg.DatabaseConnectTimeoutSec).
 		Str("logLevel", cfg.LogLevel).
 		Str("logFormat", cfg.LogFormat).
@@ -166,9 +166,10 @@ func run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// openRegistry connects the RNIC registry to rqlite. The connection is retried
-// until database_connect_timeout_sec elapses, so the controller tolerates an
-// rqlite node that is still starting; a shutdown signal aborts the wait.
+// openRegistry connects the RNIC registry to its database (rqlite or
+// PostgreSQL, by the scheme of database_uri). The connection is retried until
+// database_connect_timeout_sec elapses, so the controller tolerates a
+// database that is still starting; a shutdown signal aborts the wait.
 func openRegistry(cfg *config.ControllerConfig) (*registry.RnicRegistry, error) {
 	connectCtx, stopConnect := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stopConnect()

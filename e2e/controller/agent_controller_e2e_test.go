@@ -1,49 +1,26 @@
 // Package controller contains end-to-end tests that exercise the
-// Agent-to-Controller gRPC communication path through a real rqlite-backed
-// Controller.
+// Agent-to-Controller gRPC communication path through a real Controller
+// backed by rqlite or PostgreSQL.
 //
-// These tests require a running Controller (connected to rqlite). The
-// controller address is read from the CONTROLLER_ADDR environment variable
-// (default: "localhost:50051"). Use docker-compose.e2e-controller.yml to
-// start the required infrastructure.
+// These tests require a running Controller and direct access to its
+// database. The controller address is read from the CONTROLLER_ADDR
+// environment variable (default: "localhost:50051") and the database from
+// DATABASE_URI (see databaseURI). Use docker-compose.e2e-controller.yml to
+// start the required infrastructure; it runs the suite against both
+// backends.
 package controller
 
 import (
 	"context"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/yuuki/rpingmesh/internal/agent/controller_client"
 	"github.com/yuuki/rpingmesh/proto/controller_agent"
 )
-
-// rqliteURL returns the HTTP URL of the rqlite instance used by the Controller.
-func rqliteURL() string {
-	if url := os.Getenv("RQLITE_URL"); url != "" {
-		return url
-	}
-	return "http://localhost:4001"
-}
-
-// cleanDatabase deletes all rows from the rnics table via the rqlite HTTP API.
-// This ensures test isolation when tests share a single rqlite instance.
-func cleanDatabase(t *testing.T) {
-	t.Helper()
-	body := strings.NewReader(`[["DELETE FROM rnics"]]`)
-	resp, err := http.Post(rqliteURL()+"/db/execute", "application/json", body)
-	if err != nil {
-		t.Fatalf("failed to clean database: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("failed to clean database: HTTP %d", resp.StatusCode)
-	}
-}
 
 // controllerAddr returns the gRPC address of the Controller under test.
 func controllerAddr() string {

@@ -50,7 +50,7 @@ updates:
       docker:
         patterns: ["*"]
 
-  # The rqlite image pinned in docker-compose.e2e-controller.yml (CI).
+  # The rqlite and PostgreSQL images pinned in docker-compose.e2e-controller.yml (CI).
   - package-ecosystem: docker-compose
     directory: /
     schedule:

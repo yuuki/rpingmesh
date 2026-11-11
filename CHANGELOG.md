@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-11
+
 ### Added
 
 - PostgreSQL as an alternative to rqlite for the controller's RNIC registry

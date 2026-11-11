@@ -1146,19 +1146,32 @@ func TestRedactDatabaseURI(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"http://localhost:4001", "http://localhost:4001"},
 		{"http://rq:s3cret@rqlite.example:4001", "http://rq:xxxxx@rqlite.example:4001"},
+		{"http://rq:s3%cret@rqlite.example:4001", "http://rq:xxxxx@rqlite.example:4001"},
 		{"postgres://rpm@db.example/rpingmesh?sslmode=verify-full", "postgres://rpm@db.example/rpingmesh?sslmode=verify-full"},
 		{"postgres://rpm:s3cret@db.example/rpingmesh", "postgres://rpm:xxxxx@db.example/rpingmesh"},
-		{"postgres://db.example/rpingmesh?user=rpm&Password=s3cret", "postgres://db.example/rpingmesh?Password=xxxxx&user=rpm"},
-		{"postgres://db.example/rpingmesh?sslpassword=s3cret&sslmode=verify-full", "postgres://db.example/rpingmesh?sslmode=verify-full&sslpassword=xxxxx"},
-		{"postgres://rpm:s3%cret@db.example/rpingmesh", "postgres://(not shown)"},
-		{"postgres://rpm:s3cret@[2001:db8::1]:5432,[2001:db8::2]:5432/rpingmesh", "postgres://(not shown)"},
+		{"postgres://rpm:s3%cret@db.example/rpingmesh", "postgres://rpm:xxxxx@db.example/rpingmesh"},
+		{"postgres://rpm:s3cret@[2001:db8::1]:5432,[2001:db8::2]:5432/rpingmesh", "postgres://rpm:xxxxx@[2001:db8::1]:5432,[2001:db8::2]:5432/rpingmesh"},
+		// Passwords that pgx accepts and net/url splits elsewhere.
+		{"postgres://rpm:2024#s3cret@db.example/rpingmesh", "postgres://rpm:xxxxx@db.example/rpingmesh"},
+		{"postgres://rpm:?s3cret@db.example/rpingmesh", "postgres://rpm:xxxxx@db.example/rpingmesh"},
+		{"postgres://rpm:#s3cret@db.example/rpingmesh", "postgres://rpm:xxxxx@db.example/rpingmesh"},
+		{"postgres://rpm:42?s3cret@db.example/rpingmesh", "postgres://rpm:xxxxx@db.example/rpingmesh"},
+		{"postgres://db.example/rpingmesh?user=rpm&Password=s3cret", "postgres://db.example/rpingmesh?user=rpm&Password=xxxxx"},
+		{"postgres://db.example/rpingmesh?sslpassword=s3cret&sslmode=verify-full", "postgres://db.example/rpingmesh?sslpassword=xxxxx&sslmode=verify-full"},
+		{"postgres://db.example/rpingmesh?user=rpm&password=s3;cret", "postgres://db.example/rpingmesh?user=rpm&password=xxxxx"},
+		{"postgres://db.example/rpingmesh?password=s3%zzcret", "postgres://db.example/rpingmesh?password=xxxxx"},
+		{"postgres://db.example/rpingmesh?pass%77ord=s3cret", "postgres://db.example/rpingmesh?pass%77ord=xxxxx"},
+		{"postgres://db.example/rpingmesh?pass%zzord=s3cret", "postgres://db.example/rpingmesh?pass%zzord=xxxxx"},
+		// Where the password ends is ambiguous: an unescaped '/' in it.
+		{"postgres://rpm:s3/cret@db.example/rpingmesh", "postgres://(not shown)"},
+		{"http://rq:s3cret@rqlite.example:4001/#frag", "http://(not shown)"},
 		{"not a URI s3cret", "(not shown)"},
 	} {
 		got := RedactDatabaseURI(tc.in)
 		if got != tc.want {
 			t.Errorf("RedactDatabaseURI(%q) = %q, want %q", tc.in, got, tc.want)
 		}
-		if strings.Contains(got, "s3cret") || strings.Contains(got, "s3%cret") {
+		if strings.Contains(got, "s3") || strings.Contains(got, "cret") {
 			t.Errorf("RedactDatabaseURI(%q) leaks the password: %q", tc.in, got)
 		}
 	}

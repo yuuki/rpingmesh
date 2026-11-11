@@ -14,10 +14,11 @@ All notable changes to this project are documented in this file.
   `PGPASSFILE`; the example drop-in `40-postgresql-pgpass.conf` passes a
   password file as a systemd credential. On startup the controller creates or
   migrates the table under an advisory lock, issuing DDL only for what is
-  missing, so a role with row privileges suffices once the table exists. It
-  warns when the server is not authenticated by TLS (`sslmode` other than
-  `verify-ca` or `verify-full`, outside Unix sockets and loopback). A
-  registration aborted by a deadlock or a serialization failure is retried.
+  missing, so a role with row privileges suffices once the table exists, and
+  without waiting more than 2 s for a lock. It warns when the server is not
+  authenticated by TLS (`sslmode` other than `verify-full`, or `verify-ca`
+  without `sslrootcert`, outside Unix sockets and loopback). A registration
+  aborted by a deadlock or a serialization failure is retried.
   See README "Using PostgreSQL". `make test-e2e-controller` runs the suite
   against both backends.
 
@@ -34,7 +35,9 @@ All notable changes to this project are documented in this file.
 
 - The controller logs `database_uri` with its password masked, and quotes it
   masked in configuration errors. `database_uri` must now use one of the
-  schemes above; any other was already unusable.
+  schemes above; any other was already unusable. While the database is not
+  ready at startup, the controller logs `Registry database not ready;
+  retrying` instead of `rqlite not ready; retrying`.
 - `RegisterAgent` rejects a NUL byte in a free-form field (`agent_id`,
   `hostname`, the ToR, plane, device and netdev names), and `GetPinglist`
   in `tor_id`, with `InvalidArgument`, whichever the backend. PostgreSQL

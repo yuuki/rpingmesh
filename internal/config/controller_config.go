@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -436,35 +437,50 @@ func databaseURIScheme(uri string) string {
 // PostgreSQL's password and the passphrase of its client key.
 var redactedQueryParams = []string{"password", "sslpassword"}
 
-// RedactDatabaseURI returns uri with the password of its user information
-// and of its password parameters replaced by "xxxxx", for logs and error
-// messages. Of a URI that net/url cannot parse (pgx accepts some, such as a
-// list of IPv6 hosts) only the scheme is shown, and nothing of a string
-// without a scheme, since where a password lies cannot be told for certain.
+// RedactDatabaseURI returns uri with its passwords replaced by "xxxxx", for
+// logs and error messages: the password of the user information and the
+// values of the password and sslpassword query parameters.
+//
+// The URI is split as libpq and pgx split it, not as net/url does: the user
+// information ends at the first '@' before any '/', and the query starts at
+// the first '?' after it and splits on '&' only. net/url disagrees on
+// passwords holding '#', '?' or ';', and would print them. When an '@' or a
+// '#' remains after the user information, the parsers may disagree on where
+// the password ends (an unescaped '/' in it, say), so only the scheme is
+// shown; of a string without a scheme, nothing is.
 func RedactDatabaseURI(uri string) string {
-	scheme, _, ok := strings.Cut(uri, "://")
+	const mask = "xxxxx"
+	scheme, rest, ok := strings.Cut(uri, "://")
 	if !ok {
 		return "(not shown)"
 	}
-	u, err := url.Parse(uri)
-	if err != nil {
+	var b strings.Builder
+	b.WriteString(scheme + "://")
+	if i := strings.IndexAny(rest, "@/"); i >= 0 && rest[i] == '@' {
+		user, _, hasPassword := strings.Cut(rest[:i], ":")
+		b.WriteString(user)
+		if hasPassword {
+			b.WriteString(":" + mask)
+		}
+		b.WriteByte('@')
+		rest = rest[i+1:]
+	}
+	if strings.ContainsAny(rest, "@#") {
 		return scheme + "://(not shown)"
 	}
-	if q := u.Query(); u.RawQuery != "" {
-		changed := false
-		for key, values := range q {
-			for _, secret := range redactedQueryParams {
-				if strings.EqualFold(key, secret) {
-					for i := range values {
-						values[i] = "xxxxx"
-					}
-					changed = true
-				}
-			}
-		}
-		if changed {
-			u.RawQuery = q.Encode()
+	base, query, hasQuery := strings.Cut(rest, "?")
+	b.WriteString(base)
+	if !hasQuery {
+		return b.String()
+	}
+	params := strings.Split(query, "&")
+	for i, param := range params {
+		rawKey, _, _ := strings.Cut(param, "=")
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil || slices.ContainsFunc(redactedQueryParams, func(secret string) bool { return strings.EqualFold(key, secret) }) {
+			params[i] = rawKey + "=" + mask
 		}
 	}
-	return u.Redacted()
+	b.WriteString("?" + strings.Join(params, "&"))
+	return b.String()
 }

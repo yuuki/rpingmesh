@@ -37,6 +37,13 @@ const (
 	// fail on PostgreSQL with a unique violation in its system catalogs.
 	pgSchemaLockKey int64 = 0x72706d5f726e6963
 
+	// pgSchemaLockTimeout bounds every lock wait of the schema setup. An
+	// ALTER TABLE or CREATE INDEX that waits for a lock on rnics (held by a
+	// long transaction elsewhere) queues every query of the running
+	// controllers behind it; giving up soon lets that traffic through, and
+	// connectWithRetry tries again after its backoff.
+	pgSchemaLockTimeout = "2s"
+
 	// pgTxAttempts bounds the attempts of a registration transaction that
 	// PostgreSQL aborted with a deadlock or a serialization failure. Under
 	// rqlite every write is serialized and neither can happen; here two
@@ -75,7 +82,7 @@ func newPostgresOpener(dbURI string) (func() (store, error), error) {
 	if weakness := pgTransportWeakness(&cfg.ConnConfig.Config); weakness != "" {
 		log.Warn().
 			Str("transport", weakness).
-			Msg("The PostgreSQL server is not authenticated: anyone on the network path can read or forge the registry, and the password may be exposed. Set sslmode=verify-full (and sslrootcert) in database_uri, or connect over a Unix socket")
+			Msg("The PostgreSQL server is not authenticated: anyone on the network path can read or forge the registry, and the password may be exposed. Set sslmode=verify-full (and sslrootcert), or verify-ca with sslrootcert, in database_uri, or connect over a Unix socket")
 	}
 
 	return func() (store, error) {
@@ -90,11 +97,17 @@ func newPostgresOpener(dbURI string) (func() (store, error), error) {
 
 // pgTransportWeakness describes how a connection made with cc can reach a
 // PostgreSQL server that is not authenticated by its certificate:
-// "plaintext" when some route may connect without TLS (sslmode disable,
-// allow or prefer), "unverified TLS" when TLS is used without checking the
-// certificate (sslmode require without sslrootcert), or "" when every route
-// verifies the server. Routes over a Unix socket or to a loopback address do
-// not cross the network and are not reported.
+//   - "plaintext" when some route may connect without TLS (sslmode disable,
+//     allow or prefer);
+//   - "unverified TLS" when TLS is used without checking the certificate
+//     (sslmode require without sslrootcert);
+//   - "TLS verified against the system roots, not the host name" for
+//     sslmode verify-ca without sslrootcert: any certificate a public CA
+//     issued, for any name, is accepted;
+//   - "" when every route verifies the server.
+//
+// Routes over a Unix socket or to a loopback address do not cross the
+// network and are not reported.
 func pgTransportWeakness(cc *pgconn.Config) string {
 	routes := append([]*pgconn.FallbackConfig{{Host: cc.Host, Port: cc.Port, TLSConfig: cc.TLSConfig}}, cc.Fallbacks...)
 	weakness := ""
@@ -102,11 +115,17 @@ func pgTransportWeakness(cc *pgconn.Config) string {
 		if isLocalPostgresHost(r.Host) {
 			continue
 		}
+		tc := r.TLSConfig
 		switch {
-		case r.TLSConfig == nil:
+		case tc == nil:
 			return "plaintext"
-		case r.TLSConfig.InsecureSkipVerify && r.TLSConfig.VerifyPeerCertificate == nil:
+		case tc.InsecureSkipVerify && tc.VerifyPeerCertificate == nil:
 			weakness = "unverified TLS"
+		case tc.InsecureSkipVerify && tc.RootCAs == nil:
+			// pgx verifies the chain itself for verify-ca, against the
+			// system roots when no sslrootcert is given, and skips the
+			// host name.
+			weakness = "TLS verified against the system roots, not the host name"
 		}
 	}
 	return weakness
@@ -266,8 +285,13 @@ func (s *pgStore) anyOf(column string, values []string) (string, []any) {
 // so a controller whose role may only read and write the rows of a table
 // prepared by an administrator still starts. Column types are BIGINT where
 // SQLite's INTEGER (64-bit) holds Unix seconds or a QPN.
+//
+// Each attempt is bounded by pgDefaultOpTimeout and each lock wait by
+// pgSchemaLockTimeout, whatever the remaining connect timeout: a blocked
+// attempt fails and is retried instead of holding locks for the whole
+// database_connect_timeout_sec.
 func (s *pgStore) initSchema(ctx context.Context) error {
-	ctx, cancel := withDefaultTimeout(ctx)
+	ctx, cancel := context.WithTimeout(ctx, pgDefaultOpTimeout)
 	defer cancel()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -275,6 +299,9 @@ func (s *pgStore) initSchema(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '`+pgSchemaLockTimeout+`'`); err != nil {
+		return fmt.Errorf("failed to set lock_timeout: %w", err)
+	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, pgSchemaLockKey); err != nil {
 		return fmt.Errorf("failed to lock the rnics schema: %w", err)
 	}

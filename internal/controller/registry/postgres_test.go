@@ -2,12 +2,19 @@ package registry
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -71,6 +78,7 @@ func TestPgTransportWeakness(t *testing.T) {
 	for _, env := range []string{"PGHOST", "PGSSLMODE", "PGSSLROOTCERT", "PGSERVICE", "PGSERVICEFILE"} {
 		t.Setenv(env, "")
 	}
+	ca := writeTestCA(t)
 	for _, tc := range []struct {
 		uri, want string
 	}{
@@ -78,7 +86,12 @@ func TestPgTransportWeakness(t *testing.T) {
 		{"postgres://db.example/rpm?sslmode=prefer", "plaintext"},
 		{"postgres://db.example/rpm?sslmode=allow", "plaintext"},
 		{"postgres://db.example/rpm?sslmode=require", "unverified TLS"},
+		{"postgres://db.example/rpm?sslmode=verify-ca", "TLS verified against the system roots, not the host name"},
+		{"postgres://db.example/rpm?sslmode=verify-ca&sslrootcert=" + ca, ""},
+		// libpq and pgx treat require with a root certificate as verify-ca.
+		{"postgres://db.example/rpm?sslmode=require&sslrootcert=" + ca, ""},
 		{"postgres://db.example/rpm?sslmode=verify-full", ""},
+		{"postgres://db.example/rpm?sslmode=verify-full&sslrootcert=" + ca, ""},
 		{"postgres://localhost/rpm?sslmode=disable", ""},
 		{"postgres://127.0.0.1/rpm?sslmode=disable", ""},
 		{"postgres://[::1]/rpm?sslmode=disable", ""},
@@ -95,6 +108,34 @@ func TestPgTransportWeakness(t *testing.T) {
 			t.Errorf("pgTransportWeakness(%q) = %q, want %q", tc.uri, got, tc.want)
 		}
 	}
+}
+
+// writeTestCA writes a self-signed CA certificate in PEM to a temporary
+// file, for sslrootcert, and returns its path.
+func writeTestCA(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "rpingmesh test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestIsRetryableTxErr(t *testing.T) {
@@ -528,6 +569,10 @@ func TestPostgres_RowPrivilegesSuffice(t *testing.T) {
 // that PostgreSQL aborted is run again and succeeds.
 func TestPostgres_RegistrationRetriesAfterDeadlock(t *testing.T) {
 	db := newPgTestDB(t)
+	// The registry's sessions are found by this name below; other tests'
+	// sessions on the same server must not match.
+	appName := "rpm-test-deadlock-" + randomSuffix(t)
+	db.uri = withParam(t, db.uri, "application_name", appName)
 	reg := db.open(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -569,7 +614,7 @@ func TestPostgres_RegistrationRetriesAfterDeadlock(t *testing.T) {
 	for {
 		var waiting int
 		if err := db.admin.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE application_name = $1 AND wait_event_type = 'Lock'`, pgApplicationName).Scan(&waiting); err != nil {
+			WHERE application_name = $1 AND wait_event_type = 'Lock'`, appName).Scan(&waiting); err != nil {
 			t.Fatal(err)
 		}
 		if waiting > 0 {
@@ -604,4 +649,70 @@ func TestPostgres_RegistrationRetriesAfterDeadlock(t *testing.T) {
 	if row, err := reg.GetRNICByGID(ctx, "fe80::1"); err != nil || row == nil || row.GetHostName() != "host-a" {
 		t.Errorf("fe80::1 = %v, %v; want agent-a's row", row, err)
 	}
+}
+
+// TestPostgres_SchemaSetupGivesUpOnLockedTable opens the registry on a table
+// that needs a column while another session holds a lock on it: the ALTER
+// TABLE must give up after pgSchemaLockTimeout, so the queries of running
+// controllers queued behind it are not stalled for the whole connect
+// timeout, and the setup must succeed once the lock is released.
+func TestPostgres_SchemaSetupGivesUpOnLockedTable(t *testing.T) {
+	db := newPgTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	db.open(t, nil)
+	if _, err := db.admin.Exec(ctx, "ALTER TABLE "+db.schema+".rnics DROP COLUMN netdev"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A long transaction elsewhere, e.g. an operator's idle psql session.
+	holder, err := pgx.Connect(ctx, db.uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close(ctx)
+	tx, err := holder.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT count(*) FROM rnics"); err != nil {
+		t.Fatal(err)
+	}
+
+	// While the setup waits for its lock, a running controller's read
+	// queues behind it; it must complete once the setup gives up.
+	readDone := make(chan time.Duration, 1)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		start := time.Now()
+		conn, err := pgx.Connect(ctx, db.uri)
+		if err == nil {
+			_, err = conn.Exec(ctx, "SELECT count(*) FROM rnics")
+			_ = conn.Close(ctx)
+		}
+		if err != nil {
+			t.Errorf("read during the schema setup: %v", err)
+		}
+		readDone <- time.Since(start)
+	}()
+
+	start := time.Now()
+	_, err = NewRnicRegistry(ctx, db.uri, 0, 0, 0)
+	elapsed := time.Since(start)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("NewRnicRegistry on a locked table: %v, want lock_not_available (55P03)", err)
+	}
+	if elapsed > 8*time.Second {
+		t.Errorf("schema setup gave up after %v, want about %s", elapsed, pgSchemaLockTimeout)
+	}
+	if waited := <-readDone; waited > 8*time.Second {
+		t.Errorf("a concurrent read waited %v behind the schema setup", waited)
+	}
+
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	db.open(t, nil)
 }

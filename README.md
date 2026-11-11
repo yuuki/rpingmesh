@@ -970,7 +970,7 @@ for capability, firmware, lifecycle and test details.
 The controller unit starts after `rqlite.service` and wants it. `rqlited`
 accepts connections before its store is open, so a `Type=simple` rqlite unit
 can still let the controller start too early. The controller then logs
-`rqlite not ready; retrying` and retries for `database_connect_timeout_sec`
+`Registry database not ready; retrying` and retries for `database_connect_timeout_sec`
 before exiting. To order the start exactly, make rqlite report readiness only
 once `/readyz` succeeds:
 
@@ -1001,7 +1001,10 @@ database_uri: "postgres://rpingmesh@db.example:5432/rpingmesh?sslmode=verify-ful
   ```
 
   The controller inspects the catalog first and issues DDL only for what is
-  missing. A role with only `USAGE` on the schema and `SELECT`, `INSERT`,
+  missing. It waits at most 2 s for a lock on the table, so a long
+  transaction elsewhere cannot hold up the queries of running controllers
+  while an upgraded one adds a column; it retries within
+  `database_connect_timeout_sec` instead. A role with only `USAGE` on the schema and `SELECT`, `INSERT`,
   `UPDATE` and `DELETE` on `rnics` therefore works once an owner has created
   the table, for example by starting a controller once with the owner's role;
   repeat that after an upgrade that adds a column. Select a schema other than
@@ -1019,7 +1022,8 @@ database_uri: "postgres://rpingmesh@db.example:5432/rpingmesh?sslmode=verify-ful
   reached over a Unix socket (`postgres:///rpingmesh?host=/var/run/postgresql`)
   or a loopback address. The controller warns at startup when a route
   connects without authenticating the server: `disable`, `allow`, `prefer`
-  (the default) or `require` without `sslrootcert`.
+  (the default), `require` without `sslrootcert`, or `verify-ca` without
+  `sslrootcert`, which accepts any certificate a public CA issued.
 - **Connection parameters.** The URI takes the parameters of the
   [pgx](https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool#ParseConfig)
   driver. `connect_timeout` defaults to 10 s, and `application_name` to

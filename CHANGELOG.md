@@ -33,6 +33,12 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Require Go 1.27.4 or later, the security release of 2026-11-10 (a race in
+  `net/http`'s `MaxBytesReader`, and code execution at build time through
+  cgo flags and directives).
+- Update Go module dependencies: `golang.org/x/sys` v0.50.0,
+  `golang.org/x/text` v0.44.0, `golang.org/x/sync` v0.25.0, and the
+  `google.golang.org/genproto/googleapis` modules.
 - The controller logs `database_uri` with its password masked, and quotes it
   masked in configuration errors. `database_uri` must now use one of the
   schemes above; any other was already unusable. While the database is not

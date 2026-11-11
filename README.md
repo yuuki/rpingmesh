@@ -235,7 +235,7 @@ before an agent restart cannot match probes sent after it.
 
 | Dependency | Version | Needed for |
 |------------|---------|------------|
-| Go | 1.27.3+ | Both binaries |
+| Go | 1.27.4+ | Both binaries |
 | Zig | 0.17.0 | librdmabridge (the version used in CI and e2e) |
 | protoc, protoc-gen-go, protoc-gen-go-grpc | protoc 3.x | gRPC code generation |
 | libibverbs-dev, librdmacm-dev | any | Agent build (Linux only) |

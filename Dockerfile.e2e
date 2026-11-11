@@ -15,7 +15,7 @@
 
 FROM debian:trixie-slim
 
-ARG GO_VERSION=1.27.3
+ARG GO_VERSION=1.27.4
 ARG ZIG_VERSION=0.17.0
 
 # Install runtime and build dependencies

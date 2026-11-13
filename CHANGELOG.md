@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `PATENTS.md` no longer says that eBPF-based service tracing is not
+  implemented; it shipped in 0.9.0. Only topology-aware fault localization
+  remains unimplemented.
+
 ## [0.11.0] - 2026-11-11
 
 ### Added

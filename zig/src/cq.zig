@@ -62,15 +62,17 @@ pub const GRHInfo = struct {
 ///   Bytes 8-23:  Source GID (128 bits)
 ///   Bytes 24-39: Destination GID (128 bits)
 ///
-/// rdma_rxe (Linux soft-RoCE) delivers RoCEv2-over-IPv4 datagrams with a
-/// different "GRH": bytes 0-19 are zero and bytes 20-39 hold the IPv4
-/// header (source address at 32-35, destination at 36-39). That format is
-/// detected by bytes 0-7 being zero and byte 20 carrying an IPv4 version
-/// nibble, and the source GID is then built as the IPv4-mapped IPv6 address
-/// ::ffff:a.b.c.d; IPv4 has no flow label.
+/// RoCEv2 over IPv4 fills the same 40 bytes differently: bytes 0-19 are zero
+/// and bytes 20-39 hold the IPv4 header (source address at 32-35,
+/// destination at 36-39). This is the RoCEv2/IPv4 layout in general, not a
+/// soft-RoCE quirk: rdma_rxe and mlx5 both deliver it, and reading byte 0 as
+/// an IP version nibble fails on both. The layout is detected by bytes 0-7
+/// being zero and byte 20 carrying an IPv4 version nibble, and the source GID
+/// is then built as the IPv4-mapped IPv6 address ::ffff:a.b.c.d. IPv4 has no
+/// flow label, so the receiver always sees 0.
 pub fn parseGRH(buf: [*]const u8) GRHInfo {
-    const is_rxe_ipv4 = std.mem.allEqual(u8, buf[0..8], 0) and (buf[20] & 0xF0) == 0x40;
-    if (is_rxe_ipv4) {
+    const is_ipv4 = std.mem.allEqual(u8, buf[0..8], 0) and (buf[20] & 0xF0) == 0x40;
+    if (is_ipv4) {
         var source_gid: [16]u8 = @splat(0);
         source_gid[10] = 0xff;
         source_gid[11] = 0xff;
@@ -647,7 +649,7 @@ test "parseGRH extracts source and dest GID" {
     try std.testing.expectEqual(@as(u8, 0x00), info.source_gid[14]);
 }
 
-test "parseGRH decodes the rdma_rxe IPv4 header as an IPv4-mapped GID" {
+test "parseGRH decodes a RoCEv2-over-IPv4 header as an IPv4-mapped GID" {
     var grh: [40]u8 = @splat(0);
     grh[20] = 0x45; // IPv4, IHL 5
     grh[32] = 10; // source 10.200.0.2

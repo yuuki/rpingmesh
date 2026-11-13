@@ -20,9 +20,10 @@ contributors can take it into account.
 ## 2. Related Research
 
 This project is a clean-room reimplementation of selected techniques described
-in the published R-Pingmesh research. It implements RNIC-mesh probing and the
-paper's Phase 1 SLA analysis; the paper's eBPF-based service tracing and
-topology-aware fault localization are not implemented (see
+in the published R-Pingmesh research. It implements RNIC-mesh probing, the
+paper's Phase 1 analysis (per-path SLO evaluation), and eBPF-based service
+tracing (see [Service tracing](README.md#service-tracing)); the paper's
+topology-aware fault localization is not implemented (see
 [Limitations](README.md#limitations)). This description of the implementation
 is not a patent clearance assessment.
 

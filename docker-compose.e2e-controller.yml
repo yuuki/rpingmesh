@@ -4,7 +4,7 @@
 services:
   # rqlite — distributed SQLite used by the controller's RNIC registry.
   rqlite:
-    image: rqlite/rqlite:10.5.3
+    image: rqlite/rqlite:10.6.6
     command: -http-addr "0.0.0.0:4001"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:4001/status"]
@@ -72,7 +72,7 @@ services:
   # Late-starting rqlite for the startup-ordering test (issue #66): rqlited
   # starts only after a delay, so controller_early comes up before it.
   rqlite_late:
-    image: rqlite/rqlite:10.5.3
+    image: rqlite/rqlite:10.6.6
     entrypoint: ["/bin/sh", "-c", "sleep 15 && exec docker-entrypoint.sh -http-addr 0.0.0.0:4001"]
 
   # Controller started before its rqlite is up. It must retry the connection

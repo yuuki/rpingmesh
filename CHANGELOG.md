@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- The archived previous implementation under `legacy/` (a separate Go
+  module) and its `Legacy Tests` workflow. It was frozen, unsupported and not
+  part of any release; the implementation at the repository root is
+  unchanged.
+
 ### Fixed
 
 - `PATENTS.md` no longer says that eBPF-based service tracing is not

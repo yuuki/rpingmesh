@@ -1,5 +1,4 @@
 .git
-legacy/
 bin/
 dist/
 zig/zig-out/

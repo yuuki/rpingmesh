@@ -250,7 +250,7 @@ check: lint lint-actions test-race test-zig test-scripts
 
 # golangci-lint (linters and gofmt, configured in .golangci.yml) and go.mod
 # tidiness. The controller packages import the generated protobuf code, so it
-# is generated first. legacy/ is a separate, frozen module and is not linted.
+# is generated first.
 lint: generate
 	$(GOLANGCI_LINT) run ./...
 	go mod tidy -diff
@@ -316,8 +316,7 @@ bench: build-zig generate
 	@go test -run='^$$' -bench=. -benchmem -count=$(BENCH_COUNT) $$(go list ./... | grep -v '/e2e') > bench.txt 2>&1; \
 		rc=$$?; cat bench.txt; exit $$rc
 
-# Known vulnerabilities reachable from the code (root module; legacy/ is
-# frozen and not scanned).
+# Known vulnerabilities reachable from the code.
 vuln: generate
 	$(GOVULNCHECK) ./...
 

@@ -21,8 +21,7 @@ configurations that are accepted but do not verify what they claim to.
 ## Supported versions
 
 Security fixes are made on the `main` branch and released in the next
-version. Only the latest release is supported. The archived implementation
-under `legacy/` is not supported.
+version. Only the latest release is supported.
 
 ## Reporting a vulnerability
 

@@ -2,7 +2,6 @@
 # after a release has been public for a week (compromised releases are usually
 # pulled within days). Security updates are not delayed by this schedule.
 #
-# legacy/ is a separate, frozen Go module (see AGENTS.md) and is not updated.
 # The Go and Zig versions pinned in go.mod, mise.toml, the workflows, the
 # Dockerfiles' GO_VERSION/ZIG_VERSION build args and docker-compose.e2e.yml
 # are bumped together by hand; a golang base-image bump from the docker

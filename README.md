@@ -131,9 +131,8 @@ against its own thresholds.
 | `scripts/topology/` | Read-only tools for multi-rail ToR maps and QoS (`traffic_class`) facts |
 | `e2e/` | End-to-end tests (Docker, soft-RoCE) |
 | `docs/design/` | Design documents |
-| `legacy/` | Archived previous implementation (a separate Go module) |
 
-The active Go module is `github.com/yuuki/rpingmesh`. It was previously
+The Go module is `github.com/yuuki/rpingmesh`. It was previously
 `github.com/yuuki/rpingmesh/rebuild`; there is no compatibility shim for the
 old import path.
 

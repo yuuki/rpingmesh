@@ -1,7 +1,5 @@
 name: Tests
 
-# Validates the active implementation at the repository root. The archived
-# implementation is covered separately by legacy-test.yml.
 on:
   pull_request:
     branches: [ main ]

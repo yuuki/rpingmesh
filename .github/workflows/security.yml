@@ -92,7 +92,6 @@ jobs:
           category: /language:${{ matrix.language }}
 
   # Known vulnerabilities in the dependencies that the code actually reaches.
-  # The archived legacy/ module is frozen and not scanned.
   govulncheck:
     name: govulncheck
     runs-on: ubuntu-latest

@@ -58,16 +58,9 @@ linters:
       # very error it was handed, unwrapped).
       - path: _test\.go
         linters: [gosec, errcheck, noctx, errorlint]
-    paths:
-      # Archived first-generation implementation: a separate, frozen Go
-      # module covered by legacy-test.yml (golangci-lint does not descend
-      # into nested modules; listed so an explicit path cannot reach it).
-      - legacy/
 
 formatters:
   enable:
     - gofmt
   exclusions:
     generated: lax
-    paths:
-      - legacy/

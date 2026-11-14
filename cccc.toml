@@ -11,7 +11,6 @@ exclude = [
   "**/testdata/**",     # test fixtures
   "*_bpfel.go",         # bpf2go-generated bindings
   "**/bpf/include/**",  # vendored libbpf headers
-  "legacy/**",          # archived first-generation module
   "*.bpf.c",            # BPF programs: the verifier constrains how they can be split
   "vendor/**",          # vendored Go modules (go mod vendor)
 ]

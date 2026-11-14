@@ -10,9 +10,6 @@ workflows:
         - 'actions/checkout@v7.0.1'
         - 'k1low/octocov-action@v1.5.2'
         - 'moznion/cccc-action@v1.1.2'
-    '.github/workflows/legacy-test.yml':
-        - 'actions/checkout@v7.0.1'
-        - 'docker/setup-buildx-action@v4.4.1'
     '.github/workflows/release.yml':
         - 'actions/checkout@v7.0.1'
         - 'actions/setup-go@v7.0.0'

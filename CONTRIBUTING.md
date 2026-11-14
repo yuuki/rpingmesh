@@ -28,8 +28,6 @@ the eBPF programs, the Zig library or the protobuf API.
   requirements.
 - Code comments and documentation are in English. Do not include real
   environment identifiers (host names, IP addresses, cluster names, paths).
-- `legacy/` is archived; changes there are accepted only for legacy
-  maintenance.
 
 ## Commit messages
 

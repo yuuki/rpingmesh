@@ -2,7 +2,6 @@
 
 ## Rules
 - No real environment identifiers (host, cluster or partition names, IPs, user names, local paths, allocation IDs) in any file, issue or PR; use synthetic ones.
-- `legacy/` is a frozen, separate module: change it only when the task asks for legacy maintenance.
 - Zig hands completions to Go only through the SPSC event ring, polled by its single Go consumer; never through Cgo callbacks.
 - Keep the CQ arm-then-drain order in `zig/src/cq.zig` and the eventfd write in busy mode: a queue can fall back to busy while Go still waits on the fd.
 - The responder never waits on a send completion (it would stall its event ring); a full event ring drops events, it never blocks.

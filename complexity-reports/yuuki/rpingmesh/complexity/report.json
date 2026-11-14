@@ -1,9 +1,9 @@
 {
   "repository": "yuuki/rpingmesh/complexity",
   "ref": "refs/heads/main",
-  "commit": "53e0dbe8758e5c7d9c79ac8047ee466f97506a1a",
+  "commit": "329bc4c4d988a244c148ef4ec98520448acb7d92",
   "base_ref": "refs/heads/main",
-  "timestamp": "2026-11-13T13:47:33.807245577Z",
+  "timestamp": "2026-11-14T11:04:18.654097089Z",
   "custom_metrics": [
     {
       "key": "code_complexity",

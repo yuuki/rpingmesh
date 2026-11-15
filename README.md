@@ -1,9 +1,10 @@
 # R-Pingmesh
 
+[![AI Generated](https://img.shields.io/badge/AI%20Generated-Claude-orange?logo=anthropic)](https://claude.ai/claude-code)
 [![Tests](https://github.com/yuuki/rpingmesh/actions/workflows/test.yml/badge.svg)](https://github.com/yuuki/rpingmesh/actions/workflows/test.yml)
+[![Security](https://github.com/yuuki/rpingmesh/actions/workflows/security.yml/badge.svg)](https://github.com/yuuki/rpingmesh/actions/workflows/security.yml)
 [![Release](https://img.shields.io/github/v/release/yuuki/rpingmesh)](https://github.com/yuuki/rpingmesh/releases)
 [![Go Reference](https://pkg.go.dev/badge/github.com/yuuki/rpingmesh.svg)](https://pkg.go.dev/github.com/yuuki/rpingmesh)
-[![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/rpingmesh)](https://goreportcard.com/report/github.com/yuuki/rpingmesh)
 [![Go version](https://img.shields.io/github/go-mod/go-version/yuuki/rpingmesh)](go.mod)
 [![Zig](https://img.shields.io/badge/Zig-0.17.0-F7A41D?logo=zig&logoColor=white)](https://ziglang.org)
 [![License: Apache-2.0](https://img.shields.io/github/license/yuuki/rpingmesh)](LICENSE)

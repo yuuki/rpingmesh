@@ -563,9 +563,12 @@ All runs are seeded.
 - each fault class, loss and RTT, down to a 1% loss on one of four uplinks;
 - a healthy fabric: 20 seeds × 9 spans at a background loss of 10%, 50% and
   100% of the baseline, with no finding;
-- a whole fabric above the baseline: only `not_localizable`;
+- a whole fabric at 1.5, 2 and 5 times the baseline: only the
+  `background`, as `not_localizable`;
 - no topology file and a file with rails only;
 - two faults at once; four lossy RNICs under one ToR;
+- a host that goes down and stops reporting, with and without an earlier
+  report from its agent;
 - components that cannot be told apart, with their confidences (1/3 each,
   1/2 each);
 - one burst, one stuck path, the lifecycle of a fault over time;

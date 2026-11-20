@@ -274,6 +274,38 @@ func TestLocalization_TwoSimultaneousFaults(t *testing.T) {
 	}
 }
 
+// TestLocalization_HostGoesDown verifies the case of a host that fails as a
+// whole: from one window on, its RNICs answer nothing and its agent reports
+// nothing. The other agents' probes to its two RNICs fail. The host is
+// named as one component because the controller remembers which agent
+// reported those RNICs before; without that memory (the agent never
+// reported) each RNIC is named on its own.
+func TestLocalization_HostGoesDown(t *testing.T) {
+	fault := simFault{element: "host", group: 0, tor: 2, host: 1, loss: 1}
+	down := map[int]bool{}
+	for w := 2; w < 2+simWindows; w++ {
+		down[w] = true
+	}
+
+	t.Run("its agent reported before", func(t *testing.T) {
+		f := defaultSimFabric(91)
+		f.faults = []simFault{fault}
+		f.windowFaults = map[int]map[int]bool{0: down}
+		f.silentFrom = map[string]int{f.agentName(0, 2, 1): 2}
+		run := newSimRun(t, f, LocalizationConfig{Topology: f.topology(t, true, true)})
+		requireLocalized(t, run.after(2+simWindows), KindLoss, f.truth(fault))
+	})
+	t.Run("its agent never reported", func(t *testing.T) {
+		f := defaultSimFabric(92)
+		f.faults = []simFault{fault}
+		f.windowFaults = map[int]map[int]bool{0: down}
+		f.silent = map[string]bool{f.agentName(0, 2, 1): true}
+		run := newSimRun(t, f, LocalizationConfig{Topology: f.topology(t, true, true)})
+		requireLocalized(t, run.after(2+simWindows), KindLoss,
+			ComponentRNIC+"/"+f.gid(0, 0, 2, 1), ComponentRNIC+"/"+f.gid(1, 0, 2, 1))
+	})
+}
+
 // TestLocalization_FourRNICsAreNotTheirToR verifies the split step: four of
 // the six RNICs under one ToR lose packets, the other two are clean. The
 // ToR is the component with the largest gain, but it is not the fault: the

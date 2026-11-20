@@ -52,8 +52,9 @@ type simFabric struct {
 	seed     uint64
 	faults   []simFault
 	// silent lists agents that send no reports (their hosts still answer
-	// probes).
-	silent map[string]bool
+	// probes). silentFrom lists agents that stop reporting from a window on.
+	silent     map[string]bool
+	silentFrom map[string]int
 	// windowFaults limits a fault to some windows: fault index -> windows.
 	windowFaults map[int]map[int]bool
 
@@ -362,6 +363,9 @@ func (f *simFabric) reports(w int, summaries []simSummary) []*controller_agent.P
 	for _, s := range summaries {
 		a, b := &f.rnics[s.path.src], &f.rnics[s.path.dst]
 		if f.silent[a.agent] {
+			continue
+		}
+		if from, stops := f.silentFrom[a.agent]; stops && w >= from {
 			continue
 		}
 		ptype := controller_agent.PinglistType_INTER_TOR

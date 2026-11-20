@@ -422,6 +422,11 @@ the scope, which lists the members:
   have left at least 21 nats on every other such ToR. Their silence proves
   something only then.
 
+The confidence of a folded finding is the largest confidence that one of
+the folded findings put on its candidates together: the scope holds a fault
+at least as surely as its surest member. When the scope is already a finding
+of its own, it takes the members and no second finding is made.
+
 Findings on RNICs and hosts are never folded: several hosts of a rack can
 fail independently (a maintenance), and each is worth its own finding.
 

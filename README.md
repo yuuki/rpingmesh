@@ -1711,8 +1711,9 @@ acceptable; GIDs and other destination-RNIC identities are not.
   It names a tier, never the faulty member of an ECMP stage. It needs ToR
   IDs on the agents, agent clocks within a window of each other, and a
   topology file for anything above a ToR's uplinks; a tier the file leaves
-  out is reported on the tier above it. It keeps its evidence in the memory
-  of one controller, so controllers behind a load balancer each see a part.
+  out is reported on the tier above it. Like the SLO analyzer's summaries,
+  its evidence is kept in the memory of one controller: a restart loses it,
+  and controllers behind a load balancer each see a part.
   It does not use flow labels, traffic classes or service-tracing paths.
   There is no dashboard or alert rule for its metrics yet. See
   [the design](docs/design/analyzer-phase2-localization.md#limitations).

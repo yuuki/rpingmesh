@@ -147,20 +147,29 @@ func TestLocalization_HealthyFabricAccusesNothing(t *testing.T) {
 }
 
 // TestLocalization_NoiseAboveBaselineIsNotLocalized verifies what happens
-// when the whole fabric loses more than the configured baseline (here five
-// times as much, on every path): no component is accused. Whatever is
-// reported is reported as not localizable.
+// when the whole fabric loses more than the configured baseline, on every
+// path alike (1.5, 2 and 5 times as much): no component is accused. What is
+// reported is the background, as not localizable; at 5 times it is always
+// reported.
 func TestLocalization_NoiseAboveBaselineIsNotLocalized(t *testing.T) {
-	for seed := uint64(1); seed <= 10; seed++ {
-		f := defaultSimFabric(400 + seed)
-		f.noiseLoss = 5e-3
-		run := newSimRun(t, f, LocalizationConfig{Topology: f.topology(t, true, true)})
-		findings := run.after(simWindows)
-		for _, fd := range findings {
-			if fd.State != StateNotLocalizable {
-				t.Fatalf("seed %d: want only not-localizable findings, got:%s", seed, describeFindings(findings))
+	for _, factor := range []float64{1.5, 2, 5} {
+		t.Run(fmt.Sprintf("%g times the baseline", factor), func(t *testing.T) {
+			seeds, _ := sweepSize(t, 12)
+			for seed := uint64(1); seed <= uint64(seeds); seed++ {
+				f := defaultSimFabric(400 + seed)
+				f.noiseLoss = factor * DefaultLocalizationBaselineLossRatio
+				run := newSimRun(t, f, LocalizationConfig{Topology: f.topology(t, true, true)})
+				findings := run.after(simWindows)
+				for _, fd := range findings {
+					if fd.State != StateNotLocalizable {
+						t.Fatalf("seed %d: want only not-localizable findings, got:%s", seed, describeFindings(findings))
+					}
+				}
+				if factor == 5 {
+					requireCandidates(t, findings, KindLoss, StateNotLocalizable, ComponentBackground)
+				}
 			}
-		}
+		})
 	}
 }
 

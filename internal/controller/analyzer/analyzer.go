@@ -10,9 +10,13 @@
 // cluster paths (TOR_MESH, INTER_TOR) that may lead to the same target RNIC.
 //
 // It is deliberately in-process with the controller (a separate package so it
-// can later be split into a standalone binary): the topology needed for
-// cross-agent fault localization already lives in the controller's registry.
-// Phase 1 does no topology join; switch/link localization is Phase 2.
+// can later be split into a standalone binary). Phase 1 does no topology
+// join.
+//
+// The optional Phase 2 localizer (localizer.go, tomography.go) reads the same
+// summaries across agents and names the component the degraded paths share:
+// an RNIC, a host, a ToR, a ToR's uplinks, a spine group or a rail. It is off
+// unless Config.Localization is set and never changes what Phase 1 does.
 package analyzer
 
 import (
@@ -68,6 +72,9 @@ type Config struct {
 	// grow one bucket without bound. Values < 1 are replaced by
 	// DefaultMaxSummariesPerWindow.
 	MaxSummariesPerWindow int
+	// Localization enables the Phase 2 localizer when non-nil. It uses the
+	// Cluster RTT threshold to decide which windows count as RTT violations.
+	Localization *LocalizationConfig
 }
 
 // DefaultMaxSummariesPerWindow is applied when Config.MaxSummariesPerWindow
@@ -77,8 +84,9 @@ type Config struct {
 const DefaultMaxSummariesPerWindow = 8192
 
 // windowBucket groups the summaries retained for one aggregation window,
-// identified by its wall-clock start. Kept for recency/retention and as the
-// substrate a future Phase 2 cross-agent localization pass would read.
+// identified by its wall-clock start. Kept for recency/retention. The Phase 2
+// localizer does not read it: it keeps its own compact evidence (see
+// evidence.go for why).
 type windowBucket struct {
 	windowStartUnixNs uint64
 	summaries         []*controller_agent.PathSummary
@@ -96,6 +104,9 @@ type Analyzer struct {
 	// ring holds recent window buckets sorted ascending by windowStartUnixNs;
 	// its length is capped at cfg.WindowRetention.
 	ring []*windowBucket
+
+	// loc is the Phase 2 localizer; nil when localization is disabled.
+	loc *localizer
 }
 
 // New creates an Analyzer with the given config and metrics (metrics may be
@@ -109,11 +120,25 @@ func New(cfg Config, metrics *Metrics) *Analyzer {
 	if cfg.MaxSummariesPerWindow < 1 {
 		cfg.MaxSummariesPerWindow = DefaultMaxSummariesPerWindow
 	}
-	return &Analyzer{
+	a := &Analyzer{
 		cfg:     cfg,
 		metrics: metrics,
 		logger:  log.With().Str("component", "analyzer").Logger(),
 	}
+	if cfg.Localization != nil {
+		a.loc = newLocalizer(*cfg.Localization, cfg.Cluster.NetworkRTTP99Ns, metrics)
+	}
+	return a
+}
+
+// RunLocalization runs the Phase 2 localizer until ctx is cancelled: it
+// evaluates the evidence whenever a window closes. It returns at once when
+// localization is disabled.
+func (a *Analyzer) RunLocalization(ctx context.Context) {
+	if a.loc == nil {
+		return
+	}
+	a.loc.run(ctx)
 }
 
 // Ingest processes one reported batch of per-path window summaries: it records
@@ -128,6 +153,16 @@ func (a *Analyzer) Ingest(ctx context.Context, report *controller_agent.ProbeAna
 	agentID := report.GetAgentId()
 	summaries := report.GetSummaries()
 
+	violatingSummaries := a.ingestSummaries(ctx, agentID, summaries)
+	if a.loc != nil {
+		// After Phase 1 and outside its lock: the localizer has its own.
+		a.loc.observe(ctx, agentID, summaries)
+	}
+	return violatingSummaries
+}
+
+// ingestSummaries is the Phase 1 part of Ingest.
+func (a *Analyzer) ingestSummaries(ctx context.Context, agentID string, summaries []*controller_agent.PathSummary) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 

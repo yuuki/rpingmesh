@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"slices"
 	"strings"
 
@@ -74,6 +75,26 @@ const (
 	// DefaultControllerOtelCollectorAddr is the default OTLP gRPC collector
 	// endpoint the analyzer exports its metrics to.
 	DefaultControllerOtelCollectorAddr = "localhost:4317"
+
+	// Defaults and bounds of the analyzer's fault localization (Phase 2).
+	// They mirror analyzer.DefaultLocalization* and
+	// analyzer.MaxLocalizationWindows, for the reason given above;
+	// TestDefaultsMatchControllerPackages pins them equal.
+
+	// DefaultAnalyzerLocalizationWindows is the default evidence span: the
+	// number of most recent closed windows pooled per evaluation.
+	DefaultAnalyzerLocalizationWindows = 4
+	// MaxAnalyzerLocalizationWindows is the longest evidence span.
+	MaxAnalyzerLocalizationWindows = 64
+	// DefaultAnalyzerLocalizationBaselineLossRatio is the default loss ratio
+	// of a healthy path: a component is suspected only for loss beyond it.
+	DefaultAnalyzerLocalizationBaselineLossRatio = 0.001
+	// DefaultAnalyzerLocalizationMinConfidence is the default posterior
+	// probability a suspect needs to be reported as localized.
+	DefaultAnalyzerLocalizationMinConfidence = 0.95
+	// DefaultAnalyzerLocalizationMaxPathsPerWindow is the default cap on the
+	// paths the localizer keeps per window.
+	DefaultAnalyzerLocalizationMaxPathsPerWindow = 200_000
 )
 
 // ControllerConfig holds all configuration for the controller.
@@ -122,6 +143,26 @@ type ControllerConfig struct {
 	// metrics_cardinality_limit. See DefaultAnalyzerMetricsCardinalityLimit
 	// for the sizing.
 	AnalyzerMetricsCardinalityLimit int `mapstructure:"analyzer_metrics_cardinality_limit"`
+	// AnalyzerLocalizationEnabled turns on fault localization (Phase 2): the
+	// analyzer then names the component that degraded paths share. It is off
+	// by default and needs the analyzer (analyzer_enabled).
+	AnalyzerLocalizationEnabled bool `mapstructure:"analyzer_localization_enabled"`
+	// AnalyzerLocalizationTopologyFile is the path of the optional topology
+	// file that states the rail and the spine group of each ToR. Without
+	// it, faults above the ToRs are reported as not localizable. It is read
+	// once at startup; an invalid file stops the controller.
+	AnalyzerLocalizationTopologyFile string `mapstructure:"analyzer_localization_topology_file"`
+	// AnalyzerLocalizationWindows is the evidence span, in closed windows.
+	AnalyzerLocalizationWindows int `mapstructure:"analyzer_localization_windows"`
+	// AnalyzerLocalizationBaselineLossRatio is the loss ratio of a healthy
+	// path, in (0, 1).
+	AnalyzerLocalizationBaselineLossRatio float64 `mapstructure:"analyzer_localization_baseline_loss_ratio"`
+	// AnalyzerLocalizationMinConfidence is the posterior probability, in
+	// [0.5, 1), a suspect needs to be reported as localized.
+	AnalyzerLocalizationMinConfidence float64 `mapstructure:"analyzer_localization_min_confidence"`
+	// AnalyzerLocalizationMaxPathsPerWindow caps the paths the localizer
+	// keeps per window, which bounds its memory.
+	AnalyzerLocalizationMaxPathsPerWindow int `mapstructure:"analyzer_localization_max_paths_per_window"`
 	// OtelCollectorAddr is the OTLP gRPC endpoint the analyzer exports its
 	// metrics to (service.name=rpingmesh-analyzer). Only used when the analyzer
 	// is enabled; export is best-effort.
@@ -185,6 +226,12 @@ var controllerKeys = []keySpec{
 	{key: "analyzer_service_slo_network_rtt_p99_ns", def: uint64(DefaultAnalyzerSLONetworkRTTP99Ns), help: "Service-network (service tracing) per-path p99 network-RTT threshold (ns) above which a window is an SLO violation (0 disables)"},
 	{key: "analyzer_window_retention", def: DefaultAnalyzerWindowRetention, help: "Number of recent windows the analyzer retains in memory"},
 	{key: "analyzer_metrics_cardinality_limit", def: DefaultAnalyzerMetricsCardinalityLimit, help: "Maximum attribute sets per analyzer metric instrument (0 = OTel SDK default 2000, otherwise >= 2000)"},
+	{key: "analyzer_localization_enabled", def: false, help: "Enable fault localization (Phase 2): name the component that degraded paths share (requires analyzer-enabled)"},
+	{key: "analyzer_localization_topology_file", def: "", help: "Topology file stating the rail and spine group of each ToR (empty = faults above the ToRs are not localizable)"},
+	{key: "analyzer_localization_windows", def: DefaultAnalyzerLocalizationWindows, help: "Evidence span of fault localization: recent closed windows pooled per evaluation (1..64)"},
+	{key: "analyzer_localization_baseline_loss_ratio", def: DefaultAnalyzerLocalizationBaselineLossRatio, help: "Loss ratio of a healthy path, in (0, 1): a component is suspected only for loss beyond it"},
+	{key: "analyzer_localization_min_confidence", def: DefaultAnalyzerLocalizationMinConfidence, help: "Posterior probability, in [0.5, 1), a suspect needs to be reported as localized"},
+	{key: "analyzer_localization_max_paths_per_window", def: DefaultAnalyzerLocalizationMaxPathsPerWindow, help: "Cap on the paths fault localization keeps per window (bounds its memory)"},
 	{key: "otel_collector_addr", def: DefaultControllerOtelCollectorAddr, help: "OTLP gRPC collector endpoint for analyzer metrics"},
 	{key: "otel_collector_tls_enabled", def: false, help: "Export analyzer metrics over TLS, verifying the collector's certificate and host name"},
 	{key: "otel_collector_tls_ca_file", def: "", help: "PEM CA bundle that verifies the collector's certificate (empty = system roots; requires otel-collector-tls-enabled)"},
@@ -237,16 +284,24 @@ func LoadControllerConfig(configPath string, flags *pflag.FlagSet) (*ControllerC
 		AnalyzerServiceSLONetworkRTTP99Ns: v.GetUint64("analyzer_service_slo_network_rtt_p99_ns"),
 		AnalyzerWindowRetention:           v.GetInt("analyzer_window_retention"),
 		AnalyzerMetricsCardinalityLimit:   v.GetInt("analyzer_metrics_cardinality_limit"),
-		OtelCollectorAddr:                 v.GetString("otel_collector_addr"),
-		OtelCollectorTLSEnabled:           otlpTLSEnabled,
-		OtelCollectorTLSCAFile:            v.GetString("otel_collector_tls_ca_file"),
-		OtelCollectorTLSServerName:        v.GetString("otel_collector_tls_server_name"),
-		OtelCollectorBearerTokenFile:      v.GetString("otel_collector_bearer_token_file"),
-		TLSMode:                           v.GetString("tls_mode"),
-		TLSCertFile:                       v.GetString("tls_cert_file"),
-		TLSKeyFile:                        v.GetString("tls_key_file"),
-		TLSCAFile:                         v.GetString("tls_ca_file"),
-		TLSServerName:                     v.GetString("tls_server_name"),
+
+		AnalyzerLocalizationEnabled:           v.GetBool("analyzer_localization_enabled"),
+		AnalyzerLocalizationTopologyFile:      v.GetString("analyzer_localization_topology_file"),
+		AnalyzerLocalizationWindows:           v.GetInt("analyzer_localization_windows"),
+		AnalyzerLocalizationBaselineLossRatio: v.GetFloat64("analyzer_localization_baseline_loss_ratio"),
+		AnalyzerLocalizationMinConfidence:     v.GetFloat64("analyzer_localization_min_confidence"),
+		AnalyzerLocalizationMaxPathsPerWindow: v.GetInt("analyzer_localization_max_paths_per_window"),
+
+		OtelCollectorAddr:            v.GetString("otel_collector_addr"),
+		OtelCollectorTLSEnabled:      otlpTLSEnabled,
+		OtelCollectorTLSCAFile:       v.GetString("otel_collector_tls_ca_file"),
+		OtelCollectorTLSServerName:   v.GetString("otel_collector_tls_server_name"),
+		OtelCollectorBearerTokenFile: v.GetString("otel_collector_bearer_token_file"),
+		TLSMode:                      v.GetString("tls_mode"),
+		TLSCertFile:                  v.GetString("tls_cert_file"),
+		TLSKeyFile:                   v.GetString("tls_key_file"),
+		TLSCAFile:                    v.GetString("tls_ca_file"),
+		TLSServerName:                v.GetString("tls_server_name"),
 
 		Deprecations: deprecations,
 	}
@@ -419,6 +474,42 @@ func (c *ControllerConfig) validateAnalyzer() error {
 	if c.AnalyzerMetricsCardinalityLimit != 0 && c.AnalyzerMetricsCardinalityLimit < MinMetricsCardinalityLimit {
 		return fmt.Errorf("analyzer_metrics_cardinality_limit must be 0 (OTel SDK default) or >= %d, got: %d",
 			MinMetricsCardinalityLimit, c.AnalyzerMetricsCardinalityLimit)
+	}
+	return c.validateLocalization()
+}
+
+// validateLocalization checks the fault localization settings, which are
+// only enforced when localization (and the analyzer) is enabled. The
+// topology file is only checked to exist here; the controller parses it at
+// startup and exits when it is invalid.
+func (c *ControllerConfig) validateLocalization() error {
+	if !c.AnalyzerLocalizationEnabled {
+		return nil
+	}
+	if c.AnalyzerLocalizationWindows < 1 || c.AnalyzerLocalizationWindows > MaxAnalyzerLocalizationWindows {
+		return fmt.Errorf("analyzer_localization_windows must be in [1, %d], got: %d",
+			MaxAnalyzerLocalizationWindows, c.AnalyzerLocalizationWindows)
+	}
+	// The baseline is the rate every excess is measured against: at 0 any
+	// lost probe would be infinitely unlikely, at 1 none could exceed it.
+	if !(c.AnalyzerLocalizationBaselineLossRatio > 0 && c.AnalyzerLocalizationBaselineLossRatio < 1) {
+		return fmt.Errorf("analyzer_localization_baseline_loss_ratio must be in (0, 1), got: %v",
+			c.AnalyzerLocalizationBaselineLossRatio)
+	}
+	// Below 0.5 a suspect would be reported as localized although another
+	// component is the more probable one; 1 can never be reached.
+	if !(c.AnalyzerLocalizationMinConfidence >= 0.5 && c.AnalyzerLocalizationMinConfidence < 1) {
+		return fmt.Errorf("analyzer_localization_min_confidence must be in [0.5, 1), got: %v",
+			c.AnalyzerLocalizationMinConfidence)
+	}
+	if c.AnalyzerLocalizationMaxPathsPerWindow < 1 {
+		return fmt.Errorf("analyzer_localization_max_paths_per_window must be >= 1, got: %d",
+			c.AnalyzerLocalizationMaxPathsPerWindow)
+	}
+	if path := c.AnalyzerLocalizationTopologyFile; strings.TrimSpace(path) != "" {
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("analyzer_localization_topology_file %q: %w", path, err)
+		}
 	}
 	return nil
 }

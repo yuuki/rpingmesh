@@ -52,6 +52,43 @@ analyzer_window_retention: 20            # recent windows retained in memory
 # ToR pair x kind), all at once in a wide outage. 20000 covers ~70 ToRs;
 # 0 = OTel SDK default (2000), otherwise >= 2000.
 analyzer_metrics_cardinality_limit: 20000
+
+# Fault localization (Phase 2), off by default
+# Names the component that degraded paths share: an RNIC, a host, a ToR, a
+# ToR's uplinks, a spine group or a rail. It pools the path summaries of the
+# most recent closed windows across all agents, so it also finds loss that
+# stays below the per-path SLO above (a lossy ECMP member shows as a fraction
+# of a percent on every path through its stage). Findings go to logs (with
+# the GID and agent of a suspected RNIC or host) and to the
+# rpingmesh.analyzer.localization_* metrics (ToR, spine group and rail names
+# only). It needs analyzer_enabled, ToR IDs on the agents (tor_id,
+# device_tor_ids or LLDP discovery) and agent clocks synchronized to within a
+# window. See docs/design/analyzer-phase2-localization.md.
+analyzer_localization_enabled: false
+# Topology file stating the rail and the spine group of each ToR (see
+# configs/topology.yaml). Empty: faults above the ToRs are reported as not
+# localizable. Read once at startup; an invalid file stops the controller.
+analyzer_localization_topology_file: ""
+# Evidence span: recent closed windows pooled per evaluation (1..64). More
+# windows find weaker faults and report later; a fault is reported once two
+# windows confirm it. 4 windows are 2 minutes at the agents' default
+# analysis_window_sec of 30.
+analyzer_localization_windows: 4
+# Loss ratio of a healthy path, in (0, 1). A component is suspected only for
+# loss beyond it. Set it to about twice the loss the fabric shows when it is
+# healthy; if the whole fabric exceeds it, that is reported once, as
+# component "background".
+analyzer_localization_baseline_loss_ratio: 0.001
+# Posterior probability, in [0.5, 1), a suspect needs to be reported as
+# localized. Below it the finding lists the candidates as ambiguous.
+analyzer_localization_min_confidence: 0.95
+# Cap on the paths kept per window, which bounds the memory: about 55 bytes
+# per path and retained window, and at most analyzer_localization_windows + 6
+# windows are retained (110 MB at these defaults, when every window is at the
+# cap). Paths beyond the cap are left out and counted in
+# rpingmesh.analyzer.localization_dropped_paths_total.
+analyzer_localization_max_paths_per_window: 200000
+
 otel_collector_addr: "localhost:4317"    # OTLP endpoint for analyzer metrics
 # Security of the OTLP export, independent of the tls_* keys of the
 # gRPC server. The defaults keep plaintext gRPC without

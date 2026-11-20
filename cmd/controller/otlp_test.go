@@ -68,7 +68,10 @@ func TestSetupAnalyzer_ExportsOverTLSWithBearerToken(t *testing.T) {
 	log.Logger = zerolog.New(&logs)
 	t.Cleanup(func() { log.Logger = prevLogger })
 
-	provider := setupAnalyzer(cfg, svc)
+	_, provider, err := setupAnalyzer(cfg, svc)
+	if err != nil {
+		t.Fatalf("setupAnalyzer: %v", err)
+	}
 	if provider == nil {
 		t.Fatal("setupAnalyzer returned no meter provider")
 	}

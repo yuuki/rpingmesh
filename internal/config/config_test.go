@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,20 @@ func validControllerConfig() ControllerConfig {
 		ActiveThresholdSec: 300, StaleThresholdSec: 900, InterTorSampleSize: 5,
 		EcmpPathsAssumed: 16, EcmpCoverageProbability: 0.9, EcmpMaxFlowLabels: 64,
 	}
+}
+
+// enableLocalization turns on the analyzer and fault localization in c with
+// the default localization settings, so a Validate case can break one of
+// them.
+func enableLocalization(c *ControllerConfig) {
+	c.AnalyzerEnabled = true
+	c.AnalyzerSLOLossRatio = 0.02
+	c.AnalyzerWindowRetention = 20
+	c.AnalyzerLocalizationEnabled = true
+	c.AnalyzerLocalizationWindows = DefaultAnalyzerLocalizationWindows
+	c.AnalyzerLocalizationBaselineLossRatio = DefaultAnalyzerLocalizationBaselineLossRatio
+	c.AnalyzerLocalizationMinConfidence = DefaultAnalyzerLocalizationMinConfidence
+	c.AnalyzerLocalizationMaxPathsPerWindow = DefaultAnalyzerLocalizationMaxPathsPerWindow
 }
 
 // validAgentConfig is the smallest AgentConfig literal that passes Validate
@@ -100,6 +115,76 @@ func TestLoadControllerConfig_Defaults(t *testing.T) {
 	if cfg.TLSMode != TLSModeDisabled {
 		t.Errorf("TLSMode = %q, want %q (backward-compatible default)", cfg.TLSMode, TLSModeDisabled)
 	}
+	// Fault localization is opt-in: an upgraded controller behaves, and
+	// exports, as before until the operator turns it on.
+	if cfg.AnalyzerLocalizationEnabled {
+		t.Error("AnalyzerLocalizationEnabled = true, want false (opt-in)")
+	}
+	if cfg.AnalyzerLocalizationTopologyFile != "" {
+		t.Errorf("AnalyzerLocalizationTopologyFile = %q, want empty", cfg.AnalyzerLocalizationTopologyFile)
+	}
+	if cfg.AnalyzerLocalizationWindows != DefaultAnalyzerLocalizationWindows {
+		t.Errorf("AnalyzerLocalizationWindows = %d, want %d", cfg.AnalyzerLocalizationWindows, DefaultAnalyzerLocalizationWindows)
+	}
+	if cfg.AnalyzerLocalizationBaselineLossRatio != DefaultAnalyzerLocalizationBaselineLossRatio {
+		t.Errorf("AnalyzerLocalizationBaselineLossRatio = %v, want %v", cfg.AnalyzerLocalizationBaselineLossRatio, DefaultAnalyzerLocalizationBaselineLossRatio)
+	}
+	if cfg.AnalyzerLocalizationMinConfidence != DefaultAnalyzerLocalizationMinConfidence {
+		t.Errorf("AnalyzerLocalizationMinConfidence = %v, want %v", cfg.AnalyzerLocalizationMinConfidence, DefaultAnalyzerLocalizationMinConfidence)
+	}
+	if cfg.AnalyzerLocalizationMaxPathsPerWindow != DefaultAnalyzerLocalizationMaxPathsPerWindow {
+		t.Errorf("AnalyzerLocalizationMaxPathsPerWindow = %d, want %d", cfg.AnalyzerLocalizationMaxPathsPerWindow, DefaultAnalyzerLocalizationMaxPathsPerWindow)
+	}
+}
+
+// TestLoadControllerConfig_Localization verifies that the fault
+// localization keys load from the file, the environment and flags, and that
+// a missing topology file is rejected at load time.
+func TestLoadControllerConfig_Localization(t *testing.T) {
+	topology := writeYAML(t, "topology.yaml", "version: 1\ntors: {leaf-1: {rail: rail0}}\n")
+	path := writeYAML(t, "controller.yaml", `
+analyzer_localization_enabled: true
+analyzer_localization_topology_file: "`+topology+`"
+analyzer_localization_windows: 8
+analyzer_localization_baseline_loss_ratio: 0.0005
+analyzer_localization_min_confidence: 0.99
+analyzer_localization_max_paths_per_window: 50000
+`)
+	cfg, err := LoadControllerConfig(path, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.AnalyzerLocalizationEnabled || cfg.AnalyzerLocalizationTopologyFile != topology ||
+		cfg.AnalyzerLocalizationWindows != 8 || cfg.AnalyzerLocalizationBaselineLossRatio != 0.0005 ||
+		cfg.AnalyzerLocalizationMinConfidence != 0.99 || cfg.AnalyzerLocalizationMaxPathsPerWindow != 50000 {
+		t.Errorf("localization settings from the file = %+v", cfg)
+	}
+
+	// The environment overrides the file, a flag the environment.
+	t.Setenv("RPINGMESH_ANALYZER_LOCALIZATION_WINDOWS", "6")
+	t.Setenv("RPINGMESH_ANALYZER_LOCALIZATION_MIN_CONFIDENCE", "0.9")
+	flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	BindControllerFlags(flags)
+	if err := flags.Parse([]string{"--analyzer-localization-min-confidence", "0.97"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadControllerConfig(path, flags)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AnalyzerLocalizationWindows != 6 {
+		t.Errorf("AnalyzerLocalizationWindows = %d, want 6 (from the environment)", cfg.AnalyzerLocalizationWindows)
+	}
+	if cfg.AnalyzerLocalizationMinConfidence != 0.97 {
+		t.Errorf("AnalyzerLocalizationMinConfidence = %v, want 0.97 (from the flag)", cfg.AnalyzerLocalizationMinConfidence)
+	}
+
+	missing := writeYAML(t, "controller.yaml", `
+analyzer_localization_enabled: true
+analyzer_localization_topology_file: "`+filepath.Join(t.TempDir(), "missing.yaml")+`"
+`)
+	_, err = LoadControllerConfig(missing, nil)
+	checkErr(t, err, "analyzer_localization_topology_file")
 }
 
 func TestLoadControllerConfig_FileOverridesDefault(t *testing.T) {
@@ -304,6 +389,90 @@ func TestControllerConfig_Validate(t *testing.T) {
 		{
 			"analyzer disabled ignores its thresholds",
 			func(c *ControllerConfig) { c.AnalyzerEnabled = false; c.AnalyzerSLOLossRatio = -1 },
+			"",
+		},
+		{"localization with its defaults", func(c *ControllerConfig) { enableLocalization(c) }, ""},
+		{
+			"localization rejects a zero evidence span",
+			func(c *ControllerConfig) { enableLocalization(c); c.AnalyzerLocalizationWindows = 0 },
+			"analyzer_localization_windows must be in [1, 64]",
+		},
+		{
+			"localization rejects an evidence span above the maximum",
+			func(c *ControllerConfig) {
+				enableLocalization(c)
+				c.AnalyzerLocalizationWindows = MaxAnalyzerLocalizationWindows + 1
+			},
+			"analyzer_localization_windows must be in [1, 64]",
+		},
+		{
+			"localization accepts the longest evidence span",
+			func(c *ControllerConfig) {
+				enableLocalization(c)
+				c.AnalyzerLocalizationWindows = MaxAnalyzerLocalizationWindows
+			},
+			"",
+		},
+		{
+			"localization rejects a zero baseline",
+			func(c *ControllerConfig) { enableLocalization(c); c.AnalyzerLocalizationBaselineLossRatio = 0 },
+			"analyzer_localization_baseline_loss_ratio must be in (0, 1)",
+		},
+		{
+			"localization rejects a baseline of one",
+			func(c *ControllerConfig) { enableLocalization(c); c.AnalyzerLocalizationBaselineLossRatio = 1 },
+			"analyzer_localization_baseline_loss_ratio must be in (0, 1)",
+		},
+		{
+			"localization rejects a NaN baseline",
+			func(c *ControllerConfig) { enableLocalization(c); c.AnalyzerLocalizationBaselineLossRatio = math.NaN() },
+			"analyzer_localization_baseline_loss_ratio must be in (0, 1)",
+		},
+		{
+			"localization rejects a minimum confidence below one half",
+			func(c *ControllerConfig) { enableLocalization(c); c.AnalyzerLocalizationMinConfidence = 0.49 },
+			"analyzer_localization_min_confidence must be in [0.5, 1)",
+		},
+		{
+			"localization rejects a minimum confidence of one",
+			func(c *ControllerConfig) { enableLocalization(c); c.AnalyzerLocalizationMinConfidence = 1 },
+			"analyzer_localization_min_confidence must be in [0.5, 1)",
+		},
+		{
+			"localization accepts a minimum confidence of one half",
+			func(c *ControllerConfig) { enableLocalization(c); c.AnalyzerLocalizationMinConfidence = 0.5 },
+			"",
+		},
+		{
+			"localization rejects a zero path cap",
+			func(c *ControllerConfig) { enableLocalization(c); c.AnalyzerLocalizationMaxPathsPerWindow = 0 },
+			"analyzer_localization_max_paths_per_window",
+		},
+		{
+			"localization rejects a topology file that does not exist",
+			func(c *ControllerConfig) {
+				enableLocalization(c)
+				c.AnalyzerLocalizationTopologyFile = "/nonexistent/topology.yaml"
+			},
+			"analyzer_localization_topology_file",
+		},
+		{
+			"localization disabled ignores its settings",
+			func(c *ControllerConfig) {
+				enableLocalization(c)
+				c.AnalyzerLocalizationEnabled = false
+				c.AnalyzerLocalizationWindows = 0
+				c.AnalyzerLocalizationTopologyFile = "/nonexistent/topology.yaml"
+			},
+			"",
+		},
+		{
+			"analyzer disabled ignores the localization settings",
+			func(c *ControllerConfig) {
+				enableLocalization(c)
+				c.AnalyzerEnabled = false
+				c.AnalyzerLocalizationWindows = 0
+			},
 			"",
 		},
 		{"otel collector addr with scheme", func(c *ControllerConfig) { c.OtelCollectorAddr = "grpc://collector:4317" }, "otel_collector_addr"},

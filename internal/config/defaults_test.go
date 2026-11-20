@@ -3,6 +3,7 @@ package config
 import (
 	"testing"
 
+	"github.com/yuuki/rpingmesh/internal/controller/analyzer"
 	"github.com/yuuki/rpingmesh/internal/controller/pinglist"
 	"github.com/yuuki/rpingmesh/internal/controller/registry"
 )
@@ -24,5 +25,20 @@ func TestDefaultsMatchControllerPackages(t *testing.T) {
 	}
 	if DefaultUnspecifiedMeshMaxTargets != pinglist.DefaultUnspecifiedMeshMaxTargets {
 		t.Errorf("DefaultUnspecifiedMeshMaxTargets = %d, pinglist has %d", DefaultUnspecifiedMeshMaxTargets, pinglist.DefaultUnspecifiedMeshMaxTargets)
+	}
+	if DefaultAnalyzerLocalizationWindows != analyzer.DefaultLocalizationWindows {
+		t.Errorf("DefaultAnalyzerLocalizationWindows = %d, analyzer has %d", DefaultAnalyzerLocalizationWindows, analyzer.DefaultLocalizationWindows)
+	}
+	if MaxAnalyzerLocalizationWindows != analyzer.MaxLocalizationWindows {
+		t.Errorf("MaxAnalyzerLocalizationWindows = %d, analyzer has %d", MaxAnalyzerLocalizationWindows, analyzer.MaxLocalizationWindows)
+	}
+	if DefaultAnalyzerLocalizationBaselineLossRatio != analyzer.DefaultLocalizationBaselineLossRatio {
+		t.Errorf("DefaultAnalyzerLocalizationBaselineLossRatio = %v, analyzer has %v", DefaultAnalyzerLocalizationBaselineLossRatio, analyzer.DefaultLocalizationBaselineLossRatio)
+	}
+	if DefaultAnalyzerLocalizationMinConfidence != analyzer.DefaultLocalizationMinConfidence {
+		t.Errorf("DefaultAnalyzerLocalizationMinConfidence = %v, analyzer has %v", DefaultAnalyzerLocalizationMinConfidence, analyzer.DefaultLocalizationMinConfidence)
+	}
+	if DefaultAnalyzerLocalizationMaxPathsPerWindow != analyzer.DefaultLocalizationMaxPathsPerWindow {
+		t.Errorf("DefaultAnalyzerLocalizationMaxPathsPerWindow = %d, analyzer has %d", DefaultAnalyzerLocalizationMaxPathsPerWindow, analyzer.DefaultLocalizationMaxPathsPerWindow)
 	}
 }

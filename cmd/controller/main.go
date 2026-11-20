@@ -118,9 +118,13 @@ func run(cmd *cobra.Command, args []string) error {
 		MaxFlowLabels:       cfg.EcmpMaxFlowLabels,
 	}, cfg.InterTorSampleSize, cfg.UnspecifiedMeshMaxTargets)
 
-	// Set up the Phase 1 analyzer if enabled. Its meter provider (nil when
-	// metrics are unavailable) is flushed on shutdown.
-	if analyzerProvider := setupAnalyzer(cfg, svc); analyzerProvider != nil {
+	// Set up the analyzer if enabled. Its meter provider (nil when metrics
+	// are unavailable) is flushed on shutdown.
+	az, analyzerProvider, err := setupAnalyzer(cfg, svc)
+	if err != nil {
+		return err
+	}
+	if analyzerProvider != nil {
 		defer shutdownMeterProvider(analyzerProvider)
 	}
 
@@ -157,6 +161,10 @@ func run(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go runStaleEntryCleanup(ctx, reg, 5*time.Minute)
+	if az != nil {
+		// Returns at once unless fault localization is enabled.
+		go az.RunLocalization(ctx)
+	}
 
 	if err := waitForShutdown(grpcServer, errCh); err != nil {
 		return err
@@ -253,15 +261,24 @@ func waitForShutdown(grpcServer *grpc.Server, errCh <-chan error) error {
 	return nil
 }
 
-// setupAnalyzer builds the Phase 1 analyzer (when enabled) and wires it into
-// svc. It attempts to create an OTLP meter provider tagged
+// setupAnalyzer builds the analyzer (when enabled) and wires it into svc. It
+// attempts to create an OTLP meter provider tagged
 // service.name=rpingmesh-analyzer for the analyzer's metrics; if that fails,
-// the analyzer still runs with log-only findings. It returns the meter provider
-// (or nil) so the caller can flush it on shutdown.
-func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerService) *sdkmetric.MeterProvider {
+// the analyzer still runs with log-only findings. It returns the analyzer
+// (nil when disabled) and the meter provider (or nil) so the caller can run
+// fault localization and flush the provider on shutdown.
+//
+// The only error is an invalid topology file: the operator asked for
+// localization on those facts, and running on none or on half of them would
+// name the wrong tier.
+func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerService) (*analyzer.Analyzer, *sdkmetric.MeterProvider, error) {
 	if !cfg.AnalyzerEnabled {
 		log.Info().Msg("Analyzer disabled")
-		return nil
+		return nil, nil, nil
+	}
+	localization, err := localizationConfig(cfg)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	var provider *sdkmetric.MeterProvider
@@ -296,6 +313,7 @@ func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerServi
 			NetworkRTTP99Ns: cfg.AnalyzerServiceSLONetworkRTTP99Ns,
 		},
 		WindowRetention: cfg.AnalyzerWindowRetention,
+		Localization:    localization,
 	}, metrics)
 	svc.SetAnalyzer(az)
 
@@ -331,5 +349,45 @@ func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerServi
 		Bool("otelCollectorBearerAuth", cfg.OtelCollectorBearerTokenFile != "").
 		Msg("Analyzer enabled")
 
-	return provider
+	if localization != nil {
+		ev := log.Info().
+			Int("windows", localization.Windows).
+			Float64("baselineLossRatio", localization.BaselineLossRatio).
+			Float64("minConfidence", localization.MinConfidence).
+			Int("maxPathsPerWindow", localization.MaxPathsPerWindow).
+			Str("topologyFile", cfg.AnalyzerLocalizationTopologyFile).
+			Int("topologyTors", localization.Topology.Tors()).
+			Int("topologySpineGroups", localization.Topology.SpineGroups()).
+			Int("topologyRails", localization.Topology.Rails())
+		if localization.Topology == nil {
+			ev.Msg("Fault localization enabled without a topology file: faults above the ToRs are reported as not localizable")
+		} else {
+			ev.Msg("Fault localization enabled")
+		}
+	}
+
+	return az, provider, nil
+}
+
+// localizationConfig returns the fault localization settings, or nil when
+// localization is disabled. It reads the topology file when one is
+// configured.
+func localizationConfig(cfg *config.ControllerConfig) (*analyzer.LocalizationConfig, error) {
+	if !cfg.AnalyzerLocalizationEnabled {
+		return nil, nil
+	}
+	loc := &analyzer.LocalizationConfig{
+		Windows:           cfg.AnalyzerLocalizationWindows,
+		BaselineLossRatio: cfg.AnalyzerLocalizationBaselineLossRatio,
+		MinConfidence:     cfg.AnalyzerLocalizationMinConfidence,
+		MaxPathsPerWindow: cfg.AnalyzerLocalizationMaxPathsPerWindow,
+	}
+	if path := cfg.AnalyzerLocalizationTopologyFile; path != "" {
+		topo, err := analyzer.LoadTopologyFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("analyzer_localization_topology_file: %w", err)
+		}
+		loc.Topology = topo
+	}
+	return loc, nil
 }

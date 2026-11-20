@@ -220,3 +220,36 @@ func TestLoadTopologyFile(t *testing.T) {
 		t.Errorf("oversized file: got error %v, want one about the size", err)
 	}
 }
+
+// TestParseTopology_ShippedFiles verifies the topology files in the
+// repository: the commented example in configs/ and the file
+// scripts/topology/build_device_tor_map.py writes (its Python test compares
+// the script's output with the same file).
+func TestParseTopology_ShippedFiles(t *testing.T) {
+	root := filepath.Join("..", "..", "..")
+
+	topo, err := LoadTopologyFile(filepath.Join(root, "configs", "topology.yaml"))
+	if err != nil {
+		t.Fatalf("configs/topology.yaml: %v", err)
+	}
+	if topo.Tors() != 8 || topo.SpineGroups() != 2 || topo.Rails() != 2 {
+		t.Errorf("configs/topology.yaml: %d ToRs, %d spine groups, %d rails; want 8, 2, 2",
+			topo.Tors(), topo.SpineGroups(), topo.Rails())
+	}
+	if facts, _ := topo.Lookup("leaf-b2-r0"); facts != (TorFacts{Rail: "rail0", SpineGroup: "pod-b-r0"}) {
+		t.Errorf("configs/topology.yaml: leaf-b2-r0 = %+v", facts)
+	}
+
+	topo, err = LoadTopologyFile(filepath.Join(root, "scripts", "topology", "testdata", "topology.yaml"))
+	if err != nil {
+		t.Fatalf("scripts/topology/testdata/topology.yaml: %v", err)
+	}
+	for tor, rail := range map[string]string{"su1-mlx5_0": "mlx5_0", "su1-mlx5_1": "mlx5_1"} {
+		if facts, known := topo.Lookup(tor); !known || facts != (TorFacts{Rail: rail}) {
+			t.Errorf("generated topology: %s = %+v, %v; want rail %s", tor, facts, known, rail)
+		}
+	}
+	if topo.Tors() != 2 {
+		t.Errorf("generated topology lists %d ToRs, want 2", topo.Tors())
+	}
+}

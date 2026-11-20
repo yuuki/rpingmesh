@@ -1,0 +1,7 @@
+# Topology facts for the controller (analyzer_localization_topology_file).
+# The ToR IDs are those of device_tor_ids. Where a rail has more than one
+# spine group, add spine_group to each ToR: the facts do not show it.
+version: 1
+tors:
+  "su1-mlx5_0": {rail: "mlx5_0"}
+  "su1-mlx5_1": {rail: "mlx5_1"}

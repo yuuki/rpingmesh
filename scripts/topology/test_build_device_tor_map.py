@@ -152,10 +152,37 @@ class MainTest(unittest.TestCase):
                               "  su1-mlx5_1: 2 RNICs\n"
                               "WARNING: host-c: not in --host-groups\n")
 
+    def test_group_rail_topology(self):
+        """--format topology writes the controller's topology file. The
+        expected text is testdata/topology.yaml, which the controller's Go
+        tests parse: the two sides agree on one file."""
+        with open(os.path.join(HERE, "testdata", "topology.yaml")) as f:
+            want = f.read()
+        out, err = self.run_main("--strategy", "group-rail", "--host-groups", self.groups,
+                                 "--rail-key", "device", "--format", "topology")
+        self.assertEqual(out, want)
+        self.assertEqual(err, "2 ToRs, 4 RNICs on 2 hosts\n"
+                              "  su1-mlx5_0: 2 RNICs\n"
+                              "  su1-mlx5_1: 2 RNICs\n"
+                              "WARNING: host-c: not in --host-groups\n")
+
+    def test_group_rail_topology_subnet_rails(self):
+        out, _ = self.run_main("--strategy", "group-rail", "--host-groups", self.groups,
+                               "--rail-prefixlen", "16", "--format", "topology")
+        self.assertEqual(out.splitlines()[3:], [
+            "version: 1",
+            "tors:",
+            '  "su1-10.0.0.0/16": {rail: "10.0.0.0/16"}',
+            '  "su1-10.1.0.0/16": {rail: "10.1.0.0/16"}',
+        ])
+
     def test_missing_strategy_arguments(self):
         for args, message in ((["--strategy", "group-rail"], "--host-groups is required for group-rail"),
                               (["--strategy", "subnet"], "--prefixlen is required for subnet"),
-                              (["--strategy", "subnet", "--prefixlen", "0"], "--prefixlen is required for subnet")):
+                              (["--strategy", "subnet", "--prefixlen", "0"], "--prefixlen is required for subnet"),
+                              (["--strategy", "lldp", "--format", "topology"],
+                               "--format topology needs --strategy group-rail: "
+                               "no other strategy knows the rail of a ToR")):
             out, err = self.run_main(*args, status=2)
             self.assertEqual(out, "")
             self.assertTrue(err.endswith(f"error: {message}\n"), err)

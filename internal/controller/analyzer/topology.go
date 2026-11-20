@@ -60,7 +60,7 @@ type Topology struct {
 
 // LoadTopologyFile reads and parses the topology file at path.
 func LoadTopologyFile(path string) (*Topology, error) {
-	f, err := os.Open(path) //nolint:gosec // G304: the operator names this file in the controller configuration
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open topology file: %w", err)
 	}

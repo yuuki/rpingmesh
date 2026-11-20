@@ -26,6 +26,16 @@ listing every ToR's members and consistency warnings:
 
 Use `--format json` to get {hostname: {device: tor}} for other tooling
 (e.g. rtt_tor_check.py).
+
+With the group-rail strategy, `--format topology` writes instead the
+topology file of the controller's fault localization
+(analyzer_localization_topology_file): every ToR ID with the rail it
+belongs to. The facts do not say which ToRs share spines, so a fabric
+whose rails have more than one spine group needs `spine_group` added to
+each ToR by hand:
+
+    python3 build_device_tor_map.py --strategy group-rail --format topology \\
+        --host-groups groups.csv --rail-key device facts/*.json > topology.yaml
 """
 
 import argparse
@@ -94,43 +104,48 @@ def subnet_tor(host, dev, port, prefixlen, warnings):
     return str(ipaddress.ip_network(f"{ip.ip}/{prefixlen}", strict=False))
 
 
-def group_rail_tor(host, dev, port, args, groups, warnings):
+def group_rail_tor(host, dev, port, args, groups, warnings, rails):
     group = groups.get(short(host))
     if group is None:
         warnings.append(f"{host}: not in --host-groups")
         return None
-    if args.rail_key == "device":
-        return f"{group}-{dev}"
-    rail = subnet_tor(host, dev, port, args.rail_prefixlen, warnings)
-    if rail is None:
-        return None
-    return f"{group}-{rail}"
+    rail = dev
+    if args.rail_key != "device":
+        rail = subnet_tor(host, dev, port, args.rail_prefixlen, warnings)
+        if rail is None:
+            return None
+    tor = f"{group}-{rail}"
+    rails[tor] = rail
+    return tor
 
 
-def rnic_tor(host, dev, port, args, groups, warnings):
+def rnic_tor(host, dev, port, args, groups, warnings, rails):
     """The ToR ID of one RNIC under args.strategy, or a false value (with a
-    warning) when the strategy cannot place it."""
+    warning) when the strategy cannot place it. The group-rail strategy also
+    records the ToR's rail in rails."""
     if args.strategy == "lldp":
         return lldp_tor(host, dev, port, warnings)
     if args.strategy == "subnet":
         return subnet_tor(host, dev, port, args.prefixlen, warnings)
-    return group_rail_tor(host, dev, port, args, groups, warnings)
+    return group_rail_tor(host, dev, port, args, groups, warnings, rails)
 
 
 def map_rnics(args, allowed, groups, warnings):
-    """host -> {device: tor} in input order, and tor -> ["host/device"]."""
+    """host -> {device: tor} in input order, tor -> ["host/device"], and
+    tor -> rail for the strategies that know it."""
     mapping = collections.OrderedDict()   # host -> {device: tor}
     members = collections.defaultdict(list)  # tor -> ["host/device"]
+    rails = {}  # tor -> rail
     for path in args.facts:
         with open(path) as f:
             facts = json.load(f)
         for host, dev, port in rnics(facts, allowed):
-            tor = rnic_tor(host, dev, port, args, groups, warnings)
+            tor = rnic_tor(host, dev, port, args, groups, warnings, rails)
             if not tor:
                 continue
             mapping.setdefault(host, collections.OrderedDict())[dev] = tor
             members[tor].append(f"{short(host)}/{dev}")
-    return mapping, members
+    return mapping, members, rails
 
 
 def consistency_warnings(members):
@@ -158,6 +173,19 @@ def write_mapping(mapping, fmt):
             sys.stdout.write(f'  {dev}: "{tor}"\n')
 
 
+def write_topology(rails):
+    """The controller's topology file (version 1): each ToR with its rail.
+    Names are written as JSON strings, which are YAML strings too, so a
+    subnet or a name that YAML would read as a number stays text."""
+    sys.stdout.write(
+        "# Topology facts for the controller (analyzer_localization_topology_file).\n"
+        "# The ToR IDs are those of device_tor_ids. Where a rail has more than one\n"
+        "# spine group, add spine_group to each ToR: the facts do not show it.\n"
+        "version: 1\ntors:\n")
+    for tor in sorted(rails):
+        sys.stdout.write(f"  {json.dumps(tor)}: {{rail: {json.dumps(rails[tor])}}}\n")
+
+
 def write_summary(mapping, members, warnings):
     sys.stderr.write(f"{len(members)} ToRs, {sum(len(m) for m in members.values())} RNICs on {len(mapping)} hosts\n")
     for tor, ms in sorted(members.items()):
@@ -178,7 +206,9 @@ def main():
     ap.add_argument("--rail-prefixlen", type=int, default=24,
                     help="group-rail with --rail-key subnet: per-rail prefix length")
     ap.add_argument("--devices", help="comma-separated device names to include")
-    ap.add_argument("--format", choices=["yaml", "json"], default="yaml")
+    ap.add_argument("--format", choices=["yaml", "json", "topology"], default="yaml",
+                    help="yaml: device_tor_ids per host; json: the same for other tooling; "
+                         "topology: the controller's topology file (group-rail only)")
     args = ap.parse_args()
 
     allowed = set(args.devices.split(",")) if args.devices else None
@@ -189,11 +219,16 @@ def main():
         groups = load_host_groups(args.host_groups)
     if args.strategy == "subnet" and not args.prefixlen:
         ap.error("--prefixlen is required for subnet")
+    if args.format == "topology" and args.strategy != "group-rail":
+        ap.error("--format topology needs --strategy group-rail: no other strategy knows the rail of a ToR")
 
     warnings = []
-    mapping, members = map_rnics(args, allowed, groups, warnings)
+    mapping, members, rails = map_rnics(args, allowed, groups, warnings)
     warnings.extend(consistency_warnings(members))
-    write_mapping(mapping, args.format)
+    if args.format == "topology":
+        write_topology(rails)
+    else:
+        write_mapping(mapping, args.format)
     write_summary(mapping, members, warnings)
 
 

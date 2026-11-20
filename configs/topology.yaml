@@ -1,0 +1,42 @@
+# R-Pingmesh fault localization: topology facts (example)
+#
+# The controller reads this file when analyzer_localization_enabled is true
+# and analyzer_localization_topology_file names it. It states what probe
+# summaries do not carry and agents cannot discover: which ToRs share a
+# spine group and a rail. Without it, the controller still localizes faults
+# to an RNIC, a host, a ToR or a ToR's uplinks, and reports faults above the
+# ToRs as not localizable.
+#
+# Keys are the ToR IDs exactly as the agents report them (tor_id,
+# device_tor_ids or LLDP discovery in agent.yaml). Both facts are optional
+# per ToR:
+#
+#   rail          The rail (plane) of the ToR: the set of ToRs that reach
+#                 each other through one upper tier.
+#   spine_group   The set of spines the ToR's uplinks connect to. Every ToR
+#                 of a spine group connects to all of its spines, so two
+#                 ToRs of one group are joined by exactly one of them. A
+#                 spine group belongs to one rail.
+#
+# State every tier that exists. If a rail has several spine groups (pods)
+# and the file names only the rail, a fault in one pod's spines is reported
+# on the rail as a whole.
+#
+# The file is read once at startup; the controller exits on a file it
+# cannot interpret in full (an unknown key, a ToR listed twice, a spine
+# group whose ToRs name different rails). scripts/topology/
+# build_device_tor_map.py --format topology writes the ToRs and rails of a
+# rail-optimized fabric from collected RNIC facts.
+version: 1
+tors:
+  # Rail 0: two spine groups joined by the rail's core switches.
+  leaf-a1-r0: {rail: rail0, spine_group: pod-a-r0}
+  leaf-a2-r0: {rail: rail0, spine_group: pod-a-r0}
+  leaf-b1-r0: {rail: rail0, spine_group: pod-b-r0}
+  leaf-b2-r0: {rail: rail0, spine_group: pod-b-r0}
+
+  # Rail 1: one tier of spines above all of its ToRs, so no spine group.
+  leaf-a1-r1: {rail: rail1}
+  leaf-a2-r1: {rail: rail1}
+  leaf-b1-r1: {rail: rail1}
+  leaf-b2-r1: {rail: rail1}

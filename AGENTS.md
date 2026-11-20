@@ -17,6 +17,7 @@
 - Registry schema, rqlite and PostgreSQL (`internal/controller/registry/`): columns are added by migration only (older controllers share the database).
 - Metric names and attributes: `internal/telemetry/otel_metrics.go`, `internal/controller/analyzer/metrics.go`, queried by `dashboards/`.
 - Configuration keys and defaults (`internal/config/`, `configs/`); `packaging/` (binary names, systemd units and capabilities, nfpm layout).
+- Topology file of fault localization, version 1 (`internal/controller/analyzer/topology.go`, `configs/topology.yaml`, written by `scripts/topology/build_device_tor_map.py`).
 
 ## Before opening a pull request
 - `make check`; also `internal/agent/servicetrace/bpf/` → `make generate-bpf check-bpf`; `zig/` → `make build-zig test-zig build-agent`.

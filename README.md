@@ -29,8 +29,10 @@ This implementation keeps the paper's core measurement design:
 
 The RDMA data path is a Zig static library; the agent, controller, and
 telemetry are written in Go. A per-path SLO analyzer (the paper's "Phase 1"
-analysis) runs in the controller. Topology-aware fault localization is not
-implemented (see [Limitations](#limitations)).
+analysis) runs in the controller. An opt-in fault localizer names the
+component that degraded paths share, from an RNIC up to a rail (see
+[Fault localization](#fault-localization) and its
+[Limitations](#limitations)).
 
 ## Contents
 
@@ -52,7 +54,7 @@ implemented (see [Limitations](#limitations)).
                         +----------------------+          +------------+
                         |      Controller      |<-------->| rqlite or  |
                         | registry, pinglists, |          | PostgreSQL |
-                        | Phase 1 analyzer     |          +------------+
+                        | analyzer             |          +------------+
                         +----------+-----------+
                                    ^  gRPC: RegisterAgent, GetPinglist,
                                    |        ReportProbeAnalysis,
@@ -77,7 +79,7 @@ implemented (see [Limitations](#limitations)).
 ```
 
 **Controller** (`cmd/controller`, pure Go, `CGO_ENABLED=0`). Stores the RNIC
-registry in rqlite or PostgreSQL, generates pinglists, and runs the Phase 1
+registry in rqlite or PostgreSQL, generates pinglists, and runs the
 analyzer. It needs no RDMA hardware.
 
 **Agent** (`cmd/agent`, Go with Cgo, `CGO_ENABLED=1`). Runs on every RDMA host.
@@ -109,7 +111,10 @@ in-process analyzer flags windows whose loss ratio or p99 network RTT exceeds
 the configured SLO thresholds, and reports them in logs and OTLP metrics. The
 cluster network (the controller's pinglists) and the service network (the
 paths of traced application flows) are summarized and evaluated apart, each
-against its own thresholds.
+against its own thresholds. With `analyzer_localization_enabled`, the
+analyzer also pools the cluster summaries of all agents and names the
+component that the degraded paths share (see
+[Fault localization](#fault-localization)).
 
 ### Repository layout
 
@@ -126,7 +131,7 @@ against its own thresholds.
 | `internal/lldp/` | LLDP-based ToR discovery |
 | `zig/` | RDMA data-path library and its C ABI header |
 | `proto/` | gRPC service definition (generated code is not committed) |
-| `configs/` | Default agent and controller configuration |
+| `configs/` | Default agent and controller configuration, and an example topology file for fault localization |
 | `packaging/` | systemd units and nfpm package definitions |
 | `dashboards/`, `deploy/observability/` | Grafana dashboards, alert rules, local metrics stack |
 | `scripts/topology/` | Read-only tools for multi-rail ToR maps and QoS (`traffic_class`) facts |
@@ -600,6 +605,12 @@ devices; `summarize_qos_facts.py` reports such ports as override outliers.
 | `analyzer_service_slo_network_rtt_p99_ns` | `500000` | p99 network RTT above which a service-network window violates its SLO; `0` disables the check |
 | `analyzer_window_retention` | `20` | Number of recent windows kept in memory |
 | `analyzer_metrics_cardinality_limit` | `20000` | Maximum attribute sets per analyzer metric instrument; extra sets fold into one `otel.metric.overflow="true"` series. `rpingmesh.analyzer.slo_violations_total` can need up to 4 × T × (T−1) series for T ToRs, all at once in a wide outage; the default covers about 70 ToRs. `0` keeps the OTel SDK default (2000); otherwise at least 2000 |
+| `analyzer_localization_enabled` | `false` | Run [fault localization](#fault-localization). Needs `analyzer_enabled` |
+| `analyzer_localization_topology_file` | `""` | File that states the rail and spine group of each ToR ([`configs/topology.yaml`](configs/topology.yaml)). Empty: faults above the ToRs are reported as not localizable. Read once at startup; the controller exits on an invalid file |
+| `analyzer_localization_windows` | `4` | Evidence span: recent closed windows pooled per evaluation, 1 to 64. A fault is reported once two windows confirm it |
+| `analyzer_localization_baseline_loss_ratio` | `0.001` | Loss ratio of a healthy path, in (0, 1). A component is suspected only for loss beyond it |
+| `analyzer_localization_min_confidence` | `0.95` | Posterior probability, in [0.5, 1), that a suspect needs to be reported as localized; below it the finding lists the candidates |
+| `analyzer_localization_max_paths_per_window` | `200000` | Cap on the paths kept per window. It bounds the memory: about 55 bytes per path and retained window, with at most `analyzer_localization_windows` + 6 windows retained |
 | `otel_collector_addr` | `localhost:4317` | OTLP/gRPC collector for analyzer metrics |
 | `otel_collector_tls_enabled`, `otel_collector_tls_ca_file`, `otel_collector_tls_server_name`, `otel_collector_bearer_token_file` | `false`, `""`, `""`, `""` | As for the agent; see [OTLP export security](#otlp-export-security) |
 | `log_level`, `log_format` | `info`, `console` | As for the agent |
@@ -1136,6 +1147,22 @@ Analyzer metrics, exported by the controller with
 | `rpingmesh.analyzer.path_summaries_total` | Counter | — | Ingested per-path window summaries |
 | `rpingmesh.analyzer.slo_violations_total` | Counter | `network` (`cluster`, `service`), `source_tor`, `target_tor`, `kind` (`loss`, `rtt`) | Detected SLO violations; `network` separates the controller's pinglist paths from the paths of traced service flows |
 
+With `analyzer_localization_enabled`, the analyzer also exports:
+
+| Metric | Type | Attributes | Description |
+|--------|------|-----------|-------------|
+| `rpingmesh.analyzer.localization_suspects` | Gauge | `kind` (`loss`, `rtt`), `state` (`localized`, `ambiguous`, `not_localizable`), `component`, and the `tor`, `spine_group` and `rail` that apply | Components currently suspected. A series exists only while its finding lasts |
+| `rpingmesh.analyzer.localization_suspect_confidence` | Gauge | the same | Highest confidence (0 to 1) among the suspects of the attribute set |
+| `rpingmesh.analyzer.localization_runs_total` | Counter | — | Evaluations, one per change of the evidence |
+| `rpingmesh.analyzer.localization_dropped_paths_total` | Counter | — | Path summaries left out because a window reached `analyzer_localization_max_paths_per_window` |
+
+`component` is `rnic`, `host`, `tor`, `tor_uplink`, `spine_group`, `rail`,
+`fabric` or `background`. A suspected RNIC is counted under its ToR, and a
+suspected host carries no location; their GID and agent ID are in the
+finding's log line only. `spine_group` and `rail` take their values from the
+topology file. Without localization enabled, none of these instruments
+exists.
+
 By default no metric carries a GID or any other identity of the destination
 RNIC, because a fabric with thousands of RNICs would produce an unbounded number
 of series. Per-probe detail, including GIDs, flow labels, and all six
@@ -1355,6 +1382,65 @@ only selects labels and never enters a measurement. When `flow_label_count` is
 
 The flow label of each probe appears in debug logs but never as a metric
 attribute.
+
+### Fault localization
+
+The Phase 1 analyzer judges each path against the SLO. That says which ToR
+pairs are bad, not what is broken, and it misses a gray failure altogether:
+one of 16 uplinks that drops 2% of its packets costs each path through it
+about 0.25%, far below a 2% loss SLO. With `analyzer_localization_enabled`
+the controller pools the probes and losses of all cluster paths over the
+last `analyzer_localization_windows` closed windows and asks which component
+explains the excess:
+
+| Component | Paths it is judged on |
+|-----------|-----------------------|
+| `rnic` | every path that starts or ends at the RNIC |
+| `host` | every path of any of the host's RNICs |
+| `tor` | every path that starts or ends under the ToR |
+| `tor_uplink` | every path between the ToR and another ToR |
+| `spine_group` | every path between two ToRs that touches the spine group |
+| `rail` | every path that crosses the tier above the rail's spine groups (or ToRs) |
+
+Every probe that crossed a component and was not lost counts against it, so
+a ToR whose paths to its own RNICs are clean is not blamed for its uplinks,
+and an RNIC is not blamed for a fault of the ToR it shares with clean RNICs.
+The same is done for the windows whose p99 network RTT exceeded
+`analyzer_slo_network_rtt_p99_ns`.
+
+Spine groups and rails come from a topology file
+(`analyzer_localization_topology_file`, see
+[`configs/topology.yaml`](configs/topology.yaml)), because no agent can see
+past its ToR. `scripts/topology/build_device_tor_map.py --format topology`
+writes the ToRs and rails of a rail-optimized fabric. Without the file,
+everything up to a ToR's uplinks is still localized.
+
+A finding has one of three states:
+
+- `localized`: one component, with a confidence of at least
+  `analyzer_localization_min_confidence`. The confidence is the probability
+  that this component, and not another one or none, causes the excess, under
+  the model.
+- `ambiguous`: several components explain the evidence, for example a ToR
+  and its uplinks when no agent under the ToR reports. The finding lists the
+  candidates with their confidences.
+- `not_localizable`: the degradation spans more of a tier than faults in
+  its members would plausibly explain, or the facts to divide it are
+  missing. The finding names the scope (a spine group, a rail, the `fabric`,
+  or the `background` when every path exceeds the baseline) and lists the
+  members.
+
+A fault is reported once two windows confirm it; one burst, or one path that
+fails on its own, is not. A finding is logged by the controller when it
+appears (`warn`, "Fault localization finding") and when it clears, and it is
+exported on `rpingmesh.analyzer.localization_suspects` while it lasts.
+
+The localizer never says which member of an ECMP stage is faulty: a flow
+label selects one path among several, and the controller does not know
+which. A lossy uplink is a finding on the ToR's uplinks with the loss it
+adds per probe. [The design](docs/design/analyzer-phase2-localization.md)
+gives the model, the definition of the confidence, the bounds and what the
+simulation covers.
 
 ### Per-pinglist-type probe rates
 
@@ -1620,10 +1706,16 @@ acceptable; GIDs and other destination-RNIC identities are not.
 
 ## Limitations
 
-- **No fault localization.** The analyzer detects per-path SLO violations but
-  does not locate the faulty switch or link (the paper's Phase 2). It keeps
-  summaries only in a bounded in-memory window. See
-  [the Phase 2 design](docs/design/analyzer-phase2-localization.md).
+- **Fault localization is opt-in and validated in simulation only.** It
+  has not run on a real fabric, and its defaults are reasoned, not measured.
+  It names a tier, never the faulty member of an ECMP stage. It needs ToR
+  IDs on the agents, agent clocks within a window of each other, and a
+  topology file for anything above a ToR's uplinks; a tier the file leaves
+  out is reported on the tier above it. It keeps its evidence in the memory
+  of one controller, so controllers behind a load balancer each see a part.
+  It does not use flow labels, traffic classes or service-tracing paths.
+  There is no dashboard or alert rule for its metrics yet. See
+  [the design](docs/design/analyzer-phase2-localization.md#limitations).
 - **Service tracing covers connected QPs on Linux.** The default tracer
   sees RC, UC and XRC queue pairs created through libibverbs and can recover
   existing user connections from supported mlx5 snapshots. The optional

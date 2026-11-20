@@ -30,8 +30,11 @@ stack used to validate and demo them. The implementation lives in:
 
 ## Non-Goals
 
-- Phase 2 localization or path-tracing views. They depend on data the
-  analyzer does not emit yet (`analyzer-phase2-localization.md`).
+- Phase 2 localization or path-tracing views. The analyzer exports its
+  suspects when fault localization is enabled
+  (`rpingmesh.analyzer.localization_*`, see
+  `analyzer-phase2-localization.md`), but no board or alert rule uses them
+  yet.
 - A dashboard-generation toolchain (Grafonnet, Foundation SDK). Committed JSON
   is the source of truth.
 
@@ -517,9 +520,11 @@ The stack is validated end to end without RDMA hardware:
   compatibility is pinned and plugin provisioning is acceptable. It would
   allow reliable per-cell drilldown and remove the companion-table
   workaround.
-- **Phase 2 localization view:** a third dashboard over the analyzer's
-  path/segment attribution once those metrics exist
-  (`analyzer-phase2-localization.md`).
+- **Phase 2 localization view:** a third dashboard, and alert rules, over
+  the analyzer's suspects (`rpingmesh.analyzer.localization_suspects` and
+  `localization_suspect_confidence`, by `component`, `tor`, `spine_group` and
+  `rail`; see `analyzer-phase2-localization.md`). It needs seed data for
+  those metrics so that `make obs-verify` covers it.
 - **Dashboards as code:** migrate to Grafonnet or the Foundation SDK if the
   board count grows or duplication between the two boards becomes costly.
 - **Direct OTLP ingest:** drop the collector once VictoriaMetrics-side naming

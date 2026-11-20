@@ -13,7 +13,8 @@ service ControllerService {
     rpc GetPinglist(PinglistRequest) returns (PinglistResponse);
     // ReportProbeAnalysis reports per-path, window-aggregated probe summaries
     // from an agent so the controller-side analyzer can detect SLO violations
-    // (and, in a future phase, localize switch/link faults across agents).
+    // and, when fault localization is enabled, name the component that the
+    // degraded paths of all agents share.
     rpc ReportProbeAnalysis(ProbeAnalysisReport) returns (ProbeAnalysisAck);
     // GetTargetRnicInfo resolves the remote RNICs of the service flows an
     // agent traced (paper section 4.2.2) into probe targets: the agent knows

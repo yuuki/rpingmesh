@@ -22,10 +22,14 @@ contributors can take it into account.
 This project is a clean-room reimplementation of selected techniques described
 in the published R-Pingmesh research. It implements RNIC-mesh probing, the
 paper's Phase 1 analysis (per-path SLO evaluation), and eBPF-based service
-tracing (see [Service tracing](README.md#service-tracing)); the paper's
-topology-aware fault localization is not implemented (see
-[Limitations](README.md#limitations)). This description of the implementation
-is not a patent clearance assessment.
+tracing (see [Service tracing](README.md#service-tracing)). The paper's
+topology-aware fault localization is not implemented. The optional fault
+localization of this project (see
+[Fault localization](README.md#fault-localization)) is a different method: a
+statistical inference over the reported per-path loss and RTT counts and an
+operator-supplied list of which ToRs share a spine group and a rail,
+without path tracing; its design document describes it in full. This
+description of the implementation is not a patent clearance assessment.
 
 The paper:
 

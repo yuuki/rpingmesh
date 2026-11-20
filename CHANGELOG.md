@@ -4,6 +4,44 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Fault localization in the controller's analyzer (the paper's Phase 2,
+  #145), off by default (`analyzer_localization_enabled`). It pools the
+  probes and losses of all cluster paths over the last closed windows
+  (`analyzer_localization_windows`, default 4) and names the component that
+  explains the excess over a baseline
+  (`analyzer_localization_baseline_loss_ratio`, default 0.001): an RNIC, a
+  host, a ToR, a ToR's uplinks, a spine group or a rail. It also finds loss
+  that stays below the per-path SLO, such as one lossy uplink among several,
+  and it does the same for windows over the RTT threshold. A finding is
+  `localized` (one component whose confidence, a posterior probability, is at
+  least `analyzer_localization_min_confidence`, default 0.95), `ambiguous`
+  (the candidates, when several components explain the evidence) or
+  `not_localizable` (the scope and its degraded members). A fault is reported
+  once two windows confirm it. The localizer never names the faulty member
+  of an ECMP stage. It has been validated against a simulated fabric only.
+  See README "Fault localization" and
+  `docs/design/analyzer-phase2-localization.md`.
+- An optional topology file for fault localization
+  (`analyzer_localization_topology_file`, example in `configs/topology.yaml`)
+  that states the rail and the spine group of each ToR. Without it, faults
+  above the ToRs are reported as not localizable. The controller reads it
+  once at startup and exits on a file it cannot interpret in full.
+  `scripts/topology/build_device_tor_map.py --format topology` writes the
+  ToRs and rails of a rail-optimized fabric.
+- Analyzer metrics, exported only with fault localization enabled:
+  `rpingmesh.analyzer.localization_suspects` and
+  `rpingmesh.analyzer.localization_suspect_confidence` (gauges with the
+  attributes `kind`, `state`, `component`, `tor`, `spine_group` and `rail`;
+  a series exists while its finding lasts),
+  `rpingmesh.analyzer.localization_runs_total` and
+  `rpingmesh.analyzer.localization_dropped_paths_total`. No attribute
+  carries a GID or a host: those are in the controller's finding logs. The
+  bundled dashboards and alert rules do not use these metrics yet.
+- `analyzer_localization_max_paths_per_window` (default 200000) bounds the
+  memory of fault localization: about 55 bytes per path and retained window.
+
 ### Removed
 
 - The archived previous implementation under `legacy/` (a separate Go
@@ -14,8 +52,8 @@ All notable changes to this project are documented in this file.
 ### Fixed
 
 - `PATENTS.md` no longer says that eBPF-based service tracing is not
-  implemented; it shipped in 0.9.0. Only topology-aware fault localization
-  remains unimplemented.
+  implemented; it shipped in 0.9.0. It now also says that the optional fault
+  localization is a method of this project, not the paper's.
 
 ## [0.11.0] - 2026-11-11
 

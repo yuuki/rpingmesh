@@ -189,7 +189,8 @@ type evidenceStats struct {
 	// either end. They cannot be attributed to a component.
 	unattributable uint64
 	// outOfRange: summaries of a window too old to enter an evidence span,
-	// too far in the future, or without a duration.
+	// too far in the future, without a duration, or that does not start on
+	// a multiple of its length.
 	outOfRange uint64
 	// dropped: paths not kept because a window reached maxPathsPerWindow.
 	dropped uint64
@@ -290,10 +291,18 @@ func (s *evidenceStore) observe(agentID string, sum *controller_agent.PathSummar
 }
 
 // inRange reports whether a window can still enter an evidence span: it has
-// a duration, does not start more than one window ahead of the controller's
-// clock, and is not older than the span plus the retained slack.
+// a duration, starts on a multiple of it, does not start more than one
+// window ahead of the controller's clock, and is not older than the span
+// plus the retained slack.
+//
+// Agents align their windows to multiples of the window length
+// (probe.PathAggregator), so all agents share the same windows. A window
+// that starts elsewhere comes from no agent. Accepting it would let a few
+// summaries open windows between the agents' own: they would take the
+// places of the agents' windows in the store and put more windows into one
+// span than the span is configured to hold.
 func (s *evidenceStore) inRange(startNs, durNs, nowNs uint64) bool {
-	if durNs == 0 || startNs > math.MaxUint64-2*durNs-closeMarginNs {
+	if durNs == 0 || startNs%durNs != 0 || startNs > math.MaxUint64-2*durNs-closeMarginNs {
 		return false
 	}
 	if startNs > nowNs+durNs {
@@ -390,10 +399,11 @@ func (s *evidenceStore) prune(nowNs uint64) {
 
 // span returns the closed windows that form the evidence span at nowNs,
 // oldest first: the windows of the length windowNs that ended within the
-// last spanWindows window lengths before the newest closed one's end. It is
-// empty when the newest closed window is stale (agents stopped reporting),
-// so old evidence does not keep a finding alive. otherPaths counts the paths
-// of the closed windows of other lengths, which are left out.
+// last spanWindows window lengths before the newest closed one's end, and
+// never more than spanWindows of them. It is empty when the newest closed
+// window is stale (agents stopped reporting), so old evidence does not keep
+// a finding alive. otherPaths counts the paths of the closed windows of
+// other lengths, which are left out.
 func (s *evidenceStore) span(nowNs uint64) (out []*windowEvidence, otherPaths int) {
 	var newest *windowEvidence
 	for _, w := range s.windows {
@@ -418,6 +428,12 @@ func (s *evidenceStore) span(nowNs uint64) (out []*windowEvidence, otherPaths in
 		if w.durNs == s.windowNs && w.closedAt(nowNs) && w.endNs()+spanNs > newest.endNs() {
 			out = append(out, w)
 		}
+	}
+	// Windows of one length that start on multiples of it do not overlap,
+	// so this cut never applies. It is what the solver's per-window masks
+	// rely on, so it does not rest on the alignment check alone.
+	if len(out) > s.spanWindows {
+		out = out[len(out)-s.spanWindows:]
 	}
 	return out, otherPaths
 }

@@ -682,3 +682,138 @@ func TestEvidenceStore_WindowLengthFollowsTheMajority(t *testing.T) {
 		t.Errorf("span = %d windows, %d paths of other lengths; want the fleet's window and 1 path left out", len(windows), otherPaths)
 	}
 }
+
+// TestEvidenceStore_RefusesUnalignedWindows verifies that a window that does
+// not start on a multiple of its length is refused. Agents align their
+// windows, so such a window comes from no agent, and it must neither open a
+// window of its own nor take the place of an agents' window in the store.
+func TestEvidenceStore_RefusesUnalignedWindows(t *testing.T) {
+	store := newEvidenceStore(4, 1000, 0)
+	nowNs := windowEnd(9)
+	o := obs{agent: "host-a", src: "a", srcTor: "tor-0", dst: "b", dstTor: "tor-1", total: 100, failed: 5}
+	for w := 0; w < 10; w++ {
+		store.observe(o.agent, o.summary(w), nowNs)
+	}
+	if len(store.windows) != 10 || store.stats.outOfRange != 0 {
+		t.Fatalf("aligned windows: %d retained, %d out of range; want 10 and 0", len(store.windows), store.stats.outOfRange)
+	}
+	for i := 1; i <= 10; i++ {
+		s := o.summary(9)
+		s.WindowStartUnixNs += uint64(i) * uint64(time.Millisecond)
+		store.observe("host-b", s, nowNs)
+	}
+	if store.stats.outOfRange != 10 {
+		t.Errorf("out of range: %d, want the 10 unaligned summaries", store.stats.outOfRange)
+	}
+	for w, win := range store.windows {
+		if want := testBaseStartNs + uint64(w)*testWindowNs; win.startNs != want {
+			t.Errorf("retained window %d starts at %d, want the agents' window at %d", w, win.startNs, want)
+		}
+	}
+}
+
+// TestLocalizer_SpanHoldsAtMostItsWindows verifies, for the longest spans
+// the settings allow, that an evaluation takes no more windows than the span
+// is configured to hold and does not fail, when summaries arrive for windows
+// that start half a window apart: every second one is unaligned.
+func TestLocalizer_SpanHoldsAtMostItsWindows(t *testing.T) {
+	for _, windows := range []int{1, 58, 59, MaxLocalizationWindows} {
+		t.Run(fmt.Sprintf("windows=%d", windows), func(t *testing.T) {
+			az, clock := newTestLocalizer(t, LocalizationConfig{Windows: windows}, nil)
+			n := 2 * (windows + extraRetainedWindows)
+			clock.ns = testBaseStartNs + uint64(n/2+1)*testWindowNs
+			for i := 0; i < n; i++ {
+				var sums []*controller_agent.PathSummary
+				for d := 0; d < 4; d++ {
+					s := obs{src: "a", srcTor: "tor-0", dst: fmt.Sprintf("b%d", d), dstTor: "tor-1", total: 30, failed: 10}.summary(0)
+					s.WindowStartUnixNs = testBaseStartNs + uint64(i)*testWindowNs/2
+					sums = append(sums, s)
+				}
+				az.Ingest(context.Background(), &controller_agent.ProbeAnalysisReport{AgentId: "host-a", Summaries: sums})
+			}
+			store := az.loc.store
+			if len(store.windows) > windows+extraRetainedWindows {
+				t.Fatalf("%d windows retained, want at most %d", len(store.windows), windows+extraRetainedWindows)
+			}
+			clock.ns += testWindowNs + closeMarginNs
+			span, _ := store.span(clock.ns)
+			if len(span) != windows {
+				t.Fatalf("the span holds %d windows, want %d", len(span), windows)
+			}
+			if !az.loc.evaluate(context.Background()) {
+				t.Fatal("did not evaluate")
+			}
+			checkFindingInvariants(t, az.loc.currentFindings(), DefaultLocalizationMinConfidence)
+		})
+	}
+}
+
+// TestBuildSpan_HoldsAtMostOneWindowPerMaskBit verifies that pooling takes
+// the newest MaxLocalizationWindows windows when it is handed more: a path
+// keeps one bit per window.
+func TestBuildSpan_HoldsAtMostOneWindowPerMaskBit(t *testing.T) {
+	const extra = 6
+	var snaps []*windowSnapshot
+	for w := 0; w < MaxLocalizationWindows+extra; w++ {
+		store := newEvidenceStore(1, 1000, 0)
+		// Only the windows that are cut off hold the path a -> old.
+		dst := "new"
+		if w < extra {
+			dst = "old"
+		}
+		for d := 0; d < 3; d++ {
+			o := obs{agent: "host-a", src: "a", srcTor: "tor-0", dst: fmt.Sprintf("%s%d", dst, d), dstTor: "tor-1", total: 30, failed: 30}
+			store.observe(o.agent, o.summary(w), windowEnd(w))
+		}
+		snaps = append(snaps, store.snapshots(windowClose(w))...)
+	}
+	if len(snaps) != MaxLocalizationWindows+extra {
+		t.Fatalf("%d snapshots, want %d", len(snaps), MaxLocalizationWindows+extra)
+	}
+	sp := buildSpan(snaps, nil)
+	if sp.windows != MaxLocalizationWindows || len(sp.lossEvents) != MaxLocalizationWindows {
+		t.Fatalf("the span holds %d windows (%d event lists), want %d", sp.windows, len(sp.lossEvents), MaxLocalizationWindows)
+	}
+	for _, r := range sp.rnics {
+		if strings.HasPrefix(r.gid, "old") {
+			t.Errorf("RNIC %s of a window that was cut off is in the span", r.gid)
+		}
+	}
+	p := solverParams{baseline: DefaultLocalizationBaselineLossRatio, minConfidence: DefaultLocalizationMinConfidence, spanWindows: MaxLocalizationWindows}
+	checkFindingInvariants(t, localize(sp, p, p), p.minConfidence)
+}
+
+// TestLocalizer_EvaluationSurvivesAPanic verifies that a panic during an
+// evaluation does not escape the localizer's loop, that it is logged, and
+// that the findings of the previous evaluation are withdrawn.
+func TestLocalizer_EvaluationSurvivesAPanic(t *testing.T) {
+	az, clock := newTestLocalizer(t, LocalizationConfig{Windows: 2}, nil)
+	var logs bytes.Buffer
+	az.loc.logger = zerolog.New(&logs)
+	for w := 0; w < 2; w++ {
+		ingestWindow(az, clock, w, lossyTor0())
+	}
+	clock.ns = windowClose(1)
+	az.loc.evaluateRecovering(context.Background())
+	if len(az.loc.currentFindings()) == 0 {
+		t.Fatal("no finding to withdraw: the test needs one")
+	}
+
+	az.loc.now = func() time.Time { panic("defect in the inference") }
+	az.loc.evaluateRecovering(context.Background())
+	if got := az.loc.currentFindings(); len(got) != 0 {
+		t.Errorf("findings after a failed evaluation:%s", describeFindings(got))
+	}
+	if !strings.Contains(logs.String(), "defect in the inference") || !strings.Contains(logs.String(), `"level":"error"`) {
+		t.Errorf("the panic is not logged as an error: %s", logs.String())
+	}
+
+	// The next evaluation works again.
+	az.loc.now = clock.now
+	ingestWindow(az, clock, 2, lossyTor0())
+	clock.ns = windowClose(2)
+	az.loc.evaluateRecovering(context.Background())
+	if len(az.loc.currentFindings()) == 0 {
+		t.Error("no findings from the evaluation after the failed one")
+	}
+}

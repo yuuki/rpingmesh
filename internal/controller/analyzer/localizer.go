@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"context"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -174,11 +175,31 @@ func (l *localizer) run(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			l.evaluate(ctx)
+			l.evaluateRecovering(ctx)
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+// evaluateRecovering runs one evaluation and survives a panic in it. Fault
+// localization is an optional reading of the evidence: a defect in the
+// inference must not stop the controller, which also registers agents and
+// hands out pinglists. The findings are withdrawn, because the evaluation
+// that would have replaced them did not finish, and the span that failed is
+// not evaluated again (evaluate has already recorded it).
+func (l *localizer) evaluateRecovering(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			var none []Finding
+			l.findings.Store(&none)
+			l.logger.Error().
+				Interface("panic", r).
+				Bytes("stack", debug.Stack()).
+				Msg("Fault localization failed on this evidence span; its findings are withdrawn until the next span")
+		}
+	}()
+	l.evaluate(ctx)
 }
 
 // evaluate runs the tomography on the current evidence span, unless the
@@ -371,6 +392,11 @@ func logComponentFields(ev *zerolog.Event, c Component) *zerolog.Event {
 // per RNIC, not per path. Paths keep the order in which they were first
 // reported, so the result does not depend on map iteration.
 func buildSpan(windows []*windowSnapshot, topo *Topology) *span {
+	// A path keeps one bit per window (spanPath.lossMask): a span never
+	// holds more windows than that, whatever the caller passes.
+	if len(windows) > MaxLocalizationWindows {
+		windows = windows[len(windows)-MaxLocalizationWindows:]
+	}
 	sp := &span{
 		windows:    len(windows),
 		lossEvents: make([][]spanEvent, len(windows)),

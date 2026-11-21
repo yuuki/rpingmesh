@@ -100,7 +100,7 @@ type simPath struct {
 const (
 	simRTTThresholdNs = 500_000
 	simWindowNs       = 30 * uint64(time.Second)
-	simBaseStartNs    = 1_700_000_000 * uint64(time.Second)
+	simBaseStartNs    = 1_699_999_200 * uint64(time.Second) // a multiple of every window length in use
 )
 
 // defaultSimFabric is two rails of two spine groups of four ToRs with six

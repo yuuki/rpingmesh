@@ -101,14 +101,16 @@ tors:
 }
 
 // FuzzLocalize runs the solver on arbitrary evidence: paths between up to
-// 8 ToRs of 4 RNICs with any probe and loss counts, over one to four
-// windows, with and without topology facts. The solver must not panic or
+// 8 ToRs of 4 RNICs with any probe and loss counts, over every span length
+// the settings allow (1 to MaxLocalizationWindows windows), with and without
+// topology facts. The solver must not panic or
 // loop, and every finding must keep the invariants its consumers rely on
 // (confidences in [0, 1], finite numbers, bounded candidate lists).
 func FuzzLocalize(f *testing.F) {
-	// Each path is six bytes: source ToR and RNIC, target ToR and RNIC,
-	// probes, lost probes.
-	seed := []byte{0x03}
+	// The first byte selects the topology facts and the minimum confidence,
+	// the second the number of windows. Each path is then six bytes: source
+	// ToR and RNIC, target ToR and RNIC, probes, lost probes.
+	seed := []byte{0x01, 0x01}
 	for st := byte(0); st < 4; st++ {
 		for dt := byte(0); dt < 4; dt++ {
 			for r := byte(0); r < 3; r++ {
@@ -121,22 +123,23 @@ func FuzzLocalize(f *testing.F) {
 		}
 	}
 	f.Add(seed)
-	f.Add([]byte{0x00, 0, 0, 1, 0, 255, 255, 0, 0, 1, 0, 255, 255})
-	f.Add([]byte{0x07, 5, 0, 6, 0, 10, 10, 6, 0, 7, 0, 10, 10, 7, 0, 5, 0, 10, 10})
-	f.Add([]byte{0xff})
+	f.Add(append([]byte{0x01, MaxLocalizationWindows - 1}, seed[2:]...))
+	f.Add([]byte{0x00, 0, 0, 0, 1, 0, 255, 255, 0, 0, 1, 0, 255, 255})
+	f.Add([]byte{0x01, 3, 5, 0, 6, 0, 10, 10, 6, 0, 7, 0, 10, 10, 7, 0, 5, 0, 10, 10})
+	f.Add([]byte{0xff, 0xff})
 	f.Add([]byte{})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		if len(data) == 0 || len(data) > 6*4096 {
+		if len(data) < 2 || len(data) > 6*4096 {
 			return
 		}
 		mode := data[0]
-		data = data[1:]
+		numWindows := 1 + int(data[1])%MaxLocalizationWindows
+		data = data[2:]
 		var topo *Topology
 		if mode&1 != 0 {
 			topo = fuzzTopology(t)
 		}
-		numWindows := 1 + int(mode>>1&3)
 		windows := make([][]obs, numWindows)
 		for i := 0; i+6 <= len(data); i += 6 {
 			b := data[i : i+6]
@@ -163,7 +166,7 @@ func FuzzLocalize(f *testing.F) {
 		sp := buildSpan(store.snapshots(nowNs+testWindowNs+closeMarginNs), topo)
 		params := solverParams{
 			baseline:      DefaultLocalizationBaselineLossRatio,
-			minConfidence: 0.5 + float64(mode>>3&7)/16, // 0.5 .. 0.94
+			minConfidence: 0.5 + float64(mode>>1&7)/16, // 0.5 .. 0.94
 			spanWindows:   numWindows,
 		}
 		findings := localize(sp, params, params)
@@ -177,8 +180,9 @@ func FuzzLocalize(f *testing.F) {
 
 // FuzzLocalizerIngest feeds arbitrary wire-format ProbeAnalysisReport
 // messages (the controller may serve unauthenticated agents) through Ingest
-// with localization on, then evaluates. Whatever the reports hold, the
-// evidence store must stay within its bounds and the findings valid.
+// with localization on, then evaluates, for every span length the settings
+// allow. Whatever the reports hold, the evidence store must stay within its
+// bounds, the span within its windows, and the findings valid.
 func FuzzLocalizerIngest(f *testing.F) {
 	for _, rep := range []*controller_agent.ProbeAnalysisReport{
 		{AgentId: "host-a", Summaries: []*controller_agent.PathSummary{
@@ -195,38 +199,48 @@ func FuzzLocalizerIngest(f *testing.F) {
 		if err != nil {
 			f.Fatal(err)
 		}
-		f.Add(b)
+		f.Add(b, uint8(1))
+		f.Add(b, uint8(MaxLocalizationWindows-1))
 	}
 
-	f.Fuzz(func(t *testing.T, data []byte) {
+	f.Fuzz(func(t *testing.T, data []byte, span uint8) {
 		var rep controller_agent.ProbeAnalysisReport
 		if proto.Unmarshal(data, &rep) != nil {
 			return
 		}
 		const maxPaths = 64
-		az, clock := newTestLocalizer(t, LocalizationConfig{Windows: 2, MaxPathsPerWindow: maxPaths, Topology: fuzzTopology(t)}, nil)
-		clock.ns = windowEnd(1)
+		windows := 1 + int(span)%MaxLocalizationWindows
+		last := windows - 1
+		az, clock := newTestLocalizer(t, LocalizationConfig{Windows: windows, MaxPathsPerWindow: maxPaths, Topology: fuzzTopology(t)}, nil)
+		clock.ns = windowEnd(last)
 		az.Ingest(context.Background(), &rep)
-		// The same summaries again, moved into the two windows of the span,
-		// so that arbitrary window bounds do not keep the evidence out.
+		// The same summaries again, moved into the windows of the span, so
+		// that arbitrary window bounds do not keep the evidence out; every
+		// third one a third of a window late, as no agent reports it.
 		for i, s := range rep.GetSummaries() {
 			if s != nil {
-				s.WindowStartUnixNs = testBaseStartNs + uint64(i%2)*testWindowNs
+				s.WindowStartUnixNs = testBaseStartNs + uint64(i%windows)*testWindowNs
+				if i%3 == 2 {
+					s.WindowStartUnixNs += testWindowNs / 3
+				}
 				s.WindowDurationMs = testWindowMs
 			}
 		}
 		az.Ingest(context.Background(), &rep)
 
 		store := az.loc.store
-		if len(store.windows) > 2+extraRetainedWindows {
+		if len(store.windows) > windows+extraRetainedWindows {
 			t.Fatalf("%d windows retained", len(store.windows))
+		}
+		if span, _ := store.span(windowClose(last)); len(span) > windows {
+			t.Fatalf("the span holds %d windows, configured for %d", len(span), windows)
 		}
 		for _, w := range store.windows {
 			if len(w.pathKeys) > maxPaths || len(w.pathEv) != len(w.pathKeys) || len(w.rnics) > 2*maxPaths {
 				t.Fatalf("window holds %d paths and %d RNICs with a cap of %d paths", len(w.pathKeys), len(w.rnics), maxPaths)
 			}
 		}
-		clock.ns = windowClose(1)
+		clock.ns = windowClose(last)
 		az.loc.evaluate(context.Background())
 		checkFindingInvariants(t, az.loc.currentFindings(), DefaultLocalizationMinConfidence)
 	})

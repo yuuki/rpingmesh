@@ -24,7 +24,7 @@ type obs struct {
 const (
 	testWindowMs    = 30_000
 	testWindowNs    = uint64(testWindowMs) * 1_000_000
-	testBaseStartNs = uint64(1_700_000_000_000_000_000)
+	testBaseStartNs = uint64(1_699_999_200_000_000_000) // a multiple of every window length in use
 )
 
 func (o obs) summary(window int) *controller_agent.PathSummary {

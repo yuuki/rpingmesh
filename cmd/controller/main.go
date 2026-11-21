@@ -280,6 +280,10 @@ func setupAnalyzer(cfg *config.ControllerConfig, svc *controller.ControllerServi
 	if err != nil {
 		return nil, nil, err
 	}
+	if localization != nil {
+		// Only the agent that registered an RNIC states evidence for it.
+		localization.VerifySource = svc.HoldsRNIC
+	}
 
 	var provider *sdkmetric.MeterProvider
 	var metrics *analyzer.Metrics

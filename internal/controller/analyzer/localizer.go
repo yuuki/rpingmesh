@@ -35,12 +35,23 @@ const (
 	// 20 targets.
 	DefaultLocalizationMaxPathsPerWindow = 200_000
 
-	// baselineRTTViolationRatio is the share of path windows over the RTT
-	// threshold that counts as healthy. Unlike the loss baseline it is not a
-	// setting: a window over the threshold is already an SLO violation, so a
-	// fabric where more than 1% of the windows violate needs a different
+	// baselineRTTViolationRatio is the rate of windows over the RTT
+	// threshold that counts as healthy, per probe that returned an RTT:
+	// about one window in 100 for a path probed 30 times per window, the
+	// agents' default for inter-ToR paths.
+	//
+	// The rate is per probe, not per window. The p99 of a window with fewer
+	// than 100 probes is their maximum, so a window is over the threshold
+	// as soon as one probe is: the more probes a window holds, the more
+	// often that happens. Counted per window, a ToR-mesh path (60 probes
+	// per window at the default rates) would violate twice as often as an
+	// inter-ToR path, and a rack with a larger mesh would look degraded.
+	//
+	// Unlike the loss baseline it is not a setting: a window over the
+	// threshold is already an SLO violation, so a fabric where healthy
+	// paths violate more often needs a different
 	// analyzer_slo_network_rtt_p99_ns, not a different baseline.
-	baselineRTTViolationRatio = 0.01
+	baselineRTTViolationRatio = 0.01 / 30
 
 	// localizationTick is how often the localizer checks for newly closed
 	// windows. An evaluation runs only when the evidence span changed.
@@ -69,6 +80,13 @@ type LocalizationConfig struct {
 	// MaxPathsPerWindow caps the paths kept per window. Values below 1 are
 	// replaced by DefaultLocalizationMaxPathsPerWindow.
 	MaxPathsPerWindow int
+	// VerifySource reports whether the RNIC sourceGID is registered to the
+	// agent agentID. When set, the summaries of a report whose source RNIC
+	// it does not confirm are left out of the evidence (they still reach
+	// the per-path SLO detection). The controller sets it to its record of
+	// the registrations it served. nil accepts every reporter; the store
+	// then only keeps an RNIC with the agent that first reported it.
+	VerifySource func(agentID, sourceGID string) bool
 }
 
 func (c LocalizationConfig) withDefaults() LocalizationConfig {
@@ -119,9 +137,10 @@ type localizer struct {
 	// unlistedTors, droppedPaths and mixedWindows are what the previous
 	// evaluation saw of the conditions that weaken the evidence, so that
 	// each is logged when it changes and not on every evaluation.
-	unlistedTors int
-	droppedPaths uint64
-	mixedWindows bool
+	unlistedTors     int
+	droppedPaths     uint64
+	refusedSummaries uint64
+	mixedWindows     bool
 
 	// findings is the result of the latest evaluation, read by the metric
 	// callbacks.
@@ -157,10 +176,31 @@ func (l *localizer) currentFindings() []Finding {
 // evidence store.
 func (l *localizer) observe(ctx context.Context, agentID string, summaries []*controller_agent.PathSummary) {
 	nowNs := uint64(l.now().UnixNano())
+	// An agent's summaries name few source RNICs: each is verified once
+	// per report, before the store's lock is taken.
+	var verified map[string]bool
+	if l.cfg.VerifySource != nil {
+		verified = make(map[string]bool, 4)
+		for _, s := range summaries {
+			if s == nil {
+				continue
+			}
+			src := s.GetSourceGid()
+			if _, done := verified[src]; !done {
+				verified[src] = l.cfg.VerifySource(agentID, src)
+			}
+		}
+	}
 	dropped := 0
 	l.mu.Lock()
 	for _, s := range summaries {
-		if s != nil && l.store.observe(agentID, s, nowNs) {
+		switch {
+		case s == nil:
+		case verified != nil && !verified[s.GetSourceGid()]:
+			if s.GetPinglistType() != controller_agent.PinglistType_SERVICE_TRACING {
+				l.store.stats.foreign++
+			}
+		case l.store.observe(agentID, s, nowNs):
 			dropped++
 		}
 	}
@@ -250,6 +290,8 @@ func (l *localizer) evaluate(ctx context.Context) bool {
 		Int("findings", len(findings)).
 		Uint64("unattributable_summaries", stats.unattributable).
 		Uint64("out_of_range_summaries", stats.outOfRange).
+		Uint64("implausible_summaries", stats.implausible).
+		Uint64("foreign_summaries", stats.foreign).
 		Uint64("dropped_paths", stats.dropped).
 		Int("other_window_length_paths", otherPaths).
 		Dur("duration", time.Since(started)).
@@ -296,8 +338,15 @@ func (l *localizer) logWeakEvidence(sp *span, stats evidenceStats, otherPaths in
 		l.logger.Warn().
 			Uint64("dropped_paths", stats.dropped-l.droppedPaths).
 			Int("max_paths_per_window", l.cfg.MaxPathsPerWindow).
-			Msg("Path summaries were left out of the localization evidence: a window reached analyzer_localization_max_paths_per_window")
+			Msg("Path summaries were left out of the localization evidence: a window reached analyzer_localization_max_paths_per_window or its memory budget, or one agent reported more paths than its share of a window")
 		l.droppedPaths = stats.dropped
+	}
+	if refused := stats.foreign + stats.implausible; refused != l.refusedSummaries {
+		l.logger.Warn().
+			Uint64("foreign_summaries", stats.foreign).
+			Uint64("implausible_summaries", stats.implausible).
+			Msg("Path summaries were refused as localization evidence: their source RNIC is not registered to the reporting agent with this controller or is reported by another agent (foreign), or they count more probes than their window has milliseconds (implausible). The counts are totals since the controller started")
+		l.refusedSummaries = refused
 	}
 }
 
@@ -483,8 +532,8 @@ func buildSpan(windows []*windowSnapshot, topo *Topology) *span {
 				p.lossMask |= 1 << uint(wi)
 				sp.lossEvents[wi] = append(sp.lossEvents[wi], spanEvent{path: idx, count: ev.failed})
 			}
-			if ev.rttValid {
-				p.rttWindows++
+			if ev.rttProbes > 0 {
+				p.rttTrials = saturatingAdd(p.rttTrials, ev.rttProbes)
 				if ev.rttBad {
 					p.rttBad++
 					p.rttMask |= 1 << uint(wi)

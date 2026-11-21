@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -48,6 +49,90 @@ type ControllerService struct {
 	// now is the clock used to bound reported window starts (time.Now;
 	// injectable in tests).
 	now func() time.Time
+
+	// sources records which agent registered each RNIC with this controller
+	// process (see HoldsRNIC).
+	sourcesMu sync.Mutex
+	sources   map[[16]byte]sourceOwner
+}
+
+// sourceOwner is the agent that registered an RNIC, and until when the
+// record counts.
+type sourceOwner struct {
+	agentID string
+	expires time.Time
+}
+
+const (
+	// sourceOwnerTTL is how long a served registration vouches for an
+	// agent's reports: five heartbeats (agents re-register every 60 s),
+	// the default active_threshold_sec.
+	sourceOwnerTTL = 5 * time.Minute
+	// maxSourceOwners bounds the table against a flood of registrations.
+	maxSourceOwners = 1 << 18
+)
+
+// recordSources notes that agentID holds the registration of the given
+// RNICs, except those the registry skipped because another agent holds them.
+func (s *ControllerService) recordSources(agentID string, rnics []*controller_agent.RnicInfo, skipped []string) {
+	skip := make(map[string]struct{}, len(skipped))
+	for _, gid := range skipped {
+		skip[gid] = struct{}{}
+	}
+	now := s.now()
+	s.sourcesMu.Lock()
+	defer s.sourcesMu.Unlock()
+	if s.sources == nil {
+		s.sources = make(map[[16]byte]sourceOwner)
+	}
+	if len(s.sources) >= maxSourceOwners {
+		for gid, owner := range s.sources {
+			if now.After(owner.expires) {
+				delete(s.sources, gid)
+			}
+		}
+	}
+	for _, rnic := range rnics {
+		if _, skipped := skip[rnic.GetGid()]; skipped {
+			continue
+		}
+		gid, err := probe.ParseGID(rnic.GetGid())
+		if err != nil {
+			continue
+		}
+		if _, known := s.sources[gid]; !known && len(s.sources) >= maxSourceOwners {
+			continue
+		}
+		s.sources[gid] = sourceOwner{agentID: agentID, expires: now.Add(sourceOwnerTTL)}
+	}
+}
+
+// HoldsRNIC reports whether agentID registered the RNIC gid with this
+// controller process within sourceOwnerTTL. Fault localization uses it to
+// take a path summary as evidence only from the agent that holds the
+// summary's source RNIC (analyzer.LocalizationConfig.VerifySource), so that
+// a report cannot add probes and losses to the paths of other agents' RNICs,
+// nor to RNICs that no agent registered.
+//
+// The record is this process's memory of the registrations it served, not a
+// registry query: a report costs no database round trip. After a controller
+// restart an agent's summaries are therefore not used until its next
+// heartbeat (60 s). With several controllers behind a proxy that sends an
+// agent's registrations and reports to different controllers, the reports
+// are never confirmed; agents keep one connection, so they reach one
+// controller unless a proxy balances per call.
+//
+// It is not authentication. agent_id is what the caller states, and anyone
+// who can call RegisterAgent holds the RNICs it registers.
+func (s *ControllerService) HoldsRNIC(agentID, gid string) bool {
+	parsed, err := probe.ParseGID(gid)
+	if err != nil {
+		return false
+	}
+	s.sourcesMu.Lock()
+	owner, known := s.sources[parsed]
+	s.sourcesMu.Unlock()
+	return known && owner.agentID == agentID && !s.now().After(owner.expires)
 }
 
 // NewControllerService creates a new ControllerService backed by the given
@@ -139,6 +224,8 @@ func (s *ControllerService) RegisterAgent(
 			Message: fmt.Sprintf("failed to register RNICs: %s", err.Error()),
 		}, status.Errorf(codes.Internal, "failed to register RNICs: %v", err)
 	}
+
+	s.recordSources(req.GetAgentId(), rnics, skipped)
 
 	message := "Successfully registered agent"
 	if len(skipped) > 0 {
@@ -286,6 +373,11 @@ func (s *ControllerService) ReportProbeAnalysis(
 ) (*controller_agent.ProbeAnalysisAck, error) {
 	if req.GetAgentId() == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "agent_id is required")
+	}
+	// The analyzer keeps the agent ID with the evidence of the agent's
+	// RNICs: it is bounded like the agent_id of a registration.
+	if err := checkText("agent_id", req.GetAgentId(), maxFieldLen); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
 	if s.analyzer == nil {

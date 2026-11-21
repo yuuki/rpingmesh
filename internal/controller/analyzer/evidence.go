@@ -37,6 +37,33 @@ const (
 	// maxKnownAgentsRNICs bounds the RNIC-to-agent table against a flood of
 	// distinct source GIDs.
 	maxKnownAgentsRNICs = 1 << 18
+
+	// maxAgentIDLen bounds the agent ID the store keeps per RNIC and per
+	// window. It is the limit the controller puts on every free-form field
+	// of a registration; a longer ID comes from no registered agent.
+	maxAgentIDLen = 255
+
+	// maxPathsPerAgent and maxAgentWindowShare bound the paths one agent
+	// may hold in one window: the smaller of maxPathsPerAgent and the share
+	// of the window's cap. An agent reports a path per RNIC and target, a
+	// few hundred per RNIC, so the bound is far above what an agent sends.
+	// It keeps one reporter (a defective agent, or one client) from filling
+	// a window before the other agents report.
+	maxPathsPerAgent    = 8192
+	maxAgentWindowShare = 4
+
+	// The memory a window is accounted for (see windowEvidence.bytes): per
+	// path, RNIC, ToR and agent, the fixed part of what the window keeps of
+	// it; the strings are added by their length. A window's budget is
+	// windowBytesPerPath per path of the cap plus windowBytesFloor, which
+	// keeps the budget out of the way of small windows. A fabric with four
+	// or more paths per RNIC stays within it up to the path cap.
+	pathBytes          = 64
+	rnicBytes          = 96
+	torBytes           = 72
+	agentBytes         = 64
+	windowBytesPerPath = 100
+	windowBytesFloor   = 1 << 20
 )
 
 // pathKey identifies a path within one window by the indexes of its source
@@ -49,10 +76,11 @@ type pathKey struct {
 type pathEvidence struct {
 	probes uint32 // probe_total: every probe is one loss trial
 	failed uint32 // probe_failed
-	// rttValid: the window produced at least one valid RTT, so its p99 is
-	// one RTT trial. rttBad: that p99 exceeded the cluster RTT threshold.
-	rttValid bool
-	rttBad   bool
+	// rttProbes: probe_success, the probes whose RTT the window's p99 is
+	// taken from. Each is one RTT trial. rttBad: that p99 exceeded the
+	// cluster RTT threshold, which is one RTT event.
+	rttProbes uint32
+	rttBad    bool
 }
 
 // windowRNIC is one RNIC seen in a window, as a path's source or target.
@@ -82,6 +110,14 @@ type windowEvidence struct {
 	pathIdx  map[pathKey]uint32
 	pathKeys []pathKey
 	pathEv   []pathEvidence
+	// agentPaths counts the paths each agent holds in the window.
+	agentPaths map[string]uint32
+	// bytes is the memory the window is accounted for: pathBytes per path,
+	// rnicBytes, torBytes and agentBytes plus the length of the string per
+	// RNIC, ToR and agent. The store adds nothing to a window that would
+	// take it over its budget, so that long strings and a distinct RNIC per
+	// path cannot make a window several times larger than a real one.
+	bytes uint64
 
 	// version changes whenever the window's evidence changes, so an
 	// evaluation can tell whether anything arrived since the previous one.
@@ -138,6 +174,28 @@ func (w *windowEvidence) hasPath(src, dst string) bool {
 	return ok
 }
 
+// newBytes returns what the window would be accounted for in addition, if
+// the new path src -> dst of the agent were added to it.
+func (w *windowEvidence) newBytes(agentID, src, srcTor, dst, dstTor string) uint64 {
+	need := uint64(pathBytes)
+	if _, ok := w.rnicIdx[src]; !ok {
+		need += rnicBytes + uint64(len(src))
+	}
+	if _, ok := w.rnicIdx[dst]; !ok {
+		need += rnicBytes + uint64(len(dst))
+	}
+	if _, ok := w.torIdx[srcTor]; !ok {
+		need += torBytes + uint64(len(srcTor))
+	}
+	if _, ok := w.torIdx[dstTor]; !ok && dstTor != srcTor {
+		need += torBytes + uint64(len(dstTor))
+	}
+	if _, ok := w.agentPaths[agentID]; !ok {
+		need += agentBytes + uint64(len(agentID))
+	}
+	return need
+}
+
 // path returns the evidence of the path key, adding the path when it is
 // new.
 func (w *windowEvidence) path(key pathKey) *pathEvidence {
@@ -177,7 +235,10 @@ func (w *windowEvidence) internRNIC(gid, tor string, isSource bool) uint32 {
 	return idx
 }
 
-// agentRecord remembers the agent that last reported an RNIC as a source.
+// agentRecord remembers the agent that reports an RNIC as a source, and
+// when it last did. The RNIC stays with that agent until the record expires
+// (agentTTLNs after its last report): a summary in which another agent
+// names the RNIC as its source is refused.
 type agentRecord struct {
 	agentID    string
 	lastSeenNs uint64
@@ -192,7 +253,16 @@ type evidenceStats struct {
 	// too far in the future, without a duration, or that does not start on
 	// a multiple of its length.
 	outOfRange uint64
-	// dropped: paths not kept because a window reached maxPathsPerWindow.
+	// implausible: summaries with more probes than the window has
+	// milliseconds. An agent sends at most one probe per millisecond to a
+	// target (probe_interval_ms is at least 1).
+	implausible uint64
+	// foreign: summaries whose source RNIC another agent reports, or whose
+	// reporter the controller could not match with the RNIC's registration
+	// (LocalizationConfig.VerifySource).
+	foreign uint64
+	// dropped: paths not kept because a window reached maxPathsPerWindow or
+	// its memory budget, or the reporting agent its share of the window.
 	dropped uint64
 }
 
@@ -201,6 +271,8 @@ type evidenceStats struct {
 type evidenceStore struct {
 	spanWindows       int
 	maxPathsPerWindow int
+	maxPathsPerAgent  int
+	maxWindowBytes    uint64
 	rttThresholdNs    uint64
 
 	// windows is ascending by startNs, then by durNs: windows of different
@@ -222,6 +294,8 @@ func newEvidenceStore(spanWindows, maxPathsPerWindow int, rttThresholdNs uint64)
 	return &evidenceStore{
 		spanWindows:       spanWindows,
 		maxPathsPerWindow: maxPathsPerWindow,
+		maxPathsPerAgent:  max(1, min(maxPathsPerAgent, maxPathsPerWindow/maxAgentWindowShare)),
+		maxWindowBytes:    uint64(maxPathsPerWindow)*windowBytesPerPath + windowBytesFloor,
 		rttThresholdNs:    rttThresholdNs,
 		agents:            make(map[string]agentRecord),
 	}
@@ -239,7 +313,7 @@ func (s *evidenceStore) observe(agentID string, sum *controller_agent.PathSummar
 	src, dst := sum.GetSourceGid(), sum.GetTargetGid()
 	srcTor := probe.TorMetricLabel(sum.GetSourceTorId())
 	dstTor := probe.TorMetricLabel(sum.GetTargetTorId())
-	if src == "" || dst == "" || src == dst ||
+	if src == "" || dst == "" || src == dst || len(agentID) > maxAgentIDLen ||
 		srcTor == probe.UnspecifiedTorLabel || dstTor == probe.UnspecifiedTorLabel {
 		s.stats.unattributable++
 		return false
@@ -254,17 +328,33 @@ func (s *evidenceStore) observe(agentID string, sum *controller_agent.PathSummar
 		s.stats.outOfRange++
 		return false
 	}
+	if sum.GetProbeTotal() > sum.GetWindowDurationMs() {
+		s.stats.implausible++
+		return false
+	}
+	// An RNIC's paths are stated by one agent. Without this, any reporter
+	// could add probes and losses to the paths of another agent's RNIC.
+	if rec, known := s.agents[src]; known && rec.agentID != agentID && rec.lastSeenNs+agentTTLNs >= nowNs {
+		s.stats.foreign++
+		return false
+	}
 
 	w := s.window(startNs, durNs)
 	if w == nil {
 		s.stats.outOfRange++
 		return false
 	}
-	// The cap is checked before the RNICs are interned, so a window at its
-	// cap grows no further, whatever the GIDs of the summaries it refuses.
-	if len(w.pathKeys) >= s.maxPathsPerWindow && !w.hasPath(src, dst) {
-		s.stats.dropped++
-		return true
+	// The caps are checked before anything is interned, so a window at a
+	// cap grows no further, whatever the summaries it refuses hold.
+	if !w.hasPath(src, dst) {
+		if len(w.pathKeys) >= s.maxPathsPerWindow ||
+			int(w.agentPaths[agentID]) >= s.maxPathsPerAgent ||
+			w.bytes+w.newBytes(agentID, src, srcTor, dst, dstTor) > s.maxWindowBytes {
+			s.stats.dropped++
+			return true
+		}
+		w.bytes += w.newBytes(agentID, src, srcTor, dst, dstTor)
+		w.agentPaths[agentID]++
 	}
 	ev := w.path(pathKey{
 		src: w.internRNIC(src, srcTor, true),
@@ -274,8 +364,8 @@ func (s *evidenceStore) observe(agentID string, sum *controller_agent.PathSummar
 	failed := min(sum.GetProbeFailed(), sum.GetProbeTotal())
 	ev.probes = saturatingAdd(ev.probes, sum.GetProbeTotal())
 	ev.failed = saturatingAdd(ev.failed, failed)
-	if sum.GetProbeSuccess() > 0 {
-		ev.rttValid = true
+	if success := min(sum.GetProbeSuccess(), sum.GetProbeTotal()); success > 0 {
+		ev.rttProbes = saturatingAdd(ev.rttProbes, success)
 		if s.rttThresholdNs > 0 && sum.GetNetworkRttP99Ns() > s.rttThresholdNs {
 			ev.rttBad = true
 		}
@@ -351,11 +441,12 @@ func (s *evidenceStore) window(startNs, durNs uint64) *windowEvidence {
 		}
 	}
 	w := &windowEvidence{
-		startNs: startNs,
-		durNs:   durNs,
-		rnicIdx: make(map[string]uint32),
-		torIdx:  make(map[string]uint32),
-		pathIdx: make(map[pathKey]uint32),
+		startNs:    startNs,
+		durNs:      durNs,
+		rnicIdx:    make(map[string]uint32),
+		torIdx:     make(map[string]uint32),
+		pathIdx:    make(map[pathKey]uint32),
+		agentPaths: make(map[string]uint32),
 	}
 	s.windows = append(s.windows, nil)
 	copy(s.windows[idx+1:], s.windows[idx:])

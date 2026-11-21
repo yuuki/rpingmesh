@@ -143,10 +143,10 @@ type spanPath struct {
 	src, dst int32
 	probes   uint32
 	failed   uint32
-	// rttWindows counts the windows with a valid p99, rttBad those whose p99
-	// exceeded the threshold.
-	rttWindows uint32
-	rttBad     uint32
+	// rttTrials counts the probes that returned a valid RTT, rttBad the
+	// windows whose p99 exceeded the threshold.
+	rttTrials uint32
+	rttBad    uint32
 	// lossMask and rttMask have bit w set when window w of the span had a
 	// failed probe or an RTT violation on this path.
 	lossMask uint64
@@ -287,7 +287,7 @@ func newSolver(sp *span, signal string, p solverParams) *solver {
 // solver's signal.
 func (s *solver) observation(p *spanPath) (trials, events uint32, mask uint64) {
 	if s.signal == KindRTT {
-		return p.rttWindows, min(p.rttBad, p.rttWindows), p.rttMask
+		return p.rttTrials, min(p.rttBad, p.rttTrials), p.rttMask
 	}
 	return p.probes, min(p.failed, p.probes), p.lossMask
 }

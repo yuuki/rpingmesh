@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -190,6 +191,14 @@ func TestLocalizer_SpanSlides(t *testing.T) {
 // TestLocalizer_WithDefaults verifies that out-of-range settings are
 // replaced by the defaults instead of being used.
 func TestLocalizer_WithDefaults(t *testing.T) {
+	// The settings without the hooks, which cannot be compared.
+	type settings struct {
+		windows, maxPaths       int
+		baseline, minConfidence float64
+	}
+	of := func(c LocalizationConfig) settings {
+		return settings{c.Windows, c.MaxPathsPerWindow, c.BaselineLossRatio, c.MinConfidence}
+	}
 	want := LocalizationConfig{
 		Windows:           DefaultLocalizationWindows,
 		BaselineLossRatio: DefaultLocalizationBaselineLossRatio,
@@ -201,12 +210,12 @@ func TestLocalizer_WithDefaults(t *testing.T) {
 		{Windows: -1, BaselineLossRatio: -0.1, MinConfidence: 0.2, MaxPathsPerWindow: -5},
 		{Windows: MaxLocalizationWindows + 1, BaselineLossRatio: 1, MinConfidence: 1},
 	} {
-		if got := cfg.withDefaults(); got != want {
+		if got := cfg.withDefaults(); of(got) != of(want) {
 			t.Errorf("%+v.withDefaults() = %+v, want %+v", cfg, got, want)
 		}
 	}
 	kept := LocalizationConfig{Windows: 64, BaselineLossRatio: 0.5, MinConfidence: 0.5, MaxPathsPerWindow: 1}
-	if got := kept.withDefaults(); got != kept {
+	if got := kept.withDefaults(); of(got) != of(kept) {
 		t.Errorf("valid settings changed: %+v -> %+v", kept, got)
 	}
 }
@@ -252,11 +261,11 @@ func TestEvidenceStore_KeepsOnlyAttributableClusterPaths(t *testing.T) {
 		t.Fatalf("window holds %d paths and %d RNICs, want 2 and 3", len(w.pathKeys), len(w.rnics))
 	}
 	got := *w.path(pathKey{src: w.rnicIdx["a"], dst: w.rnicIdx["b"]})
-	if got.probes != 200 || got.failed != 6 || !got.rttValid || !got.rttBad {
-		t.Errorf("path a->b = %+v, want 200 probes, 6 failed, an RTT violation", got)
+	if got.probes != 200 || got.failed != 6 || got.rttProbes != 194 || !got.rttBad {
+		t.Errorf("path a->b = %+v, want 200 probes, 6 failed, 194 RTT trials, an RTT violation", got)
 	}
 	got = *w.path(pathKey{src: w.rnicIdx["a"], dst: w.rnicIdx["c"]})
-	if got.probes != 10 || got.failed != 10 || got.rttValid {
+	if got.probes != 10 || got.failed != 10 || got.rttProbes != 0 {
 		t.Errorf("path a->c = %+v, want 10 probes, 10 failed (clamped), no RTT", got)
 	}
 	if rec := store.agents["a"]; rec.agentID != "host-a" {
@@ -294,13 +303,15 @@ func TestEvidenceStore_IsBounded(t *testing.T) {
 	const maxPaths = 5
 	store := newEvidenceStore(2, maxPaths, 0)
 	nowNs := windowEnd(0)
+	// Every path has an agent of its own: one agent may hold only its share
+	// of a window (TestEvidenceStore_BoundsOneAgent).
 	path := func(i int) obs {
-		return obs{agent: "host", src: fmt.Sprintf("s%d", i), srcTor: "tor-1", dst: fmt.Sprintf("d%d", i), dstTor: "tor-2", total: 10}
+		return obs{agent: fmt.Sprintf("host-%d", i), src: fmt.Sprintf("s%d", i), srcTor: "tor-1", dst: fmt.Sprintf("d%d", i), dstTor: "tor-2", total: 10}
 	}
 
 	dropped := 0
 	for i := 0; i < 100; i++ {
-		if store.observe("host", path(i).summary(0), nowNs) {
+		if store.observe(path(i).agent, path(i).summary(0), nowNs) {
 			dropped++
 		}
 	}
@@ -314,7 +325,7 @@ func TestEvidenceStore_IsBounded(t *testing.T) {
 		t.Errorf("RNIC table holds %d RNICs, want %d: a refused path must not intern its RNICs", len(w.rnics), 2*maxPaths)
 	}
 	// A path already kept is still updated.
-	if store.observe("host", path(0).summary(0), nowNs) {
+	if store.observe(path(0).agent, path(0).summary(0), nowNs) {
 		t.Error("an update of a kept path was refused")
 	}
 	if got := w.path(pathKey{src: w.rnicIdx["s0"], dst: w.rnicIdx["d0"]}).probes; got != 20 {
@@ -324,7 +335,7 @@ func TestEvidenceStore_IsBounded(t *testing.T) {
 	// Windows: a span of 2 retains at most 2+extraRetainedWindows.
 	limit := 2 + extraRetainedWindows
 	for wi := 1; wi < 40; wi++ {
-		store.observe("host", path(0).summary(wi), windowEnd(wi))
+		store.observe(path(0).agent, path(0).summary(wi), windowEnd(wi))
 		if len(store.windows) > limit {
 			t.Fatalf("%d windows retained after window %d, want at most %d", len(store.windows), wi, limit)
 		}
@@ -341,11 +352,11 @@ func TestEvidenceStore_IsBounded(t *testing.T) {
 	before := len(store.windows)
 	outOfRange := store.stats.outOfRange
 	nowNs = windowEnd(39)
-	store.observe("host", path(0).summary(39-limit-1), nowNs)
-	store.observe("host", path(0).summary(42), nowNs)
+	store.observe(path(0).agent, path(0).summary(39-limit-1), nowNs)
+	store.observe(path(0).agent, path(0).summary(42), nowNs)
 	noDuration := path(0).summary(39)
 	noDuration.WindowDurationMs = 0
-	store.observe("host", noDuration, nowNs)
+	store.observe(path(0).agent, noDuration, nowNs)
 	if len(store.windows) != before || store.stats.outOfRange != outOfRange+3 {
 		t.Errorf("%d windows (were %d), %d out of range (were %d); want no new window and 3 more out of range",
 			len(store.windows), before, store.stats.outOfRange, outOfRange)
@@ -815,5 +826,209 @@ func TestLocalizer_EvaluationSurvivesAPanic(t *testing.T) {
 	az.loc.evaluateRecovering(context.Background())
 	if len(az.loc.currentFindings()) == 0 {
 		t.Error("no findings from the evaluation after the failed one")
+	}
+}
+
+// TestEvidenceStore_OneAgentPerSourceRNIC verifies that the paths of an
+// RNIC are stated by the agent that reports it: a summary in which another
+// reporter names the RNIC as its source is refused, until the agent has been
+// silent for agentTTLNs.
+func TestEvidenceStore_OneAgentPerSourceRNIC(t *testing.T) {
+	store := newEvidenceStore(2, 100, 0)
+	nowNs := windowEnd(0)
+	own := obs{agent: "host-a", src: "a", srcTor: "tor-0", dst: "b", dstTor: "tor-1", total: 30}
+	forged := obs{agent: "anyone", src: "a", srcTor: "tor-0", dst: "b", dstTor: "tor-1", total: 30_000, failed: 10_000}
+	other := obs{agent: "anyone", src: "a", srcTor: "tor-0", dst: "c", dstTor: "tor-1", total: 30_000, failed: 10_000}
+
+	store.observe(own.agent, own.summary(0), nowNs)
+	for _, o := range []obs{forged, other} {
+		if store.observe(o.agent, o.summary(0), nowNs) {
+			t.Error("a refused summary counts as dropped at the cap")
+		}
+	}
+	// A report without an agent ID does not pass either.
+	store.observe("", forged.summary(0), nowNs)
+	w := store.windows[0]
+	if len(w.pathKeys) != 1 || w.pathEv[0].probes != 30 || w.pathEv[0].failed != 0 {
+		t.Errorf("window holds %d paths, the first with %+v; want only the agent's own 30 probes", len(w.pathKeys), w.pathEv[0])
+	}
+	if store.stats.foreign != 3 {
+		t.Errorf("foreign summaries: %d, want 3", store.stats.foreign)
+	}
+	// The agent itself keeps adding to its paths.
+	store.observe(own.agent, own.summary(0), nowNs)
+	if w.pathEv[0].probes != 60 {
+		t.Errorf("probes after the agent's second summary = %d, want 60", w.pathEv[0].probes)
+	}
+
+	// The RNIC moves to another agent once the first has been silent for
+	// the TTL (a host renamed), not a moment earlier.
+	moved := obs{agent: "host-a2", src: "a", srcTor: "tor-0", dst: "b", dstTor: "tor-1", total: 30}
+	late := 30 // a window that starts shortly before the TTL ends
+	store.observe(moved.agent, moved.summary(late), nowNs+agentTTLNs)
+	if store.stats.foreign != 4 {
+		t.Error("another agent took the RNIC before the TTL passed")
+	}
+	store.observe(moved.agent, moved.summary(late), nowNs+agentTTLNs+1)
+	if rec := store.agents["a"]; rec.agentID != "host-a2" || store.stats.foreign != 4 {
+		t.Errorf("after the TTL: agent of a = %q, %d foreign; want host-a2 and 4", rec.agentID, store.stats.foreign)
+	}
+}
+
+// TestEvidenceStore_BoundsOneAgent verifies that one reporter cannot fill a
+// window: it holds at most a quarter of the window's cap (and at most
+// maxPathsPerAgent paths), so the agents that report after it still fit.
+func TestEvidenceStore_BoundsOneAgent(t *testing.T) {
+	const maxPaths = 400
+	store := newEvidenceStore(2, maxPaths, 0)
+	nowNs := windowEnd(0)
+	dropped := 0
+	for i := 0; i < 4*maxPaths; i++ {
+		o := obs{src: fmt.Sprintf("x%d", i), srcTor: "tor-x", dst: fmt.Sprintf("y%d", i), dstTor: "tor-y", total: 30}
+		if store.observe("anyone", o.summary(0), nowNs) {
+			dropped++
+		}
+	}
+	w := store.windows[0]
+	if share := maxPaths / maxAgentWindowShare; len(w.pathKeys) != share || dropped != 4*maxPaths-share {
+		t.Fatalf("one agent holds %d paths (%d dropped), want its share of %d", len(w.pathKeys), dropped, share)
+	}
+	// Three more agents with 100 paths each fit; a fourth does not.
+	for a := 0; a < 4; a++ {
+		for i := 0; i < 100; i++ {
+			o := obs{src: fmt.Sprintf("a%d", a), srcTor: "tor-0", dst: fmt.Sprintf("b%d-%d", a, i), dstTor: "tor-1", total: 30}
+			store.observe(fmt.Sprintf("host-%d", a), o.summary(0), nowNs)
+		}
+	}
+	if len(w.pathKeys) != maxPaths || w.agentPaths["host-2"] != 100 || w.agentPaths["host-3"] != 0 {
+		t.Errorf("window holds %d paths, host-2 %d, host-3 %d; want %d, 100 and 0",
+			len(w.pathKeys), w.agentPaths["host-2"], w.agentPaths["host-3"], maxPaths)
+	}
+	if got := newEvidenceStore(4, DefaultLocalizationMaxPathsPerWindow, 0).maxPathsPerAgent; got != maxPathsPerAgent {
+		t.Errorf("share of one agent at the default cap = %d, want %d", got, maxPathsPerAgent)
+	}
+}
+
+// TestEvidenceStore_RefusesImplausibleCounts verifies that a summary with
+// more probes than its window has milliseconds is refused: no agent sends
+// more than one probe per millisecond to a target, and the count is the
+// weight of the path in the inference.
+func TestEvidenceStore_RefusesImplausibleCounts(t *testing.T) {
+	store := newEvidenceStore(2, 100, 0)
+	nowNs := windowEnd(0)
+	o := obs{agent: "host-a", src: "a", srcTor: "tor-0", dst: "b", dstTor: "tor-1", total: testWindowMs, failed: 7}
+	store.observe(o.agent, o.summary(0), nowNs)
+	o.total, o.dst = testWindowMs+1, "c"
+	store.observe(o.agent, o.summary(0), nowNs)
+	o.total, o.dst = ^uint32(0), "d"
+	store.observe(o.agent, o.summary(0), nowNs)
+	if w := store.windows[0]; len(w.pathKeys) != 1 || w.pathEv[0].probes != testWindowMs || store.stats.implausible != 2 {
+		t.Errorf("window holds %d paths, %d implausible; want the one path with %d probes and 2 implausible",
+			len(w.pathKeys), store.stats.implausible, testWindowMs)
+	}
+}
+
+// TestEvidenceStore_WindowMemoryIsBounded verifies that a window stays
+// within its memory budget whatever the summaries hold: with a distinct
+// RNIC and ToR per path and strings as long as the controller accepts, the
+// window stops taking paths long before the path cap, and its heap stays
+// within a small multiple of the budget (maps and slices grow by doubling).
+func TestEvidenceStore_WindowMemoryIsBounded(t *testing.T) {
+	const maxPaths = 20_000
+	heap := func() uint64 {
+		runtime.GC()
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		return m.HeapAlloc
+	}
+	for _, tc := range []struct {
+		name       string
+		gidPad     int
+		torPad     int
+		agentEvery int // paths per agent
+		rnicEvery  int // paths per source RNIC
+		wantAll    bool
+	}{
+		{name: "a real fabric: 20 paths per RNIC", agentEvery: 40, rnicEvery: 20, wantAll: true},
+		{name: "four paths per RNIC", agentEvery: 8, rnicEvery: 4, wantAll: true},
+		{name: "a distinct RNIC, ToR and agent per path, longest strings", gidPad: 40, torPad: 240, agentEvery: 1, rnicEvery: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newEvidenceStore(4, maxPaths, 0)
+			nowNs := windowEnd(0)
+			before := heap()
+			for i := 0; i < maxPaths; i++ {
+				src := i / tc.rnicEvery
+				o := obs{
+					src:    fmt.Sprintf("fd00::%s%x", strings.Repeat("0", tc.gidPad), 2*src+1),
+					srcTor: fmt.Sprintf("%ssw-%d", strings.Repeat("t", tc.torPad), src%512),
+					dst:    fmt.Sprintf("fd00::%s%x", strings.Repeat("0", tc.gidPad), 2*((src+1+i%tc.rnicEvery)%(maxPaths/tc.rnicEvery))+1),
+					total:  30,
+				}
+				o.dstTor = o.srcTor
+				if tc.rnicEvery == 1 {
+					o.dst = fmt.Sprintf("fd00::%s%x", strings.Repeat("0", tc.gidPad), 2*i+2)
+					o.srcTor = fmt.Sprintf("%s%d", strings.Repeat("t", tc.torPad), 2*i)
+					o.dstTor = fmt.Sprintf("%s%d", strings.Repeat("t", tc.torPad), 2*i+1)
+				}
+				agent := fmt.Sprintf("host-%s%d", strings.Repeat("a", tc.torPad), i/tc.agentEvery)
+				store.observe(agent, o.summary(0), nowNs)
+			}
+			used := heap() - before
+			w := store.windows[0]
+			t.Logf("%d paths, %d RNICs, %d ToRs, %d agents: accounted %d bytes of %d, heap %d bytes (%.0f per path kept, %.0f per path of the cap)",
+				len(w.pathKeys), len(w.rnics), len(w.tors), len(w.agentPaths), w.bytes, store.maxWindowBytes, used,
+				float64(used)/float64(len(w.pathKeys)), float64(used)/maxPaths)
+			if w.bytes > store.maxWindowBytes {
+				t.Errorf("window is accounted for %d bytes, budget %d", w.bytes, store.maxWindowBytes)
+			}
+			if tc.wantAll != (len(w.pathKeys) == maxPaths) {
+				t.Errorf("window holds %d of %d paths; all kept: want %v", len(w.pathKeys), maxPaths, tc.wantAll)
+			}
+			if limit := 3 * store.maxWindowBytes; used > limit {
+				t.Errorf("heap of the window is %d bytes, more than three times its budget of %d", used, store.maxWindowBytes)
+			}
+			runtime.KeepAlive(store)
+		})
+	}
+}
+
+// TestLocalizer_VerifySource verifies that, with a verifier set, only the
+// summaries whose source RNIC it confirms for the reporting agent become
+// evidence, that it is asked once per RNIC of a report, and that the
+// per-path SLO detection still sees every summary.
+func TestLocalizer_VerifySource(t *testing.T) {
+	calls := map[string]int{}
+	verify := func(agentID, gid string) bool {
+		calls[agentID+"/"+gid]++
+		return agentID == "host-a" && gid == "a"
+	}
+	az, clock := newTestLocalizer(t, LocalizationConfig{VerifySource: verify}, nil)
+	plain := New(testConfig(), nil)
+	clock.ns = windowEnd(0)
+
+	lossy := func(src, dst string) *controller_agent.PathSummary {
+		return obs{src: src, srcTor: "tor-0", dst: dst, dstTor: "tor-1", total: 100, failed: 50}.summary(0)
+	}
+	for _, rep := range []*controller_agent.ProbeAnalysisReport{
+		{AgentId: "host-a", Summaries: []*controller_agent.PathSummary{lossy("a", "x"), lossy("a", "y"), nil, lossy("b", "x")}},
+		{AgentId: "anyone", Summaries: []*controller_agent.PathSummary{lossy("a", "z"), lossy("q", "x")}},
+	} {
+		if got, want := az.Ingest(context.Background(), rep), plain.Ingest(context.Background(), rep); got != want {
+			t.Errorf("Ingest of %s returned %d violations, %d without localization", rep.GetAgentId(), got, want)
+		}
+	}
+	store := az.loc.store
+	w := store.windows[0]
+	if len(w.pathKeys) != 2 || len(w.rnics) != 3 {
+		t.Errorf("window holds %d paths between %d RNICs, want the 2 paths of a", len(w.pathKeys), len(w.rnics))
+	}
+	if store.stats.foreign != 3 {
+		t.Errorf("foreign summaries: %d, want 3", store.stats.foreign)
+	}
+	want := map[string]int{"host-a/a": 1, "host-a/b": 1, "anyone/a": 1, "anyone/q": 1}
+	if fmt.Sprint(calls) != fmt.Sprint(want) {
+		t.Errorf("verifier calls = %v, want %v", calls, want)
 	}
 }

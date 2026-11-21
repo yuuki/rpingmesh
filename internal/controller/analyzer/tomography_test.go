@@ -397,7 +397,7 @@ tors:
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			sp := spanOf(t, topo, repeat(meshWindow(4, 4, 1000, tc.loss), 2)...)
+			sp := spanOf(t, topo, repeat(meshWindow(4, 4, 1000, tc.loss), 3)...)
 			findings := localize(sp, testParams(), testParams())
 			requireLocalized(t, findings, KindLoss, tc.want)
 			sus := findings[0].Suspects[0]
@@ -405,8 +405,8 @@ tors:
 			if math.Abs(sus.ExcessRatio-0.019) > 1e-6 {
 				t.Errorf("ExcessRatio = %v, want 0.019", sus.ExcessRatio)
 			}
-			if sus.Windows != 2 || sus.FailedPaths != sus.Paths {
-				t.Errorf("suspect = %+v, want events in 2 windows on all of its paths", sus)
+			if sus.Windows != 3 || sus.FailedPaths != sus.Paths {
+				t.Errorf("suspect = %+v, want events in 3 windows on all of its paths", sus)
 			}
 			if sus.Confidence < 0.999 {
 				t.Errorf("Confidence = %v, want nearly 1", sus.Confidence)
@@ -435,7 +435,7 @@ func TestLocalize_EvidenceRules(t *testing.T) {
 			b := dt == 0 && dr == 0 && st == 1 && sr < 2
 			return a || b
 		}, 300))
-		requireNone(t, localize(spanOf(t, nil, repeat(window, 2)...), testParams(), testParams()))
+		requireNone(t, localize(spanOf(t, nil, repeat(window, 3)...), testParams(), testParams()))
 	})
 	t.Run("three RNIC pairs are", func(t *testing.T) {
 		window := meshWindow(3, 4, 1000, lossy(func(st, sr, dt, dr int) bool {
@@ -443,7 +443,7 @@ func TestLocalize_EvidenceRules(t *testing.T) {
 			b := dt == 0 && dr == 0 && st == 1 && sr < 3
 			return a || b
 		}, 300))
-		findings := localize(spanOf(t, nil, repeat(window, 2)...), testParams(), testParams())
+		findings := localize(spanOf(t, nil, repeat(window, 3)...), testParams(), testParams())
 		// The other paths of gid-0-0 are clean, which the model cannot
 		// reconcile with an RNIC fault of 30%: whatever is reported, it is
 		// not a confident accusation of something else.
@@ -470,10 +470,42 @@ func TestLocalize_EvidenceRules(t *testing.T) {
 		sp := spanOf(t, nil, healthy, burst, stray, healthy)
 		requireNone(t, localize(sp, testParams(), testParams()))
 	})
-	t.Run("the same loss in two windows is", func(t *testing.T) {
+	t.Run("the same loss in two adjacent windows is not enough", func(t *testing.T) {
+		// A burst across a window boundary, or one that agents with
+		// different clocks put into two windows.
 		window := meshWindow(3, 4, 1000, lossy(func(st, sr, dt, dr int) bool { return st == 0 || dt == 0 }, 50))
-		sp := spanOf(t, nil, healthy, window, window, healthy)
+		for _, windows := range [][][]obs{
+			{healthy, window, window, healthy},
+			{window, window, healthy, healthy},
+			{healthy, healthy, window, window},
+			{window, window},
+		} {
+			requireNone(t, localize(spanOf(t, nil, windows...), testParams(), testParams()))
+		}
+	})
+	t.Run("two adjacent windows with a stray event in a third are not enough", func(t *testing.T) {
+		burst := meshWindow(3, 4, 1000, lossy(func(st, sr, dt, dr int) bool { return st == 0 || dt == 0 }, 50))
+		stray := meshWindow(3, 4, 1000, lossy(func(st, sr, dt, dr int) bool { return st == 0 && sr == 0 && dt == 0 && dr == 1 }, 1))
+		sp := spanOf(t, nil, stray, healthy, burst, burst)
+		requireNone(t, localize(sp, testParams(), testParams()))
+	})
+	t.Run("the same loss in three windows is", func(t *testing.T) {
+		window := meshWindow(3, 4, 1000, lossy(func(st, sr, dt, dr int) bool { return st == 0 || dt == 0 }, 50))
+		sp := spanOf(t, nil, healthy, window, window, window)
 		requireLocalized(t, localize(sp, testParams(), testParams()), KindLoss, "tor/tor-0")
+	})
+	t.Run("the same loss in two windows that are not adjacent is", func(t *testing.T) {
+		window := meshWindow(3, 4, 1000, lossy(func(st, sr, dt, dr int) bool { return st == 0 || dt == 0 }, 50))
+		sp := spanOf(t, nil, window, healthy, window, healthy)
+		requireLocalized(t, localize(sp, testParams(), testParams()), KindLoss, "tor/tor-0")
+	})
+	t.Run("a span of two windows takes two windows, not one", func(t *testing.T) {
+		window := meshWindow(3, 4, 1000, lossy(func(st, sr, dt, dr int) bool { return st == 0 || dt == 0 }, 50))
+		stray := meshWindow(3, 4, 1000, lossy(func(st, sr, dt, dr int) bool { return st == 0 && sr == 0 && dt == 0 && dr == 1 }, 1))
+		params := testParams()
+		params.spanWindows = 2
+		requireLocalized(t, localize(spanOf(t, nil, window, window), params, params), KindLoss, "tor/tor-0")
+		requireNone(t, localize(spanOf(t, nil, window, stray), params, params))
 	})
 	t.Run("the first window of a controller is not enough", func(t *testing.T) {
 		// One window present, of a configured span of four.
@@ -485,14 +517,14 @@ func TestLocalize_EvidenceRules(t *testing.T) {
 		window := meshWindow(3, 4, 1000, lossy(func(st, sr, dt, dr int) bool {
 			return (st == 0 && sr == 0) || (dt == 0 && dr == 0)
 		}, 1000))
-		findings := localize(spanOf(t, nil, repeat(window, 2)...), testParams(), testParams())
+		findings := localize(spanOf(t, nil, repeat(window, 3)...), testParams(), testParams())
 		requireLocalized(t, findings, KindLoss, "rnic/gid-0-0")
 	})
 	t.Run("weak evidence is silence", func(t *testing.T) {
 		// 3 lost probes of 22000 on tor-0's paths: more than the baseline
 		// predicts for none of them.
 		window := meshWindow(3, 4, 1000, lossy(func(st, sr, dt, dr int) bool { return st == 0 && dt == 1 && sr == dr }, 1))
-		requireNone(t, localize(spanOf(t, nil, repeat(window, 2)...), testParams(), testParams()))
+		requireNone(t, localize(spanOf(t, nil, repeat(window, 3)...), testParams(), testParams()))
 	})
 }
 
@@ -538,7 +570,7 @@ func TestLocalize_FindingsAreBounded(t *testing.T) {
 		}
 		return lost
 	})
-	findings := localize(spanOf(t, nil, repeat(window, 2)...), testParams(), testParams())
+	findings := localize(spanOf(t, nil, repeat(window, 3)...), testParams(), testParams())
 	if len(findings) == 0 || len(findings) > maxFindingsPerSignal {
 		t.Fatalf("%d findings, want between 1 and %d", len(findings), maxFindingsPerSignal)
 	}

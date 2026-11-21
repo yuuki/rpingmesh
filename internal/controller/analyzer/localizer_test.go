@@ -136,12 +136,19 @@ func TestLocalizer_EvaluatesClosedWindowsOnce(t *testing.T) {
 	if !az.loc.evaluate(ctx) {
 		t.Fatal("did not evaluate after a second window closed")
 	}
+	requireNone(t, az.loc.currentFindings()) // two adjacent windows could be one burst
+
+	ingestWindow(az, clock, 2, lossyTor0())
+	clock.ns = windowClose(2)
+	if !az.loc.evaluate(ctx) {
+		t.Fatal("did not evaluate after a third window closed")
+	}
 	requireLocalized(t, az.loc.currentFindings(), KindLoss, "tor/tor-0")
 
 	// A summary that arrives late for a closed window of the span is new
 	// evidence.
 	late := obs{agent: "late", src: "late-a", srcTor: "tor-9", dst: "late-b", dstTor: "tor-9", total: 100}
-	az.Ingest(ctx, report(late.summary(1)))
+	az.Ingest(ctx, report(late.summary(2)))
 	if !az.loc.evaluate(ctx) {
 		t.Error("did not evaluate after a late summary for a window of the span")
 	}

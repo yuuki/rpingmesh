@@ -402,8 +402,9 @@ func TestLocalization_OneBurstIsNotAFault(t *testing.T) {
 }
 
 // TestLocalization_FaultLifecycle follows one fault through time: it is
-// reported once a second window confirms it, stays reported while it
-// lasts, and clears once the windows that saw it have left the span.
+// reported once a third window confirms it (two adjacent windows could be
+// one burst), stays reported while it lasts, and clears once the windows
+// that saw it have left the span.
 func TestLocalization_FaultLifecycle(t *testing.T) {
 	f := defaultSimFabric(82)
 	fault := simFault{element: "uplink", rail: 1, group: 0, tor: 1, member: 0, loss: 0.05}
@@ -419,10 +420,10 @@ func TestLocalization_FaultLifecycle(t *testing.T) {
 	for w := 0; w <= 8+simWindows; w++ {
 		findings := run.step()
 		switch {
-		case w < 4:
-			// Healthy, then one window of evidence: not yet.
+		case w < 5:
+			// Healthy, then one and two windows of evidence: not yet.
 			if len(findings) != 0 {
-				t.Fatalf("window %d: want no findings before a second window confirms, got:%s", w, describeFindings(findings))
+				t.Fatalf("window %d: want no findings before a third window confirms, got:%s", w, describeFindings(findings))
 			}
 		case w <= 8:
 			requireLocalized(t, findings, KindLoss, f.truth(fault))
@@ -515,6 +516,17 @@ func sweepSize(t *testing.T, scenarios int) (int, uint64) {
 	return scenarios, seed
 }
 
+// eachAgent calls fn for every agent of the fabric, in a fixed order.
+func eachAgent(f *simFabric, fn func(agent string)) {
+	for g := 0; g < f.groups; g++ {
+		for tor := 0; tor < f.tors; tor++ {
+			for h := 0; h < f.hosts; h++ {
+				fn(f.agentName(g, tor, h))
+			}
+		}
+	}
+}
+
 // randomFault draws one fault: its element uniformly, its loss log-uniform
 // between 0.5% and 50%.
 func randomFault(rng *rand.Rand, f *simFabric) simFault {
@@ -579,25 +591,68 @@ func TestLocalization_RandomFaultsAreNeverMisattributed(t *testing.T) {
 		// in a spine of a single spine group has no other spine group to
 		// stand out against at the lowest loss ratios.
 		minCorrect float64
+		// windows is how many windows a scenario runs before it is judged
+		// (simWindows when 0). With the agents' timing a lost probe is
+		// reported one or two windows after it was sent.
+		windows int
 	}{
-		{"full facts", true, true, nil, 1, 0.9},
-		{"rails only", false, true, nil, 1, 0.85},
-		{"no topology file", false, false, nil, 1, 0.5},
-		{"30% of the agents silent", true, true, silence(0.3), 1, 0.85},
-		{"70% of the agents silent", true, true, silence(0.7), 1, 0.65},
-		{"two faults at once", true, true, nil, 2, 0.85},
-		{"three faults at once", true, true, nil, 3, 0.85},
+		{"full facts", true, true, nil, 1, 0.9, 0},
+		{"rails only", false, true, nil, 1, 0.85, 0},
+		{"no topology file", false, false, nil, 1, 0.5, 0},
+		{"30% of the agents silent", true, true, silence(0.3), 1, 0.85, 0},
+		{"70% of the agents silent", true, true, silence(0.7), 1, 0.65, 0},
+		{"two faults at once", true, true, nil, 2, 0.85, 0},
+		{"three faults at once", true, true, nil, 3, 0.85, 0},
 		{"2 hosts per ToR, 2 inter-ToR targets, 4 flow labels", true, true, func(_ *rand.Rand, f *simFabric) {
 			f.hosts, f.interTor, f.flowLabels = 2, 2, 4
-		}, 1, 0.65},
-		{"one flow label", true, true, func(_ *rand.Rand, f *simFabric) { f.flowLabels = 1 }, 1, 0.85},
+		}, 1, 0.65, 0},
+		{"one flow label", true, true, func(_ *rand.Rand, f *simFabric) { f.flowLabels = 1 }, 1, 0.85, 0},
 		{"one rail, one spine group, 8 ToRs", true, true, func(_ *rand.Rand, f *simFabric) {
 			f.rails, f.groups, f.tors = 1, 1, 8
-		}, 1, 0.65},
+		}, 1, 0.5, 0},
 		{"3 spine groups of 2 ToRs, 3 hosts", true, true, func(_ *rand.Rand, f *simFabric) {
 			f.groups, f.tors, f.hosts = 3, 2, 3
-		}, 1, 0.85},
-		{"background loss at the baseline", true, true, func(_ *rand.Rand, f *simFabric) { f.noiseLoss = 1e-3 }, 1, 0.9},
+		}, 1, 0.85, 0},
+		{"background loss at the baseline", true, true, func(_ *rand.Rand, f *simFabric) { f.noiseLoss = 1e-3 }, 1, 0.9, 0},
+		// From here on, conditions of ordinary operation on top of the
+		// fault: none of them may add a finding that holds no fault.
+		{"one ToR, 16 hosts", true, true, func(_ *rand.Rand, f *simFabric) {
+			f.rails, f.groups, f.tors, f.hosts = 1, 1, 1, 16
+		}, 1, 0.1, 0},
+		{"one ToR with half its uplinks", true, true, func(rng *rand.Rand, f *simFabric) {
+			spines := rng.Perm(f.spines)[:f.spines/2]
+			f.uplinks = map[string][]int{f.torName(rng.IntN(f.rails), rng.IntN(f.groups), rng.IntN(f.tors)): spines}
+		}, 1, 0.8, 0},
+		{"agents' timing", true, true, func(_ *rand.Rand, f *simFabric) { f.timing = agentTiming() }, 1, 0.8, 6},
+		{"agents' timing, clocks up to 10 s apart", true, true, func(rng *rand.Rand, f *simFabric) {
+			f.timing = agentTiming()
+			f.timing.clockOffset = map[string]float64{}
+			eachAgent(f, func(agent string) { f.timing.clockOffset[agent] = -10 * rng.Float64() })
+		}, 1, 0.8, 6},
+		{"agents' timing, three agents restart", true, true, func(rng *rand.Rand, f *simFabric) {
+			f.timing = agentTiming()
+			f.timing.restarts = map[string]simRestart{}
+			for k := 0; k < 3; k++ {
+				agent := f.agentName(rng.IntN(f.groups), rng.IntN(f.tors), rng.IntN(f.hosts))
+				f.timing.restarts[agent] = simRestart{at: 40 + 80*rng.Float64(), down: 1 + 19*rng.Float64()}
+			}
+		}, 1, 0.8, 6},
+		{"agents' timing, a rack restarts host by host", true, true, func(rng *rand.Rand, f *simFabric) {
+			f.timing = agentTiming()
+			f.timing.restarts = map[string]simRestart{}
+			g, tor, at, spacing := rng.IntN(f.groups), rng.IntN(f.tors), 40+60*rng.Float64(), 10*rng.Float64()
+			for h := 0; h < f.hosts; h++ {
+				f.timing.restarts[f.agentName(g, tor, h)] = simRestart{at: at + spacing*float64(h), down: 2}
+			}
+		}, 1, 0.8, 6},
+		{"agents' timing, one burst on a ToR", true, true, func(rng *rand.Rand, f *simFabric) {
+			f.timing = agentTiming()
+			at := 30 + 90*rng.Float64()
+			f.bursts = []simFault{{
+				element: "tor", rail: rng.IntN(f.rails), group: rng.IntN(f.groups), tor: rng.IntN(f.tors),
+				loss: 0.5, fromSec: at, untilSec: at + 2 + 18*rng.Float64(),
+			}}
+		}, 1, 0.8, 6},
 	}
 	scenarios, seed := sweepSize(t, 40)
 	for vi, v := range variants {
@@ -614,7 +669,11 @@ func TestLocalization_RandomFaultsAreNeverMisattributed(t *testing.T) {
 					f.faults = append(f.faults, randomFault(rng, f))
 				}
 				run := newSimRun(t, f, LocalizationConfig{Topology: f.topology(t, v.groups, v.rails)})
-				findings := run.after(simWindows)
+				windows := simWindows
+				if v.windows > 0 {
+					windows = v.windows
+				}
+				findings := run.after(windows)
 				checkFindingInvariants(t, findings, DefaultLocalizationMinConfidence)
 				out := f.judge(findings, v.groups, v.rails)
 				if len(out.wrongScopes) != 0 {

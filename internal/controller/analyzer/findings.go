@@ -302,38 +302,83 @@ func (s *solver) sibling(c int32) (tier int, member, scope int32, ok bool) {
 // members, looks like this), and what remains on one member after
 // subtracting the scope's average is that unevenness, not a second fault.
 //
-// The uplinks of ToRs whose upper tiers the topology does not state need
-// more care, because the model holds nothing that a fault above them could
-// be put on. Two such ToRs degraded at once are folded: two uplink faults
-// cannot be told from one fault in the unknown tier above both. One such
-// ToR is reported on its own only when a fault above it would have shown on
-// the other ToRs (see siblingsWouldShow).
+// A ToR's uplinks need more care, because a fault in the tier above can
+// look like them. The model holds that a ToR spreads its paths evenly over
+// as many uplinks as its siblings. A ToR with fewer uplinks (by design, or
+// because one is down) sends a larger share of its paths through each
+// spine, so a fault in one spine adds more excess to its paths than to its
+// siblings': after the scope's average is explained, the rest looks like a
+// fault of that ToR's own uplinks. The facts do not state uplink counts,
+// and could not state a link that went down. A spine group with fewer
+// links to the cores than its siblings looks the same one tier up. So:
+//
+//   - A finding that names a ToR's uplinks, or a spine group, is not
+//     reported on its own under a scope that is itself part of the
+//     explanation. It is folded into the scope's finding, which lists it as
+//     a member. (A finding that names the ToR as a whole is: a fault above
+//     the ToR does not touch the paths under it.)
+//   - A ToR's uplinks under a scope that is not part of the explanation
+//     are reported on their own only when a fault above would have shown on
+//     the scope's other paths, and has not (aboveWouldShow).
+//   - Under the fabric, where the facts say nothing about the tier above,
+//     two ToRs' uplinks are folded: two uplink faults cannot be told from
+//     one fault in an unknown tier above both.
 func (s *solver) siblingLimit(g *siblingGroup) int {
-	if s.selected[g.scope] && s.dispersion(g.scope, s.theta[g.scope]) > maxScopeDispersion {
+	if s.selected[g.scope] && (g.uplinks || g.tier == tierGroup || s.dispersion(g.scope, s.theta[g.scope]) > maxScopeDispersion) {
 		return 0
 	}
-	if g.tier == tierTor && g.scope == s.fabric && g.uplinks {
-		if !s.siblingsWouldShow(g) {
+	if g.tier == tierTor && g.uplinks {
+		switch {
+		case !s.aboveWouldShow(g):
 			return 0
+		case g.scope == s.fabric:
+			return 1
 		}
-		return 1
 	}
 	return maxSiblings
 }
 
-// siblingsWouldShow reports whether an excess as large as the group's, if
-// it sat in a tier above the ToRs, would have left evidence on every other
-// ToR without stated facts: at least powerNats expected on each, three
-// times what it takes to count as a hinted sibling. When it would, and the
-// other ToRs are clean, the excess belongs to the named ToR. When it would
-// not (a weak fault, or ToRs with few probes), their silence proves
-// nothing.
-func (s *solver) siblingsWouldShow(g *siblingGroup) bool {
-	base, excess := s.p.baseline, g.minExcess
+// aboveShare is the excess a fault in the tier above a ToR puts on the
+// scope's other paths, as a share of the excess it leaves on the uplinks of
+// a ToR with fewer uplinks than its siblings: at least a half, as long as
+// the ToR has a fifth of its siblings' uplinks or more. (With m uplinks per
+// sibling and n at the ToR, a spine that drops f adds 2f/m to the paths
+// between siblings and f/n - f/m more to the ToR's.)
+const aboveShare = 0.5
+
+// aboveWouldShow reports whether a fault in the tier above the group's
+// ToR, strong enough to explain the excess on its uplinks, would have left
+// evidence on the other paths of the scope, at least powerNats (three times
+// what it takes to count as a hint), and has not. When it would have, and
+// those paths are clean, the excess belongs to the named ToR's uplinks.
+// When it would not (a weak fault, few probes, no other ToR under the
+// scope), the silence of the other paths proves nothing.
+//
+// Under a spine group or a rail the facts state, the scope's other paths
+// are those that do not touch the named ToR: the scope is fitted on top of
+// the explanation, which already accounts for the ToR's paths. Under the
+// fabric, for ToRs the facts say nothing about, the tier above is unknown:
+// only the other ToRs without facts can share it, and each of them must
+// have been probed enough to show the fault.
+func (s *solver) aboveWouldShow(g *siblingGroup) bool {
+	base, excess := s.p.baseline, aboveShare*g.minExcess
 	// The gain per trial a path at the rate base+excess is expected to
 	// yield over the baseline: the Kullback-Leibler divergence of the two
 	// Poisson rates.
 	perTrial := (base+excess)*math.Log((base+excess)/base) - excess
+
+	if g.scope != s.fabric {
+		rest := s.trials[g.scope]
+		for member := range g.members {
+			rest -= s.trials[s.baseUplink+member]
+		}
+		if rest*perTrial < powerNats {
+			return false
+		}
+		theta, gain := s.fit(g.scope)
+		return !(gain >= hintNats && theta >= hintExcessShare*g.minExcess)
+	}
+
 	siblings := 0
 	for t := range s.sp.tors {
 		if _, named := g.members[int32(t)]; named || s.sp.tors[t].known() {

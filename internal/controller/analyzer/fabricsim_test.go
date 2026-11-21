@@ -57,6 +57,18 @@ type simFabric struct {
 	silentFrom map[string]int
 	// windowFaults limits a fault to some windows: fault index -> windows.
 	windowFaults map[int]map[int]bool
+	// uplinks names the spines a ToR is connected to, by ToR name. A ToR
+	// that is not listed is connected to all spines of its group. A ToR
+	// with fewer uplinks (by design, or because a link is down) sends more
+	// of its paths through each spine it has left.
+	uplinks map[string][]int
+	// timing switches from "a probe is reported in the window in which it
+	// was sent" to the agents' behaviour over time (fabrictime_test.go).
+	timing *simTiming
+	// bursts are faults that last a few seconds (fromSec to untilSec), in a
+	// simulation with timing. They drop packets like faults, but a burst is
+	// no fault: a finding that names its element holds no fault.
+	bursts []simFault
 
 	rnics []simRNIC
 	paths []simPath
@@ -74,6 +86,9 @@ type simFault struct {
 	member  int // uplink or spine index within the group, or core index
 	loss    float64
 	delayNs uint64
+	// fromSec and untilSec limit the fault in time, in seconds since the
+	// start of window 0, in a simulation with timing. Both zero: always.
+	fromSec, untilSec float64
 }
 
 type simRNIC struct {
@@ -213,20 +228,45 @@ func (f *simFabric) addPath(src, dst int, mesh bool) {
 	if !mesh {
 		a, b := &f.rnics[src], &f.rnics[dst]
 		sameGroup := a.group == b.group
-		hops := func() []simHop {
+		// The spines each end can use, and those that join the two ToRs
+		// when they are in one group.
+		spinesOf := func(r *simRNIC) []int {
+			if up, limited := f.uplinks[r.torID]; limited {
+				return up
+			}
+			all := make([]int, f.spines)
+			for i := range all {
+				all[i] = i
+			}
+			return all
+		}
+		var shared []int
+		for _, x := range spinesOf(a) {
+			for _, y := range spinesOf(b) {
+				if x == y {
+					shared = append(shared, x)
+				}
+			}
+		}
+		hops := func(from, to *simRNIC) []simHop {
 			out := make([]simHop, f.flowLabels)
 			for l := range out {
-				hop := simHop{up: int8(f.rng.IntN(f.spines)), core: -1}
-				hop.down = hop.up // one spine joins two ToRs of a group
-				if !sameGroup {
+				var hop simHop
+				if sameGroup {
+					// One spine joins two ToRs of a group.
+					hop.up = int8(shared[f.rng.IntN(len(shared))])
+					hop.down, hop.core = hop.up, -1
+				} else {
+					up, down := spinesOf(from), spinesOf(to)
+					hop.up = int8(up[f.rng.IntN(len(up))])
 					hop.core = int8(f.rng.IntN(f.cores))
-					hop.down = int8(f.rng.IntN(f.spines))
+					hop.down = int8(down[f.rng.IntN(len(down))])
 				}
 				out[l] = hop
 			}
 			return out
 		}
-		p.fwd, p.rev = hops(), hops()
+		p.fwd, p.rev = hops(a, b), hops(b, a)
 	}
 	f.paths = append(f.paths, p)
 }
@@ -296,6 +336,9 @@ type simSummary struct {
 
 // window simulates every probe of one window and returns the summaries.
 func (f *simFabric) window(w int) []simSummary {
+	if f.timing != nil {
+		return f.timedWindow(w)
+	}
 	out := make([]simSummary, 0, len(f.paths))
 	var rtts []uint64
 	for i := range f.paths {
@@ -579,8 +622,12 @@ func (f *simFabric) accepted(fault simFault, withGroups, withRails bool) map[str
 // it. It also holds a faulty ToR that the finding lists as a member, since
 // the finding then says "this ToR or what is above it". No scope holds an
 // RNIC or a host, and the background (every path alike) holds no single
-// fault at all.
+// fault at all, except in a fabric of one ToR: every path is then that
+// ToR's, and a fault of the ToR is "all paths".
 func (f *simFabric) scopeHolds(scope Component, members []string, fault simFault) bool {
+	if scope.Kind == ComponentBackground {
+		return fault.element == "tor" && f.rails*f.groups*f.tors == 1
+	}
 	inGroup := scope.SpineGroup == f.groupName(fault.rail, fault.group)
 	inRail := scope.Rail == f.railName(fault.rail)
 	var above bool

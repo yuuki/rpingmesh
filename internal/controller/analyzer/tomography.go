@@ -54,7 +54,8 @@ const (
 
 	// minFailedPairs is the least number of distinct RNIC pairs with events
 	// a component needs. One pair can fail for reasons private to it (a
-	// stale QPN after an agent restart).
+	// path pinned to one flow label that crosses a bad link nothing else of
+	// the component uses).
 	minFailedPairs = 3
 
 	// minFailedMembers is the least number of a composite component's
@@ -65,9 +66,14 @@ const (
 
 	// minEventWindows is the least number of distinct windows of the span
 	// with events, and maxWindowShare the largest share of a component's
-	// events that one window may hold. One burst is not a fault: a fault
-	// that has just begun is reported once a second window confirms it.
-	// Both rules are off for an evidence span configured to one window.
+	// events that two adjacent windows may hold together (one window, for
+	// an evidence span configured to two windows). One burst is not a
+	// fault. A burst that straddles a window boundary puts its events into
+	// two adjacent windows, and so does a burst within one window when the
+	// agents' clocks differ or their timeout sweeps fall on both sides of
+	// the boundary. A fault is therefore reported once a third window holds
+	// a quarter of its events, when it has lasted more than one window
+	// length. Both rules are off for a span configured to one window.
 	minEventWindows = 2
 	maxWindowShare  = 0.75
 
@@ -126,6 +132,10 @@ type spanRNIC struct {
 	agent string // agent that reported the RNIC, "" when unknown
 	tor   int32  // index into span.tors
 	host  int32  // index into span.hosts, -1 without a host component
+	// unanswering: the probes sent to the RNIC are lost while its own are
+	// delivered (see markUnanswering). The loss solver leaves the paths to
+	// it out.
+	unanswering bool
 }
 
 // spanTor is one ToR of an evidence span with its topology facts.
@@ -174,6 +184,8 @@ type span struct {
 	// events in that window. They tell a fault that persists from a burst.
 	lossEvents [][]spanEvent
 	rttEvents  [][]spanEvent
+	// unanswering counts the RNICs marked by markUnanswering.
+	unanswering int
 }
 
 // solverParams are the settings of one solve.
@@ -199,6 +211,9 @@ func (p solverParams) detectNats() float64 {
 // localize runs the tomography on both signals of a span and returns the
 // findings, in a stable order.
 func localize(sp *span, loss, rtt solverParams) []Finding {
+	if sp.unanswering == 0 {
+		sp.unanswering = sp.markUnanswering(loss.baseline)
+	}
 	var findings []Finding
 	findings = append(findings, newSolver(sp, KindLoss, loss).solve()...)
 	findings = append(findings, newSolver(sp, KindRTT, rtt).solve()...)
@@ -253,7 +268,11 @@ type solver struct {
 	selected []bool
 	// banned marks components a split replaced by more specific ones (see
 	// split); they do not re-enter the explanation.
-	banned   []bool
+	banned []bool
+	// catchAll marks the components that have exactly the paths of the
+	// fabric or of the background (see markCatchAlls). They are no place of
+	// their own: the catch-all stands for them.
+	catchAll []bool
 	active   []int32 // components with at least one failed path
 	eligible []int8  // 0 unknown, 1 eligible, -1 not
 
@@ -288,6 +307,10 @@ func newSolver(sp *span, signal string, p solverParams) *solver {
 func (s *solver) observation(p *spanPath) (trials, events uint32, mask uint64) {
 	if s.signal == KindRTT {
 		return p.rttTrials, min(p.rttBad, p.rttTrials), p.rttMask
+	}
+	if s.sp.rnics[p.dst].unanswering {
+		// Not the network's loss: the path is neither trials nor events.
+		return 0, 0, 0
 	}
 	return p.probes, min(p.failed, p.probes), p.lossMask
 }
@@ -377,6 +400,7 @@ func (s *solver) prepare() bool {
 	sp := s.sp
 	s.trials = make([]float64, s.numComp)
 	s.pathCount = make([]int32, s.numComp)
+	interCount := make([]int32, s.numComp) // paths between two ToRs
 	failedCount := make([]int32, s.numComp)
 
 	rnicSeen := make([]bool, len(sp.rnics))
@@ -424,6 +448,7 @@ func (s *solver) prepare() bool {
 			rnicInter[p.src], rnicInter[p.dst] = true, true
 			torInter[srcTor], torInter[dstTor] = true, true
 			for _, c := range comps {
+				interCount[c]++
 				if c >= s.baseRail && c < s.fabric {
 					rail := c - s.baseRail
 					if sp.tors[srcTor].rail == rail {
@@ -476,6 +501,7 @@ func (s *solver) prepare() bool {
 	s.dirty = make([]bool, s.numComp)
 	s.selected = make([]bool, s.numComp)
 	s.banned = make([]bool, s.numComp)
+	s.markCatchAlls(interCount)
 	s.eligible = make([]int8, s.numComp)
 	for _, c := range s.active {
 		s.dirty[c] = true
@@ -484,6 +510,33 @@ func (s *solver) prepare() bool {
 	s.torStamp = make([]int32, len(sp.tors))
 	s.compStamp = make([]int32, s.numComp)
 	return true
+}
+
+// markCatchAlls marks the components below the fabric that have exactly the
+// paths of the background (every observed path) or of the fabric (every
+// observed path between two ToRs). Such a component cannot be told from
+// "all paths are degraded": a baseline set too low for the fabric, or a
+// fault in a tier the facts do not describe. In a deployment of one ToR
+// every path is that ToR's; in a fabric of one spine group every path
+// between ToRs is that group's. Naming the ToR or the group would be a
+// guess, so the component neither enters the explanation nor counts as an
+// alternative: the catch-all takes its place, and the finding is "not
+// localizable".
+//
+// A component's paths are a subset of the catch-all's, so equal counts mean
+// equal sets (for the fabric: when all of the component's paths are between
+// ToRs).
+func (s *solver) markCatchAlls(interCount []int32) {
+	s.catchAll = make([]bool, s.numComp)
+	for c := int32(0); c < s.fabric; c++ {
+		n := s.pathCount[c]
+		if n == 0 {
+			continue
+		}
+		if n == s.pathCount[s.background] || (interCount[c] == n && n == s.pathCount[s.fabric]) {
+			s.catchAll[c] = true
+		}
+	}
 }
 
 // indexWindows records, for every path with events, its events by window.
@@ -790,9 +843,15 @@ func (s *solver) eventWindows(c int32) int {
 }
 
 // enoughWindows reports whether the events of c persist: they fall in at
-// least minEventWindows windows, and no single window holds more than
-// maxWindowShare of them. Events in two windows are not enough on their own,
-// because background noise puts a stray event next to any burst.
+// least minEventWindows windows, and no two adjacent windows hold more than
+// maxWindowShare of them together. Counting windows with events is not
+// enough on its own, because background noise puts a stray event next to
+// any burst. With a span configured to two windows the share is taken per
+// window: such a span cannot tell a burst across the boundary from a fault.
+//
+// Windows are adjacent by their position in the span. A window for which
+// nothing was reported is not in the span, so its neighbours count as
+// adjacent: that errs towards waiting.
 func (s *solver) enoughWindows(c int32) bool {
 	if s.p.spanWindows < minEventWindows {
 		return true
@@ -806,9 +865,63 @@ func (s *solver) enoughWindows(c int32) bool {
 			perWindow[wc.window] += wc.count
 		}
 	}
+	windows := min(s.sp.windows, MaxLocalizationWindows)
 	var total, busiest float64
-	for _, n := range perWindow[:min(s.sp.windows, MaxLocalizationWindows)] {
+	for w := 0; w < windows; w++ {
+		n := perWindow[w]
 		total += n
+		if s.p.spanWindows > minEventWindows && w+1 < windows {
+			n += perWindow[w+1]
+		}
+		busiest = math.Max(busiest, n)
+	}
+	return busiest <= maxWindowShare*total
+}
+
+// persists applies the persistence rule to what the selected component c
+// itself explains: its events beyond what the rest of the explanation and
+// the baseline account for, window by window. enoughWindows looks at all
+// events on the component's paths, which is not the same once another
+// component explains part of them: a ToR that drops packets for a few
+// seconds while a fault above it lasts has events in every window (the
+// fault's) and an excess of its own in one or two (the burst's). The share
+// rule is the one of enoughWindows; trials are taken as spread evenly over
+// the windows of the span.
+func (s *solver) persists(c int32) bool {
+	if s.p.spanWindows < minEventWindows {
+		return true
+	}
+	windows := min(s.sp.windows, MaxLocalizationWindows)
+	var perWindow [MaxLocalizationWindows]float64
+	var expected, failedTrials float64
+	for _, f := range s.failed(c) {
+		for _, wc := range s.fwin[s.fwinOff[f]:s.fwinOff[f+1]] {
+			perWindow[wc.window] += wc.count
+		}
+		expected += s.ftrials[f] * (s.frate[f] - s.theta[c])
+		failedTrials += s.ftrials[f]
+	}
+	expected += (s.trials[c] - failedTrials) * s.p.baseline
+	expected /= float64(windows)
+
+	var total float64
+	with := 0
+	for w := 0; w < windows; w++ {
+		perWindow[w] = math.Max(0, perWindow[w]-expected)
+		total += perWindow[w]
+		if perWindow[w] > 0 {
+			with++
+		}
+	}
+	if with < minEventWindows {
+		return false
+	}
+	var busiest float64
+	for w := 0; w < windows; w++ {
+		n := perWindow[w]
+		if s.p.spanWindows > minEventWindows && w+1 < windows {
+			n += perWindow[w+1]
+		}
 		busiest = math.Max(busiest, n)
 	}
 	return busiest <= maxWindowShare*total
@@ -883,7 +996,7 @@ func (s *solver) greedy(order []int32, limit int) ([]int32, float64) {
 	for len(order) < min(limit, maxExplanation) {
 		best, bestGain := int32(-1), detect
 		for _, c := range s.active {
-			if s.selected[c] || s.banned[c] {
+			if s.selected[c] || s.banned[c] || s.catchAll[c] {
 				continue
 			}
 			if s.dirty[c] {
@@ -1029,7 +1142,7 @@ func (s *solver) alternatives(c int32) []candidate {
 			s.compStamp[other] = gen
 			// A component that a split replaced stays an alternative: it
 			// lost its place to c, not its claim on the events.
-			if (s.selected[other] && other != c) || !s.isEligible(other) {
+			if (s.selected[other] && other != c) || s.catchAll[other] || !s.isEligible(other) {
 				continue
 			}
 			// The fabric and the background stand for what the facts do
@@ -1104,7 +1217,7 @@ func (s *solver) solve() []Finding {
 		if len(found) == maxFindingsPerSignal {
 			break
 		}
-		if !s.isEligible(c) {
+		if !s.isEligible(c) || !s.persists(c) {
 			continue // explains its events, but may not be named
 		}
 		f, ok := s.finding(s.alternatives(c))

@@ -76,6 +76,11 @@ const (
 	// length. Both rules are off for a span configured to one window.
 	minEventWindows = 2
 	maxWindowShare  = 0.75
+	// minOwnShare is the share of a component's events that must lie on
+	// paths no other component of the explanation covers for the
+	// persistence of its own excess to be judged on those paths alone (see
+	// persists).
+	minOwnShare = 0.25
 
 	// maxExplanation bounds the components one evaluation can add to the
 	// explanation of one signal, and with it the work of the solver.
@@ -790,13 +795,15 @@ func (s *solver) nextGen() int32 {
 	return s.stampGen
 }
 
-// isEligible applies the breadth and persistence rules to component c. They
-// depend only on which of its paths had events, so the result is cached.
+// isEligible applies the breadth rules to component c. They depend only on
+// which of its paths had events, so the result is cached. The persistence
+// rule is applied to the place a component takes in the explanation
+// (persists): it depends on what else is in the explanation.
 func (s *solver) isEligible(c int32) bool {
 	if s.eligible[c] != 0 {
 		return s.eligible[c] > 0
 	}
-	ok := s.enoughPairs(c) && s.enoughWindows(c) && s.enoughMembers(c)
+	ok := s.enoughPairs(c) && s.enoughMembers(c)
 	if ok {
 		s.eligible[c] = 1
 	} else {
@@ -842,89 +849,78 @@ func (s *solver) eventWindows(c int32) int {
 	return bits.OnesCount64(mask)
 }
 
-// enoughWindows reports whether the events of c persist: they fall in at
-// least minEventWindows windows, and no two adjacent windows hold more than
-// maxWindowShare of them together. Counting windows with events is not
-// enough on its own, because background noise puts a stray event next to
-// any burst. With a span configured to two windows the share is taken per
-// window: such a span cannot tell a burst across the boundary from a fault.
+// persists reports whether what the selected component c explains
+// persists: its events fall in at least minEventWindows windows, and no two
+// adjacent windows hold more than maxWindowShare of them together. Counting
+// windows with events is not enough on its own, because background noise
+// puts a stray event next to any burst. With a span configured to two
+// windows the share is taken per window: such a span cannot tell a burst
+// across the boundary from a fault.
 //
 // Windows are adjacent by their position in the span. A window for which
 // nothing was reported is not in the span, so its neighbours count as
 // adjacent: that errs towards waiting.
-func (s *solver) enoughWindows(c int32) bool {
-	if s.p.spanWindows < minEventWindows {
-		return true
-	}
-	if s.eventWindows(c) < minEventWindows {
-		return false
-	}
-	var perWindow [MaxLocalizationWindows]float64
-	for _, f := range s.failed(c) {
-		for _, wc := range s.fwin[s.fwinOff[f]:s.fwinOff[f+1]] {
-			perWindow[wc.window] += wc.count
-		}
-	}
-	windows := min(s.sp.windows, MaxLocalizationWindows)
-	var total, busiest float64
-	for w := 0; w < windows; w++ {
-		n := perWindow[w]
-		total += n
-		if s.p.spanWindows > minEventWindows && w+1 < windows {
-			n += perWindow[w+1]
-		}
-		busiest = math.Max(busiest, n)
-	}
-	return busiest <= maxWindowShare*total
-}
-
-// persists applies the persistence rule to what the selected component c
-// itself explains: its events beyond what the rest of the explanation and
-// the baseline account for, window by window. enoughWindows looks at all
-// events on the component's paths, which is not the same once another
+//
+// The events on the component's paths are not all its own once another
 // component explains part of them: a ToR that drops packets for a few
 // seconds while a fault above it lasts has events in every window (the
-// fault's) and an excess of its own in one or two (the burst's). The share
-// rule is the one of enoughWindows; trials are taken as spread evenly over
-// the windows of the span.
+// fault's) and an excess of its own in one or two (the burst's). So the
+// rule is applied to the events on the paths that no other component of
+// the explanation covers, when they are at least minOwnShare of the
+// component's events: those are the component's alone (for the ToR above,
+// the paths under it). Otherwise it is applied to the events beyond what
+// the rest of the explanation and the baseline account for, window by
+// window, with the trials taken as spread evenly over the windows.
 func (s *solver) persists(c int32) bool {
 	if s.p.spanWindows < minEventWindows {
 		return true
 	}
 	windows := min(s.sp.windows, MaxLocalizationWindows)
-	var perWindow [MaxLocalizationWindows]float64
-	var expected, failedTrials float64
+	var own, all [MaxLocalizationWindows]float64
+	var ownEvents, events, expected, failedTrials float64
 	for _, f := range s.failed(c) {
-		for _, wc := range s.fwin[s.fwinOff[f]:s.fwinOff[f+1]] {
-			perWindow[wc.window] += wc.count
+		alone := true
+		for _, other := range s.pathComps(f) {
+			if other != c && s.selected[other] {
+				alone = false
+				break
+			}
 		}
+		for _, wc := range s.fwin[s.fwinOff[f]:s.fwinOff[f+1]] {
+			all[wc.window] += wc.count
+			if alone {
+				own[wc.window] += wc.count
+				ownEvents += wc.count
+			}
+		}
+		events += s.fevents[f]
 		expected += s.ftrials[f] * (s.frate[f] - s.theta[c])
 		failedTrials += s.ftrials[f]
 	}
-	expected += (s.trials[c] - failedTrials) * s.p.baseline
-	expected /= float64(windows)
+	perWindow := &own
+	if ownEvents < minOwnShare*events {
+		expected += (s.trials[c] - failedTrials) * s.p.baseline
+		expected /= float64(windows)
+		for w := 0; w < windows; w++ {
+			all[w] = math.Max(0, all[w]-expected)
+		}
+		perWindow = &all
+	}
 
-	var total float64
+	var total, busiest float64
 	with := 0
 	for w := 0; w < windows; w++ {
-		perWindow[w] = math.Max(0, perWindow[w]-expected)
-		total += perWindow[w]
-		if perWindow[w] > 0 {
+		n := perWindow[w]
+		total += n
+		if n > 0 {
 			with++
 		}
-	}
-	if with < minEventWindows {
-		return false
-	}
-	var busiest float64
-	for w := 0; w < windows; w++ {
-		n := perWindow[w]
 		if s.p.spanWindows > minEventWindows && w+1 < windows {
 			n += perWindow[w+1]
 		}
 		busiest = math.Max(busiest, n)
 	}
-	return busiest <= maxWindowShare*total
+	return with >= minEventWindows && busiest <= maxWindowShare*total
 }
 
 // enoughMembers reports whether the events of a composite component touch
